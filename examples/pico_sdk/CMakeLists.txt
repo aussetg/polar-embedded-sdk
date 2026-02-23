@@ -1,0 +1,88 @@
+cmake_minimum_required(VERSION 3.13)
+
+if(DEFINED ENV{PICO_SDK_PATH})
+    include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+else()
+    message(FATAL_ERROR "PICO_SDK_PATH environment variable must be set")
+endif()
+
+project(h10_btstack_probe C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+pico_sdk_init()
+
+add_executable(h10_btstack_probe
+    main.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_common.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_connect.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_transport.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_wait.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_runtime_context.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_transport_adapter.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_link.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_gatt.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_gatt_route.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_helpers.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_scan.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_adv_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_sm.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_sm_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_dispatch.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_orchestrator.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_dispatch.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_btstack_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_apply.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_notify_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_query_complete.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_write.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_hr.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_ecg.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd_start.c
+)
+
+target_include_directories(h10_btstack_probe PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/include
+)
+
+target_link_libraries(h10_btstack_probe
+    pico_stdlib
+    pico_cyw43_arch_none
+    pico_btstack_ble
+    pico_btstack_cyw43
+)
+
+# Optional compile-time knobs (can be overridden with -D... at CMake configure time)
+set(H10_TARGET_ADDR "24:AC:AC:05:A3:10" CACHE STRING "Target H10 BLE address")
+set(H10_FORCE_PAIRING "0" CACHE STRING "Call sm_request_pairing() after connect")
+set(H10_ENABLE_HR "1" CACHE STRING "Enable HR service discovery + notify")
+set(H10_ENABLE_ECG_POLICY "1" CACHE STRING "Enable shared-driver PMD ECG start policy run")
+set(H10_POST_CONNECT_UPDATE "1" CACHE STRING "Use gap_update_connection_parameters after connect")
+set(H10_POST_CONNECT_CONN_INTERVAL_MIN "24" CACHE STRING "Conn interval min (1.25ms units)")
+set(H10_POST_CONNECT_CONN_INTERVAL_MAX "24" CACHE STRING "Conn interval max (1.25ms units)")
+set(H10_POST_CONNECT_CONN_LATENCY "0" CACHE STRING "Slave latency")
+set(H10_POST_CONNECT_SUPERVISION_TIMEOUT_10MS "72" CACHE STRING "Supervision timeout (10ms units)")
+
+target_compile_definitions(h10_btstack_probe PRIVATE
+    H10_TARGET_ADDR="${H10_TARGET_ADDR}"
+    H10_FORCE_PAIRING=${H10_FORCE_PAIRING}
+    H10_ENABLE_HR=${H10_ENABLE_HR}
+    H10_ENABLE_ECG_POLICY=${H10_ENABLE_ECG_POLICY}
+    H10_POST_CONNECT_UPDATE=${H10_POST_CONNECT_UPDATE}
+    H10_POST_CONNECT_CONN_INTERVAL_MIN=${H10_POST_CONNECT_CONN_INTERVAL_MIN}
+    H10_POST_CONNECT_CONN_INTERVAL_MAX=${H10_POST_CONNECT_CONN_INTERVAL_MAX}
+    H10_POST_CONNECT_CONN_LATENCY=${H10_POST_CONNECT_CONN_LATENCY}
+    H10_POST_CONNECT_SUPERVISION_TIMEOUT_10MS=${H10_POST_CONNECT_SUPERVISION_TIMEOUT_10MS}
+)
+
+pico_enable_stdio_usb(h10_btstack_probe 1)
+pico_enable_stdio_uart(h10_btstack_probe 0)
+
+pico_add_extra_outputs(h10_btstack_probe)

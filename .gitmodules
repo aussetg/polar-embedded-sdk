@@ -1,0 +1,15 @@
+[submodule "vendors/micropython"]
+	path = vendors/micropython
+	url = git@github.com:micropython/micropython.git
+[submodule "vendors/nanopb"]
+	path = vendors/nanopb
+	url = git@github.com:nanopb/nanopb.git
+[submodule "vendors/pimoroni-pico"]
+	path = vendors/pimoroni-pico
+	url = https://github.com/pimoroni/pimoroni-pico.git
+[submodule "vendors/btstack"]
+	path = vendors/btstack
+	url = git@github.com:bluekitchen/btstack.git
+[submodule "vendors/pico-sdk"]
+	path = vendors/pico-sdk
+	url = git@github.com:raspberrypi/pico-sdk.git

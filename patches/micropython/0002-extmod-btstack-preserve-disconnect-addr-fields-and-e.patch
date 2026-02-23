@@ -1,0 +1,65 @@
+From f014721b6c48738385f52eaa79084e72073b9d80 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Mon, 23 Feb 2026 15:13:26 +0100
+Subject: [PATCH 2/3] extmod/btstack: preserve disconnect addr fields and emit
+ reason
+
+---
+ extmod/btstack/modbluetooth_btstack.c | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/extmod/btstack/modbluetooth_btstack.c b/extmod/btstack/modbluetooth_btstack.c
+index 7694a1874..d01cabbef 100644
+--- a/extmod/btstack/modbluetooth_btstack.c
++++ b/extmod/btstack/modbluetooth_btstack.c
+@@ -37,6 +37,12 @@
+ 
+ #define DEBUG_printf(...) // printf("btstack: " __VA_ARGS__)
+ 
++// Optional debug mode: temporarily overload disconnect addr_type with HCI reason
++// for compatibility with old Python-side debugging scripts.
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_DEBUG_DISCONNECT_REASON_IN_ADDR_TYPE
++#define MICROPY_PY_BLUETOOTH_BTSTACK_DEBUG_DISCONNECT_REASON_IN_ADDR_TYPE (0)
++#endif
++
+ #ifndef MICROPY_PY_BLUETOOTH_DEFAULT_GAP_NAME
+ #define MICROPY_PY_BLUETOOTH_DEFAULT_GAP_NAME "MPY BTSTACK"
+ #endif
+@@ -304,6 +310,7 @@ static void btstack_packet_handler_generic(uint8_t packet_type, uint16_t channel
+     } else if (event_type == HCI_EVENT_DISCONNECTION_COMPLETE) {
+         DEBUG_printf("  --> hci disconnect complete\n");
+         uint16_t conn_handle = hci_event_disconnection_complete_get_connection_handle(packet);
++        uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
+         const hci_connection_t *conn = hci_connection_for_handle(conn_handle);
+         uint16_t irq_event;
+         if (conn == NULL || conn->role == 0) {
+@@ -313,8 +320,25 @@ static void btstack_packet_handler_generic(uint8_t packet_type, uint16_t channel
+             // Slave role.
+             irq_event = MP_BLUETOOTH_IRQ_CENTRAL_DISCONNECT;
+         }
++
++        uint8_t addr_type = 0xff;
+         uint8_t addr[6] = {0};
+-        mp_bluetooth_gap_on_connected_disconnected(irq_event, conn_handle, 0xff, addr);
++        if (conn != NULL) {
++            addr_type = conn->address_type;
++            for (size_t i = 0; i < sizeof(addr); ++i) {
++                addr[i] = conn->address[i];
++            }
++        }
++
++        #if MICROPY_PY_BLUETOOTH_BTSTACK_DEBUG_DISCONNECT_REASON_IN_ADDR_TYPE
++        addr_type = reason;
++        for (size_t i = 0; i < sizeof(addr); ++i) {
++            addr[i] = 0;
++        }
++        #endif
++
++        mp_bluetooth_gap_on_disconnect_reason(irq_event, conn_handle, reason);
++        mp_bluetooth_gap_on_connected_disconnected(irq_event, conn_handle, addr_type, addr);
+         #if MICROPY_PY_BLUETOOTH_ENABLE_GATT_CLIENT
+         remove_active_connection(conn_handle);
+         #endif
+-- 
+2.53.0
+

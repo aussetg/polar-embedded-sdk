@@ -1,0 +1,67 @@
+From 6ae04a46c1679e79b72c266819676443b3016e20 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Mon, 23 Feb 2026 16:04:05 +0100
+Subject: [PATCH 3/3] extmod/btstack: tune central connect latency and
+ supervision timeout
+
+---
+ extmod/btstack/modbluetooth_btstack.c | 36 +++++++++++++++++++++++++--
+ 1 file changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/extmod/btstack/modbluetooth_btstack.c b/extmod/btstack/modbluetooth_btstack.c
+index d01cabbef..ec644a734 100644
+--- a/extmod/btstack/modbluetooth_btstack.c
++++ b/extmod/btstack/modbluetooth_btstack.c
+@@ -47,6 +47,21 @@
+ #define MICROPY_PY_BLUETOOTH_DEFAULT_GAP_NAME "MPY BTSTACK"
+ #endif
+ 
++// Central connect parameter defaults/tuning for BTstack backend.
++// Supervision timeout is in units of 10 ms (spec range: 100..3200).
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_CONN_LATENCY
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_CONN_LATENCY (0)
++#endif
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS (1000)
++#endif
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MIN
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MIN (100)
++#endif
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MAX
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MAX (3200)
++#endif
++
+ // How long to wait for a controller to init/deinit.
+ // Some controllers can take up to 5-6 seconds in normal operation.
+ static const uint32_t BTSTACK_INIT_DEINIT_TIMEOUT_MS = 15000;
+@@ -1341,8 +1356,25 @@ int mp_bluetooth_gap_peripheral_connect(uint8_t addr_type, const uint8_t *addr,
+     uint16_t conn_scan_window = 30000 / 625;
+     uint16_t conn_interval_min = (min_conn_interval_us ? min_conn_interval_us : 10000) / 1250;
+     uint16_t conn_interval_max = (max_conn_interval_us ? max_conn_interval_us : 30000) / 1250;
+-    uint16_t conn_latency = 4;
+-    uint16_t supervision_timeout = duration_ms / 10; // default = 720
++    uint16_t conn_latency = MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_CONN_LATENCY;
++
++    // Keep supervision timeout independent from connect scan duration by default,
++    // but never lower than the duration-derived value if caller passes a larger one.
++    int32_t supervision_timeout_10ms = MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS;
++    if (duration_ms > 0) {
++        int32_t duration_timeout_10ms = duration_ms / 10;
++        if (duration_timeout_10ms > supervision_timeout_10ms) {
++            supervision_timeout_10ms = duration_timeout_10ms;
++        }
++    }
++    if (supervision_timeout_10ms < MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MIN) {
++        supervision_timeout_10ms = MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MIN;
++    }
++    if (supervision_timeout_10ms > MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MAX) {
++        supervision_timeout_10ms = MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MAX;
++    }
++    uint16_t supervision_timeout = supervision_timeout_10ms;
++
+     uint16_t min_ce_length = 10000 / 625;
+     uint16_t max_ce_length = 30000 / 625;
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,39 @@
+typings/
+
+# Nanopb generated files
+generated/
+proto/*.pb
+
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.uf2
+*.map
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+
+# Debug
+*.gdb
+captures/
+
+# Agent Stuff
+.pi
+AGENTS.md
+.agent
+compile_commands.json

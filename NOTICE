@@ -1,0 +1,54 @@
+This project includes third-party software with separate license terms:
+
+--------------------------------------------------------------------------------
+BTstack (vendors/micropython/lib/btstack/)
+--------------------------------------------------------------------------------
+Copyright (C) 2009 BlueKitchen GmbH
+
+Licensed under a modified BSD-3-Clause license with a non-commercial restriction.
+See vendors/micropython/lib/btstack/LICENSE for details.
+
+EXCEPTION FOR RASPBERRY PI PICO W / PICO 2 W:
+Raspberry Pi Ltd has negotiated a broad license for BTstack when used with
+Pico W, Pico WH, Pico 2 W, Pico 2 WH, and RM2. This permits commercial use
+on these platforms. See:
+  vendors/micropython/lib/pico-sdk/src/rp2_common/pico_btstack/LICENSE.RP
+
+--------------------------------------------------------------------------------
+Files in polar_ble/driver/ that use BTstack APIs
+--------------------------------------------------------------------------------
+The following files are derived works that depend on BTstack and are subject
+to BTstack's license terms (non-commercial, except on RP2 as noted above):
+
+  polar_ble/driver/src/polar_ble_driver_btstack_gatt.c
+  polar_ble/driver/src/polar_ble_driver_btstack_helpers.c
+  polar_ble/driver/src/polar_ble_driver_btstack_link.c
+  polar_ble/driver/src/polar_ble_driver_btstack_scan.c
+  polar_ble/driver/src/polar_ble_driver_btstack_sm.c
+  polar_ble/driver/include/polar_ble_driver_discovery_btstack_runtime.h
+  polar_ble/mpy/mod_polar_ble.c
+
+These files are marked with:
+  SPDX-License-Identifier: LicenseRef-BTstack
+
+All other files in polar_ble/driver/ are original work licensed under MIT.
+
+--------------------------------------------------------------------------------
+MicroPython (vendors/micropython/)
+--------------------------------------------------------------------------------
+Copyright (c) 2013-2025 Damien P. George
+
+Licensed under the MIT license. See vendors/micropython/LICENSE.
+
+--------------------------------------------------------------------------------
+Pico SDK (vendors/micropython/lib/pico-sdk/)
+--------------------------------------------------------------------------------
+Copyright 2020 Raspberry Pi (Trading) Ltd.
+
+Licensed under BSD-3-Clause. See vendors/micropython/lib/pico-sdk/LICENSE.TXT.
+
+--------------------------------------------------------------------------------
+Other dependencies
+--------------------------------------------------------------------------------
+Additional third-party dependencies in vendors/ are under their respective
+licenses. Refer to each package's LICENSE file for details.

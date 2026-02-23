@@ -1,0 +1,119 @@
+From a9523402c85bee2ed13b38b594d3779cfe48deeb Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Mon, 23 Feb 2026 17:56:05 +0100
+Subject: [PATCH] extmod/btstack: central post-connect HCI param update for rp2
+
+---
+ extmod/btstack/modbluetooth_btstack.c | 53 ++++++++++++++++++++++++++-
+ ports/rp2/CMakeLists.txt              |  5 +++
+ 2 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/extmod/btstack/modbluetooth_btstack.c b/extmod/btstack/modbluetooth_btstack.c
+index ec644a734..dcfbb4561 100644
+--- a/extmod/btstack/modbluetooth_btstack.c
++++ b/extmod/btstack/modbluetooth_btstack.c
+@@ -62,6 +62,24 @@
+ #define MICROPY_PY_BLUETOOTH_BTSTACK_CONNECT_SUPERVISION_TIMEOUT_10MS_MAX (3200)
+ #endif
+ 
++// Optional post-connect connection parameter update (central role only).
++// Values use BTstack units: interval in 1.25 ms, timeout in 10 ms.
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_PARAM_UPDATE
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_PARAM_UPDATE (0)
++#endif
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MIN
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MIN (24)
++#endif
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MAX
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MAX (24)
++#endif
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_LATENCY
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_LATENCY (0)
++#endif
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_SUPERVISION_TIMEOUT_10MS
++#define MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_SUPERVISION_TIMEOUT_10MS (72)
++#endif
++
+ // How long to wait for a controller to init/deinit.
+ // Some controllers can take up to 5-6 seconds in normal operation.
+ static const uint32_t BTSTACK_INIT_DEINIT_TIMEOUT_MS = 15000;
+@@ -112,6 +130,32 @@ static mp_obj_bluetooth_uuid_t create_mp_uuid(uint16_t uuid16, const uint8_t *uu
+     }
+     return result;
+ }
++
++static void btstack_maybe_request_connection_parameter_update(uint16_t conn_handle) {
++    #if MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_PARAM_UPDATE
++    // As a central, use HCI LE Connection Update directly.
++    // gap_request_connection_parameter_update() sends L2CAP CPUP request, which
++    // can be rejected by peers that don't support that direction/path.
++    int err = gap_update_connection_parameters(
++        conn_handle,
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MIN,
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MAX,
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_LATENCY,
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_SUPERVISION_TIMEOUT_10MS
++    );
++    DEBUG_printf("  --> post-connect HCI conn param update: handle=%u min=%u max=%u lat=%u sup=%u err=%d\n",
++        conn_handle,
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MIN,
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MAX,
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_LATENCY,
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_SUPERVISION_TIMEOUT_10MS,
++        err);
++    (void)err;
++    #else
++    (void)conn_handle;
++    #endif
++}
++
+ #endif // MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE
+ 
+ #if MICROPY_PY_BLUETOOTH_ENABLE_GATT_CLIENT
+@@ -228,12 +272,14 @@ static void btstack_packet_handler_generic(uint8_t packet_type, uint16_t channel
+         DEBUG_printf("  --> hci le meta\n");
+         switch (hci_event_le_meta_get_subevent_code(packet)) {
+             case HCI_SUBEVENT_LE_CONNECTION_COMPLETE: {
++                uint8_t status = hci_subevent_le_connection_complete_get_status(packet);
+                 uint16_t conn_handle = hci_subevent_le_connection_complete_get_connection_handle(packet);
+                 uint8_t addr_type = hci_subevent_le_connection_complete_get_peer_address_type(packet);
+                 bd_addr_t addr;
+                 hci_subevent_le_connection_complete_get_peer_address(packet, addr);
++                uint8_t role = hci_subevent_le_connection_complete_get_role(packet);
+                 uint16_t irq_event;
+-                if (hci_subevent_le_connection_complete_get_role(packet) == 0) {
++                if (role == 0) {
+                     // Master role.
+                     irq_event = MP_BLUETOOTH_IRQ_PERIPHERAL_CONNECT;
+                 } else {
+@@ -244,6 +290,11 @@ static void btstack_packet_handler_generic(uint8_t packet_type, uint16_t channel
+                 create_active_connection(conn_handle);
+                 #endif
+                 mp_bluetooth_gap_on_connected_disconnected(irq_event, conn_handle, addr_type, addr);
++                #if MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE
++                if (status == ERROR_CODE_SUCCESS && role == 0) {
++                    btstack_maybe_request_connection_parameter_update(conn_handle);
++                }
++                #endif
+                 break;
+             }
+             case HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE: {
+diff --git a/ports/rp2/CMakeLists.txt b/ports/rp2/CMakeLists.txt
+index f10cf1a16..900eb0b58 100644
+--- a/ports/rp2/CMakeLists.txt
++++ b/ports/rp2/CMakeLists.txt
+@@ -357,6 +357,11 @@ if (MICROPY_BLUETOOTH_BTSTACK)
+     target_compile_definitions(${MICROPY_TARGET} PRIVATE
+         MICROPY_BLUETOOTH_BTSTACK=1
+         MICROPY_BLUETOOTH_BTSTACK_CONFIG_FILE=\"btstack_inc/btstack_config.h\"
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_PARAM_UPDATE=1
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MIN=24
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MAX=24
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_LATENCY=0
++        MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_SUPERVISION_TIMEOUT_10MS=72
+     )
+ 
+     # For modbluetooth_btstack.c includes
+-- 
+2.53.0
+
