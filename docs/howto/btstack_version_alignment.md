@@ -99,7 +99,13 @@ Hook behavior:
 
 - `post-checkout` (branch changes): warning on BTstack mismatch
 - `post-merge`: warning on BTstack mismatch
-- `pre-push`: blocks push on BTstack mismatch
+- `pre-push`: warning by default on BTstack mismatch
+
+Optional strict pre-push mode (per command):
+
+```bash
+BTSTACK_ALIGNMENT_ENFORCE_PRE_PUSH=1 git push
+```
 
 Emergency bypass:
 

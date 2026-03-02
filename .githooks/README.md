@@ -18,7 +18,11 @@ git config core.hooksPath .githooks
 
 - `post-checkout` (branch checkouts): warn if BTstack trees are not aligned
 - `post-merge`: warn if BTstack trees are not aligned
-- `pre-push`: block push when BTstack trees are not aligned
+- `pre-push`: warn by default if BTstack trees are not aligned
+  - optional strict mode per push:
+    ```bash
+    BTSTACK_ALIGNMENT_ENFORCE_PRE_PUSH=1 git push
+    ```
 
 Check command used by hooks:
 

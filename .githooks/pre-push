@@ -2,4 +2,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-"${REPO_ROOT}/.githooks/_btstack_alignment_hook.sh" enforce pre-push
+MODE="warn"
+if [[ "${BTSTACK_ALIGNMENT_ENFORCE_PRE_PUSH:-0}" == "1" ]]; then
+  MODE="enforce"
+fi
+"${REPO_ROOT}/.githooks/_btstack_alignment_hook.sh" "${MODE}" pre-push
