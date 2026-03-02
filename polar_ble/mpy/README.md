@@ -31,10 +31,11 @@ Current contents:
     - discovery progression policy,
     - HR 0x2A37 parsing (`polar_ble_driver_hr`),
     - PMD ECG data parsing + byte ring (`polar_ble_driver_ecg`),
-    - PMD control bridge + ECG start policy (`polar_ble_driver_pmd_control`, `polar_ble_driver_pmd_start`).
+    - PMD IMU/ACC raw data parsing + byte ring (`polar_ble_driver_imu`),
+    - PMD control bridge + start policy (`polar_ble_driver_pmd_control`, `polar_ble_driver_pmd_start`).
 - `micropython.cmake` — user C module wiring + build flags:
   - feature flags: `POLAR_BLE_ENABLE_HR`, `POLAR_BLE_ENABLE_ECG`, `POLAR_BLE_ENABLE_PSFTP`
   - patch policy: `POLAR_BLE_VERIFY_MICROPY_PATCHES`, `POLAR_BLE_AUTO_APPLY_PATCHES`
   - build metadata injection: `POLAR_BLE_BUILD_GIT_SHA`, `POLAR_BLE_BUILD_GIT_DIRTY`, `POLAR_BLE_BUILD_PRESET`, `POLAR_BLE_BUILD_TYPE`
 
-ECG/PSFTP data-plane operations are still pending later milestones.
+PSFTP data-plane operations are still pending later milestones.

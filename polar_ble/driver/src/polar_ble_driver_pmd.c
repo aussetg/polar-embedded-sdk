@@ -54,6 +54,56 @@ size_t polar_ble_driver_pmd_build_ecg_start_command(
     return 10u;
 }
 
+size_t polar_ble_driver_pmd_build_acc_start_command(
+    const polar_ble_driver_pmd_acc_start_config_t *cfg,
+    uint8_t *out,
+    size_t out_capacity) {
+    if (cfg == 0 || out == 0) {
+        return 0;
+    }
+
+    // [opcode][type][settings...]
+    // setting encoding: [setting_id][count=1][value LE]
+    size_t needed = 6u;
+    if (cfg->include_resolution) {
+        needed += 4u;
+    }
+    if (cfg->include_range) {
+        needed += 4u;
+    }
+    if (out_capacity < needed) {
+        return 0;
+    }
+
+    out[0] = POLAR_BLE_DRIVER_PMD_OPCODE_START_MEASUREMENT;
+    out[1] = POLAR_BLE_DRIVER_PMD_MEASUREMENT_ACC;
+
+    size_t o = 2u;
+    // sampleRate setting (type 0x00)
+    out[o++] = 0x00;
+    out[o++] = 0x01;
+    out[o++] = (uint8_t)(cfg->sample_rate & 0xffu);
+    out[o++] = (uint8_t)((cfg->sample_rate >> 8) & 0xffu);
+
+    if (cfg->include_resolution) {
+        // resolution setting (type 0x01)
+        out[o++] = 0x01;
+        out[o++] = 0x01;
+        out[o++] = (uint8_t)(cfg->resolution & 0xffu);
+        out[o++] = (uint8_t)((cfg->resolution >> 8) & 0xffu);
+    }
+
+    if (cfg->include_range) {
+        // range setting (type 0x02)
+        out[o++] = 0x02;
+        out[o++] = 0x01;
+        out[o++] = (uint8_t)(cfg->range & 0xffu);
+        out[o++] = (uint8_t)((cfg->range >> 8) & 0xffu);
+    }
+
+    return o;
+}
+
 bool polar_ble_driver_pmd_parse_cp_response(
     const uint8_t *value,
     size_t value_len,

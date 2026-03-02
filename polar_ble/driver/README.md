@@ -12,5 +12,6 @@ Current runtime integration:
   - discovery progression,
   - HR parse state,
   - ECG parse/ring buffering,
+  - IMU/ACC parse/ring buffering,
   - PMD start policy callbacks.
 - `examples/pico_sdk/main.c` uses shared driver helpers for connect scheduling, runtime link transitions, and PMD start policy.

@@ -67,6 +67,9 @@
 #define H10_PMD_CCC_ATTEMPTS 4
 #define H10_PMD_ECG_SAMPLE_RATE 130
 #define H10_PMD_ECG_RESOLUTION 14
+#define H10_PMD_IMU_SAMPLE_RATE 50
+#define H10_PMD_IMU_RESOLUTION 16
+#define H10_PMD_IMU_RANGE 8
 
 #define H10_CONNECT_TIMEOUT_WINDOW_MS 60000
 #define H10_CONNECT_ATTEMPT_SLICE_MS 3500
@@ -96,7 +99,7 @@ typedef enum {
     APP_W4_HR_CCC,
     APP_W4_PMD_SERVICE,
     APP_W4_PMD_CHARS,
-    APP_W4_ECG_START,
+    APP_W4_PMD_START,
     APP_STREAMING,
 } app_state_t;
 
@@ -157,11 +160,16 @@ static bool mtu_exchange_pending = false;
 static bool mtu_exchange_done = false;
 static uint16_t att_mtu = ATT_DEFAULT_MTU;
 
-static bool ecg_policy_started = false;
-static bool ecg_policy_done = false;
+static bool pmd_policy_started = false;
+static bool pmd_policy_done = false;
 static uint32_t ecg_start_attempts_total = 0;
 static uint32_t ecg_start_success_total = 0;
+static uint32_t imu_start_attempts_total = 0;
+static uint32_t imu_start_success_total = 0;
 static uint32_t pmd_data_notifications_total = 0;
+static uint32_t pmd_data_ecg_notifications_total = 0;
+static uint32_t pmd_data_imu_notifications_total = 0;
+static uint32_t pmd_data_unknown_notifications_total = 0;
 
 static polar_ble_driver_runtime_link_t runtime_link;
 
@@ -182,7 +190,7 @@ static const char *state_name(app_state_t s) {
         case APP_W4_HR_CCC: return "W4_HR_CCC";
         case APP_W4_PMD_SERVICE: return "W4_PMD_SERVICE";
         case APP_W4_PMD_CHARS: return "W4_PMD_CHARS";
-        case APP_W4_ECG_START: return "W4_ECG_START";
+        case APP_W4_PMD_START: return "W4_PMD_START";
         case APP_STREAMING: return "STREAMING";
         default: return "?";
     }
@@ -244,8 +252,8 @@ static void request_post_connect_update(hci_con_handle_t handle) {
 static void maybe_start_hr_pipeline(void);
 #endif
 #if H10_ENABLE_ECG_POLICY
-static void maybe_start_ecg_policy_pipeline(void);
-static void run_ecg_policy_tick(void);
+static void maybe_start_pmd_policy_pipeline(void);
+static void run_pmd_policy_tick(void);
 #endif
 static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
@@ -462,7 +470,7 @@ static int pmd_ensure_minimum_mtu_cb(void *ctx, uint16_t minimum_mtu) {
     return att_mtu >= minimum_mtu ? POLAR_BLE_DRIVER_PMD_OP_OK : POLAR_BLE_DRIVER_PMD_OP_TIMEOUT;
 }
 
-static int pmd_start_ecg_and_wait_response_cb(
+static int pmd_start_measurement_and_wait_response_cb(
     void *ctx,
     const uint8_t *start_cmd,
     size_t start_cmd_len,
@@ -471,20 +479,25 @@ static int pmd_start_ecg_and_wait_response_cb(
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
         return POLAR_BLE_DRIVER_PMD_OP_NOT_CONNECTED;
     }
-    if (start_cmd == NULL || start_cmd_len == 0 || start_cmd_len > UINT16_MAX) {
+    if (start_cmd == NULL || start_cmd_len < 2 || start_cmd_len > UINT16_MAX) {
         return POLAR_BLE_DRIVER_PMD_OP_TRANSPORT;
     }
+
+    uint8_t measurement_type = start_cmd[1];
 
     pmd_cp_response_waiting = true;
     pmd_cp_response_done = false;
     pmd_cp_response_expected_opcode = POLAR_BLE_DRIVER_PMD_OPCODE_START_MEASUREMENT;
-    pmd_cp_response_expected_type = POLAR_BLE_DRIVER_PMD_MEASUREMENT_ECG;
+    pmd_cp_response_expected_type = measurement_type;
     pmd_cp_response_status = 0xff;
 
     pmd_write_pending = true;
     pmd_write_done = false;
     pmd_write_att_status = ATT_ERROR_SUCCESS;
-    printf("[h10probe] PMD START write handle=0x%04x len=%u\n", pmd_cp_char.value_handle, (unsigned)start_cmd_len);
+    printf("[h10probe] PMD START write handle=0x%04x type=0x%02x len=%u\n",
+           pmd_cp_char.value_handle,
+           measurement_type,
+           (unsigned)start_cmd_len);
     int err = gatt_client_write_value_of_characteristic(
         handle_gatt_event,
         conn_handle,
@@ -509,14 +522,14 @@ static int pmd_start_ecg_and_wait_response_cb(
 
     if (!wait_flag_until_true(&pmd_cp_response_done, 2000)) {
         pmd_cp_response_waiting = false;
-        printf("[h10probe] PMD START response timeout\n");
+        printf("[h10probe] PMD START response timeout type=0x%02x\n", measurement_type);
         return POLAR_BLE_DRIVER_PMD_OP_TIMEOUT;
     }
 
     if (out_status != NULL) {
         *out_status = pmd_cp_response_status;
     }
-    printf("[h10probe] PMD START response status=0x%02x\n", pmd_cp_response_status);
+    printf("[h10probe] PMD START response type=0x%02x status=0x%02x\n", measurement_type, pmd_cp_response_status);
 
     return POLAR_BLE_DRIVER_PMD_OP_OK;
 }
@@ -734,7 +747,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                 printf("[h10probe] PMD chars query complete att=0x%02x cp=%d data=%d\n",
                        att_status, pmd_cp_found, pmd_data_found);
                 app_state = (att_status == ATT_ERROR_SUCCESS && pmd_cp_found && pmd_data_found)
-                    ? APP_W4_ECG_START
+                    ? APP_W4_PMD_START
                     : APP_CONNECTED;
             }
             break;
@@ -781,6 +794,19 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
         if (value_event.value_handle == pmd_data_char.value_handle) {
             pmd_data_notifications_total += 1;
+
+            if (value_event.value_len > 0) {
+                uint8_t measurement_type = value_event.value[0];
+                if (measurement_type == POLAR_BLE_DRIVER_PMD_MEASUREMENT_ECG) {
+                    pmd_data_ecg_notifications_total += 1;
+                } else if (measurement_type == POLAR_BLE_DRIVER_PMD_MEASUREMENT_ACC) {
+                    pmd_data_imu_notifications_total += 1;
+                } else {
+                    pmd_data_unknown_notifications_total += 1;
+                }
+            } else {
+                pmd_data_unknown_notifications_total += 1;
+            }
             return;
         }
     }
@@ -809,7 +835,7 @@ static void maybe_start_hr_pipeline(void) {
 #endif
 
 #if H10_ENABLE_ECG_POLICY
-static void maybe_start_ecg_policy_pipeline(void) {
+static void maybe_start_pmd_policy_pipeline(void) {
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
         return;
     }
@@ -836,9 +862,12 @@ static void maybe_start_ecg_policy_pipeline(void) {
     mtu_exchange_pending = false;
     mtu_exchange_done = false;
 
-    ecg_policy_started = false;
-    ecg_policy_done = false;
+    pmd_policy_started = false;
+    pmd_policy_done = false;
     pmd_data_notifications_total = 0;
+    pmd_data_ecg_notifications_total = 0;
+    pmd_data_imu_notifications_total = 0;
+    pmd_data_unknown_notifications_total = 0;
 
     app_state = APP_W4_PMD_SERVICE;
     int err = gatt_client_discover_primary_services(
@@ -851,35 +880,27 @@ static void maybe_start_ecg_policy_pipeline(void) {
 #endif
 }
 
-static void run_ecg_policy_tick(void) {
+static void run_pmd_policy_tick(void) {
 #if H10_ENABLE_ECG_POLICY
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
         return;
     }
-    if (app_state != APP_W4_ECG_START || ecg_policy_done || ecg_policy_started) {
+    if (app_state != APP_W4_PMD_START || pmd_policy_done || pmd_policy_started) {
         return;
     }
 
-    ecg_policy_started = true;
+    pmd_policy_started = true;
     ecg_start_attempts_total += 1;
 
-    printf("[h10probe] PMD policy start attempt=%" PRIu32 " state=%s enc_key=%u mtu=%u cp=0x%04x data=0x%04x\n",
-           ecg_start_attempts_total,
+    printf("[h10probe] PMD policy start state=%s ecg_attempt=%" PRIu32 " imu_attempt=%" PRIu32 " enc_key=%u mtu=%u cp=0x%04x data=0x%04x\n",
            state_name(app_state),
+           ecg_start_attempts_total,
+           imu_start_attempts_total + 1,
            gap_encryption_key_size(conn_handle),
            att_mtu,
            pmd_cp_char.value_handle,
            pmd_data_char.value_handle);
 
-    polar_ble_driver_pmd_start_policy_t policy = {
-        .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
-        .security_rounds_per_attempt = H10_PMD_SECURITY_ROUNDS,
-        .security_wait_ms = H10_PMD_SECURITY_WAIT_MS,
-        .minimum_mtu = H10_PMD_MIN_MTU,
-        .sample_rate = H10_PMD_ECG_SAMPLE_RATE,
-        .include_resolution = true,
-        .resolution = H10_PMD_ECG_RESOLUTION,
-    };
     polar_ble_driver_pmd_start_ops_t ops = {
         .ctx = NULL,
         .is_connected = pmd_is_connected,
@@ -888,33 +909,82 @@ static void run_ecg_policy_tick(void) {
         .sleep_ms = pmd_sleep_ms_cb,
         .enable_notifications = pmd_enable_notifications_cb,
         .ensure_minimum_mtu = pmd_ensure_minimum_mtu_cb,
-        .start_ecg_and_wait_response = pmd_start_ecg_and_wait_response_cb,
+        .start_ecg_and_wait_response = pmd_start_measurement_and_wait_response_cb,
     };
 
-    uint8_t response_status = 0xff;
-    int last_ccc_att_status = 0;
-    polar_ble_driver_pmd_start_result_t result = polar_ble_driver_pmd_start_ecg_with_policy(
-        &policy,
-        &ops,
-        &response_status,
-        &last_ccc_att_status);
+    polar_ble_driver_pmd_start_policy_t ecg_policy = {
+        .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
+        .security_rounds_per_attempt = H10_PMD_SECURITY_ROUNDS,
+        .security_wait_ms = H10_PMD_SECURITY_WAIT_MS,
+        .minimum_mtu = H10_PMD_MIN_MTU,
+        .sample_rate = H10_PMD_ECG_SAMPLE_RATE,
+        .include_resolution = true,
+        .resolution = H10_PMD_ECG_RESOLUTION,
+        .include_range = false,
+        .range = 0,
+    };
 
-    printf("[h10probe] shared PMD start result=%d(%s) ccc_att=%d resp=0x%02x enc_key=%u mtu=%u\n",
-           result,
-           pmd_start_result_name(result),
-           last_ccc_att_status,
-           response_status,
+    uint8_t ecg_response_status = 0xff;
+    int ecg_last_ccc_att_status = 0;
+    polar_ble_driver_pmd_start_result_t ecg_result = polar_ble_driver_pmd_start_ecg_with_policy(
+        &ecg_policy,
+        &ops,
+        &ecg_response_status,
+        &ecg_last_ccc_att_status);
+
+    printf("[h10probe] shared PMD ECG start result=%d(%s) ccc_att=%d resp=0x%02x enc_key=%u mtu=%u\n",
+           ecg_result,
+           pmd_start_result_name(ecg_result),
+           ecg_last_ccc_att_status,
+           ecg_response_status,
            gap_encryption_key_size(conn_handle),
            att_mtu);
 
-    if (result == POLAR_BLE_DRIVER_PMD_START_RESULT_OK) {
-        ecg_start_success_total += 1;
+    if (ecg_result != POLAR_BLE_DRIVER_PMD_START_RESULT_OK) {
+        app_state = APP_CONNECTED;
+        pmd_policy_done = true;
+        return;
+    }
+
+    ecg_start_success_total += 1;
+    imu_start_attempts_total += 1;
+
+    polar_ble_driver_pmd_start_policy_t imu_policy = {
+        .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
+        .security_rounds_per_attempt = H10_PMD_SECURITY_ROUNDS,
+        .security_wait_ms = H10_PMD_SECURITY_WAIT_MS,
+        .minimum_mtu = H10_PMD_MIN_MTU,
+        .sample_rate = H10_PMD_IMU_SAMPLE_RATE,
+        .include_resolution = true,
+        .resolution = H10_PMD_IMU_RESOLUTION,
+        .include_range = true,
+        .range = H10_PMD_IMU_RANGE,
+    };
+
+    uint8_t imu_response_status = 0xff;
+    int imu_last_ccc_att_status = 0;
+    polar_ble_driver_pmd_start_result_t imu_result = polar_ble_driver_pmd_start_acc_with_policy(
+        &imu_policy,
+        &ops,
+        &imu_response_status,
+        &imu_last_ccc_att_status);
+
+    printf("[h10probe] shared PMD IMU start result=%d(%s) ccc_att=%d resp=0x%02x enc_key=%u mtu=%u\n",
+           imu_result,
+           pmd_start_result_name(imu_result),
+           imu_last_ccc_att_status,
+           imu_response_status,
+           gap_encryption_key_size(conn_handle),
+           att_mtu);
+
+    if (imu_result == POLAR_BLE_DRIVER_PMD_START_RESULT_OK) {
+        imu_start_success_total += 1;
         app_state = APP_STREAMING;
     } else {
         app_state = APP_CONNECTED;
     }
 
-    ecg_policy_done = true;
+    pmd_policy_done = true;
 #endif
 }
 
@@ -972,8 +1042,13 @@ static void on_disconnect_cleanup(void) {
     mtu_exchange_done = false;
     att_mtu = ATT_DEFAULT_MTU;
 
-    ecg_policy_started = false;
-    ecg_policy_done = false;
+    pmd_policy_started = false;
+    pmd_policy_done = false;
+
+    pmd_data_notifications_total = 0;
+    pmd_data_ecg_notifications_total = 0;
+    pmd_data_imu_notifications_total = 0;
+    pmd_data_unknown_notifications_total = 0;
 
     app_state = APP_OFF;
 }
@@ -998,13 +1073,23 @@ static void heartbeat_timer_handler(btstack_timer_source_t *ts) {
     uint32_t since_hr = (last_hr_ms > 0) ? (now - last_hr_ms) : UINT32_MAX;
 
     if (since_hr == UINT32_MAX) {
-        printf("[h10probe] hb t=%" PRIu32 " state=%s conn=%d handle=0x%04x since_connect=%" PRIu32 "ms hr=never ecg=%" PRIu32 "/%" PRIu32 " pmd_data=%" PRIu32 "\n",
+        printf("[h10probe] hb t=%" PRIu32 " state=%s conn=%d handle=0x%04x since_connect=%" PRIu32 "ms hr=never ecg=%" PRIu32 "/%" PRIu32 " imu=%" PRIu32 "/%" PRIu32 " pmd_data=%" PRIu32 " (ecg=%" PRIu32 " imu=%" PRIu32 " other=%" PRIu32 ")\n",
                now, state_name(app_state), connected, conn_handle, since_connect,
-               ecg_start_success_total, ecg_start_attempts_total, pmd_data_notifications_total);
+               ecg_start_success_total, ecg_start_attempts_total,
+               imu_start_success_total, imu_start_attempts_total,
+               pmd_data_notifications_total,
+               pmd_data_ecg_notifications_total,
+               pmd_data_imu_notifications_total,
+               pmd_data_unknown_notifications_total);
     } else {
-        printf("[h10probe] hb t=%" PRIu32 " state=%s conn=%d handle=0x%04x since_connect=%" PRIu32 "ms since_hr=%" PRIu32 "ms ecg=%" PRIu32 "/%" PRIu32 " pmd_data=%" PRIu32 "\n",
+        printf("[h10probe] hb t=%" PRIu32 " state=%s conn=%d handle=0x%04x since_connect=%" PRIu32 "ms since_hr=%" PRIu32 "ms ecg=%" PRIu32 "/%" PRIu32 " imu=%" PRIu32 "/%" PRIu32 " pmd_data=%" PRIu32 " (ecg=%" PRIu32 " imu=%" PRIu32 " other=%" PRIu32 ")\n",
                now, state_name(app_state), connected, conn_handle, since_connect, since_hr,
-               ecg_start_success_total, ecg_start_attempts_total, pmd_data_notifications_total);
+               ecg_start_success_total, ecg_start_attempts_total,
+               imu_start_success_total, imu_start_attempts_total,
+               pmd_data_notifications_total,
+               pmd_data_ecg_notifications_total,
+               pmd_data_imu_notifications_total,
+               pmd_data_unknown_notifications_total);
     }
 
     if (connected && conn_handle != HCI_CON_HANDLE_INVALID) {
@@ -1030,7 +1115,7 @@ static void on_connection_ready_common(hci_con_handle_t handle) {
 
     app_state = APP_CONNECTED;
 #if H10_ENABLE_ECG_POLICY
-    maybe_start_ecg_policy_pipeline();
+    maybe_start_pmd_policy_pipeline();
 #else
     maybe_start_hr_pipeline();
 #endif
@@ -1291,25 +1376,40 @@ int main(void) {
     stdio_init_all();
     sleep_ms(1500);
 
-    printf("\n[h10probe] ===== Pico2W BTstack/CYW43 probe =====\n");
-    printf("[h10probe] target=%s force_pairing=%d hr=%d ecg_policy=%d post_update=%d\n",
+    printf("\n[h10probe] ===== RP2-1 BTstack/CYW43 probe =====\n");
+    printf("[h10probe] target=%s force_pairing=%d hr=%d pmd_policy=%d post_update=%d\n",
            H10_TARGET_ADDR,
            H10_FORCE_PAIRING,
            H10_ENABLE_HR,
            H10_ENABLE_ECG_POLICY,
            H10_POST_CONNECT_UPDATE);
 
-    uint8_t pmd_start_cmd[16];
-    polar_ble_driver_pmd_ecg_start_config_t pmd_cfg = {
-        .sample_rate = 130,
+    uint8_t pmd_ecg_start_cmd[16];
+    polar_ble_driver_pmd_ecg_start_config_t pmd_ecg_cfg = {
+        .sample_rate = H10_PMD_ECG_SAMPLE_RATE,
         .include_resolution = true,
-        .resolution = 14,
+        .resolution = H10_PMD_ECG_RESOLUTION,
     };
-    size_t pmd_start_cmd_len = polar_ble_driver_pmd_build_ecg_start_command(
-        &pmd_cfg,
-        pmd_start_cmd,
-        sizeof(pmd_start_cmd));
-    printf("[h10probe] shared-driver PMD start template len=%u\n", (unsigned)pmd_start_cmd_len);
+    size_t pmd_ecg_start_cmd_len = polar_ble_driver_pmd_build_ecg_start_command(
+        &pmd_ecg_cfg,
+        pmd_ecg_start_cmd,
+        sizeof(pmd_ecg_start_cmd));
+
+    uint8_t pmd_imu_start_cmd[20];
+    polar_ble_driver_pmd_acc_start_config_t pmd_imu_cfg = {
+        .sample_rate = H10_PMD_IMU_SAMPLE_RATE,
+        .include_resolution = true,
+        .resolution = H10_PMD_IMU_RESOLUTION,
+        .include_range = true,
+        .range = H10_PMD_IMU_RANGE,
+    };
+    size_t pmd_imu_start_cmd_len = polar_ble_driver_pmd_build_acc_start_command(
+        &pmd_imu_cfg,
+        pmd_imu_start_cmd,
+        sizeof(pmd_imu_start_cmd));
+    printf("[h10probe] shared-driver PMD templates ecg_len=%u imu_len=%u\n",
+           (unsigned)pmd_ecg_start_cmd_len,
+           (unsigned)pmd_imu_start_cmd_len);
 
     target_addr_valid = sscanf_bd_addr(H10_TARGET_ADDR, target_addr) != 0;
     if (!target_addr_valid) {
@@ -1340,7 +1440,7 @@ int main(void) {
 
     while (true) {
 #if H10_ENABLE_ECG_POLICY
-        run_ecg_policy_tick();
+        run_pmd_policy_tick();
 #endif
         cyw43_arch_poll();
         sleep_ms(1);

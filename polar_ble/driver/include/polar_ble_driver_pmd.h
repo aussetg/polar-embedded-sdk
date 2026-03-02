@@ -10,12 +10,13 @@
 extern "C" {
 #endif
 
-// PMD opcodes/measurement types used by Polar H10 ECG path.
+// PMD opcodes/measurement types used by Polar H10 paths.
 enum {
     POLAR_BLE_DRIVER_PMD_OPCODE_GET_MEASUREMENT_SETTINGS = 0x01,
     POLAR_BLE_DRIVER_PMD_OPCODE_START_MEASUREMENT = 0x02,
     POLAR_BLE_DRIVER_PMD_OPCODE_STOP_MEASUREMENT = 0x03,
     POLAR_BLE_DRIVER_PMD_MEASUREMENT_ECG = 0x00,
+    POLAR_BLE_DRIVER_PMD_MEASUREMENT_ACC = 0x02,
     POLAR_BLE_DRIVER_PMD_CP_RESPONSE_CODE = 0xF0,
 };
 
@@ -33,6 +34,14 @@ typedef struct {
 } polar_ble_driver_pmd_ecg_start_config_t;
 
 typedef struct {
+    uint16_t sample_rate;
+    bool include_resolution;
+    uint16_t resolution;
+    bool include_range;
+    uint16_t range;
+} polar_ble_driver_pmd_acc_start_config_t;
+
+typedef struct {
     uint8_t opcode;
     uint8_t measurement_type;
     uint8_t status;
@@ -46,6 +55,11 @@ bool polar_ble_driver_pmd_response_status_ok(uint8_t status);
 
 size_t polar_ble_driver_pmd_build_ecg_start_command(
     const polar_ble_driver_pmd_ecg_start_config_t *cfg,
+    uint8_t *out,
+    size_t out_capacity);
+
+size_t polar_ble_driver_pmd_build_acc_start_command(
+    const polar_ble_driver_pmd_acc_start_config_t *cfg,
     uint8_t *out,
     size_t out_capacity);
 
@@ -74,6 +88,8 @@ typedef struct {
     uint16_t sample_rate;
     bool include_resolution;
     uint16_t resolution;
+    bool include_range;
+    uint16_t range;
 } polar_ble_driver_pmd_start_policy_t;
 
 typedef enum {
@@ -103,6 +119,12 @@ typedef struct {
 } polar_ble_driver_pmd_start_ops_t;
 
 polar_ble_driver_pmd_start_result_t polar_ble_driver_pmd_start_ecg_with_policy(
+    const polar_ble_driver_pmd_start_policy_t *policy,
+    const polar_ble_driver_pmd_start_ops_t *ops,
+    uint8_t *out_pmd_response_status,
+    int *out_last_ccc_att_status);
+
+polar_ble_driver_pmd_start_result_t polar_ble_driver_pmd_start_acc_with_policy(
     const polar_ble_driver_pmd_start_policy_t *policy,
     const polar_ble_driver_pmd_start_ops_t *ops,
     uint8_t *out_pmd_response_status,

@@ -53,12 +53,14 @@ static bool polar_ble_driver_pmd_ensure_security(
     return polar_ble_driver_pmd_security_ready(ops->encryption_key_size(ops->ctx));
 }
 
-polar_ble_driver_pmd_start_result_t polar_ble_driver_pmd_start_ecg_with_policy(
+static polar_ble_driver_pmd_start_result_t polar_ble_driver_pmd_start_with_command(
     const polar_ble_driver_pmd_start_policy_t *policy,
     const polar_ble_driver_pmd_start_ops_t *ops,
+    const uint8_t *start_cmd,
+    size_t start_cmd_len,
     uint8_t *out_pmd_response_status,
     int *out_last_ccc_att_status) {
-    if (policy == 0 || !polar_ble_driver_pmd_ops_ready(ops)) {
+    if (policy == 0 || !polar_ble_driver_pmd_ops_ready(ops) || start_cmd == 0 || start_cmd_len == 0) {
         return POLAR_BLE_DRIVER_PMD_START_RESULT_TRANSPORT_ERROR;
     }
 
@@ -139,17 +141,6 @@ polar_ble_driver_pmd_start_result_t polar_ble_driver_pmd_start_ecg_with_policy(
         return POLAR_BLE_DRIVER_PMD_START_RESULT_MTU_FAILED;
     }
 
-    uint8_t start_cmd[16];
-    polar_ble_driver_pmd_ecg_start_config_t cfg = {
-        .sample_rate = policy->sample_rate,
-        .include_resolution = policy->include_resolution,
-        .resolution = policy->resolution,
-    };
-    size_t start_cmd_len = polar_ble_driver_pmd_build_ecg_start_command(&cfg, start_cmd, sizeof(start_cmd));
-    if (start_cmd_len == 0) {
-        return POLAR_BLE_DRIVER_PMD_START_RESULT_TRANSPORT_ERROR;
-    }
-
     uint8_t response_status = 0xff;
     int start_status = ops->start_ecg_and_wait_response(ops->ctx, start_cmd, start_cmd_len, &response_status);
     if (start_status != POLAR_BLE_DRIVER_PMD_OP_OK) {
@@ -170,4 +161,56 @@ polar_ble_driver_pmd_start_result_t polar_ble_driver_pmd_start_ecg_with_policy(
     }
 
     return POLAR_BLE_DRIVER_PMD_START_RESULT_OK;
+}
+
+polar_ble_driver_pmd_start_result_t polar_ble_driver_pmd_start_ecg_with_policy(
+    const polar_ble_driver_pmd_start_policy_t *policy,
+    const polar_ble_driver_pmd_start_ops_t *ops,
+    uint8_t *out_pmd_response_status,
+    int *out_last_ccc_att_status) {
+    uint8_t start_cmd[16];
+    polar_ble_driver_pmd_ecg_start_config_t cfg = {
+        .sample_rate = policy == 0 ? 0 : policy->sample_rate,
+        .include_resolution = policy != 0 && policy->include_resolution,
+        .resolution = policy == 0 ? 0 : policy->resolution,
+    };
+    size_t start_cmd_len = polar_ble_driver_pmd_build_ecg_start_command(&cfg, start_cmd, sizeof(start_cmd));
+    if (start_cmd_len == 0) {
+        return POLAR_BLE_DRIVER_PMD_START_RESULT_TRANSPORT_ERROR;
+    }
+
+    return polar_ble_driver_pmd_start_with_command(
+        policy,
+        ops,
+        start_cmd,
+        start_cmd_len,
+        out_pmd_response_status,
+        out_last_ccc_att_status);
+}
+
+polar_ble_driver_pmd_start_result_t polar_ble_driver_pmd_start_acc_with_policy(
+    const polar_ble_driver_pmd_start_policy_t *policy,
+    const polar_ble_driver_pmd_start_ops_t *ops,
+    uint8_t *out_pmd_response_status,
+    int *out_last_ccc_att_status) {
+    uint8_t start_cmd[20];
+    polar_ble_driver_pmd_acc_start_config_t cfg = {
+        .sample_rate = policy == 0 ? 0 : policy->sample_rate,
+        .include_resolution = policy != 0 && policy->include_resolution,
+        .resolution = policy == 0 ? 0 : policy->resolution,
+        .include_range = policy != 0 && policy->include_range,
+        .range = policy == 0 ? 0 : policy->range,
+    };
+    size_t start_cmd_len = polar_ble_driver_pmd_build_acc_start_command(&cfg, start_cmd, sizeof(start_cmd));
+    if (start_cmd_len == 0) {
+        return POLAR_BLE_DRIVER_PMD_START_RESULT_TRANSPORT_ERROR;
+    }
+
+    return polar_ble_driver_pmd_start_with_command(
+        policy,
+        ops,
+        start_cmd,
+        start_cmd_len,
+        out_pmd_response_status,
+        out_last_ccc_att_status);
 }

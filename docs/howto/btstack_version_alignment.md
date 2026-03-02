@@ -208,7 +208,7 @@ pico-sdk probe:
 
 ```bash
 cmake -S examples/pico_sdk -B build/pico_sdk_probe_bt18 \
-  -DPICO_BOARD=pico2_w \
+  -DPICO_BOARD=pimoroni_pico_plus2_w_rp2350 \
   -DPICO_SDK_PATH=$PWD/vendors/pico-sdk \
   -DPICO_BTSTACK_PATH=$PWD/vendors/btstack
 cmake --build build/pico_sdk_probe_bt18 -j$(nproc)

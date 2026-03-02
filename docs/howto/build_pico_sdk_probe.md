@@ -15,7 +15,7 @@ From the repo root:
 
 ```bash
 cmake -S examples/pico_sdk -B build/pico_sdk_probe \
-  -DPICO_BOARD=pico2_w \
+  -DPICO_BOARD=pimoroni_pico_plus2_w_rp2350 \
   -DPICO_SDK_PATH=$PICO_SDK_PATH
 
 cmake --build build/pico_sdk_probe -j$(nproc)
@@ -34,7 +34,7 @@ Connection-only run (disable HR subscription):
 
 ```bash
 cmake -S examples/pico_sdk -B build/pico_sdk_probe_idle \
-  -DPICO_BOARD=pico2_w \
+  -DPICO_BOARD=pimoroni_pico_plus2_w_rp2350 \
   -DPICO_SDK_PATH=$PICO_SDK_PATH \
   -DH10_ENABLE_HR=0
 
@@ -45,7 +45,7 @@ Build against MicroPython-vendored BTstack for A/B testing:
 
 ```bash
 cmake -S examples/pico_sdk -B build/pico_sdk_probe_mpbtstack \
-  -DPICO_BOARD=pico2_w \
+  -DPICO_BOARD=pimoroni_pico_plus2_w_rp2350 \
   -DPICO_SDK_PATH=$PICO_SDK_PATH \
   -DPICO_BTSTACK_PATH=$PWD/vendors/micropython/lib/btstack \
   -DH10_ENABLE_HR=0

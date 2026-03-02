@@ -33,7 +33,7 @@ PSFTP/PFTP data-plane work remains planned for a later milestone, not part of th
 | PMD pairing/encryption retry policy | Implemented baseline | Handles ATT auth failures with retry logic |
 | PSFTP service/char discovery handles | Implemented baseline | Data-plane API not exposed yet |
 | PSFTP list/download API | Planned | Later milestone (nanopb + RFC60/RFC76 flow) |
-| IMU stream API | Not implemented | `start_streams(imu=True)` must raise not-implemented error |
+| IMU stream API (PMD ACC raw) | Implemented baseline | Raw PMD ACC frame type `0x01` (int16 x/y/z) |
 
 ---
 
@@ -44,7 +44,7 @@ Platform observations on Pico 2 W show timing sensitivity in MicroPython BLE orc
 Therefore the design is:
 - no high-rate Python IRQ callback data path,
 - preallocated C buffers/rings for streaming data,
-- pull-based Python reads (`read_hr`, `read_ecg`),
+- pull-based Python reads (`read_hr`, `read_ecg`, `read_imu`),
 - explicit counters/state for debugging and validation.
 
 ---
@@ -169,23 +169,30 @@ ECG byte payload format:
 - each sample is sign-extended from PMD ECG raw 24-bit payload,
 - returned lengths are 4-byte aligned.
 
-### 7.4 Stream helpers
+### 7.4 IMU (PMD ACC)
+- `start_imu(sample_rate=50, range=8) -> None`
+- `stop_imu() -> None`
+- `read_imu(max_bytes=1024, timeout_ms=0) -> bytes`
+
+IMU byte payload format:
+- packed little-endian signed `int16` triples (`<hhh`) per sample,
+- order is `(x, y, z)` in milli-g,
+- returned lengths are 6-byte aligned.
+
+### 7.5 Stream helpers
 - `start_streams(*, ecg=False, imu=False, hr=False) -> None`
 - `stop_streams(*, ecg=True, imu=True, hr=True) -> None`
 
-Current rule:
-- `imu=True` in `start_streams` must raise a not-implemented error.
-
-### 7.5 Diagnostics
+### 7.6 Diagnostics
 - `stats() -> dict`
 - `version() -> str` (module function)
 
-### 7.6 Module constants
+### 7.7 Module constants
 - Feature flags: `FEATURE_HR`, `FEATURE_ECG`, `FEATURE_PSFTP`
 - Platform flag: `HAS_BTSTACK`
 - Service-mask bits: `SERVICE_HR`, `SERVICE_ECG`, `SERVICE_PSFTP`, `SERVICE_ALL`
 
-### 7.7 Deferred (not currently part of implemented API)
+### 7.8 Deferred (not currently part of implemented API)
 - `list_dir(...)` / `download(...)` PSFTP data-plane methods
 - `set_log_level(...)`
 

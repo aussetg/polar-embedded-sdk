@@ -13,11 +13,13 @@
 //   - start/stop HR notifications
 //   - parse 0x2A37 into fixed-width sample tuple
 //   - read_hr(timeout_ms=...)
-// - ECG support (initial):
+// - ECG support:
 //   - PMD start/stop ECG control path
 //   - PMD ECG frame-type-0 parsing to packed int32 ring buffer
 //   - read_ecg(max_bytes=..., timeout_ms=...)
-//   - start_streams()/stop_streams() scaffold (IMU pending)
+// - IMU support (H10 ACC raw frame type 0x01):
+//   - PMD start/stop IMU(ACC) control path
+//   - read_imu(max_bytes=..., timeout_ms=...)
 //
 // Notes:
 // - BLE implementation targets MicroPython rp2 + BTstack central mode.
@@ -40,6 +42,7 @@
 #include "polar_ble_driver_gatt_query_complete.h"
 #include "polar_ble_driver_gatt_write.h"
 #include "polar_ble_driver_ecg.h"
+#include "polar_ble_driver_imu.h"
 #include "polar_ble_driver_runtime.h"
 #include "polar_ble_driver_runtime_context.h"
 #include "polar_ble_driver_transport.h"
@@ -121,16 +124,19 @@
 #define POLAR_BLE_POST_CONN_SUPERVISION_TIMEOUT_10MS (600)
 
 #define POLAR_BLE_ECG_RING_BYTES (4096)
+#define POLAR_BLE_IMU_RING_BYTES (4096)
 
 #define POLAR_BLE_PMD_OP_REQUEST_MEASUREMENT_START (POLAR_BLE_DRIVER_PMD_OPCODE_START_MEASUREMENT)
 #define POLAR_BLE_PMD_OP_STOP_MEASUREMENT (POLAR_BLE_DRIVER_PMD_OPCODE_STOP_MEASUREMENT)
 #define POLAR_BLE_PMD_MEAS_ECG (POLAR_BLE_DRIVER_PMD_MEASUREMENT_ECG)
+#define POLAR_BLE_PMD_MEAS_ACC (POLAR_BLE_DRIVER_PMD_MEASUREMENT_ACC)
 
 #define POLAR_BLE_PMD_MIN_MTU (70)
 #define POLAR_BLE_PMD_SECURITY_ROUNDS (3)
 #define POLAR_BLE_PMD_SECURITY_WAIT_MS (3500)
 #define POLAR_BLE_PMD_CCC_ATTEMPTS (4)
-
+#define POLAR_BLE_IMU_DEFAULT_RESOLUTION (16)
+#define POLAR_BLE_IMU_DEFAULT_RANGE_G (8)
 
 #define POLAR_BLE_STATE_IDLE (POLAR_BLE_DRIVER_RUNTIME_STATE_IDLE)
 #define POLAR_BLE_STATE_SCANNING (POLAR_BLE_DRIVER_RUNTIME_STATE_SCANNING)
@@ -360,6 +366,10 @@ typedef struct _polar_h10_obj_t {
     bool ecg_enabled;
     uint8_t ecg_ring_storage[POLAR_BLE_ECG_RING_BYTES];
     polar_ble_driver_ecg_ring_t ecg_ring;
+
+    bool imu_enabled;
+    uint8_t imu_ring_storage[POLAR_BLE_IMU_RING_BYTES];
+    polar_ble_driver_imu_ring_t imu_ring;
 
     uint32_t pmd_cp_notifications_total;
     uint32_t pmd_cp_response_total;
@@ -631,6 +641,18 @@ static uint16_t polar_ecg_ring_available(const polar_h10_obj_t *self) {
 
 static uint16_t polar_ecg_ring_pop_bytes(polar_h10_obj_t *self, uint8_t *out, uint16_t max_len) {
     return polar_ble_driver_ecg_ring_pop_bytes(&self->ecg_ring, out, max_len);
+}
+
+static void polar_imu_ring_reset(polar_h10_obj_t *self) {
+    polar_ble_driver_imu_ring_reset(&self->imu_ring);
+}
+
+static uint16_t polar_imu_ring_available(const polar_h10_obj_t *self) {
+    return polar_ble_driver_imu_ring_available(&self->imu_ring);
+}
+
+static uint16_t polar_imu_ring_pop_bytes(polar_h10_obj_t *self, uint8_t *out, uint16_t max_len) {
+    return polar_ble_driver_imu_ring_pop_bytes(&self->imu_ring, out, max_len);
 }
 
 static bool polar_pmd_wait_cfg_complete(polar_h10_obj_t *self, uint32_t timeout_ms) {
@@ -933,8 +955,9 @@ static void polar_pmd_parse_cp_notification(polar_h10_obj_t *self, const uint8_t
     }
 }
 
-static void polar_pmd_parse_ecg_data(polar_h10_obj_t *self, const uint8_t *value, uint16_t value_len) {
+static void polar_pmd_parse_data(polar_h10_obj_t *self, const uint8_t *value, uint16_t value_len) {
     polar_ble_driver_ecg_parse_pmd_notification(&self->ecg_ring, POLAR_BLE_PMD_MEAS_ECG, value, value_len);
+    polar_ble_driver_imu_parse_pmd_notification(&self->imu_ring, POLAR_BLE_PMD_MEAS_ACC, value, value_len);
 }
 
 static void polar_session_stop_all_listeners(polar_h10_obj_t *self) {
@@ -969,7 +992,9 @@ static void polar_session_reset_feature_state(polar_h10_obj_t *self) {
     self->pmd_cp_response_waiting = false;
     self->pmd_cp_response_done = false;
     self->ecg_enabled = false;
+    self->imu_enabled = false;
     polar_ecg_ring_reset(self);
+    polar_imu_ring_reset(self);
 
     self->runtime_link.conn_update_pending = false;
     self->mtu_exchange_pending = false;
@@ -1363,7 +1388,7 @@ static bool polar_handle_gatt_route_event(polar_h10_obj_t *self, const polar_ble
     }
 
     if (route->kind == POLAR_BLE_DRIVER_GATT_ROUTE_PMD_DATA_VALUE) {
-        polar_pmd_parse_ecg_data(self, route->value.value, route->value.value_len);
+        polar_pmd_parse_data(self, route->value.value, route->value.value_len);
         return true;
     }
 
@@ -1774,6 +1799,9 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->ecg_enabled = false;
     polar_ble_driver_ecg_ring_init(&self->ecg_ring, self->ecg_ring_storage, POLAR_BLE_ECG_RING_BYTES);
 
+    self->imu_enabled = false;
+    polar_ble_driver_imu_ring_init(&self->imu_ring, self->imu_ring_storage, POLAR_BLE_IMU_RING_BYTES);
+
     self->pmd_cp_notifications_total = 0;
     self->pmd_cp_response_total = 0;
 
@@ -1896,6 +1924,14 @@ static mp_obj_t polar_h10_stats(mp_obj_t self_in) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_ecg_parse_errors_total), mp_obj_new_int_from_uint(self->ecg_ring.parse_errors_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_ecg_drop_bytes_total), mp_obj_new_int_from_uint(self->ecg_ring.drop_bytes_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_ecg_ring_high_water), mp_obj_new_int_from_uint(self->ecg_ring.ring_high_water));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_enabled), mp_obj_new_bool(self->imu_enabled));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_available_bytes), mp_obj_new_int_from_uint(self->imu_ring.count));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_notifications_total), mp_obj_new_int_from_uint(self->imu_ring.notifications_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_frames_total), mp_obj_new_int_from_uint(self->imu_ring.frames_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_samples_total), mp_obj_new_int_from_uint(self->imu_ring.samples_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_parse_errors_total), mp_obj_new_int_from_uint(self->imu_ring.parse_errors_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_drop_bytes_total), mp_obj_new_int_from_uint(self->imu_ring.drop_bytes_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_ring_high_water), mp_obj_new_int_from_uint(self->imu_ring.ring_high_water));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_pmd_cp_notifications_total), mp_obj_new_int_from_uint(self->pmd_cp_notifications_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_pmd_cp_response_total), mp_obj_new_int_from_uint(self->pmd_cp_response_total));
 
@@ -2057,6 +2093,7 @@ static mp_obj_t polar_h10_disconnect(mp_obj_t self_in) {
     }
 
     self->ecg_enabled = false;
+    self->imu_enabled = false;
     self->runtime_link.connected = false;
     self->runtime_link.conn_handle = HCI_CON_HANDLE_INVALID;
     self->runtime_link.conn_update_pending = false;
@@ -2310,11 +2347,16 @@ static bool polar_pmd_policy_wait_response_cb(void *ctx, uint32_t timeout_ms, ui
     return done;
 }
 
-static int polar_pmd_policy_start_ecg_and_wait_response(
+static int polar_pmd_policy_start_measurement_and_wait_response(
     void *ctx,
     const uint8_t *start_cmd,
     size_t start_cmd_len,
     uint8_t *out_status) {
+    if (start_cmd == NULL || start_cmd_len < 2) {
+        return POLAR_BLE_DRIVER_PMD_OP_TRANSPORT;
+    }
+
+    uint8_t measurement_type = start_cmd[1];
     polar_ble_driver_pmd_start_cmd_ops_t ops = {
         .ctx = ctx,
         .is_connected = polar_pmd_policy_is_connected,
@@ -2327,7 +2369,7 @@ static int polar_pmd_policy_start_ecg_and_wait_response(
         start_cmd,
         start_cmd_len,
         POLAR_BLE_PMD_OP_REQUEST_MEASUREMENT_START,
-        POLAR_BLE_PMD_MEAS_ECG,
+        measurement_type,
         POLAR_BLE_GATT_OP_TIMEOUT_MS,
         POLAR_BLE_DRIVER_PMD_OP_OK,
         POLAR_BLE_DRIVER_PMD_OP_NOT_CONNECTED,
@@ -2379,6 +2421,8 @@ static mp_obj_t polar_h10_start_ecg(size_t n_args, const mp_obj_t *args, mp_map_
         .sample_rate = (uint16_t)sample_rate,
         .include_resolution = true,
         .resolution = 14,
+        .include_range = false,
+        .range = 0,
     };
     polar_ble_driver_pmd_start_ops_t ops = {
         .ctx = self,
@@ -2388,7 +2432,7 @@ static mp_obj_t polar_h10_start_ecg(size_t n_args, const mp_obj_t *args, mp_map_
         .sleep_ms = polar_pmd_policy_sleep_ms,
         .enable_notifications = polar_pmd_policy_enable_notifications,
         .ensure_minimum_mtu = polar_pmd_policy_ensure_minimum_mtu,
-        .start_ecg_and_wait_response = polar_pmd_policy_start_ecg_and_wait_response,
+        .start_ecg_and_wait_response = polar_pmd_policy_start_measurement_and_wait_response,
     };
 
     uint8_t start_response_status = 0xff;
@@ -2442,6 +2486,39 @@ static mp_obj_t polar_h10_start_ecg(size_t n_args, const mp_obj_t *args, mp_map_
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_start_ecg_obj, 1, polar_h10_start_ecg);
 
+static void polar_pmd_disable_notifications_best_effort(polar_h10_obj_t *self) {
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        polar_pmd_set_notify_for_char(
+            self,
+            &self->pmd_data_char,
+            &self->pmd_data_notification,
+            &self->pmd_data_notification_listening,
+            false
+            );
+        nlr_pop();
+    } else {
+        self->pmd_data_notification_listening = false;
+        self->pmd_cfg_pending = false;
+        self->pmd_cfg_done = false;
+    }
+
+    if (nlr_push(&nlr) == 0) {
+        polar_pmd_set_notify_for_char(
+            self,
+            &self->pmd_cp_char,
+            &self->pmd_cp_notification,
+            &self->pmd_cp_notification_listening,
+            false
+            );
+        nlr_pop();
+    } else {
+        self->pmd_cp_notification_listening = false;
+        self->pmd_cfg_pending = false;
+        self->pmd_cfg_done = false;
+    }
+}
+
 static mp_obj_t polar_h10_stop_ecg(mp_obj_t self_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
@@ -2476,35 +2553,8 @@ static mp_obj_t polar_h10_stop_ecg(mp_obj_t self_in) {
 
     self->ecg_enabled = false;
 
-    nlr_buf_t nlr;
-    if (nlr_push(&nlr) == 0) {
-        polar_pmd_set_notify_for_char(
-            self,
-            &self->pmd_data_char,
-            &self->pmd_data_notification,
-            &self->pmd_data_notification_listening,
-            false
-            );
-        nlr_pop();
-    } else {
-        self->pmd_data_notification_listening = false;
-        self->pmd_cfg_pending = false;
-        self->pmd_cfg_done = false;
-    }
-
-    if (nlr_push(&nlr) == 0) {
-        polar_pmd_set_notify_for_char(
-            self,
-            &self->pmd_cp_char,
-            &self->pmd_cp_notification,
-            &self->pmd_cp_notification_listening,
-            false
-            );
-        nlr_pop();
-    } else {
-        self->pmd_cp_notification_listening = false;
-        self->pmd_cfg_pending = false;
-        self->pmd_cfg_done = false;
+    if (!self->imu_enabled) {
+        polar_pmd_disable_notifications_best_effort(self);
     }
 
     return mp_const_none;
@@ -2589,6 +2639,238 @@ static mp_obj_t polar_h10_read_ecg(size_t n_args, const mp_obj_t *args, mp_map_t
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_read_ecg_obj, 1, polar_h10_read_ecg);
 
+static mp_obj_t polar_h10_start_imu(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+    enum {
+        ARG_sample_rate,
+        ARG_range,
+    };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_sample_rate, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = 50 } },
+        { MP_QSTR_range, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = POLAR_BLE_IMU_DEFAULT_RANGE_G } },
+    };
+
+    mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+#if !POLAR_BLE_HAS_BTSTACK
+    (void)self;
+    polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("Bluetooth BTstack is not available in this build"));
+#else
+    if (!POLAR_BLE_CFG_ENABLE_ECG) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("IMU feature disabled at build time"));
+    }
+    if (!self->runtime_link.connected || self->runtime_link.state != POLAR_BLE_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+        polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+    }
+    if (!self->pmd_cp_char_found || !self->pmd_data_char_found || self->pmd_cp_handle == 0 || self->pmd_data_handle == 0) {
+        polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD characteristics missing"));
+    }
+    if (self->imu_enabled) {
+        return mp_const_none;
+    }
+
+    mp_int_t sample_rate = parsed_args[ARG_sample_rate].u_int;
+    if (sample_rate <= 0 || sample_rate > 65535) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid IMU sample_rate"));
+    }
+
+    mp_int_t range = parsed_args[ARG_range].u_int;
+    if (range <= 0 || range > 65535) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid IMU range"));
+    }
+
+    polar_ble_driver_pmd_start_policy_t policy = {
+        .ccc_attempts = POLAR_BLE_PMD_CCC_ATTEMPTS,
+        .security_rounds_per_attempt = POLAR_BLE_PMD_SECURITY_ROUNDS,
+        .security_wait_ms = POLAR_BLE_PMD_SECURITY_WAIT_MS,
+        .minimum_mtu = POLAR_BLE_PMD_MIN_MTU,
+        .sample_rate = (uint16_t)sample_rate,
+        .include_resolution = true,
+        .resolution = POLAR_BLE_IMU_DEFAULT_RESOLUTION,
+        .include_range = true,
+        .range = (uint16_t)range,
+    };
+    polar_ble_driver_pmd_start_ops_t ops = {
+        .ctx = self,
+        .is_connected = polar_pmd_policy_is_connected,
+        .encryption_key_size = polar_pmd_policy_encryption_key_size,
+        .request_pairing = polar_pmd_policy_request_pairing,
+        .sleep_ms = polar_pmd_policy_sleep_ms,
+        .enable_notifications = polar_pmd_policy_enable_notifications,
+        .ensure_minimum_mtu = polar_pmd_policy_ensure_minimum_mtu,
+        .start_ecg_and_wait_response = polar_pmd_policy_start_measurement_and_wait_response,
+    };
+
+    uint8_t start_response_status = 0xff;
+    int last_ccc_att_status = 0;
+    polar_ble_driver_pmd_start_result_t start_result = polar_ble_driver_pmd_start_acc_with_policy(
+        &policy,
+        &ops,
+        &start_response_status,
+        &last_ccc_att_status);
+
+    if (last_ccc_att_status > 0) {
+        self->pmd_cfg_att_status = (uint8_t)last_ccc_att_status;
+        self->last_att_status = (uint8_t)last_ccc_att_status;
+    }
+    self->pmd_cp_response_status = start_response_status;
+
+    switch (start_result) {
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_OK:
+            break;
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_NOT_CONNECTED:
+            polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+            break;
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_SECURITY_TIMEOUT:
+            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("failed to establish secure link for PMD"));
+            break;
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_CCC_TIMEOUT:
+            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD CCC timeout"));
+            break;
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_CCC_REJECTED:
+            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD CCC rejected"));
+            break;
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_MTU_FAILED:
+            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD requires larger ATT MTU"));
+            break;
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_START_TIMEOUT:
+            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD start response timeout"));
+            break;
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_START_REJECTED:
+            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD start IMU rejected"));
+            break;
+        case POLAR_BLE_DRIVER_PMD_START_RESULT_TRANSPORT_ERROR:
+        default:
+            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PMD start transport failure"));
+            break;
+    }
+
+    self->imu_enabled = true;
+    polar_imu_ring_reset(self);
+    return mp_const_none;
+#endif
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_start_imu_obj, 1, polar_h10_start_imu);
+
+static mp_obj_t polar_h10_stop_imu(mp_obj_t self_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+
+#if !POLAR_BLE_HAS_BTSTACK
+    (void)self;
+    return mp_const_none;
+#else
+    if (!POLAR_BLE_CFG_ENABLE_ECG) {
+        return mp_const_none;
+    }
+
+    if (!self->runtime_link.connected || self->runtime_link.state != POLAR_BLE_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+        self->imu_enabled = false;
+        return mp_const_none;
+    }
+
+    if (self->imu_enabled) {
+        uint8_t stop_cmd[2] = {
+            POLAR_BLE_PMD_OP_STOP_MEASUREMENT,
+            POLAR_BLE_PMD_MEAS_ACC,
+        };
+
+        polar_pmd_expect_response(self, POLAR_BLE_PMD_OP_STOP_MEASUREMENT, POLAR_BLE_PMD_MEAS_ACC);
+        polar_pmd_write_command(self, stop_cmd, (uint16_t)sizeof(stop_cmd));
+
+        if (polar_pmd_wait_response(self, POLAR_BLE_GATT_OP_TIMEOUT_MS)) {
+            if (!polar_ble_driver_pmd_response_status_ok(self->pmd_cp_response_status)) {
+                polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD stop IMU rejected"));
+            }
+        }
+    }
+
+    self->imu_enabled = false;
+
+    if (!self->ecg_enabled) {
+        polar_pmd_disable_notifications_best_effort(self);
+    }
+
+    return mp_const_none;
+#endif
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_stop_imu_obj, polar_h10_stop_imu);
+
+static mp_obj_t polar_h10_read_imu(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+    enum {
+        ARG_max_bytes,
+        ARG_timeout_ms,
+    };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_max_bytes, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = 1024 } },
+        { MP_QSTR_timeout_ms, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = 0 } },
+    };
+
+    mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+#if !POLAR_BLE_HAS_BTSTACK
+    (void)self;
+    return mp_obj_new_bytes((const uint8_t *)"", 0);
+#else
+    if (!POLAR_BLE_CFG_ENABLE_ECG) {
+        return mp_obj_new_bytes((const uint8_t *)"", 0);
+    }
+    if (!self->runtime_link.connected || self->runtime_link.state != POLAR_BLE_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+        polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+    }
+
+    mp_int_t max_bytes = parsed_args[ARG_max_bytes].u_int;
+    if (max_bytes <= 0) {
+        return mp_obj_new_bytes((const uint8_t *)"", 0);
+    }
+    if (max_bytes > POLAR_BLE_IMU_RING_BYTES) {
+        max_bytes = POLAR_BLE_IMU_RING_BYTES;
+    }
+    max_bytes -= (max_bytes % 6);
+    if (max_bytes <= 0) {
+        return mp_obj_new_bytes((const uint8_t *)"", 0);
+    }
+
+    mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
+    if (timeout_ms < 0) {
+        timeout_ms = 0;
+    }
+
+    if (polar_imu_ring_available(self) == 0 && timeout_ms > 0 && self->imu_enabled) {
+        uint32_t start_ms = polar_now_ms();
+        while (!polar_elapsed_ms(start_ms, (uint32_t)timeout_ms)) {
+            if (!self->runtime_link.connected || self->runtime_link.state != POLAR_BLE_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+                break;
+            }
+            if (polar_imu_ring_available(self) > 0) {
+                break;
+            }
+            mp_event_wait_ms(5);
+        }
+    }
+
+    uint16_t n = polar_imu_ring_available(self);
+    if (n > (uint16_t)max_bytes) {
+        n = (uint16_t)max_bytes;
+    }
+    n -= (uint16_t)(n % 6u);
+    if (n == 0) {
+        return mp_obj_new_bytes((const uint8_t *)"", 0);
+    }
+
+    uint8_t *tmp = m_new(uint8_t, n);
+    uint16_t popped = polar_imu_ring_pop_bytes(self, tmp, n);
+    mp_obj_t out = mp_obj_new_bytes(tmp, popped);
+    m_del(uint8_t, tmp, n);
+    return out;
+#endif
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_read_imu_obj, 1, polar_h10_read_imu);
+
 static mp_obj_t polar_h10_start_streams(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
     enum {
         ARG_ecg,
@@ -2604,23 +2886,24 @@ static mp_obj_t polar_h10_start_streams(size_t n_args, const mp_obj_t *args, mp_
     mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
 
-    if (parsed_args[ARG_imu].u_bool) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("IMU stream is not implemented yet"));
-    }
-
     if (parsed_args[ARG_hr].u_bool) {
         (void)polar_h10_start_hr(args[0]);
     }
+
+    mp_map_t empty_kw = {
+        .all_keys_are_qstrs = 1,
+        .is_fixed = 1,
+        .is_ordered = 1,
+        .used = 0,
+        .alloc = 0,
+        .table = NULL,
+    };
+
     if (parsed_args[ARG_ecg].u_bool) {
-        mp_map_t empty_kw = {
-            .all_keys_are_qstrs = 1,
-            .is_fixed = 1,
-            .is_ordered = 1,
-            .used = 0,
-            .alloc = 0,
-            .table = NULL,
-        };
         (void)polar_h10_start_ecg(1, args, &empty_kw);
+    }
+    if (parsed_args[ARG_imu].u_bool) {
+        (void)polar_h10_start_imu(1, args, &empty_kw);
     }
 
     return mp_const_none;
@@ -2649,7 +2932,7 @@ static mp_obj_t polar_h10_stop_streams(size_t n_args, const mp_obj_t *args, mp_m
         (void)polar_h10_stop_hr(args[0]);
     }
     if (parsed_args[ARG_imu].u_bool) {
-        // Placeholder until IMU start/stop is implemented.
+        (void)polar_h10_stop_imu(args[0]);
     }
 
     return mp_const_none;
@@ -2670,6 +2953,9 @@ static const mp_rom_map_elem_t polar_h10_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_start_ecg), MP_ROM_PTR(&polar_h10_start_ecg_obj) },
     { MP_ROM_QSTR(MP_QSTR_stop_ecg), MP_ROM_PTR(&polar_h10_stop_ecg_obj) },
     { MP_ROM_QSTR(MP_QSTR_read_ecg), MP_ROM_PTR(&polar_h10_read_ecg_obj) },
+    { MP_ROM_QSTR(MP_QSTR_start_imu), MP_ROM_PTR(&polar_h10_start_imu_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stop_imu), MP_ROM_PTR(&polar_h10_stop_imu_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_imu), MP_ROM_PTR(&polar_h10_read_imu_obj) },
     { MP_ROM_QSTR(MP_QSTR_start_streams), MP_ROM_PTR(&polar_h10_start_streams_obj) },
     { MP_ROM_QSTR(MP_QSTR_stop_streams), MP_ROM_PTR(&polar_h10_stop_streams_obj) },
 };

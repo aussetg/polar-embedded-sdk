@@ -183,6 +183,7 @@ target_sources(usermod_polar INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_gatt_write.c
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_hr.c
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_ecg.c
+    ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_imu.c
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_pmd.c
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_pmd_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_pmd_start.c

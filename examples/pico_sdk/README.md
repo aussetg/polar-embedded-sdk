@@ -1,6 +1,6 @@
 # examples/pico_sdk probe
 
-Minimal Pico 2W BTstack/CYW43 central probe for Polar H10.
+Minimal RP2-1 (Pico Plus 2 W RP2350) BTstack/CYW43 central probe for Polar H10.
 
 Purpose:
 - isolate behavior below MicroPython runtime/GATT wrapper,
@@ -11,7 +11,7 @@ Purpose:
 
 ```bash
 cmake -S examples/pico_sdk -B build/pico_sdk_probe \
-  -DPICO_BOARD=pico2_w \
+  -DPICO_BOARD=pimoroni_pico_plus2_w_rp2350 \
   -DPICO_SDK_PATH=$PICO_SDK_PATH
 cmake --build build/pico_sdk_probe -j$(nproc)
 ```
@@ -40,7 +40,7 @@ Example: idle/connection-only probe (no HR subscription):
 
 ```bash
 cmake -S examples/pico_sdk -B build/pico_sdk_probe_idle \
-  -DPICO_BOARD=pico2_w \
+  -DPICO_BOARD=pimoroni_pico_plus2_w_rp2350 \
   -DPICO_SDK_PATH=$PICO_SDK_PATH \
   -DH10_ENABLE_HR=0
 cmake --build build/pico_sdk_probe_idle -j$(nproc)
@@ -57,7 +57,7 @@ For A/B tests against MicroPython's BTstack tree:
 
 ```bash
 cmake -S examples/pico_sdk -B build/pico_sdk_probe_mpbtstack \
-  -DPICO_BOARD=pico2_w \
+  -DPICO_BOARD=pimoroni_pico_plus2_w_rp2350 \
   -DPICO_SDK_PATH=$PICO_SDK_PATH \
   -DPICO_BTSTACK_PATH=$PWD/vendors/micropython/lib/btstack \
   -DH10_ENABLE_HR=0

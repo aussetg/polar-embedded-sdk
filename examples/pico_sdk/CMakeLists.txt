@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.13)
 
+if(NOT DEFINED PICO_BOARD)
+    set(PICO_BOARD "pimoroni_pico_plus2_w_rp2350" CACHE STRING "Pico SDK board")
+endif()
+
 if(DEFINED ENV{PICO_SDK_PATH})
     include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 else()
@@ -42,6 +46,7 @@ add_executable(h10_btstack_probe
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_write.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_hr.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_ecg.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_imu.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd_start.c
