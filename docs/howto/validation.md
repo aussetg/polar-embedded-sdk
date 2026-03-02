@@ -10,7 +10,7 @@ It is intentionally procedural (not a roadmap). Acceptance criteria are defined 
 ## Prerequisites
 
 - Hardware:
-  - Pico 2 W (RP2350 + CYW43)
+  - RP2-1 prototype (Pimoroni Pico Plus 2 W, RP2350B + CYW43)
   - Polar H10 (powered / worn / good skin contact)
 - Firmware built with required features enabled:
   - `-DPOLAR_ENABLE_HR=ON`

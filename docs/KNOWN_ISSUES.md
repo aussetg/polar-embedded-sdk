@@ -1,7 +1,7 @@
 # Known issues
 
 Status: Living document
-Last updated: 2026-02-24
+Last updated: 2026-03-02
 
 This file collects **confirmed, user-visible issues** encountered while developing the Polar H10 driver on **Pico 2 W (RP2350 + CYW43)** using **BTstack**.
 
@@ -77,14 +77,75 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 - See protocol reference: `docs/reference/polar_psftp.md`.
 - Ensure nanopb generation workflow is in place before implementing PSFTP on-device.
 
+## Vendor-reported device issues (Polar; informational)
+
+These issues are reported by Polar (SDK/device docs) and are included here for awareness.
+They are **not necessarily defects in this repository**.
+
+Source:
+- Polar BLE SDK — `documentation/KnownIssues.md`:
+  https://github.com/polarofficial/polar-ble-sdk/blob/master/documentation/KnownIssues.md
+  (checked: 2026-03-02)
+
+## Polar Verity Sense (Polar-reported)
+
+### PVS-01 — `requestStreamSettings()` reports incorrect PPG sample rate (normal mode)
+- **Firmware:** starting from 1.1.5
+- **Feature:** PPG stream
+- **Problem:** reading PPG settings can return **135 Hz** even though the actual stream is **55 Hz**.
+- **Workaround:**
+  - Streaming still works if `startOhrStreaming` is requested with 135 Hz; received data is sampled at 55 Hz.
+  - In SDK mode, settings are reported correctly.
+- **Fix:** fixed in Verity Sense firmware **2.1.0**.
+
+### PVS-02 — Battery level not updated while charging over USB
+- **Firmware:** fixed from 2.2.6
+- **Feature:** battery status
+- **Problem:** while charging, reported battery level can stay frozen at the value from charge-start.
+- **Workaround:** unplug charger; battery level reporting resumes correctly.
+
+### PVS-03 — Stream timestamps do not reflect `setLocalTime` until reboot
+- **Firmware:** all
+- **Feature:** stream timestamps
+- **Problem:** changing local time via `setLocalTime` does not affect emitted stream timestamps until restart.
+- **Workaround:** power cycle the device once after setting time.
+
+## Polar H10 (Polar-reported)
+
+### PH10-01 — Internal recording read can be interrupted if sensor is removed from strap
+- **Firmware:** all
+- **Feature:** stored internal recording
+- **Problem:** H10 disconnects BLE after ~45 s when removed from strap; this can abort a long memory-read session.
+- **Workaround:** keep H10 attached to strap and worn during recording download.
+
+### PH10-02 — ECG/ACC streaming must be explicitly terminated by the client
+- **Firmware:** all
+- **Feature:** terminate data streaming
+- **Problem:** if the client does not explicitly stop streaming, H10 can remain active until battery removal/depletion (even if removed from strap).
+- **Workaround:** always terminate streaming/connection from the client before removing sensor from strap.
+
+## Polar OH1 (Polar-reported)
+
+### POH1-01 — Stream timestamps do not reflect `setLocalTime` until reboot
+- **Firmware:** all
+- **Feature:** stream timestamps
+- **Problem:** changing local time via `setLocalTime` does not affect emitted stream timestamps until restart.
+- **Workaround:** power cycle the device once after setting time.
+
+### POH1-02 — `requestStreamSettings()` reports incorrect PPG sample rate
+- **Firmware:** all
+- **Feature:** PPG stream
+- **Problem:** settings can report **130 Hz** while actual PPG stream is **135 Hz**.
+- **Workaround:** starting OHR with 130 Hz still yields correctly sampled 135 Hz data.
+
 ## Resolved
 
-### R-01 — Pico 2 W app firmware failed to boot/enumerate (early `Out of memory` panic)
+### R-01 — rp2 firmware failed to boot/enumerate (early `Out of memory` panic)
 
-**Affected path:** MicroPython rp2 build with minimal Pimoroni `picographics` extras.
+**Affected path:** MicroPython rp2 builds that include C++ user modules.
 
-**Root cause:** rp2 builds default `MICROPY_C_HEAP_SIZE=0`, so early C++ runtime allocations via wrapped `malloc` failed during startup.
+**Root cause:** rp2 builds default `MICROPY_C_HEAP_SIZE=0`, so early C++ runtime allocations via wrapped `malloc` can fail during startup.
 
-**Fix:** build Pimoroni profile with non-zero C heap (preset `fw-rp2-polar-picographics` sets `MICROPY_C_HEAP_SIZE=8192`).
+**Fix:** set non-zero C heap on affected presets (currently `MICROPY_C_HEAP_SIZE=8192` on `fw-pico2w-picographics`, `fw-rp2-1`, and `fw-rp2-1-debug`).
 
-**Reference:** `CMakePresets.json` (`fw-rp2-polar-picographics`), `docs/howto/build_micropython_with_polar_module.md`.
+**Reference:** `CMakePresets.json`, `docs/howto/build_micropython_with_polar_module.md`.

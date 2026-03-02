@@ -1,6 +1,6 @@
 # Documentation
 
-This repository is building a **C-backed MicroPython driver** for the **Polar H10** on **rp2 / Pico 2 W (RP2350 + CYW43)**.
+This repository is building a **C-backed MicroPython driver** for the **Polar H10** on **rp2** (current hardware target: **RP2-1**, based on **Pimoroni Pico Plus 2 W / RP2350B + CYW43**).
 
 The documentation is organised so that:
 - the **spec** is the canonical source of required behavior and API,
@@ -15,8 +15,9 @@ The documentation is organised so that:
 3. **Build toolchain requirements:** [`howto/toolchain_requirements.md`](./howto/toolchain_requirements.md)
 4. **BTstack alignment policy (single-version target):** [`howto/btstack_version_alignment.md`](./howto/btstack_version_alignment.md)
 5. **Build/flash workflow:** [`howto/build_micropython_with_polar_module.md`](./howto/build_micropython_with_polar_module.md)
-6. **Validation procedures (HR + ECG):** [`howto/validation.md`](./howto/validation.md)
-7. **Known issues / troubleshooting:** [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md)
+6. **RP2-1 prototype hardware profile:** [`howto/rp2_1_prototype.md`](./howto/rp2_1_prototype.md)
+7. **Validation procedures (HR + ECG):** [`howto/validation.md`](./howto/validation.md)
+8. **Known issues / troubleshooting:** [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md)
 
 ## Docs map
 

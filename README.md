@@ -1,6 +1,6 @@
 # polar_logger
 
-This repository is building towards a **C-backed MicroPython module** for the **Polar H10** on **RP2 / Pico 2W**.
+This repository is building towards a **C-backed MicroPython module** for the **Polar H10** on **RP2** (current primary target: **RP2-1**, based on **Pimoroni Pico Plus 2 W**).
 
 ## Where is the driver?
 
@@ -19,7 +19,7 @@ Start here:
 
 ## Build + tooling
 
-- `CMakePresets.json` — canonical firmware build entrypoint (release/debug/autopatch + workflow presets)
+- `CMakePresets.json` — canonical firmware build entrypoint (Pico 2 W + RP2-1 release/debug/workflow presets)
 - `CMakeLists.txt` — repo-level build entrypoint forwarding into vendored MicroPython rp2 build
 - `firmware/cmake/` — firmware build fragments (minimal Pimoroni `picographics` profile + compatibility shim)
 - `examples/pico_sdk/` — standalone C probe (pico-sdk + BTstack) used for isolation testing

@@ -217,8 +217,8 @@ cmake --build build/pico_sdk_probe_bt18 -j$(nproc)
 MicroPython rp2:
 
 ```bash
-cmake --preset fw-rp2-polar
-cmake --build --preset fw-rp2-polar
+cmake --preset fw-rp2-1
+cmake --build --preset fw-rp2-1
 ```
 
 ### 6) Record final top-level pointers
