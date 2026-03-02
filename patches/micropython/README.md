@@ -9,6 +9,7 @@ Order:
 2. `0002-extmod-btstack-preserve-disconnect-addr-fields-and-e.patch`
 3. `0003-extmod-btstack-tune-central-connect-latency-and-supe.patch`
 4. `0004-extmod-btstack-central-post-connect-HCI-param-update.patch`
+5. `0005-extmod-btstack-include-hci-event-sources-for-newer-btstack.patch`
 
 Apply (recommended, preserves commit metadata):
 
@@ -28,10 +29,10 @@ Abort if needed:
 git -C vendors/micropython am --abort
 ```
 
-Undo after apply (drop last 4 commits):
+Undo after apply (drop last 5 commits):
 
 ```bash
-git -C vendors/micropython reset --hard HEAD~4
+git -C vendors/micropython reset --hard HEAD~5
 ```
 
 ## What they do
@@ -50,3 +51,14 @@ git -C vendors/micropython reset --hard HEAD~4
 - Add optional post-connect central parameter update in BTstack and enable it on rp2:
   - request 30 ms interval (`24` units), latency `0`, supervision timeout `72` (10 ms units)
   - use `gap_update_connection_parameters(...)` (HCI/LL path) rather than L2CAP CPUP request
+- Include required HCI event sources in MicroPython BTstack integration:
+  - `src/hci_event.c` (always)
+  - `src/hci_event_builder.c` when present
+  (required by newer BTstack versions, including 1.8)
+
+Note: the `hids_client` -> `hids_host` rename for MicroPython’s vendored
+`lib/pico-sdk` is handled by the pico-sdk patch stack, applied with:
+
+```bash
+./patches/apply_pico_sdk_patches.sh --target vendors/micropython/lib/pico-sdk
+```

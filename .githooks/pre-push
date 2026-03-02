@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+"${REPO_ROOT}/.githooks/_btstack_alignment_hook.sh" enforce pre-push

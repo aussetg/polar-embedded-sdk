@@ -63,3 +63,12 @@ cmake -S examples/pico_sdk -B build/pico_sdk_probe_mpbtstack \
   -DH10_ENABLE_HR=0
 cmake --build build/pico_sdk_probe_mpbtstack -j$(nproc)
 ```
+
+## BTstack 1.8 note
+
+If using BTstack 1.8 via `PICO_BTSTACK_PATH`, apply local pico-sdk patches first:
+
+```bash
+./patches/apply_pico_sdk_patches.sh --dry-run
+./patches/apply_pico_sdk_patches.sh
+```

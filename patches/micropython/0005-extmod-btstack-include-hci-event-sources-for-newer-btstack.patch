@@ -1,0 +1,59 @@
+From 7f4f4c0c8e17f4ad6d4ea95deafe00c7fdbab44b Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Mon, 2 Mar 2026 17:38:00 +0100
+Subject: [PATCH] extmod/btstack: include hci_event sources for newer btstack
+
+Newer BTstack versions (including 1.8) require symbols from:
+- src/hci_event.c
+- src/hci_event_builder.c (when present)
+
+MicroPython's static BTstack source lists did not include these files,
+which causes linker failures after bumping lib/btstack.
+
+---
+ extmod/btstack/btstack.cmake | 8 ++++++++
+ extmod/btstack/btstack.mk    | 8 ++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/extmod/btstack/btstack.cmake b/extmod/btstack/btstack.cmake
+index 8dad3886f..76e400fd8 100644
+--- a/extmod/btstack/btstack.cmake
++++ b/extmod/btstack/btstack.cmake
+@@ -54,8 +54,16 @@ target_sources(micropy_extmod_btstack INTERFACE
+     ${BTSTACK_LIB_DIR}/src/hci.c
+     ${BTSTACK_LIB_DIR}/src/hci_cmd.c
+     ${BTSTACK_LIB_DIR}/src/hci_dump.c
++    ${BTSTACK_LIB_DIR}/src/hci_event.c
+     ${BTSTACK_LIB_DIR}/src/hci_transport_em9304_spi.c
+     ${BTSTACK_LIB_DIR}/src/hci_transport_h4.c
+     ${BTSTACK_LIB_DIR}/src/l2cap.c
+     ${BTSTACK_LIB_DIR}/src/l2cap_signaling.c
+ )
++
++# Added in BTstack >= v1.6.2
++if (EXISTS ${BTSTACK_LIB_DIR}/src/hci_event_builder.c)
++    target_sources(micropy_extmod_btstack INTERFACE
++        ${BTSTACK_LIB_DIR}/src/hci_event_builder.c
++    )
++endif()
+diff --git a/extmod/btstack/btstack.mk b/extmod/btstack/btstack.mk
+index c17b0df10..9f1423e96 100644
+--- a/extmod/btstack/btstack.mk
++++ b/extmod/btstack/btstack.mk
+@@ -38,6 +38,14 @@ SRC_BTSTACK_C = \
+ 	$(addprefix lib/btstack/src/ble/, $(filter-out %_tlv.c, $(SRC_BLE_FILES))) \
+ 	lib/btstack/platform/embedded/hci_dump_embedded_stdout.c \
+ 
++SRC_BTSTACK_C += \
++	lib/btstack/src/hci_event.c
++
++ifneq ($(wildcard $(BTSTACK_DIR)/src/hci_event_builder.c),)
++SRC_BTSTACK_C += \
++	lib/btstack/src/hci_event_builder.c
++endif
++
+ ifeq ($(MICROPY_BLUETOOTH_BTSTACK_USB),1)
+ ifeq ($(MICROPY_BLUETOOTH_BTSTACK_H4),1)
+ 	$(error Cannot enable both MICROPY_BLUETOOTH_BTSTACK_USB and MICROPY_BLUETOOTH_BTSTACK_H4)
+-- 
+2.49.0

@@ -23,6 +23,7 @@ Start here:
 - `CMakeLists.txt` — repo-level build entrypoint forwarding into vendored MicroPython rp2 build
 - `firmware/cmake/` — firmware build fragments (minimal Pimoroni `picographics` profile + compatibility shim)
 - `examples/pico_sdk/` — standalone C probe (pico-sdk + BTstack) used for isolation testing
+- `scripts/setup_hooks.sh` — one-time local git hook bootstrap (`core.hooksPath=.githooks`) for BTstack alignment guardrails
 
 ## Vendor deps
 

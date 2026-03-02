@@ -13,9 +13,10 @@ The documentation is organised so that:
 1. **Driver spec (canonical):** [`specs/micropython_polar_sdk_driver.md`](./specs/micropython_polar_sdk_driver.md)
 2. **Protocol reference index:** [`reference/README.md`](./reference/README.md)
 3. **Build toolchain requirements:** [`howto/toolchain_requirements.md`](./howto/toolchain_requirements.md)
-4. **Build/flash workflow:** [`howto/build_micropython_with_polar_module.md`](./howto/build_micropython_with_polar_module.md)
-5. **Validation procedures (HR + ECG):** [`howto/validation.md`](./howto/validation.md)
-6. **Known issues / troubleshooting:** [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md)
+4. **BTstack alignment policy (single-version target):** [`howto/btstack_version_alignment.md`](./howto/btstack_version_alignment.md)
+5. **Build/flash workflow:** [`howto/build_micropython_with_polar_module.md`](./howto/build_micropython_with_polar_module.md)
+6. **Validation procedures (HR + ECG):** [`howto/validation.md`](./howto/validation.md)
+7. **Known issues / troubleshooting:** [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md)
 
 ## Docs map
 

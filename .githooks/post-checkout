@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Args: <old-ref> <new-ref> <is-branch-checkout>
+if [[ "${3:-0}" != "1" ]]; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+"${REPO_ROOT}/.githooks/_btstack_alignment_hook.sh" warn post-checkout

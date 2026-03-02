@@ -53,6 +53,18 @@ cmake -S examples/pico_sdk -B build/pico_sdk_probe_mpbtstack \
 cmake --build build/pico_sdk_probe_mpbtstack -j$(nproc)
 ```
 
+## BTstack 1.8 note
+
+If you point `PICO_BTSTACK_PATH` to a BTstack 1.8 tree while using pico-sdk 2.2.0,
+apply local pico-sdk patches first:
+
+```bash
+./patches/apply_pico_sdk_patches.sh --dry-run
+./patches/apply_pico_sdk_patches.sh
+```
+
+(Required rename in rp2 pico_btstack integration: `hids_client.c` -> `hids_host.c`.)
+
 ## Useful CMake cache variables
 
 - `H10_TARGET_ADDR` (default `24:AC:AC:05:A3:10`)

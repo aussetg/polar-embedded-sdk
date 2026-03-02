@@ -1,0 +1,63 @@
+From 2f2a4d5f8ef6e30d1c4b74bff2e7f5645e8d4001 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Mon, 2 Mar 2026 17:20:00 +0100
+Subject: [PATCH] rp2_common/pico_btstack: rename hids_client to hids_host for
+ BTstack 1.8
+
+BTstack 1.8 renamed:
+- src/ble/gatt-service/hids_client.c
++ src/ble/gatt-service/hids_host.c
+
+Update rp2 pico_btstack integration lists accordingly.
+
+---
+ src/rp2_common/pico_btstack/CMakeLists.txt | 6 +++---
+ src/rp2_common/pico_btstack/btstack.BUILD  | 2 +-
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/rp2_common/pico_btstack/CMakeLists.txt b/src/rp2_common/pico_btstack/CMakeLists.txt
+index 726f6cb5..6b0fbc18 100644
+--- a/src/rp2_common/pico_btstack/CMakeLists.txt
++++ b/src/rp2_common/pico_btstack/CMakeLists.txt
+@@ -91,7 +91,7 @@ if (TARGET pico_btstack_base)
+         ${PICO_BTSTACK_PATH}/src/ble/gatt-service/device_information_service_server.c
+         ${PICO_BTSTACK_PATH}/src/ble/gatt-service/device_information_service_client.c
+         ${PICO_BTSTACK_PATH}/src/ble/gatt-service/heart_rate_service_server.c
+-        ${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_client.c
++        ${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_host.c
+         ${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_device.c
+         ${PICO_BTSTACK_PATH}/src/ble/gatt-service/nordic_spp_service_server.c
+         ${PICO_BTSTACK_PATH}/src/ble/gatt-service/ublox_spp_service_server.c
+@@ -342,7 +342,7 @@ if (TARGET pico_btstack_base)
+         set_source_files_properties(
+             ${PICO_BTSTACK_PATH}/src/ble/att_server.c
+             ${PICO_BTSTACK_PATH}/src/ble/gatt-service/device_information_service_server.c
+-            ${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_client.c
++            ${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_host.c
+             ${PICO_BTSTACK_PATH}/src/btstack_util.c
+             ${PICO_BTSTACK_PATH}/src/btstack_crypto.c
+             ${PICO_BTSTACK_PATH}/src/classic/a2dp.c
+@@ -405,7 +405,7 @@ if (TARGET pico_btstack_base)
+             COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-sign-compare"
+             )
+         set_source_files_properties(
+-            ${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_client.c
++            ${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_host.c
+             PROPERTIES
+             COMPILE_OPTIONS "-Wno-cast-qual;-Wno-null-dereference"
+             )
+diff --git a/src/rp2_common/pico_btstack/btstack.BUILD b/src/rp2_common/pico_btstack/btstack.BUILD
+index 0ac862e9..6a7e8b1e 100644
+--- a/src/rp2_common/pico_btstack/btstack.BUILD
++++ b/src/rp2_common/pico_btstack/btstack.BUILD
+@@ -108,7 +108,7 @@ cc_library(
+         "src/ble/gatt-service/device_information_service_server.c",
+         "src/ble/gatt-service/device_information_service_client.c",
+         "src/ble/gatt-service/heart_rate_service_server.c",
+-        "src/ble/gatt-service/hids_client.c",
++        "src/ble/gatt-service/hids_host.c",
+         "src/ble/gatt-service/hids_device.c",
+         "src/ble/gatt-service/nordic_spp_service_server.c",
+         "src/ble/gatt-service/ublox_spp_service_server.c",
+-- 
+2.49.0
