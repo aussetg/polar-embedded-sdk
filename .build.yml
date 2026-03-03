@@ -1,0 +1,11 @@
+image: alpine/edge
+secrets:
+  - 109fc6eb-567a-4e99-9fb2-7c0588b469c8
+environment:
+  REPO: polar-embedded-sdk
+  GH_USER: aussetg
+tasks:
+  - push-to-github: |
+      cd ~/"${REPO}"
+      git config --global credential.helper store
+      git push --mirror "https://github.com/${GH_USER}/${REPO}"
