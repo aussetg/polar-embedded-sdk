@@ -14,22 +14,22 @@ static bool polar_sdk_pmd_ops_ready(const polar_sdk_pmd_start_ops_t *ops) {
         ops->start_ecg_and_wait_response != 0;
 }
 
-static bool polar_sdk_pmd_security_is_connected(void *ctx) {
+static bool polar_sdk_pmd_security_is_connected(const void *ctx) {
     const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
     return ops->is_connected(ops->ctx);
 }
 
-static bool polar_sdk_pmd_security_is_secure(void *ctx) {
+static bool polar_sdk_pmd_security_is_secure(const void *ctx) {
     const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
     return polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx));
 }
 
-static void polar_sdk_pmd_security_request_pairing(void *ctx) {
+static void polar_sdk_pmd_security_request_pairing(const void *ctx) {
     const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
     ops->request_pairing(ops->ctx);
 }
 
-static void polar_sdk_pmd_security_sleep_ms(void *ctx, uint32_t ms) {
+static void polar_sdk_pmd_security_sleep_ms(const void *ctx, uint32_t ms) {
     const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
     ops->sleep_ms(ops->ctx, ms);
 }
@@ -48,7 +48,7 @@ static bool polar_sdk_pmd_ensure_security(
         .poll_ms = 20,
     };
     polar_sdk_security_ops_t security_ops = {
-        .ctx = (void *)ops,
+        .ctx = ops,
         .is_connected = polar_sdk_pmd_security_is_connected,
         .is_secure = polar_sdk_pmd_security_is_secure,
         .request_pairing = polar_sdk_pmd_security_request_pairing,

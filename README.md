@@ -43,7 +43,7 @@ Start here:
 - `scripts/setup_hooks.sh` — one-time local git hook bootstrap (`core.hooksPath=.githooks`) for BTstack alignment guardrails
 - `scripts/check_python.sh` — run Python lint checks (Ruff via `uvx`) on scripts + MicroPython examples
 - `scripts/check_fast.sh` — quick local quality gate (python lint + BTstack header policy + docs link lint)
-- `scripts/check_c.sh` — C-focused quality gate (firmware preset build + clang-tidy + strict `-Wall -Wextra -Werror` syntax checks on `polar_sdk/core/src`)
+- `scripts/check_c.sh` — C-focused quality gate (firmware preset build + clang-tidy + strict warnings + `gcc -fanalyzer` + optional `cppcheck` on `polar_sdk/core/src`)
 - `scripts/check_full.sh` — aggregate gate (`check_fast` + `check_c`)
 
 ## Vendor deps

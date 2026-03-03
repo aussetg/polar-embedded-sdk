@@ -68,17 +68,17 @@ if ! command -v clang-tidy >/dev/null 2>&1; then
 fi
 
 if [[ "${POLAR_SKIP_CONFIGURE:-0}" != "1" ]]; then
-  echo "[1/5] Configure preset: ${PRESET}"
+  echo "[1/7] Configure preset: ${PRESET}"
   cmake --preset "${PRESET}"
 else
-  echo "[1/5] Configure preset: skipped (POLAR_SKIP_CONFIGURE=1)"
+  echo "[1/7] Configure preset: skipped (POLAR_SKIP_CONFIGURE=1)"
 fi
 
 if [[ "${POLAR_SKIP_BUILD:-0}" != "1" ]]; then
-  echo "[2/5] Build preset: ${PRESET}"
+  echo "[2/7] Build preset: ${PRESET}"
   cmake --build --preset "${PRESET}"
 else
-  echo "[2/5] Build preset: skipped (POLAR_SKIP_BUILD=1)"
+  echo "[2/7] Build preset: skipped (POLAR_SKIP_BUILD=1)"
 fi
 
 if [[ ! -f "${COMPILE_DB}" ]]; then
@@ -96,10 +96,14 @@ fi
 TIDY_CHECKS="${POLAR_CLANG_TIDY_CHECKS:--*,clang-analyzer-*,-clang-analyzer-security.insecureAPI.*,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions}"
 TIDY_WERRORS="${POLAR_CLANG_TIDY_WERRORS:-clang-analyzer-*,bugprone-*}"
 STRICT_WARNINGS_ENABLED="${POLAR_ENABLE_STRICT_WARNINGS:-1}"
-STRICT_WARN_FLAGS="${POLAR_STRICT_WARN_FLAGS:--Wall -Wextra -Werror}"
+STRICT_WARN_FLAGS="${POLAR_STRICT_WARN_FLAGS:--Wall -Wextra -Werror -Wconversion -Wsign-conversion -Wshadow -Wformat=2 -Wundef -Wcast-qual}"
+FANALYZER_ENABLED="${POLAR_ENABLE_FANALYZER:-1}"
+FANALYZER_FLAGS="${POLAR_FANALYZER_FLAGS:--fanalyzer -Werror}"
+CPPCHECK_MODE="${POLAR_ENABLE_CPPCHECK:-auto}"  # 0 | 1 | auto
+CPPCHECK_FLAGS="${POLAR_CPPCHECK_FLAGS:---enable=warning,performance,portability --std=c11 --language=c --suppress=missingIncludeSystem --suppress=unusedFunction --inline-suppr --error-exitcode=1 --quiet}"
 HEADER_FILTER="^${REPO_ROOT}/polar_sdk/core/"
 
-echo "[3/5] clang-tidy (core SDK sources)"
+echo "[3/7] clang-tidy (core SDK sources)"
 echo "       checks: ${TIDY_CHECKS}"
 clang-tidy \
   -p "${COMPILE_DB_DIR}" \
@@ -110,15 +114,48 @@ clang-tidy \
   --quiet
 
 if [[ "${STRICT_WARNINGS_ENABLED}" == "1" ]]; then
-  echo "[4/5] strict compiler warnings (core SDK sources)"
+  echo "[4/7] strict compiler warnings (core SDK sources)"
   echo "       extra flags: ${STRICT_WARN_FLAGS}"
   python3 scripts/check_c_strict_warnings.py \
     --compile-commands "${COMPILE_DB}" \
     --repo-root "${REPO_ROOT}" \
     --path-prefix "polar_sdk/core/src/" \
-    --extra-flags "${STRICT_WARN_FLAGS}"
+    --extra-flags "${STRICT_WARN_FLAGS}" \
+    --systemize-vendor-includes
 else
-  echo "[4/5] strict compiler warnings: skipped (POLAR_ENABLE_STRICT_WARNINGS=0)"
+  echo "[4/7] strict compiler warnings: skipped (POLAR_ENABLE_STRICT_WARNINGS=0)"
 fi
 
-echo "[5/5] OK: C checks passed"
+if [[ "${FANALYZER_ENABLED}" == "1" ]]; then
+  echo "[5/7] gcc -fanalyzer (core SDK sources)"
+  echo "       extra flags: ${FANALYZER_FLAGS}"
+  python3 scripts/check_c_strict_warnings.py \
+    --compile-commands "${COMPILE_DB}" \
+    --repo-root "${REPO_ROOT}" \
+    --path-prefix "polar_sdk/core/src/" \
+    --mode compile \
+    --extra-flags "${FANALYZER_FLAGS}" \
+    --systemize-vendor-includes
+else
+  echo "[5/7] gcc -fanalyzer: skipped (POLAR_ENABLE_FANALYZER=0)"
+fi
+
+if [[ "${CPPCHECK_MODE}" == "0" ]]; then
+  echo "[6/7] cppcheck: skipped (POLAR_ENABLE_CPPCHECK=0)"
+else
+  if ! command -v cppcheck >/dev/null 2>&1; then
+    if [[ "${CPPCHECK_MODE}" == "1" ]]; then
+      echo "[6/7] cppcheck: required but not found in PATH" >&2
+      exit 2
+    fi
+    echo "[6/7] cppcheck: not found in PATH (auto-skip; set POLAR_ENABLE_CPPCHECK=1 to enforce)"
+  else
+    echo "[6/7] cppcheck (core SDK sources)"
+    # shellcheck disable=SC2086
+    cppcheck ${CPPCHECK_FLAGS} \
+      -I "${REPO_ROOT}/polar_sdk/core/include" \
+      "${REPO_ROOT}/polar_sdk/core/src"
+  fi
+fi
+
+echo "[7/7] OK: C checks passed"

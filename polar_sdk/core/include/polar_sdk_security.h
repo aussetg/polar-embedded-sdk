@@ -25,11 +25,11 @@ typedef struct {
 } polar_sdk_security_policy_t;
 
 typedef struct {
-    void *ctx;
-    bool (*is_connected)(void *ctx);
-    bool (*is_secure)(void *ctx);
-    void (*request_pairing)(void *ctx);
-    void (*sleep_ms)(void *ctx, uint32_t ms);
+    const void *ctx;
+    bool (*is_connected)(const void *ctx);
+    bool (*is_secure)(const void *ctx);
+    void (*request_pairing)(const void *ctx);
+    void (*sleep_ms)(const void *ctx, uint32_t ms);
 } polar_sdk_security_ops_t;
 
 polar_sdk_security_result_t polar_sdk_security_request_with_retry(

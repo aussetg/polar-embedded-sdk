@@ -7,12 +7,22 @@ polar_sdk_gatt_notify_runtime_result_t polar_sdk_gatt_notify_runtime_set(
         return POLAR_SDK_GATT_NOTIFY_RUNTIME_MISSING_CHAR;
     }
 
+    if (args->properties > UINT8_MAX ||
+        args->prop_notify > UINT8_MAX ||
+        args->prop_indicate > UINT8_MAX) {
+        return POLAR_SDK_GATT_NOTIFY_RUNTIME_WRITE_FAILED;
+    }
+
+    uint8_t characteristic_properties = (uint8_t)args->properties;
+    uint8_t notify_property_mask = (uint8_t)args->prop_notify;
+    uint8_t indicate_property_mask = (uint8_t)args->prop_indicate;
+
     polar_sdk_gatt_notify_result_t r = polar_sdk_gatt_set_notify(
         args->ops,
         args->enable,
-        args->properties,
-        args->prop_notify,
-        args->prop_indicate,
+        characteristic_properties,
+        notify_property_mask,
+        indicate_property_mask,
         args->ccc_none,
         args->ccc_notify,
         args->ccc_indicate,

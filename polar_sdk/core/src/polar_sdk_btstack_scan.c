@@ -48,7 +48,7 @@ bool polar_sdk_btstack_decode_adv_report(
 
     gap_event_advertising_report_get_address(packet, out_report->addr);
     out_report->addr_type = gap_event_advertising_report_get_address_type(packet);
-    out_report->rssi = gap_event_advertising_report_get_rssi(packet);
+    out_report->rssi = (int8_t)gap_event_advertising_report_get_rssi(packet);
     out_report->adv_len = gap_event_advertising_report_get_data_length(packet);
     out_report->adv_data = gap_event_advertising_report_get_data(packet);
     return true;
