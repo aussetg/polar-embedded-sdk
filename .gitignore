@@ -11,6 +11,7 @@ proto/*.pb
 *.uf2
 *.map
 build/
+.cache
 
 # IDE
 .idea/

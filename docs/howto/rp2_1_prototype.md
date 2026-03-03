@@ -18,7 +18,7 @@ Last updated: 2026-03-02
 
 ## Wiring (validated)
 
-> Important power note: for RP2-1 peripherals, use the board's **3V3** rail for logic power, not a GPIO pin.
+> Important power note: for RP2-1 peripherals, use the board's **3V3** rail for logic power.
 
 ### RV3028 RTC breakout
 
