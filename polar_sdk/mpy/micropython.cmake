@@ -193,6 +193,7 @@ target_sources(usermod_polar_sdk INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_connect.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_transport.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_wait.c
+    ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_runtime.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_runtime_context.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_transport_adapter.c
@@ -215,6 +216,7 @@ target_sources(usermod_polar_sdk INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_gatt_notify_runtime.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_gatt_query_complete.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_gatt_write.c
+    ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_gatt_mtu.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_hr.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_ecg.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_imu.c
@@ -222,6 +224,7 @@ target_sources(usermod_polar_sdk INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_pmd_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_pmd_start.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_psftp.c
+    ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_psftp_runtime.c
 )
 
 if(POLAR_ENABLE_PSFTP)

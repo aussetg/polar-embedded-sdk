@@ -41,6 +41,8 @@
 #include "polar_sdk_gatt_notify_runtime.h"
 #include "polar_sdk_gatt_query_complete.h"
 #include "polar_sdk_gatt_write.h"
+#include "polar_sdk_gatt_mtu.h"
+#include "polar_sdk_security.h"
 #include "polar_sdk_ecg.h"
 #include "polar_sdk_imu.h"
 #include "polar_sdk_runtime.h"
@@ -61,6 +63,7 @@
 #include "polar_sdk_pmd.h"
 #include "polar_sdk_pmd_control.h"
 #include "polar_sdk_psftp.h"
+#include "polar_sdk_psftp_runtime.h"
 
 #include "py/mperrno.h"
 #include "py/mphal.h"
@@ -144,7 +147,6 @@
 #define POLAR_SDK_PSFTP_DEFAULT_DOWNLOAD_MAX_BYTES (8192u)
 #define POLAR_SDK_PSFTP_MAX_DOWNLOAD_BYTES (32768u)
 #define POLAR_SDK_PSFTP_MAX_DIR_ENTRIES (48u)
-#define POLAR_SDK_PSFTP_MAX_PROTO_REQUEST_BYTES (320u)
 #define POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES (8192u)
 
 #define POLAR_SDK_STATE_IDLE (POLAR_SDK_RUNTIME_STATE_IDLE)
@@ -722,31 +724,75 @@ static bool polar_wait_for_mtu_exchange(polar_h10_obj_t *self, uint32_t timeout_
     return polar_wait_for_flag_or_disconnect(self, &self->mtu_exchange_done, timeout_ms);
 }
 
+typedef struct {
+    polar_h10_obj_t *self;
+} polar_pmd_mtu_ctx_t;
+
+static bool polar_pmd_mtu_is_connected(void *ctx) {
+    polar_pmd_mtu_ctx_t *m = (polar_pmd_mtu_ctx_t *)ctx;
+    return m->self->runtime_link.connected && m->self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID;
+}
+
+static int polar_pmd_mtu_read(void *ctx, uint16_t *out_mtu) {
+    polar_pmd_mtu_ctx_t *m = (polar_pmd_mtu_ctx_t *)ctx;
+
+    uint16_t mtu = ATT_DEFAULT_MTU;
+    if (gatt_client_get_mtu(m->self->runtime_link.conn_handle, &mtu) != ERROR_CODE_SUCCESS) {
+        return -1;
+    }
+
+    m->self->att_mtu = mtu;
+    if (out_mtu != NULL) {
+        *out_mtu = mtu;
+    }
+    return 0;
+}
+
+static int polar_pmd_mtu_request_exchange(void *ctx) {
+    polar_pmd_mtu_ctx_t *m = (polar_pmd_mtu_ctx_t *)ctx;
+    m->self->mtu_exchange_pending = true;
+    m->self->mtu_exchange_done = false;
+    gatt_client_send_mtu_negotiation(polar_hci_packet_handler_and_discovery, m->self->runtime_link.conn_handle);
+    return 0;
+}
+
+static bool polar_pmd_mtu_wait_exchange_complete(void *ctx, uint32_t timeout_ms) {
+    polar_pmd_mtu_ctx_t *m = (polar_pmd_mtu_ctx_t *)ctx;
+    return polar_wait_for_mtu_exchange(m->self, timeout_ms);
+}
+
+static uint16_t polar_pmd_mtu_current(void *ctx) {
+    polar_pmd_mtu_ctx_t *m = (polar_pmd_mtu_ctx_t *)ctx;
+    return m->self->att_mtu;
+}
+
 static bool polar_pmd_ensure_mtu(polar_h10_obj_t *self, uint16_t minimum_mtu, uint32_t timeout_ms) {
-    if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-        return false;
-    }
+    polar_pmd_mtu_ctx_t ctx = { .self = self };
+    polar_sdk_gatt_mtu_ops_t ops = {
+        .ctx = &ctx,
+        .is_connected = polar_pmd_mtu_is_connected,
+        .read_mtu = polar_pmd_mtu_read,
+        .request_exchange = polar_pmd_mtu_request_exchange,
+        .wait_exchange_complete = polar_pmd_mtu_wait_exchange_complete,
+        .current_mtu = polar_pmd_mtu_current,
+    };
 
-    uint16_t current_mtu = ATT_DEFAULT_MTU;
-    if (gatt_client_get_mtu(self->runtime_link.conn_handle, &current_mtu) == ERROR_CODE_SUCCESS) {
-        self->att_mtu = current_mtu;
-    }
-    if (self->att_mtu >= minimum_mtu) {
-        return true;
-    }
+    polar_sdk_gatt_mtu_result_t r = polar_sdk_gatt_mtu_ensure_minimum(
+        &ops,
+        minimum_mtu,
+        timeout_ms,
+        &self->att_mtu);
 
-    self->mtu_exchange_pending = true;
-    self->mtu_exchange_done = false;
-    gatt_client_send_mtu_negotiation(polar_hci_packet_handler_and_discovery, self->runtime_link.conn_handle);
-
-    if (!polar_wait_for_mtu_exchange(self, timeout_ms)) {
+    if (r != POLAR_SDK_GATT_MTU_RESULT_OK) {
         self->mtu_exchange_pending = false;
-        self->mtu_exchange_done = false;
+        if (r == POLAR_SDK_GATT_MTU_RESULT_TIMEOUT) {
+            self->mtu_exchange_done = false;
+        }
         return false;
     }
 
     self->mtu_exchange_pending = false;
-    return self->att_mtu >= minimum_mtu;
+    return true;
 }
 
 typedef struct {
@@ -1011,33 +1057,6 @@ static void polar_pmd_parse_data(polar_h10_obj_t *self, const uint8_t *value, ui
     polar_sdk_imu_parse_pmd_notification(&self->imu_ring, POLAR_SDK_PMD_MEAS_ACC, value, value_len);
 }
 
-typedef enum {
-    POLAR_PSFTP_TRANS_OK = 0,
-    POLAR_PSFTP_TRANS_NOT_CONNECTED,
-    POLAR_PSFTP_TRANS_MISSING_CHARACTERISTICS,
-    POLAR_PSFTP_TRANS_NOTIFY_FAILED,
-    POLAR_PSFTP_TRANS_NOTIFY_TIMEOUT,
-    POLAR_PSFTP_TRANS_NOTIFY_ATT_REJECTED,
-    POLAR_PSFTP_TRANS_ENCODE_FAILED,
-    POLAR_PSFTP_TRANS_WRITE_FAILED,
-    POLAR_PSFTP_TRANS_WRITE_TIMEOUT,
-    POLAR_PSFTP_TRANS_WRITE_ATT_REJECTED,
-    POLAR_PSFTP_TRANS_RESPONSE_TIMEOUT,
-    POLAR_PSFTP_TRANS_PROTOCOL_ERROR,
-    POLAR_PSFTP_TRANS_SEQUENCE_ERROR,
-    POLAR_PSFTP_TRANS_OVERFLOW,
-    POLAR_PSFTP_TRANS_REMOTE_ERROR,
-} polar_psftp_trans_result_t;
-
-enum {
-    POLAR_PSFTP_OP_OK = 0,
-    POLAR_PSFTP_OP_NOT_CONNECTED = -1,
-    POLAR_PSFTP_OP_TIMEOUT = -2,
-    POLAR_PSFTP_OP_TRANSPORT = -3,
-    POLAR_PSFTP_OP_MISSING_CHAR = -4,
-    POLAR_PSFTP_OP_NO_NOTIFY_PROP = -5,
-};
-
 static bool polar_psftp_wait_cfg_complete(polar_h10_obj_t *self, uint32_t timeout_ms) {
     return polar_wait_for_flag_or_disconnect(self, &self->psftp_cfg_done, timeout_ms);
 }
@@ -1070,6 +1089,29 @@ static bool polar_psftp_security_ready(polar_h10_obj_t *self) {
     return gap_encryption_key_size(self->runtime_link.conn_handle) > 0;
 }
 
+static bool polar_psftp_security_is_connected_cb(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return self->runtime_link.connected && self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID;
+}
+
+static bool polar_psftp_security_is_secure_cb(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return polar_psftp_security_ready(self);
+}
+
+static void polar_psftp_security_request_pairing_cb(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+        return;
+    }
+    sm_request_pairing(self->runtime_link.conn_handle);
+}
+
+static void polar_psftp_security_sleep_ms_cb(void *ctx, uint32_t ms) {
+    (void)ctx;
+    mp_event_wait_ms(ms);
+}
+
 static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
     if (polar_psftp_security_ready(self)) {
         return true;
@@ -1081,6 +1123,20 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
 
     polar_sdk_btstack_sm_apply_default_auth_policy();
 
+    polar_sdk_security_policy_t policy = {
+        .rounds = 1,
+        .wait_ms_per_round = POLAR_SDK_PMD_SECURITY_WAIT_MS,
+        .request_gap_ms = 120,
+        .poll_ms = 20,
+    };
+    polar_sdk_security_ops_t ops = {
+        .ctx = self,
+        .is_connected = polar_psftp_security_is_connected_cb,
+        .is_secure = polar_psftp_security_is_secure_cb,
+        .request_pairing = polar_psftp_security_request_pairing_cb,
+        .sleep_ms = polar_psftp_security_sleep_ms_cb,
+    };
+
     bool dropped_stale_bond = false;
 
     for (size_t round = 0; round < POLAR_SDK_PMD_SECURITY_ROUNDS; ++round) {
@@ -1089,35 +1145,15 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
         }
 
         uint32_t pair_before = self->sm_pairing_complete_total;
-
-        sm_request_pairing(self->runtime_link.conn_handle);
-        mp_event_wait_ms(120);
-        sm_request_pairing(self->runtime_link.conn_handle);
-
-        bool pairing_failed = false;
-        uint32_t elapsed = 0;
-        while (elapsed < POLAR_SDK_PMD_SECURITY_WAIT_MS) {
-            if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-                return false;
-            }
-
-            if (self->sm_pairing_complete_total != pair_before && self->sm_last_pairing_status != 0) {
-                pairing_failed = true;
-                break;
-            }
-
-            if (polar_psftp_security_ready(self)) {
-                return true;
-            }
-
-            mp_event_wait_ms(20);
-            elapsed += 20;
-        }
-
-        if (polar_psftp_security_ready(self)) {
+        polar_sdk_security_result_t r = polar_sdk_security_request_with_retry(&policy, &ops);
+        if (r == POLAR_SDK_SECURITY_RESULT_OK) {
             return true;
         }
+        if (r == POLAR_SDK_SECURITY_RESULT_NOT_CONNECTED) {
+            return false;
+        }
 
+        bool pairing_failed = self->sm_pairing_complete_total != pair_before && self->sm_last_pairing_status != 0;
         if (pairing_failed && !dropped_stale_bond && self->peer_addr_type != BD_ADDR_TYPE_UNKNOWN) {
             gap_delete_bonding(self->peer_addr_type, self->peer_addr);
             dropped_stale_bond = true;
@@ -1230,70 +1266,98 @@ static int polar_psftp_set_notify_for_char_result(
     polar_sdk_gatt_notify_runtime_result_t r = polar_sdk_gatt_notify_runtime_set(&args);
     self->psftp_last_att_status = self->psftp_cfg_att_status;
     if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_OK) {
-        return POLAR_PSFTP_OP_OK;
+        return POLAR_SDK_PSFTP_OP_OK;
     }
     if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_NOT_CONNECTED) {
-        return POLAR_PSFTP_OP_NOT_CONNECTED;
+        return POLAR_SDK_PSFTP_OP_NOT_CONNECTED;
     }
     if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_TIMEOUT) {
-        return POLAR_PSFTP_OP_TIMEOUT;
+        return POLAR_SDK_PSFTP_OP_TIMEOUT;
     }
     if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_MISSING_CHAR) {
-        return POLAR_PSFTP_OP_MISSING_CHAR;
+        return POLAR_SDK_PSFTP_OP_MISSING_CHAR;
     }
     if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_NO_NOTIFY_PROP) {
-        return POLAR_PSFTP_OP_NO_NOTIFY_PROP;
+        return POLAR_SDK_PSFTP_OP_NO_NOTIFY_PROP;
     }
     if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_ATT_REJECTED) {
         return self->psftp_cfg_att_status;
     }
-    return POLAR_PSFTP_OP_TRANSPORT;
+    return POLAR_SDK_PSFTP_OP_TRANSPORT;
 }
 
-static int polar_psftp_enable_notify_with_security_retry(
-    polar_h10_obj_t *self,
-    gatt_client_characteristic_t *chr,
-    gatt_client_notification_t *notification,
-    bool *listening) {
+static bool polar_psftp_prepare_is_connected_ready(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return self->runtime_link.connected &&
+        self->runtime_link.state == POLAR_SDK_STATE_READY &&
+        self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID;
+}
+
+static bool polar_psftp_prepare_has_required_characteristics(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return self->psftp_mtu_char_found &&
+        self->psftp_h2d_char_found &&
+        self->psftp_mtu_handle != 0 &&
+        self->psftp_h2d_handle != 0;
+}
+
+static polar_sdk_security_result_t polar_psftp_prepare_ensure_security(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    if (polar_psftp_request_pairing_and_wait(self)) {
+        return POLAR_SDK_SECURITY_RESULT_OK;
+    }
+    if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+        return POLAR_SDK_SECURITY_RESULT_NOT_CONNECTED;
+    }
+    return POLAR_SDK_SECURITY_RESULT_TIMEOUT;
+}
+
+static bool polar_psftp_prepare_mtu_notify_enabled(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return self->psftp_mtu_enabled;
+}
+
+static int polar_psftp_prepare_enable_mtu_notify(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
     int status = polar_psftp_set_notify_for_char_result(
         self,
-        chr,
-        notification,
-        listening,
+        &self->psftp_mtu_char,
+        &self->psftp_mtu_notification,
+        &self->psftp_mtu_notification_listening,
         true);
-
-    if (status > 0 && polar_sdk_pmd_att_status_requires_security((uint8_t)status)) {
-        bool paired = polar_psftp_request_pairing_and_wait(self);
-        if (!paired) {
-            if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-                return POLAR_PSFTP_OP_NOT_CONNECTED;
-            }
-            return POLAR_PSFTP_OP_TIMEOUT;
-        }
-
-        status = polar_psftp_set_notify_for_char_result(
-            self,
-            chr,
-            notification,
-            listening,
-            true);
+    if (status == POLAR_SDK_PSFTP_OP_OK) {
+        self->psftp_mtu_enabled = true;
     }
+    return status;
+}
 
+static bool polar_psftp_prepare_d2h_notify_supported(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return self->psftp_d2h_char_found && self->psftp_d2h_handle != 0;
+}
+
+static bool polar_psftp_prepare_d2h_notify_enabled(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return self->psftp_d2h_enabled;
+}
+
+static int polar_psftp_prepare_enable_d2h_notify(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    int status = polar_psftp_set_notify_for_char_result(
+        self,
+        &self->psftp_d2h_char,
+        &self->psftp_d2h_notification,
+        &self->psftp_d2h_notification_listening,
+        true);
+    if (status == POLAR_SDK_PSFTP_OP_OK) {
+        self->psftp_d2h_enabled = true;
+    }
     return status;
 }
 
 static int polar_psftp_prepare_result(polar_h10_obj_t *self) {
-    if (!self->runtime_link.connected ||
-        self->runtime_link.state != POLAR_SDK_STATE_READY ||
-        self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-        return POLAR_PSFTP_OP_NOT_CONNECTED;
-    }
-
-    if (!self->psftp_mtu_char_found ||
-        !self->psftp_h2d_char_found ||
-        self->psftp_mtu_handle == 0 ||
-        self->psftp_h2d_handle == 0) {
-        return POLAR_PSFTP_OP_MISSING_CHAR;
+    if (!polar_psftp_prepare_is_connected_ready(self)) {
+        return POLAR_SDK_PSFTP_OP_NOT_CONNECTED;
     }
 
     // Align with probe behavior: give post-connect parameter update time to
@@ -1309,42 +1373,24 @@ static int polar_psftp_prepare_result(polar_h10_obj_t *self) {
         mp_event_wait_ms(1200);
     }
 
-    if (!polar_psftp_security_ready(self)) {
-        (void)polar_psftp_request_pairing_and_wait(self);
-        if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-            return POLAR_PSFTP_OP_NOT_CONNECTED;
-        }
-        if (!polar_psftp_security_ready(self)) {
-            return POLAR_PSFTP_OP_TIMEOUT;
-        }
-    }
+    polar_sdk_psftp_prepare_policy_t policy = {
+        .retry_security_on_att = true,
+        .strict_d2h_enable = false,
+    };
+    polar_sdk_psftp_prepare_ops_t ops = {
+        .ctx = self,
+        .is_connected_ready = polar_psftp_prepare_is_connected_ready,
+        .has_required_characteristics = polar_psftp_prepare_has_required_characteristics,
+        .security_ready = polar_psftp_security_is_secure_cb,
+        .ensure_security = polar_psftp_prepare_ensure_security,
+        .mtu_notify_enabled = polar_psftp_prepare_mtu_notify_enabled,
+        .enable_mtu_notify = polar_psftp_prepare_enable_mtu_notify,
+        .d2h_notify_supported = polar_psftp_prepare_d2h_notify_supported,
+        .d2h_notify_enabled = polar_psftp_prepare_d2h_notify_enabled,
+        .enable_d2h_notify = polar_psftp_prepare_enable_d2h_notify,
+    };
 
-    if (!self->psftp_mtu_enabled) {
-        int status = polar_psftp_enable_notify_with_security_retry(
-            self,
-            &self->psftp_mtu_char,
-            &self->psftp_mtu_notification,
-            &self->psftp_mtu_notification_listening);
-        if (status != POLAR_PSFTP_OP_OK) {
-            return status;
-        }
-        self->psftp_mtu_enabled = true;
-    }
-
-    if (!self->psftp_d2h_enabled && self->psftp_d2h_char_found && self->psftp_d2h_handle != 0) {
-        int status = polar_psftp_enable_notify_with_security_retry(
-            self,
-            &self->psftp_d2h_char,
-            &self->psftp_d2h_notification,
-            &self->psftp_d2h_notification_listening);
-        if (status == POLAR_PSFTP_OP_OK) {
-            self->psftp_d2h_enabled = true;
-        } else if (status == POLAR_PSFTP_OP_NOT_CONNECTED) {
-            return status;
-        }
-    }
-
-    return POLAR_PSFTP_OP_OK;
+    return polar_sdk_psftp_prepare_channels(&policy, &ops);
 }
 
 typedef struct {
@@ -1407,23 +1453,83 @@ static int polar_psftp_write_frame_result(polar_h10_obj_t *self, const uint8_t *
     self->psftp_last_att_status = att_status;
 
     if (r == POLAR_SDK_GATT_WRITE_OK) {
-        return POLAR_PSFTP_OP_OK;
+        return POLAR_SDK_PSFTP_OP_OK;
     }
     if (r == POLAR_SDK_GATT_WRITE_NOT_CONNECTED) {
-        return POLAR_PSFTP_OP_NOT_CONNECTED;
+        return POLAR_SDK_PSFTP_OP_NOT_CONNECTED;
     }
     if (r == POLAR_SDK_GATT_WRITE_TIMEOUT) {
         self->psftp_write_pending = false;
         self->psftp_write_done = false;
-        return POLAR_PSFTP_OP_TIMEOUT;
+        return POLAR_SDK_PSFTP_OP_TIMEOUT;
     }
     if (r == POLAR_SDK_GATT_WRITE_ATT_REJECTED) {
         return self->psftp_write_att_status;
     }
-    return POLAR_PSFTP_OP_TRANSPORT;
+    return POLAR_SDK_PSFTP_OP_TRANSPORT;
 }
 
-static polar_psftp_trans_result_t polar_psftp_execute_get(
+static int polar_psftp_get_prepare_channels_cb(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return polar_psftp_prepare_result(self);
+}
+
+static uint16_t polar_psftp_get_frame_capacity_cb(void *ctx) {
+    const polar_h10_obj_t *self = (const polar_h10_obj_t *)ctx;
+    return polar_psftp_frame_capacity(self);
+}
+
+static int polar_psftp_get_write_frame_cb(void *ctx, const uint8_t *frame, uint16_t frame_len) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return polar_psftp_write_frame_result(self, frame, frame_len);
+}
+
+static void polar_psftp_get_on_tx_frame_ok_cb(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    self->psftp_tx_frames_total += 1;
+}
+
+static void polar_psftp_get_begin_response_cb(void *ctx, uint8_t *response, size_t response_capacity) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    self->psftp_last_error_code = 0;
+    self->psftp_last_response_bytes = 0;
+    self->psftp_response_waiting = true;
+    self->psftp_response_done = false;
+    self->psftp_response_result = POLAR_SDK_PSFTP_RX_MORE;
+    polar_sdk_psftp_rx_reset(&self->psftp_rx_state, response, response_capacity);
+}
+
+static bool polar_psftp_get_wait_response_cb(void *ctx, uint32_t timeout_ms) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    bool done = polar_psftp_wait_response(self, timeout_ms);
+    if (!done) {
+        self->psftp_response_waiting = false;
+        self->psftp_response_done = false;
+    }
+    return done;
+}
+
+static polar_sdk_psftp_rx_result_t polar_psftp_get_response_result_cb(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return self->psftp_response_result;
+}
+
+static const polar_sdk_psftp_rx_state_t *polar_psftp_get_rx_state_cb(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    return &self->psftp_rx_state;
+}
+
+static bool polar_psftp_get_is_remote_success_cb(void *ctx, uint16_t error_code) {
+    (void)ctx;
+#if POLAR_CFG_ENABLE_PSFTP
+    return error_code == protocol_PbPFtpError_OPERATION_SUCCEEDED;
+#else
+    (void)error_code;
+    return false;
+#endif
+}
+
+static polar_sdk_psftp_trans_result_t polar_psftp_execute_get(
     polar_h10_obj_t *self,
     const char *path,
     size_t path_len,
@@ -1435,152 +1541,62 @@ static polar_psftp_trans_result_t polar_psftp_execute_get(
         *out_response_len = 0;
     }
 
-    int prep = POLAR_PSFTP_OP_TRANSPORT;
-    bool prep_reconnected = false;
+    polar_sdk_psftp_get_ops_t ops = {
+        .ctx = self,
+        .prepare_channels = polar_psftp_get_prepare_channels_cb,
+        .frame_capacity = polar_psftp_get_frame_capacity_cb,
+        .write_frame = polar_psftp_get_write_frame_cb,
+        .on_tx_frame_ok = polar_psftp_get_on_tx_frame_ok_cb,
+        .begin_response = polar_psftp_get_begin_response_cb,
+        .wait_response = polar_psftp_get_wait_response_cb,
+        .response_result = polar_psftp_get_response_result_cb,
+        .rx_state = polar_psftp_get_rx_state_cb,
+        .is_remote_success = polar_psftp_get_is_remote_success_cb,
+    };
+
+    bool retried_after_reconnect = false;
     for (;;) {
-        prep = polar_psftp_prepare_result(self);
-        if (prep == POLAR_PSFTP_OP_OK) {
-            break;
+        int prepare_status = POLAR_SDK_PSFTP_OP_OK;
+        int write_status = POLAR_SDK_PSFTP_OP_OK;
+        uint16_t error_code = 0;
+
+        polar_sdk_psftp_trans_result_t result = polar_sdk_psftp_execute_get_operation(
+            &ops,
+            path,
+            path_len,
+            response,
+            response_capacity,
+            timeout_ms,
+            out_response_len,
+            &error_code,
+            &prepare_status,
+            &write_status);
+
+        self->psftp_last_response_bytes = (uint32_t)self->psftp_rx_state.length;
+
+        if (result == POLAR_SDK_PSFTP_TRANS_OK) {
+            self->psftp_response_waiting = false;
+            return result;
         }
 
-        bool security_related = false;
-        if (prep > 0 && polar_sdk_pmd_att_status_requires_security((uint8_t)prep)) {
-            security_related = true;
-        } else if ((prep == POLAR_PSFTP_OP_NOT_CONNECTED || prep == POLAR_PSFTP_OP_TIMEOUT || prep == POLAR_PSFTP_OP_TRANSPORT) &&
-                   !polar_psftp_security_ready(self)) {
-            security_related = true;
+        if (prepare_status > 0 || write_status > 0) {
+            self->psftp_last_att_status = (uint8_t)(write_status > 0 ? write_status : prepare_status);
+        }
+        self->psftp_last_error_code = error_code;
+
+        bool security_related = polar_sdk_psftp_prepare_failure_is_security_related(
+            prepare_status,
+            polar_psftp_security_ready(self));
+
+        if (!retried_after_reconnect && security_related &&
+            polar_psftp_reconnect_after_security_failure(self, POLAR_SDK_PSFTP_RECONNECT_TIMEOUT_MS)) {
+            retried_after_reconnect = true;
+            continue;
         }
 
-        if (!prep_reconnected && security_related) {
-            prep_reconnected = true;
-            if (polar_psftp_reconnect_after_security_failure(self, POLAR_SDK_PSFTP_RECONNECT_TIMEOUT_MS)) {
-                continue;
-            }
-        }
-        break;
-    }
-
-    if (prep == POLAR_PSFTP_OP_NOT_CONNECTED) {
-        return POLAR_PSFTP_TRANS_NOT_CONNECTED;
-    }
-    if (prep == POLAR_PSFTP_OP_MISSING_CHAR || prep == POLAR_PSFTP_OP_NO_NOTIFY_PROP) {
-        return POLAR_PSFTP_TRANS_MISSING_CHARACTERISTICS;
-    }
-    if (prep == POLAR_PSFTP_OP_TIMEOUT) {
-        return POLAR_PSFTP_TRANS_NOTIFY_TIMEOUT;
-    }
-    if (prep == POLAR_PSFTP_OP_TRANSPORT) {
-        return POLAR_PSFTP_TRANS_NOTIFY_FAILED;
-    }
-    if (prep > 0) {
-        self->psftp_last_att_status = (uint8_t)prep;
-        return POLAR_PSFTP_TRANS_NOTIFY_ATT_REJECTED;
-    }
-
-    uint8_t proto_payload[POLAR_SDK_PSFTP_MAX_PROTO_REQUEST_BYTES];
-    size_t proto_payload_len = 0;
-    if (!polar_sdk_psftp_encode_get_operation(path, path_len, proto_payload, sizeof(proto_payload), &proto_payload_len)) {
-        return POLAR_PSFTP_TRANS_ENCODE_FAILED;
-    }
-
-    uint8_t request_stream[POLAR_SDK_PSFTP_MAX_PROTO_REQUEST_BYTES + 2u];
-    size_t request_len = polar_sdk_psftp_build_rfc60_request(
-        proto_payload,
-        proto_payload_len,
-        request_stream,
-        sizeof(request_stream));
-    if (request_len == 0) {
-        return POLAR_PSFTP_TRANS_ENCODE_FAILED;
-    }
-
-    self->psftp_last_error_code = 0;
-    self->psftp_last_response_bytes = 0;
-    self->psftp_response_waiting = true;
-    self->psftp_response_done = false;
-    self->psftp_response_result = POLAR_SDK_PSFTP_RX_MORE;
-    polar_sdk_psftp_rx_reset(&self->psftp_rx_state, response, response_capacity);
-
-    uint16_t frame_capacity = polar_psftp_frame_capacity(self);
-    uint8_t frame[520];
-    if (frame_capacity == 0 || frame_capacity > sizeof(frame)) {
         self->psftp_response_waiting = false;
-        return POLAR_PSFTP_TRANS_ENCODE_FAILED;
+        return result;
     }
-
-    polar_sdk_psftp_tx_state_t tx;
-    polar_sdk_psftp_tx_init(&tx, request_stream, request_len);
-
-    while (polar_sdk_psftp_tx_has_more(&tx)) {
-        bool is_last = false;
-        size_t frame_len = polar_sdk_psftp_tx_build_next_frame(
-            &tx,
-            frame_capacity,
-            frame,
-            sizeof(frame),
-            &is_last);
-        (void)is_last;
-        if (frame_len == 0 || frame_len > UINT16_MAX) {
-            self->psftp_response_waiting = false;
-            return POLAR_PSFTP_TRANS_ENCODE_FAILED;
-        }
-
-        int write_status = polar_psftp_write_frame_result(self, frame, (uint16_t)frame_len);
-        if (write_status == POLAR_PSFTP_OP_NOT_CONNECTED) {
-            self->psftp_response_waiting = false;
-            return POLAR_PSFTP_TRANS_NOT_CONNECTED;
-        }
-        if (write_status == POLAR_PSFTP_OP_TIMEOUT) {
-            self->psftp_response_waiting = false;
-            return POLAR_PSFTP_TRANS_WRITE_TIMEOUT;
-        }
-        if (write_status == POLAR_PSFTP_OP_TRANSPORT) {
-            self->psftp_response_waiting = false;
-            return POLAR_PSFTP_TRANS_WRITE_FAILED;
-        }
-        if (write_status > 0) {
-            self->psftp_response_waiting = false;
-            self->psftp_last_att_status = (uint8_t)write_status;
-            return POLAR_PSFTP_TRANS_WRITE_ATT_REJECTED;
-        }
-
-        self->psftp_tx_frames_total += 1;
-    }
-
-    if (!polar_psftp_wait_response(self, timeout_ms)) {
-        self->psftp_response_waiting = false;
-        self->psftp_response_done = false;
-        return POLAR_PSFTP_TRANS_RESPONSE_TIMEOUT;
-    }
-
-    self->psftp_response_waiting = false;
-    self->psftp_last_response_bytes = (uint32_t)self->psftp_rx_state.length;
-
-    if (self->psftp_response_result == POLAR_SDK_PSFTP_RX_COMPLETE) {
-        if (out_response_len != NULL) {
-            *out_response_len = self->psftp_rx_state.length;
-        }
-        return POLAR_PSFTP_TRANS_OK;
-    }
-    if (self->psftp_response_result == POLAR_SDK_PSFTP_RX_ERROR_FRAME) {
-        self->psftp_last_error_code = self->psftp_rx_state.error_code;
-#if POLAR_CFG_ENABLE_PSFTP
-        if (self->psftp_last_error_code == protocol_PbPFtpError_OPERATION_SUCCEEDED) {
-            if (out_response_len != NULL) {
-                *out_response_len = self->psftp_rx_state.length;
-            }
-            return POLAR_PSFTP_TRANS_OK;
-        }
-#endif
-        return POLAR_PSFTP_TRANS_REMOTE_ERROR;
-    }
-    if (self->psftp_response_result == POLAR_SDK_PSFTP_RX_SEQUENCE_ERROR) {
-        return POLAR_PSFTP_TRANS_SEQUENCE_ERROR;
-    }
-    if (self->psftp_response_result == POLAR_SDK_PSFTP_RX_OVERFLOW) {
-        return POLAR_PSFTP_TRANS_OVERFLOW;
-    }
-
-    return POLAR_PSFTP_TRANS_PROTOCOL_ERROR;
 }
 
 static NORETURN void polar_raise_psftp_remote_error(uint16_t error_code) {
@@ -1597,32 +1613,32 @@ static NORETURN void polar_raise_psftp_remote_error(uint16_t error_code) {
     mp_raise_msg_varg(&polar_type_ProtocolError, MP_ERROR_TEXT("PSFTP error code %u"), (unsigned)error_code);
 }
 
-static NORETURN void polar_raise_for_psftp_result(polar_h10_obj_t *self, polar_psftp_trans_result_t result) {
+static NORETURN void polar_raise_for_psftp_result(polar_h10_obj_t *self, polar_sdk_psftp_trans_result_t result) {
     (void)self;
-    if (result == POLAR_PSFTP_TRANS_NOT_CONNECTED) {
+    if (result == POLAR_SDK_PSFTP_TRANS_NOT_CONNECTED) {
         polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
     }
-    if (result == POLAR_PSFTP_TRANS_MISSING_CHARACTERISTICS) {
+    if (result == POLAR_SDK_PSFTP_TRANS_MISSING_CHARACTERISTICS) {
         polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PSFTP characteristics missing"));
     }
-    if (result == POLAR_PSFTP_TRANS_NOTIFY_TIMEOUT ||
-        result == POLAR_PSFTP_TRANS_WRITE_TIMEOUT ||
-        result == POLAR_PSFTP_TRANS_RESPONSE_TIMEOUT) {
+    if (result == POLAR_SDK_PSFTP_TRANS_NOTIFY_TIMEOUT ||
+        result == POLAR_SDK_PSFTP_TRANS_WRITE_TIMEOUT ||
+        result == POLAR_SDK_PSFTP_TRANS_RESPONSE_TIMEOUT) {
         polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PSFTP timeout"));
     }
-    if (result == POLAR_PSFTP_TRANS_NOTIFY_ATT_REJECTED || result == POLAR_PSFTP_TRANS_WRITE_ATT_REJECTED) {
+    if (result == POLAR_SDK_PSFTP_TRANS_NOTIFY_ATT_REJECTED || result == POLAR_SDK_PSFTP_TRANS_WRITE_ATT_REJECTED) {
         polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PSFTP ATT rejected"));
     }
-    if (result == POLAR_PSFTP_TRANS_OVERFLOW) {
+    if (result == POLAR_SDK_PSFTP_TRANS_OVERFLOW) {
         polar_raise_exc(&polar_type_BufferOverflowError, MP_ERROR_TEXT("PSFTP response overflow"));
     }
-    if (result == POLAR_PSFTP_TRANS_SEQUENCE_ERROR) {
+    if (result == POLAR_SDK_PSFTP_TRANS_SEQUENCE_ERROR) {
         polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PSFTP sequence error"));
     }
-    if (result == POLAR_PSFTP_TRANS_PROTOCOL_ERROR) {
+    if (result == POLAR_SDK_PSFTP_TRANS_PROTOCOL_ERROR) {
         polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PSFTP protocol error"));
     }
-    if (result == POLAR_PSFTP_TRANS_REMOTE_ERROR) {
+    if (result == POLAR_SDK_PSFTP_TRANS_REMOTE_ERROR) {
         polar_raise_psftp_remote_error(self->psftp_last_error_code);
     }
 
@@ -3764,7 +3780,7 @@ static mp_obj_t polar_h10_list_dir(mp_obj_t self_in, mp_obj_t path_in) {
 
     uint8_t *response = m_new(uint8_t, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
     size_t response_len = 0;
-    polar_psftp_trans_result_t r = polar_psftp_execute_get(
+    polar_sdk_psftp_trans_result_t r = polar_psftp_execute_get(
         self,
         normalized_path,
         normalized_len,
@@ -3772,7 +3788,7 @@ static mp_obj_t polar_h10_list_dir(mp_obj_t self_in, mp_obj_t path_in) {
         POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES,
         POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS,
         &response_len);
-    if (r != POLAR_PSFTP_TRANS_OK) {
+    if (r != POLAR_SDK_PSFTP_TRANS_OK) {
         m_del(uint8_t, response, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
         polar_raise_for_psftp_result(self, r);
     }
@@ -3860,7 +3876,7 @@ static mp_obj_t polar_h10_download(size_t n_args, const mp_obj_t *args, mp_map_t
 
     uint8_t *response = m_new(uint8_t, (size_t)max_bytes);
     size_t response_len = 0;
-    polar_psftp_trans_result_t r = polar_psftp_execute_get(
+    polar_sdk_psftp_trans_result_t r = polar_psftp_execute_get(
         self,
         path,
         path_len,
@@ -3868,7 +3884,7 @@ static mp_obj_t polar_h10_download(size_t n_args, const mp_obj_t *args, mp_map_t
         (size_t)max_bytes,
         (uint32_t)timeout_ms,
         &response_len);
-    if (r != POLAR_PSFTP_TRANS_OK) {
+    if (r != POLAR_SDK_PSFTP_TRANS_OK) {
         m_del(uint8_t, response, (size_t)max_bytes);
         polar_raise_for_psftp_result(self, r);
     }

@@ -22,6 +22,7 @@
 #include "polar_sdk_btstack_dispatch.h"
 #include "polar_sdk_discovery_apply.h"
 #include "polar_sdk_gatt_notify_runtime.h"
+#include "polar_sdk_gatt_mtu.h"
 #include "polar_sdk_pmd.h"
 #include "polar_sdk_pmd_control.h"
 
@@ -439,34 +440,85 @@ static int pmd_enable_notifications_cb(void *ctx) {
     return pmd_enable_notifications_once();
 }
 
+static int pmd_mtu_read_cb(void *ctx, uint16_t *out_mtu) {
+    UNUSED(ctx);
+
+    uint16_t current_mtu = ATT_DEFAULT_MTU;
+    if (gatt_client_get_mtu(conn_handle, &current_mtu) != ERROR_CODE_SUCCESS) {
+        return -1;
+    }
+
+    att_mtu = current_mtu;
+    if (out_mtu != NULL) {
+        *out_mtu = current_mtu;
+    }
+    return 0;
+}
+
+static int pmd_mtu_request_exchange_cb(void *ctx) {
+    UNUSED(ctx);
+
+    mtu_exchange_pending = true;
+    mtu_exchange_done = false;
+    gatt_client_send_mtu_negotiation(handle_gatt_event, conn_handle);
+    return 0;
+}
+
+static bool pmd_mtu_wait_exchange_complete_cb(void *ctx, uint32_t timeout_ms) {
+    UNUSED(ctx);
+    return wait_flag_until_true(&mtu_exchange_done, timeout_ms);
+}
+
+static uint16_t pmd_mtu_current_cb(void *ctx) {
+    UNUSED(ctx);
+    return att_mtu;
+}
+
 static int pmd_ensure_minimum_mtu_cb(void *ctx, uint16_t minimum_mtu) {
     UNUSED(ctx);
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
         return POLAR_SDK_PMD_OP_NOT_CONNECTED;
     }
 
-    uint16_t current_mtu = ATT_DEFAULT_MTU;
-    if (gatt_client_get_mtu(conn_handle, &current_mtu) == ERROR_CODE_SUCCESS) {
-        att_mtu = current_mtu;
+    uint16_t mtu_before = att_mtu;
+    if (gatt_client_get_mtu(conn_handle, &mtu_before) == ERROR_CODE_SUCCESS) {
+        att_mtu = mtu_before;
     }
     if (att_mtu >= minimum_mtu) {
         printf("[h10probe] PMD MTU already sufficient: current=%u required=%u\n", att_mtu, minimum_mtu);
-        return POLAR_SDK_PMD_OP_OK;
+    } else {
+        printf("[h10probe] PMD MTU upgrade requested: current=%u required=%u\n", att_mtu, minimum_mtu);
     }
 
-    printf("[h10probe] PMD MTU upgrade requested: current=%u required=%u\n", att_mtu, minimum_mtu);
-    mtu_exchange_pending = true;
-    mtu_exchange_done = false;
-    gatt_client_send_mtu_negotiation(handle_gatt_event, conn_handle);
-    if (!wait_flag_until_true(&mtu_exchange_done, 2000)) {
-        mtu_exchange_pending = false;
-        printf("[h10probe] PMD MTU upgrade timeout\n");
-        return POLAR_SDK_PMD_OP_TIMEOUT;
-    }
+    polar_sdk_gatt_mtu_ops_t mtu_ops = {
+        .ctx = NULL,
+        .is_connected = pmd_is_connected,
+        .read_mtu = pmd_mtu_read_cb,
+        .request_exchange = pmd_mtu_request_exchange_cb,
+        .wait_exchange_complete = pmd_mtu_wait_exchange_complete_cb,
+        .current_mtu = pmd_mtu_current_cb,
+    };
+
+    polar_sdk_gatt_mtu_result_t r = polar_sdk_gatt_mtu_ensure_minimum(
+        &mtu_ops,
+        minimum_mtu,
+        2000,
+        &att_mtu);
+
     mtu_exchange_pending = false;
+    if (r != POLAR_SDK_GATT_MTU_RESULT_OK) {
+        if (r == POLAR_SDK_GATT_MTU_RESULT_NOT_CONNECTED) {
+            return POLAR_SDK_PMD_OP_NOT_CONNECTED;
+        }
+        if (r == POLAR_SDK_GATT_MTU_RESULT_TIMEOUT) {
+            printf("[h10probe] PMD MTU upgrade timeout\n");
+            return POLAR_SDK_PMD_OP_TIMEOUT;
+        }
+        return POLAR_SDK_PMD_OP_TRANSPORT;
+    }
 
     printf("[h10probe] PMD MTU after upgrade=%u\n", att_mtu);
-    return att_mtu >= minimum_mtu ? POLAR_SDK_PMD_OP_OK : POLAR_SDK_PMD_OP_TIMEOUT;
+    return POLAR_SDK_PMD_OP_OK;
 }
 
 static int pmd_start_measurement_and_wait_response_cb(

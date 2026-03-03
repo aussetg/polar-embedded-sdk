@@ -52,6 +52,7 @@ add_executable(h10_btstack_psftp_probe
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_connect.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_transport.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_wait.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_runtime.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_runtime_context.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_transport_adapter.c
@@ -72,6 +73,7 @@ add_executable(h10_btstack_psftp_probe
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_write.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_pmd.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_psftp.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_psftp_runtime.c
     ${POLAR_PROTO_GENERATED_DIR}/types.pb.c
     ${POLAR_PROTO_GENERATED_DIR}/structures.pb.c
     ${POLAR_PROTO_GENERATED_DIR}/pftp_error.pb.c

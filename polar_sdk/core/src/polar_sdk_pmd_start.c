@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "polar_sdk_pmd.h"
 
+#include "polar_sdk_security.h"
+
 static bool polar_sdk_pmd_ops_ready(const polar_sdk_pmd_start_ops_t *ops) {
     return ops != 0 &&
         ops->is_connected != 0 &&
@@ -12,45 +14,51 @@ static bool polar_sdk_pmd_ops_ready(const polar_sdk_pmd_start_ops_t *ops) {
         ops->start_ecg_and_wait_response != 0;
 }
 
-static bool polar_sdk_pmd_wait_for_security(
-    const polar_sdk_pmd_start_ops_t *ops,
-    uint32_t timeout_ms) {
-    uint32_t elapsed = 0;
-    while (elapsed < timeout_ms) {
-        if (!ops->is_connected(ops->ctx)) {
-            return false;
-        }
-        if (polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx))) {
-            return true;
-        }
-        ops->sleep_ms(ops->ctx, 20);
-        elapsed += 20;
-    }
-    return ops->is_connected(ops->ctx) &&
-        polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx));
+static bool polar_sdk_pmd_security_is_connected(void *ctx) {
+    const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
+    return ops->is_connected(ops->ctx);
+}
+
+static bool polar_sdk_pmd_security_is_secure(void *ctx) {
+    const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
+    return polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx));
+}
+
+static void polar_sdk_pmd_security_request_pairing(void *ctx) {
+    const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
+    ops->request_pairing(ops->ctx);
+}
+
+static void polar_sdk_pmd_security_sleep_ms(void *ctx, uint32_t ms) {
+    const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
+    ops->sleep_ms(ops->ctx, ms);
 }
 
 static bool polar_sdk_pmd_ensure_security(
     const polar_sdk_pmd_start_policy_t *policy,
     const polar_sdk_pmd_start_ops_t *ops) {
-    if (polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx))) {
-        return true;
+    if (policy == 0 || ops == 0) {
+        return false;
     }
 
-    for (size_t r = 0; r < policy->security_rounds_per_attempt; ++r) {
-        if (!ops->is_connected(ops->ctx)) {
-            return false;
-        }
-        ops->request_pairing(ops->ctx);
-        ops->sleep_ms(ops->ctx, 120);
-        ops->request_pairing(ops->ctx);
+    polar_sdk_security_policy_t security_policy = {
+        .rounds = policy->security_rounds_per_attempt,
+        .wait_ms_per_round = policy->security_wait_ms,
+        .request_gap_ms = 120,
+        .poll_ms = 20,
+    };
+    polar_sdk_security_ops_t security_ops = {
+        .ctx = (void *)ops,
+        .is_connected = polar_sdk_pmd_security_is_connected,
+        .is_secure = polar_sdk_pmd_security_is_secure,
+        .request_pairing = polar_sdk_pmd_security_request_pairing,
+        .sleep_ms = polar_sdk_pmd_security_sleep_ms,
+    };
 
-        if (polar_sdk_pmd_wait_for_security(ops, policy->security_wait_ms)) {
-            return true;
-        }
-    }
-
-    return polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx));
+    polar_sdk_security_result_t r = polar_sdk_security_request_with_retry(
+        &security_policy,
+        &security_ops);
+    return r == POLAR_SDK_SECURITY_RESULT_OK;
 }
 
 static polar_sdk_pmd_start_result_t polar_sdk_pmd_start_with_command(

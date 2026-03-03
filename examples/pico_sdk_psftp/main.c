@@ -23,6 +23,8 @@
 #include "polar_sdk_gatt_notify_runtime.h"
 #include "polar_sdk_pmd.h"
 #include "polar_sdk_psftp.h"
+#include "polar_sdk_psftp_runtime.h"
+#include "polar_sdk_security.h"
 
 #ifndef H10_TARGET_ADDR
 #define H10_TARGET_ADDR "24:AC:AC:05:A3:10"
@@ -907,14 +909,12 @@ static bool psftp_notify_wait_complete(void *ctx, uint32_t timeout_ms, uint8_t *
     return done;
 }
 
-enum {
-    PSFTP_OP_OK = 0,
-    PSFTP_OP_NOT_CONNECTED = -1,
-    PSFTP_OP_TIMEOUT = -2,
-    PSFTP_OP_TRANSPORT = -3,
-    PSFTP_OP_MISSING_CHAR = -4,
-    PSFTP_OP_NO_NOTIFY_PROP = -5,
-};
+#define PSFTP_OP_OK POLAR_SDK_PSFTP_OP_OK
+#define PSFTP_OP_NOT_CONNECTED POLAR_SDK_PSFTP_OP_NOT_CONNECTED
+#define PSFTP_OP_TIMEOUT POLAR_SDK_PSFTP_OP_TIMEOUT
+#define PSFTP_OP_TRANSPORT POLAR_SDK_PSFTP_OP_TRANSPORT
+#define PSFTP_OP_MISSING_CHAR POLAR_SDK_PSFTP_OP_MISSING_CHAR
+#define PSFTP_OP_NO_NOTIFY_PROP POLAR_SDK_PSFTP_OP_NO_NOTIFY_PROP
 
 static int psftp_set_notify(gatt_client_characteristic_t *chr, gatt_client_notification_t *notification, bool *listening, bool enable) {
     psftp_notify_ctx_t ctx = {
@@ -1078,133 +1078,148 @@ static int psftp_write_frame(const uint8_t *frame, uint16_t frame_len) {
     return PSFTP_OP_OK;
 }
 
+static bool psftp_security_is_connected_cb(void *ctx) {
+    (void)ctx;
+    return connected && conn_handle != HCI_CON_HANDLE_INVALID;
+}
+
+static bool psftp_security_is_secure_cb(void *ctx) {
+    (void)ctx;
+    return psftp_security_ready();
+}
+
+static void psftp_security_request_pairing_cb(void *ctx) {
+    (void)ctx;
+    if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
+        return;
+    }
+    sm_request_pairing(conn_handle);
+}
+
+static void psftp_security_sleep_ms_cb(void *ctx, uint32_t ms) {
+    (void)ctx;
+    probe_sleep_ms(ms);
+}
+
 static bool psftp_request_pairing_and_wait(void) {
     if (psftp_security_ready()) {
         return true;
     }
 
-    for (size_t round = 0; round < PSFTP_SECURITY_ROUNDS; ++round) {
-        if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-            return false;
-        }
+    polar_sdk_btstack_sm_apply_default_auth_policy();
 
-        uint32_t pair_before = sm_pairing_complete_total;
-        sm_request_pairing(conn_handle);
-        probe_sleep_ms(120);
-        sm_request_pairing(conn_handle);
+    polar_sdk_security_policy_t policy = {
+        .rounds = PSFTP_SECURITY_ROUNDS,
+        .wait_ms_per_round = PSFTP_SECURITY_WAIT_MS,
+        .request_gap_ms = 120,
+        .poll_ms = 20,
+    };
+    polar_sdk_security_ops_t ops = {
+        .ctx = NULL,
+        .is_connected = psftp_security_is_connected_cb,
+        .is_secure = psftp_security_is_secure_cb,
+        .request_pairing = psftp_security_request_pairing_cb,
+        .sleep_ms = psftp_security_sleep_ms_cb,
+    };
 
-        uint32_t elapsed = 0;
-        while (elapsed < PSFTP_SECURITY_WAIT_MS) {
-            if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-                return false;
-            }
-            if (sm_pairing_complete_total != pair_before && sm_last_pairing_status != 0) {
-                break;
-            }
-            if (psftp_security_ready()) {
-                return true;
-            }
-            probe_sleep_ms(20);
-            elapsed += 20;
-        }
+    polar_sdk_security_result_t r = polar_sdk_security_request_with_retry(&policy, &ops);
+    return r == POLAR_SDK_SECURITY_RESULT_OK;
+}
 
-        if (psftp_security_ready()) {
-            return true;
-        }
+static bool psftp_prepare_is_connected_ready_cb(void *ctx) {
+    (void)ctx;
+    return connected && conn_handle != HCI_CON_HANDLE_INVALID;
+}
+
+static bool psftp_prepare_has_required_characteristics_cb(void *ctx) {
+    (void)ctx;
+    return psftp_mtu_found && psftp_h2d_found &&
+        psftp_mtu_char.value_handle != 0 && psftp_h2d_char.value_handle != 0;
+}
+
+static polar_sdk_security_result_t psftp_prepare_ensure_security_cb(void *ctx) {
+    (void)ctx;
+    if (psftp_request_pairing_and_wait()) {
+        return POLAR_SDK_SECURITY_RESULT_OK;
     }
+    return connected ? POLAR_SDK_SECURITY_RESULT_TIMEOUT : POLAR_SDK_SECURITY_RESULT_NOT_CONNECTED;
+}
 
-    return psftp_security_ready();
+static bool psftp_prepare_mtu_notify_enabled_cb(void *ctx) {
+    (void)ctx;
+    return psftp_mtu_enabled;
+}
+
+static int psftp_prepare_enable_mtu_notify_cb(void *ctx) {
+    (void)ctx;
+    int status = psftp_set_notify(&psftp_mtu_char, &psftp_mtu_listener, &psftp_mtu_listener_registered, true);
+    if (status == PSFTP_OP_OK) {
+        psftp_mtu_enabled = true;
+    }
+    return status;
+}
+
+static bool psftp_prepare_d2h_notify_supported_cb(void *ctx) {
+    (void)ctx;
+    return psftp_d2h_found && psftp_d2h_char.value_handle != 0;
+}
+
+static bool psftp_prepare_d2h_notify_enabled_cb(void *ctx) {
+    (void)ctx;
+    return psftp_d2h_enabled;
+}
+
+static int psftp_prepare_enable_d2h_notify_cb(void *ctx) {
+    (void)ctx;
+    int status = psftp_set_notify(&psftp_d2h_char, &psftp_d2h_listener, &psftp_d2h_listener_registered, true);
+    if (status == PSFTP_OP_OK) {
+        psftp_d2h_enabled = true;
+    }
+    return status;
 }
 
 static int psftp_prepare_channels(void) {
-    if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-        return PSFTP_OP_NOT_CONNECTED;
-    }
-    if (!psftp_mtu_found || !psftp_h2d_found ||
-        psftp_mtu_char.value_handle == 0 || psftp_h2d_char.value_handle == 0) {
-        return PSFTP_OP_MISSING_CHAR;
-    }
-
-    if (!psftp_security_ready()) {
-        if (!psftp_request_pairing_and_wait()) {
-            return connected ? PSFTP_OP_TIMEOUT : PSFTP_OP_NOT_CONNECTED;
-        }
-    }
-
-    if (!psftp_mtu_enabled) {
-        int status = psftp_set_notify(&psftp_mtu_char, &psftp_mtu_listener, &psftp_mtu_listener_registered, true);
-        if (status > 0 && polar_sdk_pmd_att_status_requires_security((uint8_t)status)) {
-            if (!psftp_request_pairing_and_wait()) {
-                return connected ? PSFTP_OP_TIMEOUT : PSFTP_OP_NOT_CONNECTED;
-            }
-            status = psftp_set_notify(&psftp_mtu_char, &psftp_mtu_listener, &psftp_mtu_listener_registered, true);
-        }
-        if (status != PSFTP_OP_OK) {
-            return status;
-        }
-        psftp_mtu_enabled = true;
-    }
-
-    if (!psftp_d2h_enabled && psftp_d2h_found && psftp_d2h_char.value_handle != 0) {
-        int status = psftp_set_notify(&psftp_d2h_char, &psftp_d2h_listener, &psftp_d2h_listener_registered, true);
-        if (status == PSFTP_OP_OK) {
-            psftp_d2h_enabled = true;
-        }
-    }
-
-    return PSFTP_OP_OK;
+    polar_sdk_psftp_prepare_policy_t policy = {
+        .retry_security_on_att = true,
+        .strict_d2h_enable = false,
+    };
+    polar_sdk_psftp_prepare_ops_t ops = {
+        .ctx = NULL,
+        .is_connected_ready = psftp_prepare_is_connected_ready_cb,
+        .has_required_characteristics = psftp_prepare_has_required_characteristics_cb,
+        .security_ready = psftp_security_is_secure_cb,
+        .ensure_security = psftp_prepare_ensure_security_cb,
+        .mtu_notify_enabled = psftp_prepare_mtu_notify_enabled_cb,
+        .enable_mtu_notify = psftp_prepare_enable_mtu_notify_cb,
+        .d2h_notify_supported = psftp_prepare_d2h_notify_supported_cb,
+        .d2h_notify_enabled = psftp_prepare_d2h_notify_enabled_cb,
+        .enable_d2h_notify = psftp_prepare_enable_d2h_notify_cb,
+    };
+    return polar_sdk_psftp_prepare_channels(&policy, &ops);
 }
 
-static bool psftp_execute_get(
-    const char *path,
-    uint8_t *out_buf,
-    size_t out_capacity,
-    size_t *out_len,
-    uint16_t *out_error_code) {
-    if (out_len) {
-        *out_len = 0;
-    }
-    if (out_error_code) {
-        *out_error_code = 0;
-    }
+static int psftp_get_prepare_channels_cb(void *ctx) {
+    (void)ctx;
+    return psftp_prepare_channels();
+}
 
-    psftp_diag_reset();
-    psftp_diag_snapshot_t diag_before = psftp_diag_snapshot_take();
+static uint16_t psftp_get_frame_capacity_cb(void *ctx) {
+    (void)ctx;
+    return att_mtu <= 3 ? 20 : (uint16_t)(att_mtu - 3);
+}
 
-    int prep = psftp_prepare_channels();
-    if (prep != PSFTP_OP_OK) {
-        psftp_last_diag.prep_code = prep;
-        printf("[psftp-probe] prepare failed code=%d enc_key=%u pair_status=0x%02x\n",
-               prep,
-               conn_handle != HCI_CON_HANDLE_INVALID ? gap_encryption_key_size(conn_handle) : 0,
-               sm_last_pairing_status);
-        psftp_diag_finalize(&diag_before, false);
-        return false;
-    }
+static int psftp_get_write_frame_cb(void *ctx, const uint8_t *frame, uint16_t frame_len) {
+    (void)ctx;
+    return psftp_write_frame(frame, frame_len);
+}
 
-    uint8_t proto_payload[320];
-    size_t proto_len = 0;
-    if (!polar_sdk_psftp_encode_get_operation(path, strlen(path), proto_payload, sizeof(proto_payload), &proto_len)) {
-        printf("[psftp-probe] encode GET failed path=%s\n", path);
-        psftp_diag_finalize(&diag_before, false);
-        return false;
-    }
+static void psftp_get_on_tx_frame_ok_cb(void *ctx) {
+    (void)ctx;
+    psftp_tx_frames_total += 1;
+}
 
-    uint8_t request_stream[322];
-    size_t request_len = polar_sdk_psftp_build_rfc60_request(
-        proto_payload,
-        proto_len,
-        request_stream,
-        sizeof(request_stream));
-    if (request_len == 0) {
-        printf("[psftp-probe] build RFC60 failed path=%s\n", path);
-        psftp_diag_finalize(&diag_before, false);
-        return false;
-    }
-
-    printf("[psftp-probe] GET path=%s proto_len=%u rfc60_len=%u rfc60_hex=", path, (unsigned)proto_len, (unsigned)request_len);
-    print_hex_prefix(request_stream, (uint16_t)request_len, H10_PSFTP_TX_HEX_DUMP_BYTES);
-    printf("\n");
+static void psftp_get_begin_response_cb(void *ctx, uint8_t *response, size_t response_capacity) {
+    (void)ctx;
 
     printf("[psftp-probe] pre-tx channels mtu(handle=0x%04x listen=%d enabled=%d) d2h(handle=0x%04x listen=%d enabled=%d) att_mtu=%u ready=%d pre_tx_delay_ms=%u\n",
            psftp_mtu_char.value_handle,
@@ -1224,46 +1239,95 @@ static bool psftp_execute_get(
     psftp_response_waiting = true;
     psftp_response_done = false;
     psftp_response_result = POLAR_SDK_PSFTP_RX_MORE;
-    polar_sdk_psftp_rx_reset(&psftp_rx_state, out_buf, out_capacity);
-
-    uint16_t frame_capacity = att_mtu <= 3 ? 20 : (uint16_t)(att_mtu - 3);
-    uint8_t frame[520];
-
-    polar_sdk_psftp_tx_state_t tx;
-    polar_sdk_psftp_tx_init(&tx, request_stream, request_len);
+    polar_sdk_psftp_rx_reset(&psftp_rx_state, response, response_capacity);
     write_packet_index = 0;
+}
 
-    while (polar_sdk_psftp_tx_has_more(&tx)) {
-        bool is_last = false;
-        size_t frame_len = polar_sdk_psftp_tx_build_next_frame(
-            &tx,
-            frame_capacity,
-            frame,
-            sizeof(frame),
-            &is_last);
-        (void)is_last;
-
-        if (frame_len == 0 || frame_len > UINT16_MAX) {
-            psftp_response_waiting = false;
-            psftp_diag_finalize(&diag_before, false);
-            return false;
-        }
-
-        int wr = psftp_write_frame(frame, (uint16_t)frame_len);
-        if (wr != PSFTP_OP_OK) {
-            psftp_response_waiting = false;
-            psftp_last_diag.write_code = wr;
-            printf("[psftp-probe] frame write failed code=%d\n", wr);
-            psftp_diag_finalize(&diag_before, false);
-            return false;
-        }
-
-        psftp_tx_frames_total += 1;
-    }
-
-    if (!wait_flag_until_true(&psftp_response_done, PSFTP_RESPONSE_TIMEOUT_MS)) {
+static bool psftp_get_wait_response_cb(void *ctx, uint32_t timeout_ms) {
+    (void)ctx;
+    bool done = wait_flag_until_true(&psftp_response_done, timeout_ms);
+    if (!done) {
         psftp_response_waiting = false;
         psftp_response_done = false;
+    }
+    return done;
+}
+
+static polar_sdk_psftp_rx_result_t psftp_get_response_result_cb(void *ctx) {
+    (void)ctx;
+    return psftp_response_result;
+}
+
+static const polar_sdk_psftp_rx_state_t *psftp_get_rx_state_cb(void *ctx) {
+    (void)ctx;
+    return &psftp_rx_state;
+}
+
+static bool psftp_get_is_remote_success_cb(void *ctx, uint16_t error_code) {
+    (void)ctx;
+    (void)error_code;
+    return false;
+}
+
+static bool psftp_execute_get(
+    const char *path,
+    uint8_t *out_buf,
+    size_t out_capacity,
+    size_t *out_len,
+    uint16_t *out_error_code) {
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (out_error_code) {
+        *out_error_code = 0;
+    }
+
+    psftp_diag_reset();
+    psftp_diag_snapshot_t diag_before = psftp_diag_snapshot_take();
+
+    printf("[psftp-probe] GET path=%s\n", path);
+
+    polar_sdk_psftp_get_ops_t ops = {
+        .ctx = NULL,
+        .prepare_channels = psftp_get_prepare_channels_cb,
+        .frame_capacity = psftp_get_frame_capacity_cb,
+        .write_frame = psftp_get_write_frame_cb,
+        .on_tx_frame_ok = psftp_get_on_tx_frame_ok_cb,
+        .begin_response = psftp_get_begin_response_cb,
+        .wait_response = psftp_get_wait_response_cb,
+        .response_result = psftp_get_response_result_cb,
+        .rx_state = psftp_get_rx_state_cb,
+        .is_remote_success = psftp_get_is_remote_success_cb,
+    };
+
+    int prep_status = PSFTP_OP_OK;
+    int write_status = PSFTP_OP_OK;
+    uint16_t error_code = 0;
+
+    polar_sdk_psftp_trans_result_t r = polar_sdk_psftp_execute_get_operation(
+        &ops,
+        path,
+        strlen(path),
+        out_buf,
+        out_capacity,
+        PSFTP_RESPONSE_TIMEOUT_MS,
+        out_len,
+        &error_code,
+        &prep_status,
+        &write_status);
+
+    psftp_last_diag.prep_code = prep_status;
+    psftp_last_diag.write_code = write_status;
+
+    if (r == POLAR_SDK_PSFTP_TRANS_OK) {
+        psftp_response_waiting = false;
+        psftp_diag_finalize(&diag_before, true);
+        return true;
+    }
+
+    psftp_response_waiting = false;
+
+    if (r == POLAR_SDK_PSFTP_TRANS_RESPONSE_TIMEOUT) {
         psftp_last_diag.response_timeout = true;
         printf("[psftp-probe] response timeout path=%s\n", path);
         printf("[psftp-probe] timeout channels mtu(listen=%d enabled=%d) d2h(listen=%d enabled=%d) ready=%d qc(total=%" PRIu32 ",cfg=%" PRIu32 ",write=%" PRIu32 ")\n",
@@ -1275,32 +1339,22 @@ static bool psftp_execute_get(
                qc_event_total,
                qc_match_cfg_total,
                qc_match_write_total);
-        psftp_diag_finalize(&diag_before, false);
-        return false;
-    }
-
-    psftp_response_waiting = false;
-
-    if (psftp_response_result == POLAR_SDK_PSFTP_RX_COMPLETE) {
-        if (out_len) {
-            *out_len = psftp_rx_state.length;
-        }
-        psftp_diag_finalize(&diag_before, true);
-        return true;
-    }
-
-    if (psftp_response_result == POLAR_SDK_PSFTP_RX_ERROR_FRAME) {
+    } else if (r == POLAR_SDK_PSFTP_TRANS_REMOTE_ERROR) {
         if (out_error_code) {
-            *out_error_code = psftp_rx_state.error_code;
+            *out_error_code = error_code;
         }
         psftp_last_diag.remote_error = true;
-        psftp_last_diag.remote_error_code = psftp_rx_state.error_code;
-        printf("[psftp-probe] remote error path=%s code=%u\n", path, (unsigned)psftp_rx_state.error_code);
-        psftp_diag_finalize(&diag_before, false);
-        return false;
+        psftp_last_diag.remote_error_code = error_code;
+        printf("[psftp-probe] remote error path=%s code=%u\n", path, (unsigned)error_code);
+    } else {
+        printf("[psftp-probe] GET failed path=%s trans=%d prep=%d write=%d resp=%d\n",
+               path,
+               (int)r,
+               prep_status,
+               write_status,
+               (int)psftp_response_result);
     }
 
-    printf("[psftp-probe] response failed path=%s result=%d\n", path, (int)psftp_response_result);
     psftp_diag_finalize(&diag_before, false);
     return false;
 }

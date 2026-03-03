@@ -22,6 +22,7 @@ add_executable(h10_btstack_probe
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_connect.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_transport.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_wait.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_runtime.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_runtime_context.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_transport_adapter.c
@@ -44,6 +45,7 @@ add_executable(h10_btstack_probe
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_notify_runtime.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_query_complete.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_write.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_mtu.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_hr.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_ecg.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_imu.c
