@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-BTstack
+// See NOTICE for license details (non-commercial, RP2 exception available)
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>

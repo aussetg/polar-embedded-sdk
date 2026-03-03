@@ -7,3 +7,15 @@ if [[ "${BTSTACK_ALIGNMENT_ENFORCE_PRE_PUSH:-0}" == "1" ]]; then
   MODE="enforce"
 fi
 "${REPO_ROOT}/.githooks/_btstack_alignment_hook.sh" "${MODE}" pre-push
+
+if [[ "${SKIP_BTSTACK_LICENSE_CHECK:-0}" == "1" ]]; then
+  exit 0
+fi
+
+if ! "${REPO_ROOT}/scripts/check_btstack_license_headers.py"; then
+  if [[ "${BTSTACK_LICENSE_ENFORCE_PRE_PUSH:-0}" == "1" ]]; then
+    echo "pre-push blocked by BTstack license header check" >&2
+    exit 1
+  fi
+  echo "warning: BTstack license header check failed (set BTSTACK_LICENSE_ENFORCE_PRE_PUSH=1 to enforce)" >&2
+fi
