@@ -13,3 +13,6 @@
 [submodule "vendors/pico-sdk"]
 	path = vendors/pico-sdk
 	url = git@github.com:raspberrypi/pico-sdk.git
+[submodule "vendors/polar-ble-sdk"]
+	path = vendors/polar-ble-sdk
+	url = git@github.com:polarofficial/polar-ble-sdk.git
