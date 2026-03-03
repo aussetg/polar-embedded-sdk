@@ -1,5 +1,8 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: LicenseRef-BTstack
+// See NOTICE for license details (non-commercial, RP2 exception available)
 #include "polar_sdk_btstack_gatt_route.h"
+
+#include "btstack.h"
 
 bool polar_sdk_btstack_route_gatt_event(
     uint8_t packet_type,
@@ -20,7 +23,7 @@ bool polar_sdk_btstack_route_gatt_event(
 
     if (polar_sdk_btstack_decode_value_event(packet_type, packet, &out->value) &&
         state->connected &&
-        state->conn_handle != 0xffff &&
+        state->conn_handle != HCI_CON_HANDLE_INVALID &&
         out->value.handle == state->conn_handle) {
         if (out->value.value_handle == state->hr_value_handle && state->hr_enabled) {
             out->kind = POLAR_SDK_GATT_ROUTE_HR_VALUE;

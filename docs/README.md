@@ -10,7 +10,7 @@ The documentation is organised so that:
 
 ## Read this first
 
-1. **SDK spec (canonical):** [`specs/micropython_polar_sdk.md`](./specs/micropython_polar_sdk.md)
+1. **SDK spec (canonical):** [`specs/micropython_polar_sdk_driver.md`](./specs/micropython_polar_sdk_driver.md)
 2. **Protocol reference index:** [`reference/README.md`](./reference/README.md)
 3. **Build toolchain requirements:** [`howto/toolchain_requirements.md`](./howto/toolchain_requirements.md)
 4. **BTstack alignment policy (single-version target):** [`howto/btstack_version_alignment.md`](./howto/btstack_version_alignment.md)

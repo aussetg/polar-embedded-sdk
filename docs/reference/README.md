@@ -18,3 +18,7 @@ Rules:
 - **PMD (Polar Measurement Data):** [`polar_pmd.md`](./polar_pmd.md)
 - **PSFTP/PFTP (file transfer):** [`polar_psftp.md`](./polar_psftp.md)
 - **Which `.proto` files matter and where they live:** [`polar_proto_sources.md`](./polar_proto_sources.md)
+
+### BTstack dependency surface
+
+- **BTstack APIs/events/constants used by this SDK:** [`btstack_api_surface.md`](./btstack_api_surface.md)

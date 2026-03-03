@@ -311,6 +311,7 @@ typedef struct _polar_h10_obj_t {
     uint32_t mtu_exchange_total;
 
     uint32_t sm_just_works_total;
+    uint32_t sm_numeric_comparison_total;
     uint32_t sm_authorization_requests_total;
     uint32_t sm_pairing_complete_total;
     uint8_t sm_last_pairing_status;
@@ -1875,12 +1876,14 @@ static void polar_sm_on_just_works_request(void *ctx, uint16_t handle) {
 
 static void polar_sm_on_numeric_comparison_request(void *ctx, uint16_t handle) {
     polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
-    self->sm_just_works_total += 1;
+    self->sm_numeric_comparison_total += 1;
     sm_numeric_comparison_confirm(handle);
 }
 
 static void polar_sm_on_authorization_request(void *ctx, uint16_t handle) {
     polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    // Current embedded policy is permissive: auto-grant authorization requests.
+    // Keep this explicit in code + stats so security behavior is auditable.
     self->sm_authorization_requests_total += 1;
     sm_authorization_grant(handle);
 }
@@ -2314,13 +2317,21 @@ static int polar_cleanup_stop_scan(void *ctx) {
 }
 
 static int polar_cleanup_cancel_connect(void *ctx) {
-    (void)ctx;
-    return gap_connect_cancel();
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    uint8_t err = gap_connect_cancel();
+    if (err != ERROR_CODE_SUCCESS) {
+        self->runtime_link.last_hci_status = err;
+    }
+    return err;
 }
 
 static int polar_cleanup_disconnect(void *ctx, uint16_t conn_handle) {
-    (void)ctx;
-    return gap_disconnect(conn_handle);
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    uint8_t err = gap_disconnect(conn_handle);
+    if (err != ERROR_CODE_SUCCESS) {
+        self->runtime_link.last_hci_status = err;
+    }
+    return err;
 }
 
 static bool polar_cleanup_is_link_down(void *ctx) {
@@ -2389,16 +2400,20 @@ static void polar_ensure_ble_ready(void) {
     polar_sdk_btstack_sm_apply_default_auth_policy();
 
     // Ensure GATT client is initialized for our direct btstack usage.
-    // If MicroPython already enabled GATT client support, assume it was initialized by mp_bluetooth_init().
+    // On MicroPython BTstack ports with GATT client enabled, mp_bluetooth_init()
+    // performs gatt_client_init(). We keep that integration contract and avoid a
+    // second explicit init here.
     #if MICROPY_PY_BLUETOOTH_ENABLE_GATT_CLIENT
     polar_gatt_client_initialized = true;
     #else
     if (!polar_gatt_client_initialized) {
         gatt_client_init();
-        gatt_client_mtu_enable_auto_negotiation(false);
         polar_gatt_client_initialized = true;
     }
     #endif
+    // Keep MTU negotiation behavior deterministic for our direct GATT calls,
+    // regardless of upstream defaults.
+    gatt_client_mtu_enable_auto_negotiation(false);
 }
 
 static void polar_register_hci_handler_refresh(void) {
@@ -2440,7 +2455,7 @@ static bool polar_transport_start_attempt(void *ctx) {
     self->last_att_status = ATT_ERROR_SUCCESS;
     self->runtime_link.state = POLAR_SDK_STATE_SCANNING;
 
-    gap_set_scan_parameters(1, POLAR_SDK_SCAN_INTERVAL_UNITS, POLAR_SDK_SCAN_WINDOW_UNITS);
+    gap_set_scan_params(1, POLAR_SDK_SCAN_INTERVAL_UNITS, POLAR_SDK_SCAN_WINDOW_UNITS, 0);
     gap_start_scan();
     return true;
 }
@@ -2571,7 +2586,7 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->addr = parsed_args[ARG_addr].u_obj;
     self->name_prefix = parsed_args[ARG_name_prefix].u_obj;
     self->required_services_mask = (uint8_t)required_services_mask;
-    polar_sdk_runtime_link_init(&self->runtime_link, 0xffff);
+    polar_sdk_runtime_link_init(&self->runtime_link, HCI_CON_HANDLE_INVALID);
     self->runtime_link.state = POLAR_SDK_STATE_IDLE;
     self->runtime_link.connected = false;
     self->connect_calls = 0;
@@ -2617,6 +2632,7 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->runtime_link.disconnect_reason_other_total = 0;
 
     self->sm_just_works_total = 0;
+    self->sm_numeric_comparison_total = 0;
     self->sm_authorization_requests_total = 0;
     self->sm_pairing_complete_total = 0;
     self->sm_last_pairing_status = 0;
@@ -2772,6 +2788,7 @@ static mp_obj_t polar_h10_stats(mp_obj_t self_in) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_disconnect_reason_0x3e_total), mp_obj_new_int_from_uint(self->runtime_link.disconnect_reason_0x3e_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_disconnect_reason_other_total), mp_obj_new_int_from_uint(self->runtime_link.disconnect_reason_other_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_just_works_total), mp_obj_new_int_from_uint(self->sm_just_works_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_numeric_comparison_total), mp_obj_new_int_from_uint(self->sm_numeric_comparison_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_authorization_requests_total), mp_obj_new_int_from_uint(self->sm_authorization_requests_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_pairing_complete_total), mp_obj_new_int_from_uint(self->sm_pairing_complete_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_last_pairing_status), mp_obj_new_int_from_uint(self->sm_last_pairing_status));
