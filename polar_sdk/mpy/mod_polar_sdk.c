@@ -1090,17 +1090,17 @@ static bool polar_psftp_security_ready(polar_h10_obj_t *self) {
     return gap_encryption_key_size(self->runtime_link.conn_handle) > 0;
 }
 
-static bool polar_psftp_security_is_connected_cb(void *ctx) {
-    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+static bool polar_psftp_security_is_connected_cb(const void *ctx) {
+    const polar_h10_obj_t *self = (const polar_h10_obj_t *)ctx;
     return self->runtime_link.connected && self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID;
 }
 
-static bool polar_psftp_security_is_secure_cb(void *ctx) {
+static bool polar_psftp_security_is_secure_cb(const void *ctx) {
     polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
     return polar_psftp_security_ready(self);
 }
 
-static void polar_psftp_security_request_pairing_cb(void *ctx) {
+static void polar_psftp_security_request_pairing_cb(const void *ctx) {
     polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
     if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         return;
@@ -1108,9 +1108,13 @@ static void polar_psftp_security_request_pairing_cb(void *ctx) {
     sm_request_pairing(self->runtime_link.conn_handle);
 }
 
-static void polar_psftp_security_sleep_ms_cb(void *ctx, uint32_t ms) {
+static void polar_psftp_security_sleep_ms_cb(const void *ctx, uint32_t ms) {
     (void)ctx;
     mp_event_wait_ms(ms);
+}
+
+static bool polar_psftp_security_is_secure_prepare_cb(void *ctx) {
+    return polar_psftp_security_is_secure_cb((const void *)ctx);
 }
 
 static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
@@ -1382,7 +1386,7 @@ static int polar_psftp_prepare_result(polar_h10_obj_t *self) {
         .ctx = self,
         .is_connected_ready = polar_psftp_prepare_is_connected_ready,
         .has_required_characteristics = polar_psftp_prepare_has_required_characteristics,
-        .security_ready = polar_psftp_security_is_secure_cb,
+        .security_ready = polar_psftp_security_is_secure_prepare_cb,
         .ensure_security = polar_psftp_prepare_ensure_security,
         .mtu_notify_enabled = polar_psftp_prepare_mtu_notify_enabled,
         .enable_mtu_notify = polar_psftp_prepare_enable_mtu_notify,

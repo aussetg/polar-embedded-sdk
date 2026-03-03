@@ -45,6 +45,7 @@ Start here:
 - `scripts/check_fast.sh` — quick local quality gate (python lint + BTstack header policy + docs link lint)
 - `scripts/check_c.sh` — C-focused quality gate (firmware preset build + clang-tidy + strict warnings + `gcc -fanalyzer` + optional `cppcheck` on `polar_sdk/core/src`)
 - `scripts/check_full.sh` — aggregate gate (`check_fast` + `check_c`)
+- `patches/align_btstack_trees.sh` — align BTstack trees to pinned commit and apply local patch stacks (auto-run by firmware/probe configure, can be disabled via CMake cache vars)
 
 ## Vendor deps
 

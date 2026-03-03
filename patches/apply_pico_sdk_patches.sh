@@ -139,7 +139,7 @@ for p in "${PATCHES[@]}"; do
   case "$st" in
     APPLICABLE)
       echo "Applying: $(basename "$p")"
-      if ! git -C "$SUBMODULE_DIR" am "$p"; then
+      if ! git -C "$SUBMODULE_DIR" -c commit.gpgsign=false am "$p"; then
         echo
         echo "Patch apply failed. To abort:" >&2
         echo "  git -C $TARGET_PATH am --abort" >&2

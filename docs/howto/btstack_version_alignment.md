@@ -85,6 +85,28 @@ Use the helper checker at any time:
 ./patches/check_btstack_alignment.sh
 ```
 
+One-command local alignment (pin + apply local patch stacks):
+
+```bash
+./patches/align_btstack_trees.sh
+```
+
+Dry-run:
+
+```bash
+./patches/align_btstack_trees.sh --dry-run
+```
+
+Both primary build entrypoints run alignment automatically during configure:
+- repo firmware superbuild (`CMakeLists.txt`)
+- probe build (`examples/pico_sdk/CMakeLists.txt`)
+
+To disable auto-alignment for a configure invocation, pass:
+
+```bash
+-DPOLAR_ENSURE_BTSTACK_ALIGNMENT=OFF
+```
+
 ## Git hook guardrails (recommended)
 
 Git cannot auto-run project hooks on clone, so setup is a one-time local step:

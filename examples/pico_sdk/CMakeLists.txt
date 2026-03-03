@@ -14,6 +14,31 @@ project(h10_btstack_probe C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+set(POLAR_ENSURE_BTSTACK_ALIGNMENT "ON" CACHE STRING "Run BTstack alignment + patch script during configure")
+set(POLAR_BTSTACK_ALIGN_NO_FETCH "ON" CACHE STRING "Run alignment script with --no-fetch during configure")
+
+if(POLAR_ENSURE_BTSTACK_ALIGNMENT)
+    set(POLAR_BTSTACK_ALIGN_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/../../patches/align_btstack_trees.sh")
+    if(NOT EXISTS "${POLAR_BTSTACK_ALIGN_SCRIPT}")
+        message(FATAL_ERROR "BTstack alignment script not found: ${POLAR_BTSTACK_ALIGN_SCRIPT}")
+    endif()
+
+    set(_polar_btstack_align_args)
+    if(POLAR_BTSTACK_ALIGN_NO_FETCH)
+        list(APPEND _polar_btstack_align_args "--no-fetch")
+    endif()
+
+    message(STATUS "[h10-probe] ensuring BTstack alignment + patch stacks")
+    execute_process(
+        COMMAND "${POLAR_BTSTACK_ALIGN_SCRIPT}" ${_polar_btstack_align_args}
+        WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
+        RESULT_VARIABLE _polar_btstack_align_rc
+    )
+    if(NOT _polar_btstack_align_rc EQUAL 0)
+        message(FATAL_ERROR "BTstack alignment step failed (exit=${_polar_btstack_align_rc})")
+    endif()
+endif()
+
 pico_sdk_init()
 
 add_executable(h10_btstack_probe

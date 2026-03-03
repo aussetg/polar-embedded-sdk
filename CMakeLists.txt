@@ -16,6 +16,8 @@ set(POLAR_ENABLE_PSFTP "ON" CACHE STRING "Enable Polar PSFTP feature")
 set(POLAR_PROTO_GENERATED_DIR "${CMAKE_CURRENT_LIST_DIR}/build/polar_proto" CACHE PATH "Generated nanopb directory for PSFTP build")
 set(POLAR_VERIFY_MICROPY_PATCHES "ON" CACHE STRING "Verify local MicroPython patch series")
 set(POLAR_AUTO_APPLY_PATCHES "ON" CACHE STRING "Auto-apply patch series during configure")
+set(POLAR_ENSURE_BTSTACK_ALIGNMENT "ON" CACHE STRING "Run BTstack alignment + patch script during configure")
+set(POLAR_BTSTACK_ALIGN_NO_FETCH "ON" CACHE STRING "Run alignment script with --no-fetch during configure")
 
 set(POLAR_BUILD_PRESET_NAME "manual" CACHE STRING "Human-readable preset/build profile name")
 set(POLAR_ARTIFACTS_PROFILE "${POLAR_BUILD_PRESET_NAME}" CACHE STRING "Artifact profile directory name")
@@ -23,6 +25,28 @@ set(POLAR_ARTIFACT_DIR "${CMAKE_CURRENT_LIST_DIR}/build/artifacts/${POLAR_ARTIFA
 
 if(USER_C_MODULES STREQUAL "")
     message(FATAL_ERROR "USER_C_MODULES must be set (for example: ${CMAKE_CURRENT_LIST_DIR}/polar_sdk/mpy)")
+endif()
+
+if(POLAR_ENSURE_BTSTACK_ALIGNMENT)
+    set(POLAR_BTSTACK_ALIGN_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/patches/align_btstack_trees.sh")
+    if(NOT EXISTS "${POLAR_BTSTACK_ALIGN_SCRIPT}")
+        message(FATAL_ERROR "BTstack alignment script not found: ${POLAR_BTSTACK_ALIGN_SCRIPT}")
+    endif()
+
+    set(_polar_btstack_align_args)
+    if(POLAR_BTSTACK_ALIGN_NO_FETCH)
+        list(APPEND _polar_btstack_align_args "--no-fetch")
+    endif()
+
+    message(STATUS "[polar-sdk-fw] ensuring BTstack alignment + patch stacks")
+    execute_process(
+        COMMAND "${POLAR_BTSTACK_ALIGN_SCRIPT}" ${_polar_btstack_align_args}
+        WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+        RESULT_VARIABLE _polar_btstack_align_rc
+    )
+    if(NOT _polar_btstack_align_rc EQUAL 0)
+        message(FATAL_ERROR "BTstack alignment step failed (exit=${_polar_btstack_align_rc})")
+    endif()
 endif()
 
 # Build metadata (can be overridden by cache vars if needed).
@@ -68,6 +92,12 @@ else()
     set(POLAR_BUILD_TYPE "MinSizeRel")
 endif()
 
+set(_polar_auto_apply_micropy "${POLAR_AUTO_APPLY_PATCHES}")
+if(POLAR_ENSURE_BTSTACK_ALIGNMENT)
+    # Alignment script already applies patch stacks; avoid duplicate mutation in inner configure.
+    set(_polar_auto_apply_micropy "OFF")
+endif()
+
 string(REPLACE ";" "\\;" _polar_sdk_user_c_modules_escaped "${USER_C_MODULES}")
 
 set(_polar_sdk_fw_cmake_args
@@ -79,7 +109,7 @@ set(_polar_sdk_fw_cmake_args
     "-DPOLAR_ENABLE_ECG=${POLAR_ENABLE_ECG}"
     "-DPOLAR_ENABLE_PSFTP=${POLAR_ENABLE_PSFTP}"
     "-DPOLAR_VERIFY_MICROPY_PATCHES=${POLAR_VERIFY_MICROPY_PATCHES}"
-    "-DPOLAR_AUTO_APPLY_PATCHES=${POLAR_AUTO_APPLY_PATCHES}"
+    "-DPOLAR_AUTO_APPLY_PATCHES=${_polar_auto_apply_micropy}"
     "-DPOLAR_BUILD_GIT_SHA=${POLAR_BUILD_GIT_SHA}"
     "-DPOLAR_BUILD_GIT_DIRTY=${POLAR_BUILD_GIT_DIRTY}"
     "-DPOLAR_BUILD_PRESET=${POLAR_BUILD_PRESET_NAME}"
@@ -104,6 +134,7 @@ message(STATUS "[polar-sdk-fw] source: ${POLAR_FW_SOURCE_DIR}")
 message(STATUS "[polar-sdk-fw] binary: ${POLAR_FW_BUILD_DIR}")
 message(STATUS "[polar-sdk-fw] artifact dir: ${POLAR_ARTIFACT_DIR}")
 message(STATUS "[polar-sdk-fw] build metadata: sha=${POLAR_BUILD_GIT_SHA}, dirty=${POLAR_BUILD_GIT_DIRTY}, preset=${POLAR_BUILD_PRESET_NAME}, type=${POLAR_BUILD_TYPE}")
+message(STATUS "[polar-sdk-fw] inner POLAR_AUTO_APPLY_PATCHES=${_polar_auto_apply_micropy}")
 
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -S "${POLAR_FW_SOURCE_DIR}" -B "${POLAR_FW_BUILD_DIR}" ${_polar_sdk_fw_cmake_args}
