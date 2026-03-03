@@ -15,6 +15,7 @@
 #   -DPOLAR_BUILD_GIT_DIRTY=0|1|unknown (default: unknown)
 #   -DPOLAR_BUILD_PRESET=<name> (default: manual)
 #   -DPOLAR_BUILD_TYPE=<type> (default: CMAKE_BUILD_TYPE or unknown)
+#   -DPOLAR_PROTO_GENERATED_DIR=<path> (default: <repo>/build/polar_proto)
 
 option(POLAR_ENABLE_HR "Enable Polar HR support" ON)
 option(POLAR_ENABLE_ECG "Enable Polar ECG support" ON)
@@ -151,6 +152,39 @@ if(POLAR_VERIFY_MICROPY_PATCHES)
     endif()
 endif()
 
+set(POLAR_PROTO_GENERATED_DIR "${POLAR_REPO_ROOT}/build/polar_proto" CACHE PATH "Directory containing generated Polar nanopb sources")
+
+set(POLAR_PSFTP_GENERATED_REQUIRED_FILES
+    "${POLAR_PROTO_GENERATED_DIR}/types.pb.c"
+    "${POLAR_PROTO_GENERATED_DIR}/types.pb.h"
+    "${POLAR_PROTO_GENERATED_DIR}/structures.pb.c"
+    "${POLAR_PROTO_GENERATED_DIR}/structures.pb.h"
+    "${POLAR_PROTO_GENERATED_DIR}/pftp_error.pb.c"
+    "${POLAR_PROTO_GENERATED_DIR}/pftp_error.pb.h"
+    "${POLAR_PROTO_GENERATED_DIR}/pftp_request.pb.c"
+    "${POLAR_PROTO_GENERATED_DIR}/pftp_request.pb.h"
+    "${POLAR_PROTO_GENERATED_DIR}/pftp_response.pb.c"
+    "${POLAR_PROTO_GENERATED_DIR}/pftp_response.pb.h")
+
+if(POLAR_ENABLE_PSFTP)
+    set(_polar_psftp_missing_generated "")
+    foreach(_generated_file IN LISTS POLAR_PSFTP_GENERATED_REQUIRED_FILES)
+        if(NOT EXISTS "${_generated_file}")
+            list(APPEND _polar_psftp_missing_generated "${_generated_file}")
+        endif()
+    endforeach()
+
+    if(_polar_psftp_missing_generated)
+        string(REPLACE ";" "\n  " _polar_psftp_missing_generated_msg "${_polar_psftp_missing_generated}")
+        message(FATAL_ERROR
+            "POLAR_ENABLE_PSFTP=ON but required generated protobuf files were not found.\n\n"
+            "Expected files under: ${POLAR_PROTO_GENERATED_DIR}\n\n"
+            "Missing:\n  ${_polar_psftp_missing_generated_msg}\n\n"
+            "Run:\n"
+            "  ./polar_ble/proto/generate_nanopb.sh <polar-sdk-proto-dir>\n")
+    endif()
+endif()
+
 add_library(usermod_polar INTERFACE)
 
 target_sources(usermod_polar INTERFACE
@@ -187,17 +221,41 @@ target_sources(usermod_polar INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_pmd.c
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_pmd_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_pmd_start.c
+    ${CMAKE_CURRENT_LIST_DIR}/../driver/src/polar_ble_driver_psftp.c
 )
+
+if(POLAR_ENABLE_PSFTP)
+    target_sources(usermod_polar INTERFACE
+        ${POLAR_PROTO_GENERATED_DIR}/types.pb.c
+        ${POLAR_PROTO_GENERATED_DIR}/structures.pb.c
+        ${POLAR_PROTO_GENERATED_DIR}/pftp_error.pb.c
+        ${POLAR_PROTO_GENERATED_DIR}/pftp_request.pb.c
+        ${POLAR_PROTO_GENERATED_DIR}/pftp_response.pb.c
+        ${POLAR_REPO_ROOT}/vendors/nanopb/pb_common.c
+        ${POLAR_REPO_ROOT}/vendors/nanopb/pb_decode.c
+        ${POLAR_REPO_ROOT}/vendors/nanopb/pb_encode.c
+    )
+endif()
 
 target_include_directories(usermod_polar INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/../driver/include
 )
 
+if(POLAR_ENABLE_PSFTP)
+    target_include_directories(usermod_polar INTERFACE
+        ${POLAR_PROTO_GENERATED_DIR}
+        ${POLAR_REPO_ROOT}/vendors/nanopb
+    )
+endif()
+
 target_compile_definitions(usermod_polar INTERFACE
     POLAR_CFG_ENABLE_HR=${POLAR_ENABLE_HR_NUM}
     POLAR_CFG_ENABLE_ECG=${POLAR_ENABLE_ECG_NUM}
     POLAR_CFG_ENABLE_PSFTP=${POLAR_ENABLE_PSFTP_NUM}
+    POLAR_BLE_CFG_ENABLE_HR=${POLAR_ENABLE_HR_NUM}
+    POLAR_BLE_CFG_ENABLE_ECG=${POLAR_ENABLE_ECG_NUM}
+    POLAR_BLE_CFG_ENABLE_PSFTP=${POLAR_ENABLE_PSFTP_NUM}
     POLAR_BUILD_GIT_SHA=\"${POLAR_BUILD_GIT_SHA}\"
     POLAR_BUILD_GIT_DIRTY=\"${POLAR_BUILD_GIT_DIRTY}\"
     POLAR_BUILD_PRESET=\"${POLAR_BUILD_PRESET}\"

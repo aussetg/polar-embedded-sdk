@@ -2,16 +2,13 @@
 
 Portable C driver code (no MicroPython dependencies).
 
-This driver layer is intentionally portable and shared by:
+This layer is shared by:
 - `polar_ble/mpy` (MicroPython binding)
 - `examples/pico_sdk` (pure C harness)
-- 
-Current runtime integration:
-- `polar_ble/mpy/mod_polar_ble.c` uses shared driver helpers for:
-  - connect attempt scheduling,
-  - discovery progression,
-  - HR parse state,
-  - ECG parse/ring buffering,
-  - IMU/ACC parse/ring buffering,
-  - PMD start policy callbacks.
-- `examples/pico_sdk/main.c` uses shared driver helpers for connect scheduling, runtime link transitions, and PMD start policy.
+
+Current helper coverage includes:
+- transport/connect/discovery orchestration,
+- BTstack SM helpers (event decode + default auth policy setup),
+- HR parser state,
+- PMD ECG/IMU parsing + PMD start policy,
+- PSFTP RFC60/RFC76 framing + protobuf helpers (`polar_ble_driver_psftp`).

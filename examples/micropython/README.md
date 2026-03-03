@@ -104,5 +104,27 @@ mpremote connect /dev/ttyACM0 fs cp examples/micropython/ecg_hr_lcd_gfx_demo.py 
 mpremote connect /dev/ttyACM0 run :ecg_hr_lcd_gfx_demo.py
 ```
 
+## psftp_list_demo.py
+
+`psftp_list_demo.py` performs a simple PSFTP directory listing (`list_dir`).
+
+Run with `mpremote`:
+
+```bash
+mpremote connect /dev/ttyACM0 fs cp examples/micropython/psftp_list_demo.py :psftp_list_demo.py
+mpremote connect /dev/ttyACM0 run :psftp_list_demo.py
+```
+
+## psftp_download_demo.py
+
+`psftp_download_demo.py` lists a directory and downloads one small file (`download`).
+
+Run with `mpremote`:
+
+```bash
+mpremote connect /dev/ttyACM0 fs cp examples/micropython/psftp_download_demo.py :psftp_download_demo.py
+mpremote connect /dev/ttyACM0 run :psftp_download_demo.py
+```
+
 Legacy investigation notes/logs live under:
 - `.agent/archive/investigations/`

@@ -6,4 +6,4 @@ This directory is the intended *product output* of the repo.
 - `mpy/` contains the MicroPython C module glue that exposes the Python API.
 - `proto/` contains nanopb-related *inputs* we maintain (e.g. `.options`), but generated outputs should be produced into `build/` and are not committed.
 
-Current implementation is incomplete; see `docs/` for the plan.
+Current implementation is still in progress; PSFTP read-only (`list_dir`, `download`) has landed but requires on-device validation.

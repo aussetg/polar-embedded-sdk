@@ -1,7 +1,7 @@
 # Known issues
 
 Status: Living document
-Last updated: 2026-03-02
+Last updated: 2026-03-03
 
 This file collects **confirmed, user-visible issues** encountered while developing the Polar H10 driver on **Pico 2 W (RP2350 + CYW43)** using **BTstack**.
 
@@ -69,13 +69,34 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 - Ensure MTU negotiation is performed before starting high-throughput PMD streams.
 - If pairing is intermittent across fresh sessions, try clearing the bond state (both sides) and re-pairing.
 
-## KI-04 — PSFTP/PFTP not yet validated end-to-end on embedded
+## KI-04 — PSFTP can fail if BTstack SM auth policy is not initialized consistently
 
-**Status:** protocol reference exists, but end-to-end embedded implementation/validation is not complete.
+**Observed on:** Pico 2 W + Polar H10 during PSFTP list/download validation.
 
-### Notes
-- See protocol reference: `docs/reference/polar_psftp.md`.
-- Ensure nanopb generation workflow is in place before implementing PSFTP on-device.
+### Symptoms
+- PSFTP operations can appear to fail for transport reasons (timeouts / missing responses), even after discovery+CCC success.
+- Typical bad signatures include:
+  - write-request completion timeout,
+  - no routed PSFTP RX (`rx=0`) after request TX,
+  - intermittent behavior across fresh sessions.
+
+### How to confirm
+- Check whether the integration path sets BTstack SM defaults before operation:
+  - IO capabilities: `IO_CAPABILITY_NO_INPUT_NO_OUTPUT`
+  - auth requirements: `SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION`
+- If these are missing/inconsistent, PSFTP reliability can degrade.
+
+### Mitigations / best practices
+- Initialize SM auth policy consistently in all entry points (MicroPython binding + probes/examples).
+- Use the shared helper in this repo:
+  - `polar_ble_driver_btstack_sm_apply_default_auth_policy()`
+- Keep reconnect-on-security-failure behavior and explicit diagnostics in place for regressions.
+
+### Current state
+- Dedicated C PSFTP probe (`examples/pico_sdk_psftp`) is stable after auth-policy alignment, with repeated successful `list_dir("/")` + `download("/DEVICE.BPB")` runs.
+
+### Investigation references
+- `docs/reference/polar_psftp.md`
 
 ## Vendor-reported device issues (Polar; informational)
 

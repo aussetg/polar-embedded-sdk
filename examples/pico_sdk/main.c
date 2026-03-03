@@ -425,8 +425,7 @@ static void pmd_request_pairing(void *ctx) {
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
         return;
     }
-    sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
-    sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+    polar_ble_driver_btstack_sm_apply_default_auth_policy();
     sm_request_pairing(conn_handle);
 }
 
@@ -1426,7 +1425,7 @@ int main(void) {
     l2cap_init();
     sm_init();
     gatt_client_init();
-    sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    polar_ble_driver_btstack_sm_apply_default_auth_policy();
 
     polar_ble_driver_runtime_link_init(&runtime_link, HCI_CON_HANDLE_INVALID);
 

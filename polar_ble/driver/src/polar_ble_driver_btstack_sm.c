@@ -54,3 +54,8 @@ bool polar_ble_driver_sm_event_matches_handle(
     }
     return active_handle == invalid_conn_handle || event->handle == active_handle;
 }
+
+void polar_ble_driver_btstack_sm_apply_default_auth_policy(void) {
+    sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+}

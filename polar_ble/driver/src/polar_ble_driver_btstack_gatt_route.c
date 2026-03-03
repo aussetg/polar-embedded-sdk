@@ -34,6 +34,14 @@ bool polar_ble_driver_btstack_route_gatt_event(
             out->kind = POLAR_BLE_DRIVER_GATT_ROUTE_PMD_DATA_VALUE;
             return true;
         }
+        if (out->value.value_handle == state->psftp_mtu_value_handle && state->psftp_mtu_listening) {
+            out->kind = POLAR_BLE_DRIVER_GATT_ROUTE_PSFTP_MTU_VALUE;
+            return true;
+        }
+        if (out->value.value_handle == state->psftp_d2h_value_handle && state->psftp_d2h_listening) {
+            out->kind = POLAR_BLE_DRIVER_GATT_ROUTE_PSFTP_D2H_VALUE;
+            return true;
+        }
         if (state->hr_enabled) {
             out->kind = POLAR_BLE_DRIVER_GATT_ROUTE_HR_UNMATCHED_VALUE;
             return true;

@@ -1,56 +1,42 @@
-# How-to — nanopb generation (planned clean workflow)
+# How-to — nanopb generation
 
-Status: How-to (planned)
-Last updated: 2026-02-24
+Status: Active
+Last updated: 2026-03-02
 
 This repo vendors:
 - nanopb: `vendors/nanopb/`
-- Polar BLE SDK: https://github.com/polarofficial/polar-ble-sdk (contains the `.proto` sources)
+- Polar BLE SDK proto sources: <https://github.com/polarofficial/polar-ble-sdk>
 
-The project previously had `proto/`, `options/`, and `generated/` directories at the repo root. Those were **deleted intentionally** to restart clean.
+Generated outputs are build artifacts and are **not committed**.
 
-This document describes the intended *from-scratch* workflow to re-generate protobuf bindings when PSFTP/PFTP implementation begins.
+## Generate
 
-## Recommended generated layout (not committed)
+Use the project script:
 
-When implementation starts, generate into something like:
-
-- `build/polar_proto/` *(or `src/_generated/` if you prefer, but still usually not committed)*
-
-Example:
-
-```
-build/polar_proto/
-  pftp_request.pb.c
-  pftp_request.pb.h
-  ...
+```bash
+./polar_ble/proto/generate_nanopb.sh \
+  /path/to/polar-ble-sdk/sources/Android/android-communications/library/src/sdk/proto
 ```
 
-## Proto source location
+Default output directory:
 
-Proto files live here:
+- `build/polar_proto/`
 
-- https://github.com/polarofficial/polar-ble-sdk/tree/master/sources/Android/android-communications/library/src/sdk/proto
+Optional custom output directory:
 
-See also: [`../reference/polar_proto_sources.md`](../reference/polar_proto_sources.md)
+```bash
+./polar_ble/proto/generate_nanopb.sh \
+  /path/to/polar-ble-sdk/sources/Android/android-communications/library/src/sdk/proto \
+  /tmp/polar_proto_out
+```
 
-## Generation script (outline)
+## Inputs and options
 
-A future script should:
+- Local nanopb options live in `polar_ble/proto/options/`.
+- Current options bound:
+  - request path string size (`pftp_request.options`)
+  - directory entry name size (`pftp_response.options`)
 
-1. Copy (or reference via `-I`) the Polar `.proto` directory.
-2. Provide nanopb `.options` files (max_size/max_count) for embedded constraints.
-3. Run `nanopb_generator.py` to emit `*.pb.c/h`.
+## Build integration
 
-The nanopb generator entrypoint in this repo is:
-
-- `vendors/nanopb/generator/nanopb_generator.py`
-
-## Notes / pitfalls
-
-- Many Polar protos are **proto2** and require explicit `max_size` / `max_count` for nanopb.
-- Some messages contain very large repeated fields (exercise samples). Plan for:
-  - streaming decode (nanopb callbacks), or
-  - a “download raw bytes” approach and decode on a host.
-
-This is intentionally left as *documentation only* for now (no generation scripts added yet).
+When `POLAR_ENABLE_PSFTP=ON`, `polar_ble/mpy/micropython.cmake` expects generated files in `build/polar_proto/` (or `POLAR_PROTO_GENERATED_DIR`) and fails configure with an actionable message if missing.

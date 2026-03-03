@@ -38,4 +38,8 @@ Current contents:
   - patch policy: `POLAR_BLE_VERIFY_MICROPY_PATCHES`, `POLAR_BLE_AUTO_APPLY_PATCHES`
   - build metadata injection: `POLAR_BLE_BUILD_GIT_SHA`, `POLAR_BLE_BUILD_GIT_DIRTY`, `POLAR_BLE_BUILD_PRESET`, `POLAR_BLE_BUILD_TYPE`
 
-PSFTP data-plane operations are still pending later milestones.
+PSFTP data-plane baseline is now integrated:
+- `H10.list_dir(path)`
+- `H10.download(path, *, max_bytes=..., timeout_ms=...)`
+
+Current scope is read-only GET operations (directory listing + raw download payload).

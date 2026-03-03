@@ -19,7 +19,7 @@ Primary capabilities for the current task:
 - ECG streaming via PMD (raw frame type 0 path),
 - strong diagnostics/observability via `stats()`.
 
-PSFTP/PFTP data-plane work remains planned for a later milestone, not part of the current implemented API baseline.
+PSFTP/PFTP read-only data-plane (`list_dir`, `download`) is now implemented in the baseline (validation still ongoing).
 
 ---
 
@@ -32,7 +32,7 @@ PSFTP/PFTP data-plane work remains planned for a later milestone, not part of th
 | PMD ECG start/stop + data parse | Implemented baseline | Raw PMD frame type 0 only |
 | PMD pairing/encryption retry policy | Implemented baseline | Handles ATT auth failures with retry logic |
 | PSFTP service/char discovery handles | Implemented baseline | Data-plane API not exposed yet |
-| PSFTP list/download API | Planned | Later milestone (nanopb + RFC60/RFC76 flow) |
+| PSFTP list/download API | Implemented baseline (read-only) | RFC60/RFC76 + nanopb GET path |
 | IMU stream API (PMD ACC raw) | Implemented baseline | Raw PMD ACC frame type `0x01` (int16 x/y/z) |
 
 ---
@@ -179,24 +179,29 @@ IMU byte payload format:
 - order is `(x, y, z)` in milli-g,
 - returned lengths are 6-byte aligned.
 
-### 7.5 Stream helpers
+### 7.5 PSFTP (read-only)
+- `list_dir(path: str) -> list[tuple[str, int]]`
+- `download(path: str, *, max_bytes=8192, timeout_ms=12000) -> bytes`
+
+Current scope is GET-only request flow over PSFTP MTU characteristic.
+
+### 7.6 Stream helpers
 - `start_streams(*, ecg=False, imu=False, hr=False) -> None`
 - `stop_streams(*, ecg=True, imu=True, hr=True) -> None`
 
-### 7.6 Diagnostics
+### 7.7 Diagnostics
 - `stats() -> dict`
 - `version() -> str` (module function)
 
-### 7.7 Module constants
+### 7.8 Module constants
 - Feature flags: `FEATURE_HR`, `FEATURE_ECG`, `FEATURE_PSFTP`
 - Platform flag: `HAS_BTSTACK`
 - Service-mask bits: `SERVICE_HR`, `SERVICE_ECG`, `SERVICE_PSFTP`, `SERVICE_ALL`
 
-### 7.8 Deferred (not currently part of implemented API)
-- `list_dir(...)` / `download(...)` PSFTP data-plane methods
+### 7.9 Deferred (not currently part of implemented API)
+- PSFTP query/notification host APIs
+- PSFTP write/remove/merge APIs
 - `set_log_level(...)`
-
-These remain planned for a later milestone and are not required for current API conformance.
 
 ---
 
@@ -243,8 +248,8 @@ At minimum include:
 
 Validation procedure reference: `../howto/validation.md`.
 
-### 10.2 Extension acceptance (future PSFTP milestone)
-5. PSFTP list/download end-to-end succeeds repeatedly after nanopb workflow is added.
+### 10.2 PSFTP validation acceptance (current implementation)
+5. PSFTP list/download end-to-end succeeds repeatedly with the nanopb workflow in place.
 
 ---
 

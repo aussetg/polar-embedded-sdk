@@ -34,6 +34,10 @@ bool polar_ble_driver_sm_event_matches_handle(
     uint16_t active_handle,
     uint16_t invalid_conn_handle);
 
+// Apply project-default Security Manager policy for central/client role.
+// Keeps BLE security setup consistent across probes and MicroPython binding.
+void polar_ble_driver_btstack_sm_apply_default_auth_policy(void);
+
 #ifdef __cplusplus
 }
 #endif

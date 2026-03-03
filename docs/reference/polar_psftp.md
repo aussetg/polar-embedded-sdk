@@ -1,7 +1,7 @@
 # Polar PSFTP / "PFTP" - protocol reference
 
 Status: Reference (vendor-sourced)
-Last updated: 2026-02-24
+Last updated: 2026-03-03
 
 Polar BLE SDK version: tag **6.15.0** ([GitHub](https://github.com/polarofficial/polar-ble-sdk)).
 
@@ -85,12 +85,19 @@ If `status == 0` and the packet length is exactly 3 bytes (`header + 2`), the SD
 
 ## BLE write/notify directions
 
-The iOS client uses:
-- **H2D** characteristic (`FB005C53...`) for writes (host → device)
-- **D2H** characteristic (`FB005C52...`) for notifications (device → host)
-- **MTU** characteristic (`FB005C51...`) for MTU negotiation and some transfers (the iOS client enables notifications on it too)
+Observed SDK behavior for request/response path:
+- request frames are sent to **MTU** characteristic (`FB005C51...`),
+- responses arrive via MTU notifications,
+- **D2H** (`FB005C52...`) and **H2D** (`FB005C53...`) are used for PSFTP notification flow.
 
-Exact usage patterns should be mirrored from the SDK and validated with on-device testing and (optionally) sniffer captures.
+### Write opcode cadence in SDKs
+
+SDK clients do not use a single opcode mode for all packets:
+- iOS uses `packetChunks` (default `6`) and sends with-response periodically,
+- Android uses `packetsCount` (default `5`) and similarly inserts periodic with-response writes,
+- most frames are sent as write commands (without response), with periodic write requests.
+
+For embedded parity tests, validate both endpoint and opcode cadence against the SDK behavior.
 
 ## Protobuf definitions
 

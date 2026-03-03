@@ -16,6 +16,8 @@ typedef enum {
     POLAR_BLE_DRIVER_GATT_ROUTE_HR_VALUE,
     POLAR_BLE_DRIVER_GATT_ROUTE_PMD_CP_VALUE,
     POLAR_BLE_DRIVER_GATT_ROUTE_PMD_DATA_VALUE,
+    POLAR_BLE_DRIVER_GATT_ROUTE_PSFTP_MTU_VALUE,
+    POLAR_BLE_DRIVER_GATT_ROUTE_PSFTP_D2H_VALUE,
     POLAR_BLE_DRIVER_GATT_ROUTE_HR_UNMATCHED_VALUE,
     POLAR_BLE_DRIVER_GATT_ROUTE_QUERY_COMPLETE,
 } polar_ble_driver_btstack_gatt_route_kind_t;
@@ -32,6 +34,12 @@ typedef struct {
 
     uint16_t pmd_data_value_handle;
     bool ecg_enabled;
+
+    uint16_t psftp_mtu_value_handle;
+    bool psftp_mtu_listening;
+
+    uint16_t psftp_d2h_value_handle;
+    bool psftp_d2h_listening;
 } polar_ble_driver_btstack_gatt_route_state_t;
 
 typedef struct {

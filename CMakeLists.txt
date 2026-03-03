@@ -13,6 +13,7 @@ set(PICO_BUILD_DOCS "0" CACHE STRING "Disable Pico SDK docs in firmware builds")
 set(POLAR_BLE_ENABLE_HR "ON" CACHE STRING "Enable Polar HR feature")
 set(POLAR_BLE_ENABLE_ECG "ON" CACHE STRING "Enable Polar ECG feature")
 set(POLAR_BLE_ENABLE_PSFTP "ON" CACHE STRING "Enable Polar PSFTP feature")
+set(POLAR_PROTO_GENERATED_DIR "${CMAKE_CURRENT_LIST_DIR}/build/polar_proto" CACHE PATH "Generated nanopb directory for PSFTP build")
 set(POLAR_BLE_VERIFY_MICROPY_PATCHES "ON" CACHE STRING "Verify local MicroPython patch series")
 set(POLAR_BLE_AUTO_APPLY_PATCHES "ON" CACHE STRING "Auto-apply patch series during configure")
 
@@ -85,6 +86,10 @@ set(_polar_ble_fw_cmake_args
     "-DPOLAR_BUILD_TYPE=${POLAR_BLE_BUILD_TYPE}"
     "-DCMAKE_EXPORT_COMPILE_COMMANDS=${CMAKE_EXPORT_COMPILE_COMMANDS}"
 )
+
+if(DEFINED POLAR_PROTO_GENERATED_DIR AND NOT POLAR_PROTO_GENERATED_DIR STREQUAL "")
+    list(APPEND _polar_ble_fw_cmake_args "-DPOLAR_PROTO_GENERATED_DIR=${POLAR_PROTO_GENERATED_DIR}")
+endif()
 
 if(DEFINED MICROPY_C_HEAP_SIZE)
     list(APPEND _polar_ble_fw_cmake_args "-DMICROPY_C_HEAP_SIZE=${MICROPY_C_HEAP_SIZE}")
