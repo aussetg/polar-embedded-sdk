@@ -126,13 +126,13 @@ def main() -> int:
     same: list[str] = []
 
     for n in names:
-        l = left.get(n)
-        r = right.get(n)
-        if l is None:
+        left_macro = left.get(n)
+        right_macro = right.get(n)
+        if left_macro is None:
             only_right.append(n)
-        elif r is None:
+        elif right_macro is None:
             only_left.append(n)
-        elif l.value != r.value:
+        elif left_macro.value != right_macro.value:
             changed.append(n)
         else:
             same.append(n)

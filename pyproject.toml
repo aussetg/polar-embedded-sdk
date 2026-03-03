@@ -1,0 +1,18 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    "vendors",
+    "build",
+    ".agent",
+    ".cache",
+    ".ruff_cache",
+]
+
+[tool.ruff.lint]
+# Keep defaults and add stub-focused linting for future .pyi files.
+extend-select = ["PYI"]
+
+[tool.ruff.lint.per-file-ignores]
+# MicroPython board manifests use build-time DSL helpers injected by the firmware build.
+"firmware/boards/*/manifest.py" = ["F821"]
