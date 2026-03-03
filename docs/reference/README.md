@@ -22,3 +22,5 @@ Rules:
 ### BTstack dependency surface
 
 - **BTstack APIs/events/constants used by this SDK:** [`btstack_api_surface.md`](./btstack_api_surface.md)
+- **How Polar features map onto BTstack protocol/events:** [`btstack_protocol_mapping.md`](./btstack_protocol_mapping.md)
+- **Quick status triage table for debugging (`stats()`):** [`btstack_status_triage.md`](./btstack_status_triage.md)

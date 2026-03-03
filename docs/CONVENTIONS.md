@@ -58,3 +58,13 @@ It is not a roadmap; it should remain factual and help debugging/validation.
 ## 4) Docs QA
 
 Run link checks before/after major doc edits.
+
+## 5) BTstack-touching changes (workflow guard)
+
+For changes that touch BTstack-facing code/config, run the BTstack change checklist:
+- [`howto/btstack_change_checklist.md`](./howto/btstack_change_checklist.md)
+
+At minimum this includes:
+1. pico-sdk probe build,
+2. MicroPython rp2 build,
+3. minimal connect/discover/HR smoke test.

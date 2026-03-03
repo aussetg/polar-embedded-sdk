@@ -19,6 +19,17 @@ The documentation is organised so that:
 7. **Validation procedures (HR + ECG):** [`howto/validation.md`](./howto/validation.md)
 8. **Known issues / troubleshooting:** [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md)
 
+## BTstack read order (for this project)
+
+If you’re working on transport/discovery/streaming behavior, read in this order:
+
+1. **BTstack API surface used here:** [`reference/btstack_api_surface.md`](./reference/btstack_api_surface.md)
+2. **How Polar features map to BTstack protocols/events:** [`reference/btstack_protocol_mapping.md`](./reference/btstack_protocol_mapping.md)
+3. **Status triage for `stats()` fields:** [`reference/btstack_status_triage.md`](./reference/btstack_status_triage.md)
+4. **BTstack debug/config flags (practical shortlist):** [`howto/btstack_debug_flags.md`](./howto/btstack_debug_flags.md)
+5. **BTstack change checklist (PR gate):** [`howto/btstack_change_checklist.md`](./howto/btstack_change_checklist.md)
+6. **Then upstream BTstack manual pages** (architecture/how_to/protocols), interpreted with our pinned version policy in [`howto/btstack_version_alignment.md`](./howto/btstack_version_alignment.md)
+
 ## Docs map
 
 - [`specs/`](./specs/) — canonical requirements and API
