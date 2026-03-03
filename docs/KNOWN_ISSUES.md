@@ -94,6 +94,9 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 
 ### Current state
 - Dedicated C PSFTP probe (`examples/pico_sdk_psftp`) is stable after auth-policy alignment, with repeated successful `list_dir("/")` + `download("/DEVICE.BPB")` runs.
+- MicroPython path can still enter a sticky pairing-failed state during intensive repeated PSFTP runs:
+  - typical signature: `sm_last_pairing_status=19`, `conn_encryption_key_size=0`, `conn_bonded=False`, `psftp_tx_frames_total=0`, `psftp_rx_frames_total=0`, followed by `TimeoutError: PSFTP timeout`.
+  - practical recovery: reset the board (soft reset via `mpremote reset` or hardware reset), then retry.
 
 ### Investigation references
 - `docs/reference/polar_psftp.md`

@@ -250,6 +250,10 @@ Validation procedure reference: `../howto/validation.md`.
 
 ### 10.2 PSFTP validation acceptance (current implementation)
 5. PSFTP list/download end-to-end succeeds repeatedly with the nanopb workflow in place.
+6. Oversize `download(max_bytes=...)` path raises bounded-memory overflow (`BufferOverflowError`) instead of overrunning buffers.
+7. Forced-disconnect during PSFTP yields clean failure and reconnect recovery.
+
+Current caveat (to remove in follow-up): in some intensive MicroPython repeat loops, PSFTP can enter a pairing-failed state (`sm_last_pairing_status=19`, `enc=0`) that currently requires board reset for recovery.
 
 ---
 

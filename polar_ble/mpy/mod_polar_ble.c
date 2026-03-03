@@ -499,6 +499,7 @@ static uint8_t polar_discovery_cmd_hr_chars(void *ctx);
 static uint8_t polar_discovery_cmd_pmd_chars(void *ctx);
 static uint8_t polar_discovery_cmd_psftp_chars(void *ctx);
 static bool polar_psftp_reconnect_after_security_failure(polar_h10_obj_t *self, uint32_t timeout_ms);
+static void polar_wait_conn_update_settle(polar_h10_obj_t *self, uint32_t timeout_ms);
 
 static void polar_hr_parse_notification(polar_h10_obj_t *self, const uint8_t *value, uint16_t value_len) {
     (void)polar_ble_driver_hr_parse_measurement(&self->hr_state, value, value_len, polar_now_ms());
@@ -1097,6 +1098,8 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
 
     polar_ble_driver_btstack_sm_apply_default_auth_policy();
 
+    bool dropped_stale_bond = false;
+
     for (size_t round = 0; round < POLAR_BLE_PMD_SECURITY_ROUNDS; ++round) {
         if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
             return false;
@@ -1108,6 +1111,7 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
         mp_event_wait_ms(120);
         sm_request_pairing(self->runtime_link.conn_handle);
 
+        bool pairing_failed = false;
         uint32_t elapsed = 0;
         while (elapsed < POLAR_BLE_PMD_SECURITY_WAIT_MS) {
             if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
@@ -1115,6 +1119,7 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
             }
 
             if (self->sm_pairing_complete_total != pair_before && self->sm_last_pairing_status != 0) {
+                pairing_failed = true;
                 break;
             }
 
@@ -1128,6 +1133,11 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
 
         if (polar_psftp_security_ready(self)) {
             return true;
+        }
+
+        if (pairing_failed && !dropped_stale_bond && self->peer_addr_type != BD_ADDR_TYPE_UNKNOWN) {
+            gap_delete_bonding(self->peer_addr_type, self->peer_addr);
+            dropped_stale_bond = true;
         }
     }
 
@@ -1301,6 +1311,19 @@ static int polar_psftp_prepare_result(polar_h10_obj_t *self) {
         self->psftp_mtu_handle == 0 ||
         self->psftp_h2d_handle == 0) {
         return POLAR_PSFTP_OP_MISSING_CHAR;
+    }
+
+    // Align with probe behavior: give post-connect parameter update time to
+    // settle before first security-sensitive PSFTP preparation step.
+    if (self->runtime_link.conn_update_pending) {
+        polar_wait_conn_update_settle(self, 1200);
+    }
+
+    // First PSFTP operation after connect can race immediately into pairing on
+    // some sessions. Hold a one-time pre-security settle window so callers
+    // don't need ad-hoc sleeps after connect().
+    if (!self->psftp_mtu_enabled && !self->psftp_d2h_enabled && !polar_psftp_security_ready(self)) {
+        mp_event_wait_ms(1200);
     }
 
     if (!polar_psftp_security_ready(self)) {
@@ -2345,12 +2368,26 @@ static void polar_ensure_ble_ready(void) {
         (void)mp_call_function_0(ble_type);
     }
 
+    bool bluetooth_just_activated = false;
     if (!mp_bluetooth_is_active()) {
         int err = mp_bluetooth_init();
         if (err != 0) {
             polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("failed to initialize Bluetooth stack"));
         }
+        bluetooth_just_activated = true;
     }
+
+    // First operations right after stack activation can be timing-sensitive.
+    // Apply a one-time settle window per activation so callers don't need
+    // startup sleeps in scripts.
+    if (bluetooth_just_activated) {
+        mp_event_wait_ms(1200);
+    }
+
+    // Keep Security Manager defaults aligned with probe/examples.
+    // Apply after BLE stack is active so all subsequent pairing requests follow
+    // the same bonding + secure-connection policy.
+    polar_ble_driver_btstack_sm_apply_default_auth_policy();
 
     // Ensure GATT client is initialized for our direct btstack usage.
     // If MicroPython already enabled GATT client support, assume it was initialized by mp_bluetooth_init().
