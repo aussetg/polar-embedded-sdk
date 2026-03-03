@@ -1,6 +1,6 @@
 # Documentation
 
-This repository is building a **C-backed MicroPython driver** for the **Polar H10** on **rp2** (current hardware target: **RP2-1**, based on **Pimoroni Pico Plus 2 W / RP2350B + CYW43**).
+This repository (**polar-embedded-sdk**) is building a **C-backed MicroPython driver** for Polar BLE sensors on **rp2** (current focus: **Polar H10**; current hardware target: **RP2-1**, based on **Pimoroni Pico Plus 2 W / RP2350B + CYW43**).
 
 The documentation is organised so that:
 - the **spec** is the canonical source of required behavior and API,
