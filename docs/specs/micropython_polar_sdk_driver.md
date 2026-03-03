@@ -1,17 +1,21 @@
-# Spec — Polar H10 driver (driver-first C core + MicroPython binding)
+# Spec — Polar H10 SDK core + MicroPython module (C core + binding)
 
 Status: Active development (**canonical spec**)
 Last updated: 2026-02-24
 
 Targets:
 - **Primary runtime:** MicroPython `rp2` on Pico 2 W (RP2350 + CYW43), BLE stack = **BTstack**
-- **Driver portability target:** same C driver code reusable from pure pico-sdk/BTstack apps (see `examples/pico_sdk/`)
+- **SDK core portability target:** same C SDK core code reusable from pure pico-sdk/BTstack apps (see `examples/pico_sdk/`)
+
+Terminology (important):
+- **SDK core**: `polar_sdk/core/` — Polar-specific, BTstack-backed C core.
+- **MicroPython module/binding**: `polar_sdk/mpy/` — user module glue exposing the Python API.
 
 ---
 
 ## 1) Goal
 
-Implement a robust Polar H10 driver where BLE critical-path handling and protocol parsing run in **C**, with a small pull-based Python API.
+Implement a robust Polar H10 integration where BLE critical-path handling and protocol parsing run in the **C SDK core**, with a small pull-based Python API exposed by the MicroPython module.
 
 Primary capabilities for the current task:
 - reliable connect/disconnect + retry/recovery behavior,
@@ -63,29 +67,29 @@ Therefore the design is:
 
 ### 5.1 Layering and ownership
 
-**Layer A — portable driver core (`polar_ble/driver/`)**
-- Owns transport/policy state machines, protocol parsers, buffering, and reusable control helpers.
+**Layer A — Polar SDK core (`polar_sdk/core/`)**
+- Owns Polar-specific transport/policy state machines, protocol parsers, buffering, and reusable control helpers.
 - Must not depend on MicroPython types/headers.
 - Exposes callback-driven interfaces so host integrations provide platform operations (time, sleep, GATT ops, etc.).
 
-**Layer B — host/stack adapters (still inside `polar_ble/driver/`)**
-- BTstack decode/classification/dispatch helpers (`polar_ble_driver_btstack_*`, discovery/runtime adapters, SM control helpers).
+**Layer B — host/stack adapters (still inside `polar_sdk/core/`)**
+- BTstack decode/classification/dispatch helpers (`polar_sdk_btstack_*`, discovery/runtime adapters, SM control helpers).
 - Shared by both MicroPython and pure pico-sdk hosts.
 
-**Layer C — MicroPython binding (`polar_ble/mpy/mod_polar_ble.c`)**
+**Layer C — MicroPython binding (`polar_sdk/mpy/mod_polar_sdk.c`)**
 - Thin glue only: argument parsing, object lifecycle, exception mapping, and exposure of Python API.
 - No duplicate protocol parsing/state-machine logic that belongs in Layer A/B.
 
 **Layer D — pure pico-sdk usage (`examples/pico_sdk/`)**
-- Uses the same driver components without MicroPython.
+- Uses the same SDK core components without MicroPython.
 
 ### 5.2 “Thin binding” rule
 
-New transport/protocol logic should be added to `polar_ble/driver/` first.
-`polar_ble/mpy/` should stay focused on:
+New transport/protocol logic should be added to `polar_sdk/core/` first.
+`polar_sdk/mpy/` should stay focused on:
 1. Python argument marshalling,
-2. invoking driver helpers/policies,
-3. mapping driver outcomes to Python exceptions,
+2. invoking SDK core helpers/policies,
+3. mapping SDK/core outcomes to Python exceptions,
 4. exporting telemetry.
 
 ### 5.3 Runtime state model
@@ -109,7 +113,7 @@ Only one active transport instance is supported at a time in the current MicroPy
 ### 6.1 Security/pairing requirements (PMD)
 
 PMD operations on H10 may require encrypted/authenticated links.
-Driver behavior must include:
+SDK core behavior must include:
 - detecting ATT security-style failures (notably `0x05`, `0x08`, and related encryption/auth statuses),
 - requesting pairing/encryption,
 - retrying protected operations (especially PMD CCC enable),
@@ -134,9 +138,9 @@ Latest negotiated/update status must be observable in `stats()`.
 
 ## 7) Public Python API (canonical current baseline)
 
-Module: `polar_ble`
+Module: `polar_sdk`
 
-Main class: `polar_ble.H10`
+Main class: `polar_sdk.H10`
 
 ### 7.1 Lifecycle / transport
 - `H10(addr: str | None = None, *, name_prefix: str | None = "Polar", required_services: int = <enabled-feature mask>)`
@@ -208,11 +212,11 @@ Current scope is GET-only request flow over PSFTP MTU characteristic.
 ## 8) Error model
 
 Module exception types:
-- `polar_ble.Error`
-- `polar_ble.TimeoutError`
-- `polar_ble.NotConnectedError`
-- `polar_ble.ProtocolError`
-- `polar_ble.BufferOverflowError`
+- `polar_sdk.Error`
+- `polar_sdk.TimeoutError`
+- `polar_sdk.NotConnectedError`
+- `polar_sdk.ProtocolError`
+- `polar_sdk.BufferOverflowError`
 
 Mapping intent:
 - connection attempt timeout → `TimeoutError`

@@ -9,21 +9,21 @@
 
 #include "btstack.h"
 
-#include "polar_ble_driver_connect.h"
-#include "polar_ble_driver_runtime.h"
-#include "polar_ble_driver_runtime_context.h"
-#include "polar_ble_driver_btstack_link.h"
-#include "polar_ble_driver_btstack_gatt.h"
-#include "polar_ble_driver_btstack_helpers.h"
-#include "polar_ble_driver_btstack_scan.h"
-#include "polar_ble_driver_btstack_adv_runtime.h"
-#include "polar_ble_driver_btstack_sm.h"
-#include "polar_ble_driver_sm_control.h"
-#include "polar_ble_driver_btstack_dispatch.h"
-#include "polar_ble_driver_discovery_apply.h"
-#include "polar_ble_driver_gatt_notify_runtime.h"
-#include "polar_ble_driver_pmd.h"
-#include "polar_ble_driver_pmd_control.h"
+#include "polar_sdk_connect.h"
+#include "polar_sdk_runtime.h"
+#include "polar_sdk_runtime_context.h"
+#include "polar_sdk_btstack_link.h"
+#include "polar_sdk_btstack_gatt.h"
+#include "polar_sdk_btstack_helpers.h"
+#include "polar_sdk_btstack_scan.h"
+#include "polar_sdk_btstack_adv_runtime.h"
+#include "polar_sdk_btstack_sm.h"
+#include "polar_sdk_sm_control.h"
+#include "polar_sdk_btstack_dispatch.h"
+#include "polar_sdk_discovery_apply.h"
+#include "polar_sdk_gatt_notify_runtime.h"
+#include "polar_sdk_pmd.h"
+#include "polar_sdk_pmd_control.h"
 
 #ifndef H10_TARGET_ADDR
 #define H10_TARGET_ADDR "24:AC:AC:05:A3:10"
@@ -171,13 +171,13 @@ static uint32_t pmd_data_ecg_notifications_total = 0;
 static uint32_t pmd_data_imu_notifications_total = 0;
 static uint32_t pmd_data_unknown_notifications_total = 0;
 
-static polar_ble_driver_runtime_link_t runtime_link;
+static polar_sdk_runtime_link_t runtime_link;
 
-static polar_ble_driver_connect_policy_t reconnect_policy = {
+static polar_sdk_connect_policy_t reconnect_policy = {
     .timeout_ms = H10_CONNECT_TIMEOUT_WINDOW_MS,
     .attempt_slice_ms = H10_CONNECT_ATTEMPT_SLICE_MS,
 };
-static polar_ble_driver_connect_state_t reconnect_state;
+static polar_sdk_connect_state_t reconnect_state;
 
 static const char *state_name(app_state_t s) {
     switch (s) {
@@ -196,17 +196,17 @@ static const char *state_name(app_state_t s) {
     }
 }
 
-static const char *pmd_start_result_name(polar_ble_driver_pmd_start_result_t r) {
+static const char *pmd_start_result_name(polar_sdk_pmd_start_result_t r) {
     switch (r) {
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_OK: return "OK";
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_NOT_CONNECTED: return "NOT_CONNECTED";
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_SECURITY_TIMEOUT: return "SECURITY_TIMEOUT";
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_CCC_REJECTED: return "CCC_REJECTED";
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_CCC_TIMEOUT: return "CCC_TIMEOUT";
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_MTU_FAILED: return "MTU_FAILED";
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_START_TIMEOUT: return "START_TIMEOUT";
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_START_REJECTED: return "START_REJECTED";
-        case POLAR_BLE_DRIVER_PMD_START_RESULT_TRANSPORT_ERROR: return "TRANSPORT_ERROR";
+        case POLAR_SDK_PMD_START_RESULT_OK: return "OK";
+        case POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED: return "NOT_CONNECTED";
+        case POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT: return "SECURITY_TIMEOUT";
+        case POLAR_SDK_PMD_START_RESULT_CCC_REJECTED: return "CCC_REJECTED";
+        case POLAR_SDK_PMD_START_RESULT_CCC_TIMEOUT: return "CCC_TIMEOUT";
+        case POLAR_SDK_PMD_START_RESULT_MTU_FAILED: return "MTU_FAILED";
+        case POLAR_SDK_PMD_START_RESULT_START_TIMEOUT: return "START_TIMEOUT";
+        case POLAR_SDK_PMD_START_RESULT_START_REJECTED: return "START_REJECTED";
+        case POLAR_SDK_PMD_START_RESULT_TRANSPORT_ERROR: return "TRANSPORT_ERROR";
         default: return "?";
     }
 }
@@ -215,14 +215,14 @@ static void schedule_reconnect(uint32_t delay_ms);
 
 static uint32_t next_reconnect_delay_ms(void) {
     uint32_t now = btstack_run_loop_get_time_ms();
-    uint32_t delay_ms = polar_ble_driver_connect_next_backoff_ms(&reconnect_policy, &reconnect_state, now);
+    uint32_t delay_ms = polar_sdk_connect_next_backoff_ms(&reconnect_policy, &reconnect_state, now);
     if (delay_ms > 0) {
         return delay_ms;
     }
 
     // Restart timeout window and retry from first backoff slot.
-    polar_ble_driver_connect_init(&reconnect_state, now);
-    delay_ms = polar_ble_driver_connect_next_backoff_ms(&reconnect_policy, &reconnect_state, now);
+    polar_sdk_connect_init(&reconnect_state, now);
+    delay_ms = polar_sdk_connect_next_backoff_ms(&reconnect_policy, &reconnect_state, now);
     return delay_ms > 0 ? delay_ms : 1000;
 }
 
@@ -346,7 +346,7 @@ static int probe_pmd_set_notify_for_char_result(
         .notification = notification,
         .listening = listening,
     };
-    polar_ble_driver_gatt_notify_ops_t ops = {
+    polar_sdk_gatt_notify_ops_t ops = {
         .ctx = &ctx,
         .is_connected_ready = probe_pmd_notify_is_connected_ready,
         .listener_active = probe_pmd_notify_listener_active,
@@ -355,7 +355,7 @@ static int probe_pmd_set_notify_for_char_result(
         .write_ccc = probe_pmd_notify_write_ccc,
         .wait_complete = probe_pmd_notify_wait_complete,
     };
-    polar_ble_driver_gatt_notify_runtime_args_t args = {
+    polar_sdk_gatt_notify_runtime_args_t args = {
         .ops = &ops,
         .has_value_handle = chr != NULL && chr->value_handle != 0,
         .enable = enable,
@@ -371,19 +371,19 @@ static int probe_pmd_set_notify_for_char_result(
         .cfg_done = &pmd_cfg_done,
     };
 
-    polar_ble_driver_gatt_notify_runtime_result_t r = polar_ble_driver_gatt_notify_runtime_set(&args);
-    return polar_ble_driver_pmd_map_notify_result(
+    polar_sdk_gatt_notify_runtime_result_t r = polar_sdk_gatt_notify_runtime_set(&args);
+    return polar_sdk_pmd_map_notify_result(
         r,
         pmd_cfg_att_status,
-        POLAR_BLE_DRIVER_PMD_OP_OK,
-        POLAR_BLE_DRIVER_PMD_OP_NOT_CONNECTED,
-        POLAR_BLE_DRIVER_PMD_OP_TIMEOUT,
-        POLAR_BLE_DRIVER_PMD_OP_TRANSPORT);
+        POLAR_SDK_PMD_OP_OK,
+        POLAR_SDK_PMD_OP_NOT_CONNECTED,
+        POLAR_SDK_PMD_OP_TIMEOUT,
+        POLAR_SDK_PMD_OP_TRANSPORT);
 }
 
 static int pmd_enable_notifications_once(void) {
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID || !pmd_cp_found || !pmd_data_found) {
-        return POLAR_BLE_DRIVER_PMD_OP_NOT_CONNECTED;
+        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
     }
 
     int status = probe_pmd_set_notify_for_char_result(
@@ -391,7 +391,7 @@ static int pmd_enable_notifications_once(void) {
         &pmd_cp_listener,
         &pmd_cp_listener_registered,
         true);
-    if (status != POLAR_BLE_DRIVER_PMD_OP_OK) {
+    if (status != POLAR_SDK_PMD_OP_OK) {
         return status;
     }
 
@@ -400,11 +400,11 @@ static int pmd_enable_notifications_once(void) {
         &pmd_data_listener,
         &pmd_data_listener_registered,
         true);
-    if (status != POLAR_BLE_DRIVER_PMD_OP_OK) {
+    if (status != POLAR_SDK_PMD_OP_OK) {
         return status;
     }
 
-    return POLAR_BLE_DRIVER_PMD_OP_OK;
+    return POLAR_SDK_PMD_OP_OK;
 }
 
 static bool pmd_is_connected(void *ctx) {
@@ -425,7 +425,7 @@ static void pmd_request_pairing(void *ctx) {
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
         return;
     }
-    polar_ble_driver_btstack_sm_apply_default_auth_policy();
+    polar_sdk_btstack_sm_apply_default_auth_policy();
     sm_request_pairing(conn_handle);
 }
 
@@ -442,7 +442,7 @@ static int pmd_enable_notifications_cb(void *ctx) {
 static int pmd_ensure_minimum_mtu_cb(void *ctx, uint16_t minimum_mtu) {
     UNUSED(ctx);
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-        return POLAR_BLE_DRIVER_PMD_OP_NOT_CONNECTED;
+        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
     }
 
     uint16_t current_mtu = ATT_DEFAULT_MTU;
@@ -451,7 +451,7 @@ static int pmd_ensure_minimum_mtu_cb(void *ctx, uint16_t minimum_mtu) {
     }
     if (att_mtu >= minimum_mtu) {
         printf("[h10probe] PMD MTU already sufficient: current=%u required=%u\n", att_mtu, minimum_mtu);
-        return POLAR_BLE_DRIVER_PMD_OP_OK;
+        return POLAR_SDK_PMD_OP_OK;
     }
 
     printf("[h10probe] PMD MTU upgrade requested: current=%u required=%u\n", att_mtu, minimum_mtu);
@@ -461,12 +461,12 @@ static int pmd_ensure_minimum_mtu_cb(void *ctx, uint16_t minimum_mtu) {
     if (!wait_flag_until_true(&mtu_exchange_done, 2000)) {
         mtu_exchange_pending = false;
         printf("[h10probe] PMD MTU upgrade timeout\n");
-        return POLAR_BLE_DRIVER_PMD_OP_TIMEOUT;
+        return POLAR_SDK_PMD_OP_TIMEOUT;
     }
     mtu_exchange_pending = false;
 
     printf("[h10probe] PMD MTU after upgrade=%u\n", att_mtu);
-    return att_mtu >= minimum_mtu ? POLAR_BLE_DRIVER_PMD_OP_OK : POLAR_BLE_DRIVER_PMD_OP_TIMEOUT;
+    return att_mtu >= minimum_mtu ? POLAR_SDK_PMD_OP_OK : POLAR_SDK_PMD_OP_TIMEOUT;
 }
 
 static int pmd_start_measurement_and_wait_response_cb(
@@ -476,17 +476,17 @@ static int pmd_start_measurement_and_wait_response_cb(
     uint8_t *out_status) {
     UNUSED(ctx);
     if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-        return POLAR_BLE_DRIVER_PMD_OP_NOT_CONNECTED;
+        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
     }
     if (start_cmd == NULL || start_cmd_len < 2 || start_cmd_len > UINT16_MAX) {
-        return POLAR_BLE_DRIVER_PMD_OP_TRANSPORT;
+        return POLAR_SDK_PMD_OP_TRANSPORT;
     }
 
     uint8_t measurement_type = start_cmd[1];
 
     pmd_cp_response_waiting = true;
     pmd_cp_response_done = false;
-    pmd_cp_response_expected_opcode = POLAR_BLE_DRIVER_PMD_OPCODE_START_MEASUREMENT;
+    pmd_cp_response_expected_opcode = POLAR_SDK_PMD_OPCODE_START_MEASUREMENT;
     pmd_cp_response_expected_type = measurement_type;
     pmd_cp_response_status = 0xff;
 
@@ -506,13 +506,13 @@ static int pmd_start_measurement_and_wait_response_cb(
     if (err) {
         pmd_write_pending = false;
         printf("[h10probe] PMD START write transport err=%d\n", err);
-        return POLAR_BLE_DRIVER_PMD_OP_TRANSPORT;
+        return POLAR_SDK_PMD_OP_TRANSPORT;
     }
 
     if (!wait_flag_until_true(&pmd_write_done, 2000)) {
         pmd_write_pending = false;
         printf("[h10probe] PMD START write timeout\n");
-        return POLAR_BLE_DRIVER_PMD_OP_TIMEOUT;
+        return POLAR_SDK_PMD_OP_TIMEOUT;
     }
     if (pmd_write_att_status != ATT_ERROR_SUCCESS) {
         printf("[h10probe] PMD START write ATT reject=0x%02x\n", pmd_write_att_status);
@@ -522,7 +522,7 @@ static int pmd_start_measurement_and_wait_response_cb(
     if (!wait_flag_until_true(&pmd_cp_response_done, 2000)) {
         pmd_cp_response_waiting = false;
         printf("[h10probe] PMD START response timeout type=0x%02x\n", measurement_type);
-        return POLAR_BLE_DRIVER_PMD_OP_TIMEOUT;
+        return POLAR_SDK_PMD_OP_TIMEOUT;
     }
 
     if (out_status != NULL) {
@@ -530,7 +530,7 @@ static int pmd_start_measurement_and_wait_response_cb(
     }
     printf("[h10probe] PMD START response type=0x%02x status=0x%02x\n", measurement_type, pmd_cp_response_status);
 
-    return POLAR_BLE_DRIVER_PMD_OP_OK;
+    return POLAR_SDK_PMD_OP_OK;
 }
 
 static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -540,8 +540,8 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
     uint8_t event = hci_event_packet_get_type(packet);
 
-    polar_ble_driver_btstack_mtu_event_t mtu_event;
-    if (polar_ble_driver_btstack_decode_mtu_event(packet_type, packet, &mtu_event)) {
+    polar_sdk_btstack_mtu_event_t mtu_event;
+    if (polar_sdk_btstack_decode_mtu_event(packet_type, packet, &mtu_event)) {
         att_mtu = mtu_event.mtu;
         mtu_exchange_done = true;
         mtu_exchange_pending = false;
@@ -550,7 +550,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
     }
 
     uint8_t query_complete_att_status = ATT_ERROR_SUCCESS;
-    bool have_query_complete = polar_ble_driver_btstack_decode_query_complete_att_status(
+    bool have_query_complete = polar_sdk_btstack_decode_query_complete_att_status(
         packet_type,
         packet,
         &query_complete_att_status);
@@ -573,7 +573,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
     switch (app_state) {
         case APP_W4_HR_SERVICE:
-            if (polar_ble_driver_btstack_decode_service_query_result(packet_type, packet, &hr_service)) {
+            if (polar_sdk_btstack_decode_service_query_result(packet_type, packet, &hr_service)) {
                 hr_service_found = true;
                 printf("[h10probe] HR service found: start=0x%04x end=0x%04x\n",
                        hr_service.start_group_handle, hr_service.end_group_handle);
@@ -594,7 +594,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
             break;
 
         case APP_W4_HR_CHAR:
-            if (polar_ble_driver_btstack_decode_characteristic_query_result(packet_type, packet, &hr_char)) {
+            if (polar_sdk_btstack_decode_characteristic_query_result(packet_type, packet, &hr_char)) {
                 hr_char_found = true;
                 printf("[h10probe] HR char found: start=0x%04x value=0x%04x end=0x%04x\n",
                        hr_char.start_handle, hr_char.value_handle, hr_char.end_handle);
@@ -635,7 +635,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                 if (att_status == ATT_ERROR_SUCCESS) {
                     app_state = APP_STREAMING;
                 } else {
-                    if (polar_ble_driver_pmd_att_status_requires_security(att_status)) {
+                    if (polar_sdk_pmd_att_status_requires_security(att_status)) {
                         printf("[h10probe] HR CCC requires security, requesting pairing\n");
                         sm_request_pairing(conn_handle);
                     }
@@ -646,8 +646,8 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
         case APP_W4_PMD_SERVICE: {
             gatt_client_service_t svc;
-            if (polar_ble_driver_btstack_decode_service_query_result(packet_type, packet, &svc)) {
-                polar_ble_driver_disc_service_kind_t service_kind = polar_ble_driver_btstack_classify_service(
+            if (polar_sdk_btstack_decode_service_query_result(packet_type, packet, &svc)) {
+                polar_sdk_disc_service_kind_t service_kind = polar_sdk_btstack_classify_service(
                     svc.uuid16,
                     svc.uuid128,
                     ORG_BLUETOOTH_SERVICE_HEART_RATE,
@@ -664,10 +664,10 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                        svc.uuid128[3],
                        svc.uuid128[14],
                        svc.uuid128[15]);
-                if (service_kind == POLAR_BLE_DRIVER_DISC_SERVICE_PMD) {
+                if (service_kind == POLAR_SDK_DISC_SERVICE_PMD) {
                     pmd_service = svc;
-                    polar_ble_driver_discovery_apply_service_kind(
-                        POLAR_BLE_DRIVER_DISC_SERVICE_PMD,
+                    polar_sdk_discovery_apply_service_kind(
+                        POLAR_SDK_DISC_SERVICE_PMD,
                         NULL,
                         &pmd_service_found,
                         NULL);
@@ -696,9 +696,9 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
         case APP_W4_PMD_CHARS: {
             gatt_client_characteristic_t chr;
-            if (polar_ble_driver_btstack_decode_characteristic_query_result(packet_type, packet, &chr)) {
-                polar_ble_driver_disc_char_kind_t ck = polar_ble_driver_btstack_classify_char(
-                    POLAR_BLE_DRIVER_DISC_STAGE_PMD_CHARS,
+            if (polar_sdk_btstack_decode_characteristic_query_result(packet_type, packet, &chr)) {
+                polar_sdk_disc_char_kind_t ck = polar_sdk_btstack_classify_char(
+                    POLAR_SDK_DISC_STAGE_PMD_CHARS,
                     chr.uuid16,
                     chr.uuid128,
                     ORG_BLUETOOTH_CHARACTERISTIC_HEART_RATE_MEASUREMENT,
@@ -707,12 +707,12 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     0,
                     0,
                     0);
-                if (ck == POLAR_BLE_DRIVER_DISC_CHAR_PMD_CP) {
+                if (ck == POLAR_SDK_DISC_CHAR_PMD_CP) {
                     pmd_cp_char = chr;
-                } else if (ck == POLAR_BLE_DRIVER_DISC_CHAR_PMD_DATA) {
+                } else if (ck == POLAR_SDK_DISC_CHAR_PMD_DATA) {
                     pmd_data_char = chr;
                 }
-                polar_ble_driver_discovery_apply_char_kind(
+                polar_sdk_discovery_apply_char_kind(
                     ck,
                     chr.value_handle,
                     NULL,
@@ -724,9 +724,9 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     NULL,
                     NULL,
                     NULL);
-                if (ck == POLAR_BLE_DRIVER_DISC_CHAR_PMD_CP) {
+                if (ck == POLAR_SDK_DISC_CHAR_PMD_CP) {
                     printf("[h10probe] PMD CP char value=0x%04x props=0x%02x\n", chr.value_handle, chr.properties);
-                } else if (ck == POLAR_BLE_DRIVER_DISC_CHAR_PMD_DATA) {
+                } else if (ck == POLAR_SDK_DISC_CHAR_PMD_DATA) {
                     printf("[h10probe] PMD DATA char value=0x%04x props=0x%02x\n", chr.value_handle, chr.properties);
                 } else {
                     printf("[h10probe] PMD char other start=0x%04x value=0x%04x end=0x%04x uuid16=0x%04x uuid128=%02x%02x%02x%02x..%02x%02x\n",
@@ -756,8 +756,8 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
             break;
     }
 
-    polar_ble_driver_btstack_value_event_t value_event;
-    if (polar_ble_driver_btstack_decode_value_event(packet_type, packet, &value_event) &&
+    polar_sdk_btstack_value_event_t value_event;
+    if (polar_sdk_btstack_decode_value_event(packet_type, packet, &value_event) &&
         conn_handle != HCI_CON_HANDLE_INVALID) {
 
         if (value_event.value_handle == hr_char.value_handle) {
@@ -772,8 +772,8 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
         }
 
         if (value_event.value_handle == pmd_cp_char.value_handle) {
-            polar_ble_driver_pmd_cp_response_t response;
-            if (!polar_ble_driver_pmd_parse_cp_response(value_event.value, value_event.value_len, &response)) {
+            polar_sdk_pmd_cp_response_t response;
+            if (!polar_sdk_pmd_parse_cp_response(value_event.value, value_event.value_len, &response)) {
                 return;
             }
             printf("[h10probe] PMD CP rsp via=%s opcode=0x%02x type=0x%02x status=0x%02x\n",
@@ -796,9 +796,9 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
             if (value_event.value_len > 0) {
                 uint8_t measurement_type = value_event.value[0];
-                if (measurement_type == POLAR_BLE_DRIVER_PMD_MEASUREMENT_ECG) {
+                if (measurement_type == POLAR_SDK_PMD_MEASUREMENT_ECG) {
                     pmd_data_ecg_notifications_total += 1;
-                } else if (measurement_type == POLAR_BLE_DRIVER_PMD_MEASUREMENT_ACC) {
+                } else if (measurement_type == POLAR_SDK_PMD_MEASUREMENT_ACC) {
                     pmd_data_imu_notifications_total += 1;
                 } else {
                     pmd_data_unknown_notifications_total += 1;
@@ -900,7 +900,7 @@ static void run_pmd_policy_tick(void) {
            pmd_cp_char.value_handle,
            pmd_data_char.value_handle);
 
-    polar_ble_driver_pmd_start_ops_t ops = {
+    polar_sdk_pmd_start_ops_t ops = {
         .ctx = NULL,
         .is_connected = pmd_is_connected,
         .encryption_key_size = pmd_encryption_key_size,
@@ -911,7 +911,7 @@ static void run_pmd_policy_tick(void) {
         .start_ecg_and_wait_response = pmd_start_measurement_and_wait_response_cb,
     };
 
-    polar_ble_driver_pmd_start_policy_t ecg_policy = {
+    polar_sdk_pmd_start_policy_t ecg_policy = {
         .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
         .security_rounds_per_attempt = H10_PMD_SECURITY_ROUNDS,
         .security_wait_ms = H10_PMD_SECURITY_WAIT_MS,
@@ -925,7 +925,7 @@ static void run_pmd_policy_tick(void) {
 
     uint8_t ecg_response_status = 0xff;
     int ecg_last_ccc_att_status = 0;
-    polar_ble_driver_pmd_start_result_t ecg_result = polar_ble_driver_pmd_start_ecg_with_policy(
+    polar_sdk_pmd_start_result_t ecg_result = polar_sdk_pmd_start_ecg_with_policy(
         &ecg_policy,
         &ops,
         &ecg_response_status,
@@ -939,7 +939,7 @@ static void run_pmd_policy_tick(void) {
            gap_encryption_key_size(conn_handle),
            att_mtu);
 
-    if (ecg_result != POLAR_BLE_DRIVER_PMD_START_RESULT_OK) {
+    if (ecg_result != POLAR_SDK_PMD_START_RESULT_OK) {
         app_state = APP_CONNECTED;
         pmd_policy_done = true;
         return;
@@ -948,7 +948,7 @@ static void run_pmd_policy_tick(void) {
     ecg_start_success_total += 1;
     imu_start_attempts_total += 1;
 
-    polar_ble_driver_pmd_start_policy_t imu_policy = {
+    polar_sdk_pmd_start_policy_t imu_policy = {
         .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
         .security_rounds_per_attempt = H10_PMD_SECURITY_ROUNDS,
         .security_wait_ms = H10_PMD_SECURITY_WAIT_MS,
@@ -962,7 +962,7 @@ static void run_pmd_policy_tick(void) {
 
     uint8_t imu_response_status = 0xff;
     int imu_last_ccc_att_status = 0;
-    polar_ble_driver_pmd_start_result_t imu_result = polar_ble_driver_pmd_start_acc_with_policy(
+    polar_sdk_pmd_start_result_t imu_result = polar_sdk_pmd_start_acc_with_policy(
         &imu_policy,
         &ops,
         &imu_response_status,
@@ -976,7 +976,7 @@ static void run_pmd_policy_tick(void) {
            gap_encryption_key_size(conn_handle),
            att_mtu);
 
-    if (imu_result == POLAR_BLE_DRIVER_PMD_START_RESULT_OK) {
+    if (imu_result == POLAR_SDK_PMD_START_RESULT_OK) {
         imu_start_success_total += 1;
         app_state = APP_STREAMING;
     } else {
@@ -1103,7 +1103,7 @@ static void on_connection_ready_common(hci_con_handle_t handle) {
     conn_handle = handle;
     connected = runtime_link.connected;
     connect_time_ms = btstack_run_loop_get_time_ms();
-    polar_ble_driver_connect_init(&reconnect_state, connect_time_ms);
+    polar_sdk_connect_init(&reconnect_state, connect_time_ms);
 
     request_post_connect_update(conn_handle);
 
@@ -1125,7 +1125,7 @@ static bool probe_adv_runtime_is_scanning(void *ctx) {
     return app_state == APP_SCANNING;
 }
 
-static void probe_adv_runtime_on_match(void *ctx, const polar_ble_driver_btstack_adv_report_t *report) {
+static void probe_adv_runtime_on_match(void *ctx, const polar_sdk_btstack_adv_report_t *report) {
     UNUSED(ctx);
     memcpy(peer_addr, report->addr, sizeof(peer_addr));
     peer_addr_type = report->addr_type;
@@ -1148,10 +1148,10 @@ static int probe_adv_runtime_connect(void *ctx, const uint8_t *addr, uint8_t add
     return gap_connect(a, addr_type);
 }
 
-static void probe_dispatch_on_adv_report(void *ctx, const polar_ble_driver_btstack_adv_report_t *adv_report) {
+static void probe_dispatch_on_adv_report(void *ctx, const polar_sdk_btstack_adv_report_t *adv_report) {
     UNUSED(ctx);
 
-    polar_ble_driver_btstack_scan_filter_t filter = {
+    polar_sdk_btstack_scan_filter_t filter = {
         .use_addr = target_addr_valid,
         .addr = {0},
         .use_name_prefix = false,
@@ -1165,7 +1165,7 @@ static void probe_dispatch_on_adv_report(void *ctx, const polar_ble_driver_btsta
         memcpy(filter.addr, target_addr, sizeof(bd_addr_t));
     }
 
-    polar_ble_driver_btstack_adv_runtime_ops_t ops = {
+    polar_sdk_btstack_adv_runtime_ops_t ops = {
         .ctx = NULL,
         .is_scanning = probe_adv_runtime_is_scanning,
         .on_report = NULL,
@@ -1174,7 +1174,7 @@ static void probe_dispatch_on_adv_report(void *ctx, const polar_ble_driver_btsta
         .connect = probe_adv_runtime_connect,
         .on_connect_error = NULL,
     };
-    (void)polar_ble_driver_btstack_adv_runtime_on_report(
+    (void)polar_sdk_btstack_adv_runtime_on_report(
         &runtime_link,
         &filter,
         adv_report,
@@ -1182,12 +1182,12 @@ static void probe_dispatch_on_adv_report(void *ctx, const polar_ble_driver_btsta
         &ops);
 }
 
-static void probe_link_on_connected_ready(void *ctx, const polar_ble_driver_link_event_t *link_event) {
+static void probe_link_on_connected_ready(void *ctx, const polar_sdk_link_event_t *link_event) {
     UNUSED(ctx);
     on_connection_ready_common(link_event->handle);
 }
 
-static void probe_link_on_disconnected(void *ctx, const polar_ble_driver_link_event_t *link_event) {
+static void probe_link_on_disconnected(void *ctx, const polar_sdk_link_event_t *link_event) {
     UNUSED(ctx);
     printf("[h10probe] disconnect status=0x%02x handle=0x%04x reason=0x%02x\n",
            link_event->status, link_event->handle, link_event->reason);
@@ -1195,15 +1195,15 @@ static void probe_link_on_disconnected(void *ctx, const polar_ble_driver_link_ev
     schedule_reconnect(next_reconnect_delay_ms());
 }
 
-static void probe_link_on_conn_update_complete(void *ctx, const polar_ble_driver_link_event_t *link_event) {
+static void probe_link_on_conn_update_complete(void *ctx, const polar_sdk_link_event_t *link_event) {
     UNUSED(ctx);
     printf("[h10probe] conn update complete status=0x%02x handle=0x%04x interval=%u lat=%u sup=%u\n",
            link_event->status, link_event->handle, link_event->conn_interval, link_event->conn_latency, link_event->supervision_timeout_10ms);
 }
 
-static void probe_dispatch_on_link_event(void *ctx, const polar_ble_driver_link_event_t *link_event) {
+static void probe_dispatch_on_link_event(void *ctx, const polar_sdk_link_event_t *link_event) {
     UNUSED(ctx);
-    if (link_event->type == POLAR_BLE_DRIVER_LINK_EVENT_CONN_COMPLETE) {
+    if (link_event->type == POLAR_SDK_LINK_EVENT_CONN_COMPLETE) {
         printf("[h10probe] conn complete status=0x%02x handle=0x%04x role=%u interval=%u lat=%u sup=%u\n",
                link_event->status,
                link_event->handle,
@@ -1218,20 +1218,20 @@ static void probe_dispatch_on_link_event(void *ctx, const polar_ble_driver_link_
         }
     }
 
-    polar_ble_driver_runtime_context_link_ops_t ops = {
+    polar_sdk_runtime_context_link_ops_t ops = {
         .ctx = NULL,
         .on_connected_ready = probe_link_on_connected_ready,
         .on_disconnected = probe_link_on_disconnected,
         .on_conn_update_complete = probe_link_on_conn_update_complete,
     };
-    bool handled = polar_ble_driver_runtime_context_handle_link_event(
+    bool handled = polar_sdk_runtime_context_handle_link_event(
         &runtime_link,
         HCI_CON_HANDLE_INVALID,
         link_event,
         false,
         true,
         &ops);
-    if (link_event->type == POLAR_BLE_DRIVER_LINK_EVENT_CONN_COMPLETE &&
+    if (link_event->type == POLAR_SDK_LINK_EVENT_CONN_COMPLETE &&
         handled &&
         link_event->status != ERROR_CODE_SUCCESS) {
         on_disconnect_cleanup();
@@ -1239,7 +1239,7 @@ static void probe_dispatch_on_link_event(void *ctx, const polar_ble_driver_link_
     }
 }
 
-static void probe_dispatch_on_sm_event(void *ctx, const polar_ble_driver_sm_event_t *sm_event) {
+static void probe_dispatch_on_sm_event(void *ctx, const polar_sdk_sm_event_t *sm_event) {
     UNUSED(ctx);
     UNUSED(sm_event);
 }
@@ -1254,13 +1254,13 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 
     uint8_t event = hci_event_packet_get_type(packet);
 
-    polar_ble_driver_btstack_dispatch_ops_t dispatch_ops = {
+    polar_sdk_btstack_dispatch_ops_t dispatch_ops = {
         .ctx = NULL,
         .on_adv_report = probe_dispatch_on_adv_report,
         .on_link_event = probe_dispatch_on_link_event,
         .on_sm_event = probe_dispatch_on_sm_event,
     };
-    if (polar_ble_driver_btstack_dispatch_event(packet_type, packet, &dispatch_ops)) {
+    if (polar_sdk_btstack_dispatch_event(packet_type, packet, &dispatch_ops)) {
         return;
     }
 
@@ -1268,7 +1268,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
         case BTSTACK_EVENT_STATE:
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
                 printf("[h10probe] BTstack ready\n");
-                polar_ble_driver_connect_init(&reconnect_state, btstack_run_loop_get_time_ms());
+                polar_sdk_connect_init(&reconnect_state, btstack_run_loop_get_time_ms());
                 btstack_run_loop_set_timer_handler(&heartbeat_timer, heartbeat_timer_handler);
                 btstack_run_loop_set_timer(&heartbeat_timer, 1000);
                 btstack_run_loop_add_timer(&heartbeat_timer);
@@ -1290,7 +1290,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                    hci_event_encryption_change_v2_get_connection_handle(packet),
                    hci_event_encryption_change_v2_get_encryption_enabled(packet),
                    key_size,
-                   polar_ble_driver_pmd_security_ready(key_size));
+                   polar_sdk_pmd_security_ready(key_size));
             break;
         }
 
@@ -1323,7 +1323,7 @@ static void probe_sm_on_authorization_request(void *ctx, uint16_t handle) {
     sm_authorization_grant(handle);
 }
 
-static void probe_sm_on_pairing_complete(void *ctx, const polar_ble_driver_sm_event_t *event) {
+static void probe_sm_on_pairing_complete(void *ctx, const polar_sdk_sm_event_t *event) {
     UNUSED(ctx);
     printf("[h10probe] SM pairing complete status=0x%02x reason=0x%02x\n",
            event->status,
@@ -1338,16 +1338,16 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
         return;
     }
 
-    polar_ble_driver_sm_event_t sm_event;
-    if (polar_ble_driver_btstack_decode_sm_event(packet_type, packet, &sm_event)) {
-        polar_ble_driver_sm_control_ops_t ops = {
+    polar_sdk_sm_event_t sm_event;
+    if (polar_sdk_btstack_decode_sm_event(packet_type, packet, &sm_event)) {
+        polar_sdk_sm_control_ops_t ops = {
             .ctx = NULL,
             .on_just_works_request = probe_sm_on_just_works_request,
             .on_numeric_comparison_request = probe_sm_on_numeric_comparison_request,
             .on_authorization_request = probe_sm_on_authorization_request,
             .on_pairing_complete = probe_sm_on_pairing_complete,
         };
-        if (polar_ble_driver_sm_control_apply(&sm_event, conn_handle, HCI_CON_HANDLE_INVALID, &ops)) {
+        if (polar_sdk_sm_control_apply(&sm_event, conn_handle, HCI_CON_HANDLE_INVALID, &ops)) {
             return;
         }
     }
@@ -1384,29 +1384,29 @@ int main(void) {
            H10_POST_CONNECT_UPDATE);
 
     uint8_t pmd_ecg_start_cmd[16];
-    polar_ble_driver_pmd_ecg_start_config_t pmd_ecg_cfg = {
+    polar_sdk_pmd_ecg_start_config_t pmd_ecg_cfg = {
         .sample_rate = H10_PMD_ECG_SAMPLE_RATE,
         .include_resolution = true,
         .resolution = H10_PMD_ECG_RESOLUTION,
     };
-    size_t pmd_ecg_start_cmd_len = polar_ble_driver_pmd_build_ecg_start_command(
+    size_t pmd_ecg_start_cmd_len = polar_sdk_pmd_build_ecg_start_command(
         &pmd_ecg_cfg,
         pmd_ecg_start_cmd,
         sizeof(pmd_ecg_start_cmd));
 
     uint8_t pmd_imu_start_cmd[20];
-    polar_ble_driver_pmd_acc_start_config_t pmd_imu_cfg = {
+    polar_sdk_pmd_acc_start_config_t pmd_imu_cfg = {
         .sample_rate = H10_PMD_IMU_SAMPLE_RATE,
         .include_resolution = true,
         .resolution = H10_PMD_IMU_RESOLUTION,
         .include_range = true,
         .range = H10_PMD_IMU_RANGE,
     };
-    size_t pmd_imu_start_cmd_len = polar_ble_driver_pmd_build_acc_start_command(
+    size_t pmd_imu_start_cmd_len = polar_sdk_pmd_build_acc_start_command(
         &pmd_imu_cfg,
         pmd_imu_start_cmd,
         sizeof(pmd_imu_start_cmd));
-    printf("[h10probe] shared-driver PMD templates ecg_len=%u imu_len=%u\n",
+    printf("[h10probe] shared-sdk PMD templates ecg_len=%u imu_len=%u\n",
            (unsigned)pmd_ecg_start_cmd_len,
            (unsigned)pmd_imu_start_cmd_len);
 
@@ -1425,9 +1425,9 @@ int main(void) {
     l2cap_init();
     sm_init();
     gatt_client_init();
-    polar_ble_driver_btstack_sm_apply_default_auth_policy();
+    polar_sdk_btstack_sm_apply_default_auth_policy();
 
-    polar_ble_driver_runtime_link_init(&runtime_link, HCI_CON_HANDLE_INVALID);
+    polar_sdk_runtime_link_init(&runtime_link, HCI_CON_HANDLE_INVALID);
 
     hci_event_cb.callback = &hci_packet_handler;
     hci_add_event_handler(&hci_event_cb);

@@ -1,12 +1,12 @@
 # HR demo: connect, start HR notifications, read samples.
 
-import polar_ble
+import polar_sdk
 
 SAMPLES = 10
 MAX_EMPTY = 20
 
-h10 = polar_ble.H10(name_prefix="Polar")
-print("version", polar_ble.version())
+h10 = polar_sdk.H10(name_prefix="Polar")
+print("version", polar_sdk.version())
 
 try:
     h10.connect(timeout_ms=10000)
@@ -24,9 +24,9 @@ try:
         started = True
         print("hr started")
     except (
-        polar_ble.TimeoutError,
-        polar_ble.NotConnectedError,
-        polar_ble.ProtocolError,
+        polar_sdk.TimeoutError,
+        polar_sdk.NotConnectedError,
+        polar_sdk.ProtocolError,
     ) as exc:
         print("start_hr failed:", type(exc).__name__, exc)
 
@@ -35,7 +35,7 @@ try:
     while started and got < SAMPLES and empty < MAX_EMPTY:
         try:
             sample = h10.read_hr(timeout_ms=4000)
-        except polar_ble.NotConnectedError as exc:
+        except polar_sdk.NotConnectedError as exc:
             print("read_hr stopped:", exc)
             break
         if sample is None:
@@ -52,7 +52,7 @@ try:
     try:
         h10.stop_hr()
         print("hr stopped")
-    except polar_ble.NotConnectedError:
+    except polar_sdk.NotConnectedError:
         pass
 
     print("stats", h10.stats())

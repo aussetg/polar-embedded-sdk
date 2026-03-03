@@ -9,7 +9,7 @@ This project uses a **single BTstack version policy**.
 
 - We target **BTstack 1.8** everywhere.
 - We do **not** support multiple BTstack versions in parallel.
-- If an upstream integration breaks on 1.8, we patch that integration (no compatibility shims in driver code).
+- If an upstream integration breaks on 1.8, we patch that integration (no compatibility shims in the SDK core).
 
 ## Baseline snapshot
 
@@ -26,7 +26,7 @@ upstream, `pico-sdk` and `micropython`:
   - commit: `af0dac01d02abce42643e9dcd35e80a43a673704`
   - describe: `v1.8-1-gaf0dac01d`
 
-As we specifically make use of `btstack` API in our driver code, we need to ensure that all versions of `btstack` are aligned to the same version. We achieve this by pinning all BTstack trees to version 1.8.
+As we specifically make use of `btstack` API in our SDK core code, we need to ensure that all versions of `btstack` are aligned to the same version. We achieve this by pinning all BTstack trees to version 1.8.
 
 ## Alignment approach
 

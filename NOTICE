@@ -15,23 +15,23 @@ on these platforms. See:
   vendors/micropython/lib/pico-sdk/src/rp2_common/pico_btstack/LICENSE.RP
 
 --------------------------------------------------------------------------------
-Files in polar_ble/driver/ that use BTstack APIs
+Files in polar_sdk/core/ that use BTstack APIs
 --------------------------------------------------------------------------------
 The following files are derived works that depend on BTstack and are subject
 to BTstack's license terms (non-commercial, except on RP2 as noted above):
 
-  polar_ble/driver/src/polar_ble_driver_btstack_gatt.c
-  polar_ble/driver/src/polar_ble_driver_btstack_helpers.c
-  polar_ble/driver/src/polar_ble_driver_btstack_link.c
-  polar_ble/driver/src/polar_ble_driver_btstack_scan.c
-  polar_ble/driver/src/polar_ble_driver_btstack_sm.c
-  polar_ble/driver/include/polar_ble_driver_discovery_btstack_runtime.h
-  polar_ble/mpy/mod_polar_ble.c
+  polar_sdk/core/src/polar_sdk_btstack_gatt.c
+  polar_sdk/core/src/polar_sdk_btstack_helpers.c
+  polar_sdk/core/src/polar_sdk_btstack_link.c
+  polar_sdk/core/src/polar_sdk_btstack_scan.c
+  polar_sdk/core/src/polar_sdk_btstack_sm.c
+  polar_sdk/core/include/polar_sdk_discovery_btstack_runtime.h
+  polar_sdk/mpy/mod_polar_sdk.c
 
 These files are marked with:
   SPDX-License-Identifier: LicenseRef-BTstack
 
-All other files in polar_ble/driver/ are original work licensed under MIT.
+All other files in polar_sdk/core/ are original work licensed under MIT.
 
 --------------------------------------------------------------------------------
 MicroPython (vendors/micropython/)

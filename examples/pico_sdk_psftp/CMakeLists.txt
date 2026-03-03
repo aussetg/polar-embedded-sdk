@@ -42,36 +42,36 @@ if(_polar_psftp_missing_generated)
     string(REPLACE ";" "\n  " _polar_psftp_missing_generated_msg "${_polar_psftp_missing_generated}")
     message(FATAL_ERROR
         "Missing generated nanopb PSFTP files for probe.\n"
-        "Run: ./polar_ble/proto/generate_nanopb.sh\n"
+        "Run: ./polar_sdk/proto/generate_nanopb.sh\n"
         "Missing:\n  ${_polar_psftp_missing_generated_msg}\n")
 endif()
 
 add_executable(h10_btstack_psftp_probe
     main.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_common.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_connect.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_transport.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_wait.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_runtime.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_runtime_context.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_transport_adapter.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_link.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_gatt.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_gatt_route.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_helpers.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_scan.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_adv_runtime.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_sm.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_sm_control.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_dispatch.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_apply.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_control.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_notify_runtime.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_query_complete.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_write.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_psftp.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_common.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_connect.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_transport.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_wait.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_runtime_context.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_transport_adapter.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_link.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_gatt.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_gatt_route.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_helpers.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_scan.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_adv_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_sm.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_sm_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_dispatch.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_discovery.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_discovery_apply.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_notify_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_query_complete.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_write.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_pmd.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_psftp.c
     ${POLAR_PROTO_GENERATED_DIR}/types.pb.c
     ${POLAR_PROTO_GENERATED_DIR}/structures.pb.c
     ${POLAR_PROTO_GENERATED_DIR}/pftp_error.pb.c
@@ -84,7 +84,7 @@ add_executable(h10_btstack_psftp_probe
 
 target_include_directories(h10_btstack_psftp_probe PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/include
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/include
     ${POLAR_PROTO_GENERATED_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/../../vendors/nanopb
 )

@@ -1,6 +1,6 @@
 # Protocol reference
 
-These documents capture **protocol facts** needed to implement the driver.
+These documents capture **protocol facts** needed to implement the Polar SDK core and its MicroPython module.
 
 Rules:
 - Polar-specific protocol details are sourced from the [Polar BLE SDK](https://github.com/polarofficial/polar-ble-sdk) (tag **6.15.0**).

@@ -1,13 +1,13 @@
-# How-to — build MicroPython (rp2) with the `polar_ble` user C module
+# How-to — build MicroPython (rp2) with the `polar_sdk` user C module
 
 Status: How-to
 Last updated: 2026-03-02
 
 This repo vendors MicroPython under `vendors/micropython/`.
 
-The `polar_ble` MicroPython module scaffold lives under:
+The `polar_sdk` MicroPython module scaffold lives under:
 
-- `polar_ble/mpy/`
+- `polar_sdk/mpy/`
 
 Prerequisites: [`toolchain_requirements.md`](./toolchain_requirements.md)
 
@@ -15,9 +15,9 @@ Prerequisites: [`toolchain_requirements.md`](./toolchain_requirements.md)
 
 We currently keep **4 firmware presets**:
 
-1. `fw-pico2w` — Pico 2 W base (polar module)
+1. `fw-pico2w` — Pico 2 W base (polar_sdk module)
 2. `fw-pico2w-picographics` — Pico 2 W + minimal Pimoroni picographics
-3. `fw-rp2-1` — RP2-1 prototype (polar module + Pimoroni RV3028 `breakout_rtc` support)
+3. `fw-rp2-1` — RP2-1 prototype (polar_sdk module + Pimoroni RV3028 `breakout_rtc` support)
 4. `fw-rp2-1-debug` — RP2-1 prototype debug build (same module set)
 
 RP2-1 presets set `MICROPY_C_HEAP_SIZE=8192` for stable startup with the included C++ user modules.
@@ -30,7 +30,7 @@ RP2-1 is the active prototype target.
 
 Patch handling is always configure-time auto-apply:
 
-- `POLAR_BLE_AUTO_APPLY_PATCHES=ON`
+- `POLAR_AUTO_APPLY_PATCHES=ON`
 
 No dedicated `*-autopatch` presets are kept.
 
@@ -108,9 +108,9 @@ openocd -f interface/cmsis-dap.cfg -f target/rp2350.cfg \
 ## Build metadata in firmware
 
 ```python
-import polar_ble
-print(polar_ble.version())
-print(polar_ble.build_info())
+import polar_sdk
+print(polar_sdk.version())
+print(polar_sdk.build_info())
 ```
 
 `build_info()` includes at least:

@@ -1,9 +1,9 @@
-# How-to — validate the driver (HR + ECG soak tests)
+# How-to — validate the module (HR + ECG soak tests)
 
 Status: How-to
 Last updated: 2026-02-24
 
-This document describes **repeatable validation procedures** for the embedded Polar H10 driver.
+This document describes **repeatable validation procedures** for the embedded Polar MicroPython module (built on the C SDK core).
 
 It is intentionally procedural (not a roadmap). Acceptance criteria are defined in the spec.
 
@@ -33,9 +33,9 @@ Suggested MicroPython script:
 
 ```python
 import time
-import polar_ble
+import polar_sdk
 
-h10 = polar_ble.H10(None, required_services=polar_ble.SERVICE_HR)
+h10 = polar_sdk.H10(None, required_services=polar_sdk.SERVICE_HR)
 h10.connect(timeout_ms=15000)
 h10.start_hr()
 
@@ -70,13 +70,13 @@ Suggested MicroPython script:
 
 ```python
 import time
-import polar_ble
+import polar_sdk
 
-h10 = polar_ble.H10(None, required_services=polar_ble.SERVICE_ECG)
+h10 = polar_sdk.H10(None, required_services=polar_sdk.SERVICE_ECG)
 h10.connect(timeout_ms=15000)
 
 # ECG requires pairing/encryption on H10 in practice.
-# Driver should handle this internally; if it fails, see KNOWN_ISSUES.
+# SDK should handle this internally; if it fails, see KNOWN_ISSUES.
 h10.start_ecg(sample_rate=130)
 
 start = time.ticks_ms()
@@ -105,14 +105,14 @@ Pass criteria (high level):
 
 ## Test 3 — Forced disconnect + recovery (manual)
 
-Goal: confirm the driver recovers cleanly after a real link loss.
+Goal: confirm the SDK recovers cleanly after a real link loss.
 
 Procedure:
 1. Start either HR or ECG streaming.
 2. Force the H10 to power down:
    - remove it from the strap and wait ~1 minute.
 3. Reattach the H10 to the strap.
-4. Verify the driver can reconnect and resume streaming without a reboot.
+4. Verify the SDK can reconnect and resume streaming without a reboot.
 
 Notes:
 - Recovery behavior is part of the v1 acceptance criteria in the spec.

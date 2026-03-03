@@ -10,7 +10,7 @@ This guide collects **practical, repeatable** things to check when you see:
 - long stalls (no notifications) followed by disconnect,
 - instability that correlates with heavy Python load, timers, or WiFi usage.
 
-For driver-specific symptoms/mitigations see: [`../KNOWN_ISSUES.md`](../KNOWN_ISSUES.md)
+For MicroPython-module-specific symptoms/mitigations see: [`../KNOWN_ISSUES.md`](../KNOWN_ISSUES.md)
 
 ## 1) Understand the CYW43 bus/IRQ coupling on Pico 2 W
 
@@ -97,7 +97,7 @@ Reference:
 A supervision timeout is often the symptom of “the host did not service the link/controller in time”, not necessarily RF range.
 
 When debugging:
-- capture `h10.stats()` periodically (for this repo’s driver),
+- capture `h10.stats()` periodically (for this repo’s MicroPython module),
 - correlate with Python workload (printing, timers, other I/O),
 - rerun with WiFi fully disabled and no LED access,
 - verify your firmware baseline (Pico SDK version).

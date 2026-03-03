@@ -9,20 +9,20 @@
 
 #include "btstack.h"
 
-#include "polar_ble_driver_runtime.h"
-#include "polar_ble_driver_transport_adapter.h"
-#include "polar_ble_driver_btstack_dispatch.h"
-#include "polar_ble_driver_btstack_adv_runtime.h"
-#include "polar_ble_driver_btstack_scan.h"
-#include "polar_ble_driver_btstack_helpers.h"
-#include "polar_ble_driver_btstack_sm.h"
-#include "polar_ble_driver_sm_control.h"
-#include "polar_ble_driver_btstack_gatt.h"
-#include "polar_ble_driver_btstack_gatt_route.h"
-#include "polar_ble_driver_discovery.h"
-#include "polar_ble_driver_gatt_notify_runtime.h"
-#include "polar_ble_driver_pmd.h"
-#include "polar_ble_driver_psftp.h"
+#include "polar_sdk_runtime.h"
+#include "polar_sdk_transport_adapter.h"
+#include "polar_sdk_btstack_dispatch.h"
+#include "polar_sdk_btstack_adv_runtime.h"
+#include "polar_sdk_btstack_scan.h"
+#include "polar_sdk_btstack_helpers.h"
+#include "polar_sdk_btstack_sm.h"
+#include "polar_sdk_sm_control.h"
+#include "polar_sdk_btstack_gatt.h"
+#include "polar_sdk_btstack_gatt_route.h"
+#include "polar_sdk_discovery.h"
+#include "polar_sdk_gatt_notify_runtime.h"
+#include "polar_sdk_pmd.h"
+#include "polar_sdk_psftp.h"
 
 #ifndef H10_TARGET_ADDR
 #define H10_TARGET_ADDR "24:AC:AC:05:A3:10"
@@ -142,7 +142,7 @@ static btstack_packet_callback_registration_t sm_event_cb;
 static btstack_timer_source_t reconnect_timer;
 static btstack_timer_source_t heartbeat_timer;
 
-static polar_ble_driver_runtime_link_t runtime_link;
+static polar_sdk_runtime_link_t runtime_link;
 
 static bool target_addr_valid = false;
 static bd_addr_t target_addr;
@@ -193,8 +193,8 @@ static uint8_t qc_last_att_status = ATT_ERROR_SUCCESS;
 
 static bool psftp_response_waiting = false;
 static bool psftp_response_done = false;
-static polar_ble_driver_psftp_rx_result_t psftp_response_result = POLAR_BLE_DRIVER_PSFTP_RX_MORE;
-static polar_ble_driver_psftp_rx_state_t psftp_rx_state;
+static polar_sdk_psftp_rx_result_t psftp_response_result = POLAR_SDK_PSFTP_RX_MORE;
+static polar_sdk_psftp_rx_state_t psftp_rx_state;
 
 static uint16_t att_mtu = ATT_DEFAULT_MTU;
 
@@ -240,7 +240,7 @@ typedef struct {
     bool response_timeout;
     bool remote_error;
     uint16_t remote_error_code;
-    polar_ble_driver_psftp_rx_result_t response_result;
+    polar_sdk_psftp_rx_result_t response_result;
     uint32_t tx_delta;
     uint32_t rx_delta;
     uint32_t raw_mtu_delta;
@@ -354,7 +354,7 @@ static void print_hex_prefix(const uint8_t *data, uint16_t len, uint16_t max_byt
 
 static void psftp_diag_reset(void) {
     memset(&psftp_last_diag, 0, sizeof(psftp_last_diag));
-    psftp_last_diag.response_result = POLAR_BLE_DRIVER_PSFTP_RX_MORE;
+    psftp_last_diag.response_result = POLAR_SDK_PSFTP_RX_MORE;
     psftp_last_verdict = PSFTP_VERDICT_UNKNOWN;
 }
 
@@ -405,9 +405,9 @@ static void psftp_diag_finalize(const psftp_diag_snapshot_t *before, bool succes
         return;
     }
 
-    if (psftp_last_diag.response_result == POLAR_BLE_DRIVER_PSFTP_RX_PROTOCOL_ERROR ||
-        psftp_last_diag.response_result == POLAR_BLE_DRIVER_PSFTP_RX_SEQUENCE_ERROR ||
-        psftp_last_diag.response_result == POLAR_BLE_DRIVER_PSFTP_RX_OVERFLOW) {
+    if (psftp_last_diag.response_result == POLAR_SDK_PSFTP_RX_PROTOCOL_ERROR ||
+        psftp_last_diag.response_result == POLAR_SDK_PSFTP_RX_SEQUENCE_ERROR ||
+        psftp_last_diag.response_result == POLAR_SDK_PSFTP_RX_OVERFLOW) {
         psftp_last_verdict = PSFTP_VERDICT_E_PARSER;
         return;
     }
@@ -523,8 +523,8 @@ static void on_disconnect_cleanup(void) {
 
     psftp_response_waiting = false;
     psftp_response_done = false;
-    psftp_response_result = POLAR_BLE_DRIVER_PSFTP_RX_MORE;
-    polar_ble_driver_psftp_rx_reset(&psftp_rx_state, NULL, 0);
+    psftp_response_result = POLAR_SDK_PSFTP_RX_MORE;
+    polar_sdk_psftp_rx_reset(&psftp_rx_state, NULL, 0);
 
     psftp_diag_reset();
 
@@ -544,7 +544,7 @@ static void start_scan(void) {
     app_state = APP_SCANNING;
     connect_intent = true;
     user_disconnect_requested = false;
-    runtime_link.state = POLAR_BLE_DRIVER_RUNTIME_STATE_SCANNING;
+    runtime_link.state = POLAR_SDK_RUNTIME_STATE_SCANNING;
 
     printf("[psftp-probe] start scan target=%s valid=%d\n", H10_TARGET_ADDR, target_addr_valid);
     if (target_addr_valid) {
@@ -634,7 +634,7 @@ static void probe_sm_on_authorization_request(void *ctx, uint16_t handle) {
     sm_authorization_grant(handle);
 }
 
-static void probe_sm_on_pairing_complete(void *ctx, const polar_ble_driver_sm_event_t *event) {
+static void probe_sm_on_pairing_complete(void *ctx, const polar_sdk_sm_event_t *event) {
     (void)ctx;
     sm_pairing_complete_total += 1;
     sm_last_pairing_status = event->status;
@@ -652,19 +652,19 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
         return;
     }
 
-    polar_ble_driver_sm_event_t sm_event;
-    if (!polar_ble_driver_btstack_decode_sm_event(packet_type, packet, &sm_event)) {
+    polar_sdk_sm_event_t sm_event;
+    if (!polar_sdk_btstack_decode_sm_event(packet_type, packet, &sm_event)) {
         return;
     }
 
-    polar_ble_driver_sm_control_ops_t ops = {
+    polar_sdk_sm_control_ops_t ops = {
         .ctx = NULL,
         .on_just_works_request = probe_sm_on_just_works_request,
         .on_numeric_comparison_request = probe_sm_on_numeric_comparison_request,
         .on_authorization_request = probe_sm_on_authorization_request,
         .on_pairing_complete = probe_sm_on_pairing_complete,
     };
-    (void)polar_ble_driver_sm_control_apply(&sm_event, conn_handle, HCI_CON_HANDLE_INVALID, &ops);
+    (void)polar_sdk_sm_control_apply(&sm_event, conn_handle, HCI_CON_HANDLE_INVALID, &ops);
 }
 
 static bool probe_adv_runtime_is_scanning(void *ctx) {
@@ -672,7 +672,7 @@ static bool probe_adv_runtime_is_scanning(void *ctx) {
     return app_state == APP_SCANNING;
 }
 
-static void probe_adv_runtime_on_match(void *ctx, const polar_ble_driver_btstack_adv_report_t *report) {
+static void probe_adv_runtime_on_match(void *ctx, const polar_sdk_btstack_adv_report_t *report) {
     (void)ctx;
     memcpy(peer_addr, report->addr, sizeof(peer_addr));
     peer_addr_type = report->addr_type;
@@ -706,10 +706,10 @@ static void probe_adv_runtime_on_connect_error(void *ctx, int status) {
     schedule_reconnect(RECONNECT_DELAY_MS);
 }
 
-static void probe_dispatch_on_adv_report(void *ctx, const polar_ble_driver_btstack_adv_report_t *adv_report) {
+static void probe_dispatch_on_adv_report(void *ctx, const polar_sdk_btstack_adv_report_t *adv_report) {
     (void)ctx;
 
-    polar_ble_driver_btstack_scan_filter_t filter = {
+    polar_sdk_btstack_scan_filter_t filter = {
         .use_addr = target_addr_valid,
         .addr = {0},
         .use_name_prefix = false,
@@ -723,7 +723,7 @@ static void probe_dispatch_on_adv_report(void *ctx, const polar_ble_driver_btsta
         memcpy(filter.addr, target_addr, sizeof(bd_addr_t));
     }
 
-    polar_ble_driver_btstack_adv_runtime_ops_t ops = {
+    polar_sdk_btstack_adv_runtime_ops_t ops = {
         .ctx = NULL,
         .is_scanning = probe_adv_runtime_is_scanning,
         .on_report = NULL,
@@ -732,7 +732,7 @@ static void probe_dispatch_on_adv_report(void *ctx, const polar_ble_driver_btsta
         .connect = probe_adv_runtime_connect,
         .on_connect_error = probe_adv_runtime_on_connect_error,
     };
-    (void)polar_ble_driver_btstack_adv_runtime_on_report(
+    (void)polar_sdk_btstack_adv_runtime_on_report(
         &runtime_link,
         &filter,
         adv_report,
@@ -740,17 +740,17 @@ static void probe_dispatch_on_adv_report(void *ctx, const polar_ble_driver_btsta
         &ops);
 }
 
-static void probe_dispatch_on_link_event(void *ctx, const polar_ble_driver_link_event_t *event) {
+static void probe_dispatch_on_link_event(void *ctx, const polar_sdk_link_event_t *event) {
     (void)ctx;
 
     switch (event->type) {
-        case POLAR_BLE_DRIVER_LINK_EVENT_CONN_COMPLETE:
+        case POLAR_SDK_LINK_EVENT_CONN_COMPLETE:
             if (connected && event->status == ERROR_CODE_SUCCESS && conn_handle == event->handle) {
                 printf("[psftp-probe] duplicate conn-complete ignored handle=0x%04x\n", event->handle);
                 break;
             }
 
-            polar_ble_driver_runtime_on_connection_complete(
+            polar_sdk_runtime_on_connection_complete(
                 &runtime_link,
                 HCI_CON_HANDLE_INVALID,
                 event->status,
@@ -773,8 +773,8 @@ static void probe_dispatch_on_link_event(void *ctx, const polar_ble_driver_link_
             }
             break;
 
-        case POLAR_BLE_DRIVER_LINK_EVENT_CONN_UPDATE_COMPLETE:
-            polar_ble_driver_runtime_on_connection_update_complete(
+        case POLAR_SDK_LINK_EVENT_CONN_UPDATE_COMPLETE:
+            polar_sdk_runtime_on_connection_update_complete(
                 &runtime_link,
                 event->status,
                 event->conn_interval,
@@ -787,8 +787,8 @@ static void probe_dispatch_on_link_event(void *ctx, const polar_ble_driver_link_
                    event->supervision_timeout_10ms);
             break;
 
-        case POLAR_BLE_DRIVER_LINK_EVENT_DISCONNECT:
-            polar_ble_driver_runtime_on_disconnect(
+        case POLAR_SDK_LINK_EVENT_DISCONNECT:
+            polar_sdk_runtime_on_disconnect(
                 &runtime_link,
                 HCI_CON_HANDLE_INVALID,
                 event->status,
@@ -815,13 +815,13 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
         return;
     }
 
-    polar_ble_driver_btstack_dispatch_ops_t ops = {
+    polar_sdk_btstack_dispatch_ops_t ops = {
         .ctx = NULL,
         .on_adv_report = probe_dispatch_on_adv_report,
         .on_link_event = probe_dispatch_on_link_event,
         .on_sm_event = NULL,
     };
-    (void)polar_ble_driver_btstack_dispatch_event(packet_type, packet, &ops);
+    (void)polar_sdk_btstack_dispatch_event(packet_type, packet, &ops);
 
     uint8_t event_type = hci_event_packet_get_type(packet);
     if (event_type == BTSTACK_EVENT_STATE && btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
@@ -923,7 +923,7 @@ static int psftp_set_notify(gatt_client_characteristic_t *chr, gatt_client_notif
         .listening = listening,
     };
 
-    polar_ble_driver_gatt_notify_ops_t ops = {
+    polar_sdk_gatt_notify_ops_t ops = {
         .ctx = &ctx,
         .is_connected_ready = psftp_notify_is_connected_ready,
         .listener_active = psftp_notify_listener_active,
@@ -933,7 +933,7 @@ static int psftp_set_notify(gatt_client_characteristic_t *chr, gatt_client_notif
         .wait_complete = psftp_notify_wait_complete,
     };
 
-    polar_ble_driver_gatt_notify_runtime_args_t args = {
+    polar_sdk_gatt_notify_runtime_args_t args = {
         .ops = &ops,
         .has_value_handle = chr->value_handle != 0,
         .enable = enable,
@@ -949,23 +949,23 @@ static int psftp_set_notify(gatt_client_characteristic_t *chr, gatt_client_notif
         .cfg_done = &cfg_done,
     };
 
-    polar_ble_driver_gatt_notify_runtime_result_t r = polar_ble_driver_gatt_notify_runtime_set(&args);
-    if (r == POLAR_BLE_DRIVER_GATT_NOTIFY_RUNTIME_OK) {
+    polar_sdk_gatt_notify_runtime_result_t r = polar_sdk_gatt_notify_runtime_set(&args);
+    if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_OK) {
         return PSFTP_OP_OK;
     }
-    if (r == POLAR_BLE_DRIVER_GATT_NOTIFY_RUNTIME_NOT_CONNECTED) {
+    if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_NOT_CONNECTED) {
         return PSFTP_OP_NOT_CONNECTED;
     }
-    if (r == POLAR_BLE_DRIVER_GATT_NOTIFY_RUNTIME_TIMEOUT) {
+    if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_TIMEOUT) {
         return PSFTP_OP_TIMEOUT;
     }
-    if (r == POLAR_BLE_DRIVER_GATT_NOTIFY_RUNTIME_MISSING_CHAR) {
+    if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_MISSING_CHAR) {
         return PSFTP_OP_MISSING_CHAR;
     }
-    if (r == POLAR_BLE_DRIVER_GATT_NOTIFY_RUNTIME_NO_NOTIFY_PROP) {
+    if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_NO_NOTIFY_PROP) {
         return PSFTP_OP_NO_NOTIFY_PROP;
     }
-    if (r == POLAR_BLE_DRIVER_GATT_NOTIFY_RUNTIME_ATT_REJECTED) {
+    if (r == POLAR_SDK_GATT_NOTIFY_RUNTIME_ATT_REJECTED) {
         return cfg_att_status;
     }
     return PSFTP_OP_TRANSPORT;
@@ -1133,7 +1133,7 @@ static int psftp_prepare_channels(void) {
 
     if (!psftp_mtu_enabled) {
         int status = psftp_set_notify(&psftp_mtu_char, &psftp_mtu_listener, &psftp_mtu_listener_registered, true);
-        if (status > 0 && polar_ble_driver_pmd_att_status_requires_security((uint8_t)status)) {
+        if (status > 0 && polar_sdk_pmd_att_status_requires_security((uint8_t)status)) {
             if (!psftp_request_pairing_and_wait()) {
                 return connected ? PSFTP_OP_TIMEOUT : PSFTP_OP_NOT_CONNECTED;
             }
@@ -1184,14 +1184,14 @@ static bool psftp_execute_get(
 
     uint8_t proto_payload[320];
     size_t proto_len = 0;
-    if (!polar_ble_driver_psftp_encode_get_operation(path, strlen(path), proto_payload, sizeof(proto_payload), &proto_len)) {
+    if (!polar_sdk_psftp_encode_get_operation(path, strlen(path), proto_payload, sizeof(proto_payload), &proto_len)) {
         printf("[psftp-probe] encode GET failed path=%s\n", path);
         psftp_diag_finalize(&diag_before, false);
         return false;
     }
 
     uint8_t request_stream[322];
-    size_t request_len = polar_ble_driver_psftp_build_rfc60_request(
+    size_t request_len = polar_sdk_psftp_build_rfc60_request(
         proto_payload,
         proto_len,
         request_stream,
@@ -1223,19 +1223,19 @@ static bool psftp_execute_get(
 
     psftp_response_waiting = true;
     psftp_response_done = false;
-    psftp_response_result = POLAR_BLE_DRIVER_PSFTP_RX_MORE;
-    polar_ble_driver_psftp_rx_reset(&psftp_rx_state, out_buf, out_capacity);
+    psftp_response_result = POLAR_SDK_PSFTP_RX_MORE;
+    polar_sdk_psftp_rx_reset(&psftp_rx_state, out_buf, out_capacity);
 
     uint16_t frame_capacity = att_mtu <= 3 ? 20 : (uint16_t)(att_mtu - 3);
     uint8_t frame[520];
 
-    polar_ble_driver_psftp_tx_state_t tx;
-    polar_ble_driver_psftp_tx_init(&tx, request_stream, request_len);
+    polar_sdk_psftp_tx_state_t tx;
+    polar_sdk_psftp_tx_init(&tx, request_stream, request_len);
     write_packet_index = 0;
 
-    while (polar_ble_driver_psftp_tx_has_more(&tx)) {
+    while (polar_sdk_psftp_tx_has_more(&tx)) {
         bool is_last = false;
-        size_t frame_len = polar_ble_driver_psftp_tx_build_next_frame(
+        size_t frame_len = polar_sdk_psftp_tx_build_next_frame(
             &tx,
             frame_capacity,
             frame,
@@ -1281,7 +1281,7 @@ static bool psftp_execute_get(
 
     psftp_response_waiting = false;
 
-    if (psftp_response_result == POLAR_BLE_DRIVER_PSFTP_RX_COMPLETE) {
+    if (psftp_response_result == POLAR_SDK_PSFTP_RX_COMPLETE) {
         if (out_len) {
             *out_len = psftp_rx_state.length;
         }
@@ -1289,7 +1289,7 @@ static bool psftp_execute_get(
         return true;
     }
 
-    if (psftp_response_result == POLAR_BLE_DRIVER_PSFTP_RX_ERROR_FRAME) {
+    if (psftp_response_result == POLAR_SDK_PSFTP_RX_ERROR_FRAME) {
         if (out_error_code) {
             *out_error_code = psftp_rx_state.error_code;
         }
@@ -1353,16 +1353,16 @@ static bool run_psftp_round(void) {
         return false;
     }
 
-    polar_ble_driver_psftp_dir_entry_t entries[PSFTP_MAX_DIR_ENTRIES];
+    polar_sdk_psftp_dir_entry_t entries[PSFTP_MAX_DIR_ENTRIES];
     size_t entry_count = 0;
-    polar_ble_driver_psftp_dir_decode_result_t decode = polar_ble_driver_psftp_decode_directory(
+    polar_sdk_psftp_dir_decode_result_t decode = polar_sdk_psftp_decode_directory(
         psftp_dir_buf,
         dir_len,
         entries,
         PSFTP_MAX_DIR_ENTRIES,
         &entry_count);
 
-    if (decode != POLAR_BLE_DRIVER_PSFTP_DIR_DECODE_OK) {
+    if (decode != POLAR_SDK_PSFTP_DIR_DECODE_OK) {
         printf("[psftp-probe] directory decode failed result=%d len=%u\n", (int)decode, (unsigned)dir_len);
         return false;
     }
@@ -1372,7 +1372,7 @@ static bool run_psftp_round(void) {
         printf("  - %s (%" PRIu64 ")\n", entries[i].name, entries[i].size);
     }
 
-    const polar_ble_driver_psftp_dir_entry_t *target = NULL;
+    const polar_sdk_psftp_dir_entry_t *target = NULL;
     for (size_t i = 0; i < entry_count; ++i) {
         size_t nlen = strlen(entries[i].name);
         if (nlen == 0 || entries[i].name[nlen - 1] == '/') {
@@ -1496,8 +1496,8 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
     (void)channel;
     (void)size;
 
-    polar_ble_driver_btstack_value_event_t raw_value;
-    if (polar_ble_driver_btstack_decode_value_event(packet_type, packet, &raw_value) &&
+    polar_sdk_btstack_value_event_t raw_value;
+    if (polar_sdk_btstack_decode_value_event(packet_type, packet, &raw_value) &&
         connected && conn_handle != HCI_CON_HANDLE_INVALID && raw_value.handle == conn_handle) {
         raw_value_events_total += 1;
 
@@ -1523,7 +1523,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 #endif
     }
 
-    polar_ble_driver_btstack_gatt_route_state_t route_state = {
+    polar_sdk_btstack_gatt_route_state_t route_state = {
         .conn_handle = conn_handle,
         .connected = connected,
         .hr_value_handle = 0,
@@ -1538,10 +1538,10 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
         .psftp_d2h_listening = psftp_d2h_listener_registered,
     };
 
-    polar_ble_driver_btstack_gatt_route_result_t route;
-    bool routed = polar_ble_driver_btstack_route_gatt_event(packet_type, packet, &route_state, &route);
+    polar_sdk_btstack_gatt_route_result_t route;
+    bool routed = polar_sdk_btstack_route_gatt_event(packet_type, packet, &route_state, &route);
     if (routed) {
-        if (route.kind == POLAR_BLE_DRIVER_GATT_ROUTE_MTU_EVENT) {
+        if (route.kind == POLAR_SDK_GATT_ROUTE_MTU_EVENT) {
             if (route.mtu.handle == conn_handle) {
                 att_mtu = route.mtu.mtu;
                 printf("[psftp-probe] ATT MTU event mtu=%u\n", att_mtu);
@@ -1549,11 +1549,11 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
             return;
         }
 
-        if (route.kind == POLAR_BLE_DRIVER_GATT_ROUTE_PSFTP_MTU_VALUE) {
+        if (route.kind == POLAR_SDK_GATT_ROUTE_PSFTP_MTU_VALUE) {
             routed_psftp_mtu_total += 1;
             psftp_rx_frames_total += 1;
             if (psftp_response_waiting) {
-                psftp_response_result = polar_ble_driver_psftp_rx_feed_frame(
+                psftp_response_result = polar_sdk_psftp_rx_feed_frame(
                     &psftp_rx_state,
                     route.value.value,
                     route.value.value_len);
@@ -1562,11 +1562,11 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                        (int)psftp_response_result);
                 print_hex_prefix(route.value.value, route.value.value_len, H10_PSFTP_RX_HEX_DUMP_BYTES);
                 printf("\n");
-                if (psftp_response_result == POLAR_BLE_DRIVER_PSFTP_RX_COMPLETE ||
-                    psftp_response_result == POLAR_BLE_DRIVER_PSFTP_RX_ERROR_FRAME ||
-                    psftp_response_result == POLAR_BLE_DRIVER_PSFTP_RX_SEQUENCE_ERROR ||
-                    psftp_response_result == POLAR_BLE_DRIVER_PSFTP_RX_PROTOCOL_ERROR ||
-                    psftp_response_result == POLAR_BLE_DRIVER_PSFTP_RX_OVERFLOW) {
+                if (psftp_response_result == POLAR_SDK_PSFTP_RX_COMPLETE ||
+                    psftp_response_result == POLAR_SDK_PSFTP_RX_ERROR_FRAME ||
+                    psftp_response_result == POLAR_SDK_PSFTP_RX_SEQUENCE_ERROR ||
+                    psftp_response_result == POLAR_SDK_PSFTP_RX_PROTOCOL_ERROR ||
+                    psftp_response_result == POLAR_SDK_PSFTP_RX_OVERFLOW) {
                     psftp_response_done = true;
                     psftp_response_waiting = false;
                 }
@@ -1574,7 +1574,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
             return;
         }
 
-        if (route.kind == POLAR_BLE_DRIVER_GATT_ROUTE_PSFTP_D2H_VALUE) {
+        if (route.kind == POLAR_SDK_GATT_ROUTE_PSFTP_D2H_VALUE) {
             routed_psftp_d2h_total += 1;
             printf("[psftp-probe] routed D2H value len=%u hex=", route.value.value_len);
             print_hex_prefix(route.value.value, route.value.value_len, H10_PSFTP_RX_HEX_DUMP_BYTES);
@@ -1582,7 +1582,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
             return;
         }
 
-        if (route.kind == POLAR_BLE_DRIVER_GATT_ROUTE_QUERY_COMPLETE) {
+        if (route.kind == POLAR_SDK_GATT_ROUTE_QUERY_COMPLETE) {
             routed_query_complete_total += 1;
 
             uint16_t qc_service_id = gatt_event_query_complete_get_service_id(packet);
@@ -1644,14 +1644,14 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
     switch (app_state) {
         case APP_W4_PSFTP_SERVICE: {
             gatt_client_service_t svc;
-            if (polar_ble_driver_btstack_decode_service_query_result(packet_type, packet, &svc)) {
-                polar_ble_driver_disc_service_kind_t kind = polar_ble_driver_btstack_classify_service(
+            if (polar_sdk_btstack_decode_service_query_result(packet_type, packet, &svc)) {
+                polar_sdk_disc_service_kind_t kind = polar_sdk_btstack_classify_service(
                     svc.uuid16,
                     svc.uuid128,
                     ORG_BLUETOOTH_SERVICE_HEART_RATE,
                     PSFTP_SERVICE_UUID16,
                     UUID_PMD_SERVICE_BE);
-                if (kind == POLAR_BLE_DRIVER_DISC_SERVICE_PSFTP) {
+                if (kind == POLAR_SDK_DISC_SERVICE_PSFTP) {
                     psftp_service = svc;
                     psftp_service_found = true;
                     printf("[psftp-probe] PSFTP service found start=0x%04x end=0x%04x\n",
@@ -1661,7 +1661,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
             }
 
             uint8_t att_status = ATT_ERROR_SUCCESS;
-            if (polar_ble_driver_btstack_decode_query_complete_att_status(packet_type, packet, &att_status)) {
+            if (polar_sdk_btstack_decode_query_complete_att_status(packet_type, packet, &att_status)) {
                 printf("[psftp-probe] PSFTP service discovery complete att=0x%02x found=%d\n",
                        att_status,
                        psftp_service_found ? 1 : 0);
@@ -1689,9 +1689,9 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
         case APP_W4_PSFTP_CHARS: {
             gatt_client_characteristic_t chr;
-            if (polar_ble_driver_btstack_decode_characteristic_query_result(packet_type, packet, &chr)) {
-                polar_ble_driver_disc_char_kind_t kind = polar_ble_driver_btstack_classify_char(
-                    POLAR_BLE_DRIVER_DISC_STAGE_PSFTP_CHARS,
+            if (polar_sdk_btstack_decode_characteristic_query_result(packet_type, packet, &chr)) {
+                polar_sdk_disc_char_kind_t kind = polar_sdk_btstack_classify_char(
+                    POLAR_SDK_DISC_STAGE_PSFTP_CHARS,
                     chr.uuid16,
                     chr.uuid128,
                     ORG_BLUETOOTH_CHARACTERISTIC_HEART_RATE_MEASUREMENT,
@@ -1701,15 +1701,15 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     UUID_PSFTP_D2H_BE,
                     UUID_PSFTP_H2D_BE);
 
-                if (kind == POLAR_BLE_DRIVER_DISC_CHAR_PSFTP_MTU) {
+                if (kind == POLAR_SDK_DISC_CHAR_PSFTP_MTU) {
                     psftp_mtu_char = chr;
                     psftp_mtu_found = true;
                     printf("[psftp-probe] PSFTP MTU char value=0x%04x props=0x%02x\n", chr.value_handle, chr.properties);
-                } else if (kind == POLAR_BLE_DRIVER_DISC_CHAR_PSFTP_D2H) {
+                } else if (kind == POLAR_SDK_DISC_CHAR_PSFTP_D2H) {
                     psftp_d2h_char = chr;
                     psftp_d2h_found = true;
                     printf("[psftp-probe] PSFTP D2H char value=0x%04x props=0x%02x\n", chr.value_handle, chr.properties);
-                } else if (kind == POLAR_BLE_DRIVER_DISC_CHAR_PSFTP_H2D) {
+                } else if (kind == POLAR_SDK_DISC_CHAR_PSFTP_H2D) {
                     psftp_h2d_char = chr;
                     psftp_h2d_found = true;
                     printf("[psftp-probe] PSFTP H2D char value=0x%04x props=0x%02x\n", chr.value_handle, chr.properties);
@@ -1717,7 +1717,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
             }
 
             uint8_t att_status = ATT_ERROR_SUCCESS;
-            if (polar_ble_driver_btstack_decode_query_complete_att_status(packet_type, packet, &att_status)) {
+            if (polar_sdk_btstack_decode_query_complete_att_status(packet_type, packet, &att_status)) {
                 printf("[psftp-probe] PSFTP char discovery complete att=0x%02x mtu=%d d2h=%d h2d=%d\n",
                        att_status,
                        psftp_mtu_found ? 1 : 0,
@@ -1819,9 +1819,9 @@ int main(void) {
     l2cap_init();
     sm_init();
     gatt_client_init();
-    polar_ble_driver_btstack_sm_apply_default_auth_policy();
+    polar_sdk_btstack_sm_apply_default_auth_policy();
 
-    polar_ble_driver_runtime_link_init(&runtime_link, HCI_CON_HANDLE_INVALID);
+    polar_sdk_runtime_link_init(&runtime_link, HCI_CON_HANDLE_INVALID);
     psftp_diag_reset();
 
     hci_event_cb.callback = &hci_packet_handler;

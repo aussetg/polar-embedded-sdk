@@ -1,6 +1,10 @@
 # Documentation conventions
 
-This repository’s `docs/` directory is intended to be the **primary guide** for implementing and validating the Polar H10 driver.
+This repository’s `docs/` directory is intended to be the **primary guide** for implementing and validating the Polar H10 stack.
+
+Terminology used in this repo:
+- **SDK core**: the Polar-specific, BTstack-backed C core under `polar_sdk/core/`.
+- **MicroPython binding**: the `polar_sdk` user module under `polar_sdk/mpy/`.
 
 ## 1) Document types (and what is “canonical”)
 
@@ -42,11 +46,11 @@ It is not a roadmap; it should remain factual and help debugging/validation.
 - When adding new protocol facts, prefer **the official Polar BLE SDK** (https://github.com/polarofficial/polar-ble-sdk).
 - Keep a clear separation between:
   - **observations** (what we measured on hardware), and
-  - **requirements** (what the driver must do).
+  - **requirements** (what the SDK core / module must do).
 
 ## 3) Naming and dating
 
-- Stable documents: `snake_case.md` (e.g. `micropython_polar_sdk_driver.md`).
+- Stable documents: `snake_case.md` (e.g. `micropython_polar_sdk.md`).
 - Prefer a short header block in key docs:
   - `Status:` (Draft / Active / Stable)
   - `Last updated:` (YYYY-MM-DD)

@@ -1,6 +1,6 @@
 # polar-embedded-sdk
 
-This repository is building towards an **unofficial embedded reimplementation of Polar BLE SDK protocols** for **microcontrollers**, with a **portable C driver core** and a **MicroPython `rp2` binding**.
+This repository is building towards an **unofficial embedded reimplementation of Polar BLE SDK protocols** for **microcontrollers**, with a **portable C SDK core** (Polar-specific, BTstack-backed) and a **MicroPython `rp2` binding**.
 
 Current primary development target: **Polar H10** on **RP2** (current hardware: **RP2-1**, based on **Pimoroni Pico Plus 2 W / RP2350B + CYW43**) using **BTstack**.
 
@@ -19,12 +19,12 @@ However, thanks to a combination of sunk-cost fallacy, not wanting to work on th
 
 If you somehow are facing the same problem and this library doesn't suit your needs I highly recommend you consider just using an Android device. However if you end up using this library for Academic research I would be very grateful if you did indeed cite it.
 
-## Where is the driver?
+## Where is the SDK / core?
 
 The intended deliverable lives under:
 
-- `polar_ble/driver/` — portable C driver (no MicroPython types)
-- `polar_ble/mpy/` — MicroPython binding layer (C module glue)
+- `polar_sdk/core/` — portable C **SDK core** (no MicroPython types). This is the Polar-specific, BTstack-backed core layer.
+- `polar_sdk/mpy/` — MicroPython binding layer (C module glue)
 
 Current status: active implementation (transport, HR, PMD ECG/IMU, and initial PSFTP read-only APIs are in-tree).
 

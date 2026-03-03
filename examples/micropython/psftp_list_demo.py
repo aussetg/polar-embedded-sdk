@@ -1,9 +1,9 @@
 import time
-import polar_ble
+import polar_sdk
 
 TARGET_DIR = "/"
 
-h10 = polar_ble.H10(required_services=polar_ble.SERVICE_PSFTP)
+h10 = polar_sdk.H10(required_services=polar_sdk.SERVICE_PSFTP)
 
 try:
     print("connecting...")

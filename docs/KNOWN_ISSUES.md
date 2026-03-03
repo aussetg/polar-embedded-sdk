@@ -3,7 +3,7 @@
 Status: Living document
 Last updated: 2026-03-03
 
-This file collects **confirmed, user-visible issues** encountered while developing the Polar H10 driver on **Pico 2 W (RP2350 + CYW43)** using **BTstack**.
+This file collects **confirmed, user-visible issues** encountered while developing the Polar H10 stack (SDK core + MicroPython module) on **Pico 2 W (RP2350 + CYW43)** using **BTstack**.
 
 Rules:
 - Keep entries **actionable** (symptoms → how to confirm → mitigations).
@@ -23,7 +23,7 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 - Stalls were often seen within ~10–60 seconds in some MicroPython-driven runs.
 
 ### How to confirm
-- Inspect driver telemetry (`stats()`):
+- Inspect telemetry (`stats()`), which is exposed by the MicroPython module but largely sourced from the SDK core:
   - `last_disconnect_reason == 0x08`, or equivalent counter.
 - If you have a sniffer capture, the on-air signature is consistent with supervision timeout expiry (no graceful LL terminate, followed by empty PDUs and then silence).
 
@@ -65,7 +65,7 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 - `stats()` indicates CCC write failure (ATT status 5) and encryption key size remains 0.
 
 ### Mitigations / best practices
-- The driver must treat ATT `0x05` / `0x08` (insufficient auth/authorization) as a **signal to initiate pairing/encryption and retry**.
+- The SDK core (and therefore the MicroPython module) must treat ATT `0x05` / `0x08` (insufficient auth/authorization) as a **signal to initiate pairing/encryption and retry**.
 - Ensure MTU negotiation is performed before starting high-throughput PMD streams.
 - If pairing is intermittent across fresh sessions, try clearing the bond state (both sides) and re-pairing.
 
@@ -89,7 +89,7 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 ### Mitigations / best practices
 - Initialize SM auth policy consistently in all entry points (MicroPython binding + probes/examples).
 - Use the shared helper in this repo:
-  - `polar_ble_driver_btstack_sm_apply_default_auth_policy()`
+  - `polar_sdk_btstack_sm_apply_default_auth_policy()`
 - Keep reconnect-on-security-failure behavior and explicit diagnostics in place for regressions.
 
 ### Current state

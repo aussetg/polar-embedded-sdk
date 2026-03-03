@@ -1,8 +1,8 @@
-import polar_ble
+import polar_sdk
 import time
 
-h10 = polar_ble.H10(name_prefix="Polar")
-print("version", polar_ble.version())
+h10 = polar_sdk.H10(name_prefix="Polar")
+print("version", polar_sdk.version())
 
 try:
     h10.connect(timeout_ms=10000)
@@ -15,7 +15,7 @@ try:
     while time.ticks_diff(time.ticks_ms(), t0) < 15000:
         try:
             s = h10.read_hr(timeout_ms=500)
-        except polar_ble.NotConnectedError as exc:
+        except polar_sdk.NotConnectedError as exc:
             print("read stopped:", exc)
             break
         if s is not None:
@@ -26,7 +26,7 @@ try:
 
     try:
         h10.stop_hr()
-    except polar_ble.NotConnectedError:
+    except polar_sdk.NotConnectedError:
         pass
 finally:
     h10.disconnect()

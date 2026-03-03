@@ -7,7 +7,7 @@
 
 import time
 import struct
-import polar_ble
+import polar_sdk
 
 try:
     import machine
@@ -420,9 +420,9 @@ def yq_pop():
 
 
 # ---------- Polar ----------
-h10 = polar_ble.H10(
+h10 = polar_sdk.H10(
     name_prefix="Polar",
-    required_services=(polar_ble.SERVICE_HR | polar_ble.SERVICE_ECG),
+    required_services=(polar_sdk.SERVICE_HR | polar_sdk.SERVICE_ECG),
 )
 
 last_hr = 0
@@ -479,7 +479,7 @@ def try_start_ecg(now):
         pass
 
 
-print("polar_ble", polar_ble.version())
+print("polar_sdk", polar_sdk.version())
 print("display", display_name, WIDTH, "x", HEIGHT)
 
 try:

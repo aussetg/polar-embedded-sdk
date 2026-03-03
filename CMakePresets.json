@@ -11,11 +11,11 @@
       "hidden": true,
       "binaryDir": "${fileDir}/build/${presetName}",
       "cacheVariables": {
-        "POLAR_BLE_ENABLE_HR": "ON",
-        "POLAR_BLE_ENABLE_ECG": "ON",
-        "POLAR_BLE_ENABLE_PSFTP": "ON",
-        "POLAR_BLE_VERIFY_MICROPY_PATCHES": "ON",
-        "POLAR_BLE_AUTO_APPLY_PATCHES": "ON",
+        "POLAR_ENABLE_HR": "ON",
+        "POLAR_ENABLE_ECG": "ON",
+        "POLAR_ENABLE_PSFTP": "ON",
+        "POLAR_VERIFY_MICROPY_PATCHES": "ON",
+        "POLAR_AUTO_APPLY_PATCHES": "ON",
         "PICO_BUILD_DOCS": "0",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
@@ -30,54 +30,54 @@
     },
     {
       "name": "fw-pico2w",
-      "displayName": "Firmware Pico 2 W: polar module",
+      "displayName": "Firmware Pico 2 W: polar_sdk module",
       "inherits": ["_fw-rp2-release"],
       "binaryDir": "${fileDir}/build/mpy-pico2w",
       "cacheVariables": {
         "MICROPY_BOARD": "RPI_PICO2_W",
         "MICROPY_BOARD_DIR": "${fileDir}/vendors/micropython/ports/rp2/boards/RPI_PICO2_W",
-        "USER_C_MODULES": "${fileDir}/polar_ble/mpy",
-        "POLAR_BLE_BUILD_PRESET_NAME": "fw-pico2w",
-        "POLAR_BLE_ARTIFACTS_PROFILE": "fw-pico2w"
+        "USER_C_MODULES": "${fileDir}/polar_sdk/mpy",
+        "POLAR_BUILD_PRESET_NAME": "fw-pico2w",
+        "POLAR_ARTIFACTS_PROFILE": "fw-pico2w"
       }
     },
     {
       "name": "fw-pico2w-picographics",
-      "displayName": "Firmware Pico 2 W: polar + minimal Pimoroni picographics",
+      "displayName": "Firmware Pico 2 W: polar_sdk + minimal Pimoroni picographics",
       "inherits": ["_fw-rp2-release"],
       "binaryDir": "${fileDir}/build/mpy-pico2w-picographics",
       "cacheVariables": {
         "MICROPY_BOARD": "RPI_PICO2_W",
         "MICROPY_BOARD_DIR": "${fileDir}/vendors/micropython/ports/rp2/boards/RPI_PICO2_W",
-        "USER_C_MODULES": "${fileDir}/polar_ble/mpy;${fileDir}/firmware/cmake/pimoroni_minimal.cmake",
+        "USER_C_MODULES": "${fileDir}/polar_sdk/mpy;${fileDir}/firmware/cmake/pimoroni_minimal.cmake",
         "MICROPY_C_HEAP_SIZE": "8192",
-        "POLAR_BLE_BUILD_PRESET_NAME": "fw-pico2w-picographics",
-        "POLAR_BLE_ARTIFACTS_PROFILE": "fw-pico2w-picographics"
+        "POLAR_BUILD_PRESET_NAME": "fw-pico2w-picographics",
+        "POLAR_ARTIFACTS_PROFILE": "fw-pico2w-picographics"
       }
     },
     {
       "name": "fw-rp2-1",
-      "displayName": "Firmware RP2-1: polar module",
+      "displayName": "Firmware RP2-1: polar_sdk module",
       "inherits": ["_fw-rp2-release"],
       "binaryDir": "${fileDir}/build/mpy-rp2-1",
       "cacheVariables": {
         "MICROPY_BOARD": "RP2_1",
         "MICROPY_BOARD_DIR": "${fileDir}/firmware/boards/RP2_1",
         "MICROPY_C_HEAP_SIZE": "8192",
-        "USER_C_MODULES": "${fileDir}/polar_ble/mpy;${fileDir}/firmware/cmake/pimoroni_rtc_minimal.cmake",
-        "POLAR_BLE_BUILD_PRESET_NAME": "fw-rp2-1",
-        "POLAR_BLE_ARTIFACTS_PROFILE": "fw-rp2-1"
+        "USER_C_MODULES": "${fileDir}/polar_sdk/mpy;${fileDir}/firmware/cmake/pimoroni_rtc_minimal.cmake",
+        "POLAR_BUILD_PRESET_NAME": "fw-rp2-1",
+        "POLAR_ARTIFACTS_PROFILE": "fw-rp2-1"
       }
     },
     {
       "name": "fw-rp2-1-debug",
-      "displayName": "Firmware RP2-1: polar module (debug)",
+      "displayName": "Firmware RP2-1: polar_sdk module (debug)",
       "inherits": ["fw-rp2-1"],
       "binaryDir": "${fileDir}/build/mpy-rp2-1-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "POLAR_BLE_BUILD_PRESET_NAME": "fw-rp2-1-debug",
-        "POLAR_BLE_ARTIFACTS_PROFILE": "fw-rp2-1-debug"
+        "POLAR_BUILD_PRESET_NAME": "fw-rp2-1-debug",
+        "POLAR_ARTIFACTS_PROFILE": "fw-rp2-1-debug"
       }
     }
   ],
@@ -106,7 +106,7 @@
   "workflowPresets": [
     {
       "name": "wf-fw-pico2w",
-      "displayName": "Configure+build Pico 2 W polar firmware",
+      "displayName": "Configure+build Pico 2 W polar_sdk firmware",
       "steps": [
         {
           "type": "configure",
@@ -134,7 +134,7 @@
     },
     {
       "name": "wf-fw-rp2-1",
-      "displayName": "Configure+build RP2-1 polar firmware",
+      "displayName": "Configure+build RP2-1 polar_sdk firmware",
       "steps": [
         {
           "type": "configure",
@@ -148,7 +148,7 @@
     },
     {
       "name": "wf-fw-rp2-1-debug",
-      "displayName": "Configure+build RP2-1 polar firmware (debug)",
+      "displayName": "Configure+build RP2-1 polar_sdk firmware (debug)",
       "steps": [
         {
           "type": "configure",

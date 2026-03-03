@@ -1,7 +1,7 @@
 # ECG streaming demo: connect, start ECG, stream for a fixed window, stop.
 
 import time
-import polar_ble
+import polar_sdk
 
 DURATION_S = 120
 READ_MAX_BYTES = 1024
@@ -9,8 +9,8 @@ READ_TIMEOUT_MS = 1000
 STATS_PERIOD_MS = 10000
 STALE_DATA_TIMEOUT_MS = 5000
 
-h10 = polar_ble.H10(name_prefix="Polar", required_services=polar_ble.SERVICE_ECG)
-print("version", polar_ble.version())
+h10 = polar_sdk.H10(name_prefix="Polar", required_services=polar_sdk.SERVICE_ECG)
+print("version", polar_sdk.version())
 print("required services", h10.required_services())
 
 bytes_total = 0
@@ -30,7 +30,7 @@ try:
     while time.ticks_diff(time.ticks_ms(), start_ms) < DURATION_S * 1000:
         try:
             chunk = h10.read_ecg(max_bytes=READ_MAX_BYTES, timeout_ms=READ_TIMEOUT_MS)
-        except polar_ble.NotConnectedError as exc:
+        except polar_sdk.NotConnectedError as exc:
             print("read stopped (not connected):", exc)
             break
 
@@ -71,7 +71,7 @@ try:
     try:
         h10.stop_ecg()
         print("ecg stopped")
-    except polar_ble.NotConnectedError:
+    except polar_sdk.NotConnectedError:
         pass
 finally:
     h10.disconnect()

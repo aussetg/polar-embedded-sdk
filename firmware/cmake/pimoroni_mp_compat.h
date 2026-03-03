@@ -1,5 +1,5 @@
-#ifndef POLAR_BLE_PIMORONI_MP_COMPAT_H
-#define POLAR_BLE_PIMORONI_MP_COMPAT_H
+#ifndef POLAR_SDK_PIMORONI_MP_COMPAT_H
+#define POLAR_SDK_PIMORONI_MP_COMPAT_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,4 +14,4 @@ static inline void mp_handle_pending(bool behavior_bool) {
 }
 #endif
 
-#endif // POLAR_BLE_PIMORONI_MP_COMPAT_H
+#endif // POLAR_SDK_PIMORONI_MP_COMPAT_H

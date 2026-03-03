@@ -1,8 +1,8 @@
-import polar_ble
+import polar_sdk
 import time
 
-h10 = polar_ble.H10(name_prefix="Polar")
-print("version", polar_ble.version())
+h10 = polar_sdk.H10(name_prefix="Polar")
+print("version", polar_sdk.version())
 
 try:
     h10.connect(timeout_ms=10000)

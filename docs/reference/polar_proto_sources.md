@@ -42,6 +42,6 @@ If you want to decode downloaded exercise files (e.g. `BASE.BPB`, `SAMPLES.BPB`,
 
 Generated nanopb outputs (`*.pb.c`, `*.pb.h`) are **build artifacts** and are not currently committed.
 
-The driver spec/task plan assumes we will:
+The SDK/Module spec and task plan assume we will:
 - keep `.proto` sources referenced from the Polar BLE SDK repository,
 - generate nanopb C sources during development/build into a dedicated generated directory.

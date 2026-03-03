@@ -18,43 +18,43 @@ pico_sdk_init()
 
 add_executable(h10_btstack_probe
     main.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_common.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_connect.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_transport.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_wait.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_runtime.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_runtime_context.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_transport_adapter.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_link.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_gatt.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_gatt_route.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_helpers.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_scan.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_adv_runtime.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_sm.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_sm_control.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_btstack_dispatch.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_orchestrator.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_dispatch.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_runtime.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_btstack_runtime.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_discovery_apply.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_control.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_notify_runtime.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_query_complete.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_gatt_write.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_hr.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_ecg.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_imu.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd_control.c
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/src/polar_ble_driver_pmd_start.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_common.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_connect.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_transport.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_wait.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_runtime_context.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_transport_adapter.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_link.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_gatt.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_gatt_route.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_helpers.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_scan.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_adv_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_sm.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_sm_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_dispatch.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_discovery.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_discovery_orchestrator.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_discovery_dispatch.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_discovery_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_discovery_btstack_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_discovery_apply.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_notify_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_query_complete.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_gatt_write.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_hr.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_ecg.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_imu.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_pmd.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_pmd_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_pmd_start.c
 )
 
 target_include_directories(h10_btstack_probe PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
-    ${CMAKE_CURRENT_LIST_DIR}/../../polar_ble/driver/include
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/include
 )
 
 target_link_libraries(h10_btstack_probe
@@ -68,7 +68,7 @@ target_link_libraries(h10_btstack_probe
 set(H10_TARGET_ADDR "24:AC:AC:05:A3:10" CACHE STRING "Target H10 BLE address")
 set(H10_FORCE_PAIRING "0" CACHE STRING "Call sm_request_pairing() after connect")
 set(H10_ENABLE_HR "1" CACHE STRING "Enable HR service discovery + notify")
-set(H10_ENABLE_ECG_POLICY "1" CACHE STRING "Enable shared-driver PMD ECG start policy run")
+set(H10_ENABLE_ECG_POLICY "1" CACHE STRING "Enable shared-sdk PMD ECG start policy run")
 set(H10_POST_CONNECT_UPDATE "1" CACHE STRING "Use gap_update_connection_parameters after connect")
 set(H10_POST_CONNECT_CONN_INTERVAL_MIN "24" CACHE STRING "Conn interval min (1.25ms units)")
 set(H10_POST_CONNECT_CONN_INTERVAL_MAX "24" CACHE STRING "Conn interval max (1.25ms units)")
