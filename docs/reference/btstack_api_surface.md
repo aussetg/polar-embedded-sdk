@@ -203,6 +203,14 @@ Current runtime policy note:
 - `ERROR_CODE_SUCCESS`
 - `sscanf_bd_addr`
 
+## Runtime observability snapshot
+
+The module now exposes a compile-time BTstack config snapshot in:
+- `polar_sdk.build_info()["btstack_config"]`
+- `h10.stats()["btstack_config"]`
+
+This is intended to make field logs self-describing when behavior differs due to config flags/pool sizes.
+
 ## Upgrade-sensitive checkpoints
 
 When bumping BTstack, verify at minimum:

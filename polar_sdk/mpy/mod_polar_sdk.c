@@ -2740,6 +2740,120 @@ static mp_obj_t polar_h10_required_services(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_required_services_obj, polar_h10_required_services);
 
+#if POLAR_SDK_HAS_BTSTACK
+static uint32_t polar_btstack_cfg_feature_mask(void) {
+    uint32_t mask = 0;
+    #if defined(ENABLE_LE_CENTRAL)
+    mask |= (1u << 0);
+    #endif
+    #if defined(ENABLE_LE_PERIPHERAL)
+    mask |= (1u << 1);
+    #endif
+    #if defined(ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL)
+    mask |= (1u << 2);
+    #endif
+    #if defined(ENABLE_LOG_INFO)
+    mask |= (1u << 3);
+    #endif
+    #if defined(ENABLE_LOG_ERROR)
+    mask |= (1u << 4);
+    #endif
+    #if defined(ENABLE_LOG_DEBUG)
+    mask |= (1u << 5);
+    #endif
+    return mask;
+}
+
+static mp_obj_t polar_btstack_config_snapshot_dict(void) {
+    mp_obj_t dict = mp_obj_new_dict(24);
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_feature_mask), mp_obj_new_int_from_uint(polar_btstack_cfg_feature_mask()));
+
+    #if defined(ENABLE_LE_CENTRAL)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_le_central), mp_const_true);
+    #else
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_le_central), mp_const_false);
+    #endif
+
+    #if defined(ENABLE_LE_PERIPHERAL)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_le_peripheral), mp_const_true);
+    #else
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_le_peripheral), mp_const_false);
+    #endif
+
+    #if defined(ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_hci_controller_to_host_flow_control), mp_const_true);
+    #else
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_hci_controller_to_host_flow_control), mp_const_false);
+    #endif
+
+    #if defined(ENABLE_LOG_INFO)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_log_info), mp_const_true);
+    #else
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_log_info), mp_const_false);
+    #endif
+
+    #if defined(ENABLE_LOG_ERROR)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_log_error), mp_const_true);
+    #else
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_log_error), mp_const_false);
+    #endif
+
+    #if defined(ENABLE_LOG_DEBUG)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_log_debug), mp_const_true);
+    #else
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_enable_log_debug), mp_const_false);
+    #endif
+
+    #if defined(HCI_ACL_PAYLOAD_SIZE)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_hci_acl_payload_size), mp_obj_new_int_from_uint((uint32_t)HCI_ACL_PAYLOAD_SIZE));
+    #endif
+    #if defined(HCI_HOST_ACL_PACKET_LEN)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_hci_host_acl_packet_len), mp_obj_new_int_from_uint((uint32_t)HCI_HOST_ACL_PACKET_LEN));
+    #endif
+    #if defined(HCI_HOST_ACL_PACKET_NUM)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_hci_host_acl_packet_num), mp_obj_new_int_from_uint((uint32_t)HCI_HOST_ACL_PACKET_NUM));
+    #endif
+    #if defined(MAX_NR_HCI_CONNECTIONS)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_hci_connections), mp_obj_new_int_from_uint((uint32_t)MAX_NR_HCI_CONNECTIONS));
+    #endif
+    #if defined(MAX_NR_GATT_CLIENTS)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_gatt_clients), mp_obj_new_int_from_uint((uint32_t)MAX_NR_GATT_CLIENTS));
+    #endif
+    #if defined(MAX_NR_L2CAP_CHANNELS)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_l2cap_channels), mp_obj_new_int_from_uint((uint32_t)MAX_NR_L2CAP_CHANNELS));
+    #endif
+    #if defined(MAX_NR_L2CAP_SERVICES)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_l2cap_services), mp_obj_new_int_from_uint((uint32_t)MAX_NR_L2CAP_SERVICES));
+    #endif
+    #if defined(MAX_NR_SM_LOOKUP_ENTRIES)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_sm_lookup_entries), mp_obj_new_int_from_uint((uint32_t)MAX_NR_SM_LOOKUP_ENTRIES));
+    #endif
+    #if defined(MAX_NR_WHITELIST_ENTRIES)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_whitelist_entries), mp_obj_new_int_from_uint((uint32_t)MAX_NR_WHITELIST_ENTRIES));
+    #endif
+    #if defined(MAX_NR_LE_DEVICE_DB_ENTRIES)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_le_device_db_entries), mp_obj_new_int_from_uint((uint32_t)MAX_NR_LE_DEVICE_DB_ENTRIES));
+    #endif
+    #if defined(MAX_NR_CONTROLLER_ACL_BUFFERS)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_controller_acl_buffers), mp_obj_new_int_from_uint((uint32_t)MAX_NR_CONTROLLER_ACL_BUFFERS));
+    #endif
+    #if defined(NVM_NUM_DEVICE_DB_ENTRIES)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_nvm_num_device_db_entries), mp_obj_new_int_from_uint((uint32_t)NVM_NUM_DEVICE_DB_ENTRIES));
+    #endif
+    #if defined(NVM_NUM_LINK_KEYS)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_nvm_num_link_keys), mp_obj_new_int_from_uint((uint32_t)NVM_NUM_LINK_KEYS));
+    #endif
+    #if defined(MAX_ATT_DB_SIZE)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_att_db_size), mp_obj_new_int_from_uint((uint32_t)MAX_ATT_DB_SIZE));
+    #endif
+    #if defined(HCI_RESET_RESEND_TIMEOUT_MS)
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_hci_reset_resend_timeout_ms), mp_obj_new_int_from_uint((uint32_t)HCI_RESET_RESEND_TIMEOUT_MS));
+    #endif
+
+    return dict;
+}
+#endif
+
 static mp_obj_t polar_h10_stats(mp_obj_t self_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
@@ -2754,6 +2868,7 @@ static mp_obj_t polar_h10_stats(mp_obj_t self_in) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_required_services), mp_obj_new_int_from_uint(self->required_services_mask));
 
 #if POLAR_SDK_HAS_BTSTACK
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_config), polar_btstack_config_snapshot_dict());
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_polar_conn_handle), mp_obj_new_int_from_uint(self->runtime_link.conn_handle));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_connect_attempts_total), mp_obj_new_int_from_uint(self->connect_attempts_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_connect_success_total), mp_obj_new_int_from_uint(self->connect_success_total));
@@ -4022,7 +4137,7 @@ static mp_obj_t polar_version(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(polar_version_obj, polar_version);
 
 static mp_obj_t polar_build_info(void) {
-    mp_obj_t dict = mp_obj_new_dict(10);
+    mp_obj_t dict = mp_obj_new_dict(11);
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_version), mp_obj_new_str("0.1.0-dev", 9));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_git_sha), mp_obj_new_str(POLAR_BUILD_GIT_SHA, strlen(POLAR_BUILD_GIT_SHA)));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_git_dirty), mp_obj_new_str(POLAR_BUILD_GIT_DIRTY, strlen(POLAR_BUILD_GIT_DIRTY)));
@@ -4032,6 +4147,9 @@ static mp_obj_t polar_build_info(void) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_feature_hr), mp_obj_new_int(POLAR_CFG_ENABLE_HR));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_feature_ecg), mp_obj_new_int(POLAR_CFG_ENABLE_ECG));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_feature_psftp), mp_obj_new_int(POLAR_CFG_ENABLE_PSFTP));
+    #if POLAR_SDK_HAS_BTSTACK
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_config), polar_btstack_config_snapshot_dict());
+    #endif
     return dict;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(polar_build_info_obj, polar_build_info);
