@@ -1,24 +1,18 @@
 [submodule "vendors/micropython"]
 	path = vendors/micropython
 	url = https://github.com/micropython/micropython.git
-	shallow = true
 [submodule "vendors/nanopb"]
 	path = vendors/nanopb
 	url = https://github.com/nanopb/nanopb.git
-	shallow = true
 [submodule "vendors/pimoroni-pico"]
 	path = vendors/pimoroni-pico
 	url = https://github.com/pimoroni/pimoroni-pico.git
-	shallow = true
 [submodule "vendors/btstack"]
 	path = vendors/btstack
 	url = https://github.com/bluekitchen/btstack.git
-	shallow = true
 [submodule "vendors/pico-sdk"]
 	path = vendors/pico-sdk
 	url = https://github.com/raspberrypi/pico-sdk.git
-	shallow = true
 [submodule "vendors/polar-ble-sdk"]
 	path = vendors/polar-ble-sdk
 	url = https://github.com/polarofficial/polar-ble-sdk.git
-	shallow = true
