@@ -1,43 +1,50 @@
-# Spec — Polar H10 SDK core + MicroPython module (C core + binding)
+# Spec — Polar SDK core + MicroPython module (C core + binding)
 
 Status: Active development (**canonical spec**)
-Last updated: 2026-02-24
+Last updated: 2026-03-03
 
 Targets:
 - **Primary runtime:** MicroPython `rp2` on Pico 2 W (RP2350 + CYW43), BLE stack = **BTstack**
 - **SDK core portability target:** same C SDK core code reusable from pure pico-sdk/BTstack apps (see `examples/pico_sdk/`)
 
+Related:
+- API design draft: [`polar_sdk_api_design.md`](./polar_sdk_api_design.md)
+
 Terminology (important):
 - **SDK core**: `polar_sdk/core/` — Polar-specific, BTstack-backed C core.
 - **MicroPython module/binding**: `polar_sdk/mpy/` — user module glue exposing the Python API.
+- **Session**: one connected Polar device runtime instance.
 
 ---
 
 ## 1) Goal
 
-Implement a robust Polar H10 integration where BLE critical-path handling and protocol parsing run in the **C SDK core**, with a small pull-based Python API exposed by the MicroPython module.
+Implement a robust Polar integration where BLE critical-path handling and protocol parsing run in the **C SDK core**, with a small pull-based MicroPython API on top.
 
-Primary capabilities for the current task:
-- reliable connect/disconnect + retry/recovery behavior,
-- Heart Rate (standard HR service) streaming,
-- ECG streaming via PMD (raw frame type 0 path),
-- strong diagnostics/observability via `stats()`.
-
-PSFTP/PFTP read-only data-plane (`list_dir`, `download`) is now implemented in the baseline (validation still ongoing).
+Project target is now:
+- feature-level parity with Polar BLE SDK capabilities,
+- support for multiple Polar device families through capability discovery,
+- full PMD stream support (including compressed/delta decoding paths),
+- full offline-recording control surface,
+- PSFTP data plane for read and mutation operations.
 
 ---
 
-## 2) Scope snapshot (current vs planned)
+## 2) Scope snapshot (current vs target)
 
 | Area | Status | Notes |
 |---|---|---|
-| Transport core (scan/connect/discovery/retry) | Implemented baseline | Required-service mask supported |
+| Transport core (scan/connect/discovery/retry) | Implemented baseline | Capability-oriented requirement filtering supported |
 | HR (0x2A37 parse + pull API) | Implemented baseline | Fixed-width tuple API |
-| PMD ECG start/stop + data parse | Implemented baseline | Raw PMD frame type 0 only |
-| PMD pairing/encryption retry policy | Implemented baseline | Handles ATT auth failures with retry logic |
-| PSFTP service/char discovery handles | Implemented baseline | Data-plane API not exposed yet |
-| PSFTP list/download API | Implemented baseline (read-only) | RFC60/RFC76 + nanopb GET path |
-| IMU stream API (PMD ACC raw) | Implemented baseline | Raw PMD ACC frame type `0x01` (int16 x/y/z) |
+| PMD ECG online stream | Implemented baseline | Raw frame-type-0 decode path implemented |
+| PMD ACC online stream | Implemented baseline | Raw ACC frame type `0x01` implemented |
+| PMD pairing/encryption retry policy | Implemented baseline | ATT auth/encryption retry behavior present |
+| PMD additional stream types (PPG/PPI/GYRO/MAG/...) | In scope (planned) | Capability-gated by device |
+| PMD compressed/delta frame decode | In scope (planned) | Raw + decoded formats both required |
+| Multi-device family support | In scope (planned) | Runtime capability discovery is required |
+| PSFTP list/download | Implemented baseline | RFC60/RFC76 + nanopb GET path |
+| PSFTP mutation ops (delete/write/merge/...) | In scope (planned) | Bounded-memory operation required |
+| Offline recording control surface | In scope (planned) | Start/stop/status/triggers/settings |
 
 ---
 
@@ -48,7 +55,9 @@ Platform observations on Pico 2 W show timing sensitivity in MicroPython BLE orc
 Therefore the design is:
 - no high-rate Python IRQ callback data path,
 - preallocated C buffers/rings for streaming data,
-- pull-based Python reads (`read_hr`, `read_ecg`, `read_imu`),
+- pull-based Python reads (`read_hr`, `read_stream`, `read_stream_into`),
+- conservative default ring/buffer sizing with bounded constructor-time overrides,
+- no hidden heap allocation in streaming/transfer hot paths,
 - explicit counters/state for debugging and validation.
 
 ---
@@ -68,7 +77,7 @@ Therefore the design is:
 ### 5.1 Layering and ownership
 
 **Layer A — Polar SDK core (`polar_sdk/core/`)**
-- Owns Polar-specific transport/policy state machines, protocol parsers, buffering, and reusable control helpers.
+- Owns Polar-specific transport/policy state machines, protocol parsers, buffering, recording/file helpers, and reusable control helpers.
 - Must not depend on MicroPython types/headers.
 - Exposes callback-driven interfaces so host integrations provide platform operations (time, sleep, GATT ops, etc.).
 
@@ -85,8 +94,8 @@ Therefore the design is:
 
 ### 5.2 “Thin binding” rule
 
-New transport/protocol logic should be added to `polar_sdk/core/` first.
-`polar_sdk/mpy/` should stay focused on:
+New transport/protocol logic must be added to `polar_sdk/core/` first.
+`polar_sdk/mpy/` stays focused on:
 1. Python argument marshalling,
 2. invoking SDK core helpers/policies,
 3. mapping SDK/core outcomes to Python exceptions,
@@ -98,25 +107,31 @@ Transport states:
 
 `IDLE → SCANNING → CONNECTING → DISCOVERING → READY → (RECOVERING)`
 
-`READY` feature substates (host-managed flags/counters):
+`READY` feature substates are capability-driven and include:
 - HR enabled/disabled,
-- ECG enabled/disabled,
+- stream enabled/disabled per PMD kind,
 - PMD CP response wait state,
-- discovery/handle availability per required service mask.
+- recording operation state,
+- discovered handle/capability availability per required capability set.
 
 Only one active transport instance is supported at a time in the current MicroPython integration.
+
+### 5.4 Status normalization boundary (normative)
+
+Core modules may use subsystem-specific result enums internally (`transport`, `pmd`, `psftp`, ...).
+Public C API surfaces must normalize these to one top-level status contract (`polar_status_t`).
 
 ---
 
 ## 6) BLE security and connection behavior requirements
 
-### 6.1 Security/pairing requirements (PMD)
+### 6.1 Security/pairing requirements (PMD/PSFTP/recording)
 
-PMD operations on H10 may require encrypted/authenticated links.
+Protected Polar operations may require encrypted/authenticated links.
 SDK core behavior must include:
 - detecting ATT security-style failures (notably `0x05`, `0x08`, and related encryption/auth statuses),
 - requesting pairing/encryption,
-- retrying protected operations (especially PMD CCC enable),
+- retrying protected operations,
 - surfacing security outcomes via `stats()` (e.g., encryption key size, bonded flag, pairing counters).
 
 See `../KNOWN_ISSUES.md` (KI-03).
@@ -136,76 +151,159 @@ Latest negotiated/update status must be observable in `stats()`.
 
 ---
 
-## 7) Public Python API (canonical current baseline)
+## 7) Public APIs (canonical target)
 
 Module: `polar_sdk`
 
-Main class: `polar_sdk.H10`
+Normative C/API contract details are defined in `polar_sdk_api_design.md` sections 5.2–5.7 and 7 (capabilities schema, decoded/raw framing, recording metadata, chunked-transfer semantics, exception details) and are part of this target API.
 
-### 7.1 Lifecycle / transport
-- `H10(addr: str | None = None, *, name_prefix: str | None = "Polar", required_services: int = <enabled-feature mask>)`
-- `connect(timeout_ms=10000, *, required_services=-1) -> None`
-  - `required_services=-1` keeps current object mask.
+### 7.1 C API shape (session + stream based)
+
+The top-level C API is session-oriented and capability-driven:
+- one unified status enum: `polar_status_t`,
+- stream kind enum: `polar_stream_kind_t` (`HR`, `ECG`, `ACC`, `PPG`, `PPI`, `GYRO`, `MAG`, ...),
+- generic stream lifecycle/read operations,
+- recording + PSFTP operation groups,
+- capability query APIs to determine supported device features.
+
+### 7.2 MicroPython class and lifecycle
+
+Main class: `polar_sdk.Device`
+
+- `Device(addr: str | None = None, *, name_prefix: str | None = "Polar", required_capabilities: tuple[str, ...] | None = None)`
+- `connect(timeout_ms=10000, *, required_capabilities: tuple[str, ...] | None = None) -> None`
+  - non-`None` `required_capabilities` overrides object defaults for that connection attempt.
 - `disconnect() -> None`
 - `is_connected() -> bool`
 - `state() -> str`
-- `required_services() -> int`
-- `set_required_services(mask: int) -> None`
+- `required_capabilities() -> tuple[str, ...]`
+- `set_required_capabilities(caps: tuple[str, ...] | list[str]) -> None`
+- `capabilities() -> dict`
+- `stats() -> dict`
 
-### 7.2 Heart Rate
-- `start_hr() -> None`
-- `stop_hr() -> None`
-- `read_hr(timeout_ms=0) -> tuple | None`
+`capabilities()` must include `schema_version`.
 
-Return shape:
+Schema-version policy:
+- pre-beta: `schema_version = 0` and schema shape may change without compatibility guarantees,
+- first beta/stable release: schema is frozen at `schema_version = 1`,
+- after freeze: breaking schema changes require a version bump.
+
+`capabilities()` required top-level keys:
+- `schema_version`, `device`, `streams`, `recording`, `psftp`, `security`
+
+Public naming policy:
+- old public names `H10` and `imu` are removed from the target API surface.
+
+### 7.3 Generic stream API (canonical)
+
+- `stream_default_config(kind: str) -> dict`
+- `start_stream(kind: str, *, format: str | None = None, **cfg) -> None`
+- `stop_stream(kind: str) -> None`
+- `read_stream(kind: str, max_bytes=1024, timeout_ms=0) -> bytes`
+- `read_stream_into(kind: str, buf, timeout_ms=0) -> int`
+
+Canonical stream kind strings:
+- `"hr"`, `"ecg"`, `"acc"`, `"ppg"`, `"ppi"`, `"gyro"`, `"mag"`
+
+Canonical format values:
+- `"decoded"` (normalized sample payload)
+- `"raw"` (raw framed record path)
+
+Format-selection rules:
+- if `start_stream(..., format=None)`, stream default format from capabilities is used,
+- for `hr`, v1 default format is `raw`,
+- read methods use the active stream format selected by `start_stream(...)`.
+
+Decoded format contract:
+- payloads use `decoded_chunk_v1` envelope (24-byte header + packed samples),
+- timestamps are Unix epoch nanoseconds,
+- per-kind sample packing is fixed-width and little-endian.
+
+Raw format contract:
+- stream reads return framed records: `u16_le record_len` + `record_len` bytes,
+- PMD kinds use exact PMD notification bytes as framed payload,
+- HR raw mode uses exact 0x2A37 payload bytes as framed payload.
+
+HR stream policy (v1):
+- canonical decoded HR read API is `read_hr()`,
+- `start_stream("hr")` / `stop_stream("hr")` are valid,
+- `start_stream("hr", format="decoded")` is unsupported unless a compact binary HR stream format is explicitly specified.
+
+Timestamp/units policy:
+- outward-facing timestamps use Unix epoch,
+- stream units are frozen per kind using the most common/default unit.
+
+Decoded sample layouts (v1 target):
+- `ecg`: `<i4` repeated, units `uV`
+- `acc`: `<hhh` repeated (`x,y,z`), units `mg`
+- `ppg`: interleaved signed int32 channels, units `counts`
+- `ppi`: packed samples (`hr_bpm:u8`, `ppi_ms:u16`, `error_estimate_ms:u16`, `flags:u8`)
+- `gyro`: `<iii` repeated (`x,y,z`), units `mdps`
+- `mag`: `<iii` repeated (`x,y,z`), units `uT`
+
+Concurrency policy (v1 default):
+- allow `hr` + at most one PMD stream unless capability map explicitly advertises broader combinations,
+- unsupported combinations raise `UnsupportedError`.
+
+### 7.4 Typed convenience methods
+
+Convenience wrappers over generic stream API:
+- `start_hr()`, `stop_hr()`, `read_hr(timeout_ms=0) -> tuple | None`
+- `start_ecg(...)`, `stop_ecg()`, `read_ecg(...) -> bytes`
+- `start_acc(...)`, `stop_acc()`, `read_acc(...) -> bytes`
+
+`acc` is canonical naming (not `imu`).
+
+`read_hr()` return shape (current contract):
 - `(ts_ms, bpm, rr_count, rr0, rr1, rr2, rr3, contact)`
-- RR values are integer milliseconds.
-- Missing RR slots are `0`.
-- `contact` is `0/1`.
+- `ts_ms` is Unix epoch milliseconds.
+- RR values are integer milliseconds; missing RR slots are `0`; `contact` is `0/1`.
 
-### 7.3 ECG (PMD)
-- `start_ecg(sample_rate=130) -> None`
-- `stop_ecg() -> None`
-- `read_ecg(max_bytes=1024, timeout_ms=0) -> bytes`
+### 7.5 Recording + PSFTP
 
-ECG byte payload format:
-- packed little-endian signed `int32` samples (`<i4`),
-- each sample is sign-extended from PMD ECG raw 24-bit payload,
-- returned lengths are 4-byte aligned.
+Recording control surface (capability-gated):
+- `recording_start(kind: str, **cfg) -> None`
+- `recording_stop(kind: str) -> None`
+- `recording_status() -> dict`
+- `recording_list() -> list`
+- `recording_get_settings(kind: str) -> dict`
+- `recording_set_trigger(kind: str, **cfg) -> None`
 
-### 7.4 IMU (PMD ACC)
-- `start_imu(sample_rate=50, range=8) -> None`
-- `stop_imu() -> None`
-- `read_imu(max_bytes=1024, timeout_ms=0) -> bytes`
+Recording data model policy:
+- recordings expose a stable opaque `recording_id`,
+- metadata is returned via normalized dict fields,
+- retrieval can be by id/path as indicated by capability map.
 
-IMU byte payload format:
-- packed little-endian signed `int16` triples (`<hhh`) per sample,
-- order is `(x, y, z)` in milli-g,
-- returned lengths are 6-byte aligned.
-
-### 7.5 PSFTP (read-only)
+PSFTP/file operations (capability-gated):
 - `list_dir(path: str) -> list[tuple[str, int]]`
 - `download(path: str, *, max_bytes=8192, timeout_ms=12000) -> bytes`
+- `delete(path: str, *, timeout_ms=12000) -> None`
+- chunked-transfer path:
+  - `download_open(path: str, *, timeout_ms=12000) -> int`
+  - `download_read(handle: int, buf, *, timeout_ms=12000) -> int` (`0` means EOF)
+  - `download_close(handle: int) -> None`
+- additional write/merge/stat operations as supported by device capability map.
 
-Current scope is GET-only request flow over PSFTP MTU characteristic.
+Chunked-transfer policy (v1):
+- one active download handle per `Device` instance,
+- opening while a handle is active raises `polar_sdk.Error`,
+- invalid/closed handle raises `ValueError`.
 
-### 7.6 Stream helpers
-- `start_streams(*, ecg=False, imu=False, hr=False) -> None`
-- `stop_streams(*, ecg=True, imu=True, hr=True) -> None`
+### 7.6 Module functions/constants
 
-### 7.7 Diagnostics
-- `stats() -> dict`
-- `version() -> str` (module function)
-
-### 7.8 Module constants
-- Feature flags: `FEATURE_HR`, `FEATURE_ECG`, `FEATURE_PSFTP`
-- Platform flag: `HAS_BTSTACK`
-- Service-mask bits: `SERVICE_HR`, `SERVICE_ECG`, `SERVICE_PSFTP`, `SERVICE_ALL`
-
-### 7.9 Deferred (not currently part of implemented API)
-- PSFTP query/notification host APIs
-- PSFTP write/remove/merge APIs
-- `set_log_level(...)`
+- `version() -> str`
+- Feature/platform flags (build + runtime capability gated)
+- Capability constants (string-valued):
+  - `CAP_STREAM_HR = "stream:hr"`
+  - `CAP_STREAM_ECG = "stream:ecg"`
+  - `CAP_STREAM_ACC = "stream:acc"`
+  - `CAP_STREAM_PPG = "stream:ppg"`
+  - `CAP_STREAM_PPI = "stream:ppi"`
+  - `CAP_STREAM_GYRO = "stream:gyro"`
+  - `CAP_STREAM_MAG = "stream:mag"`
+  - `CAP_RECORDING = "recording"`
+  - `CAP_PSFTP_READ = "psftp:read"`
+  - `CAP_PSFTP_WRITE = "psftp:write"`
 
 ---
 
@@ -217,54 +315,70 @@ Module exception types:
 - `polar_sdk.NotConnectedError`
 - `polar_sdk.ProtocolError`
 - `polar_sdk.BufferOverflowError`
+- `polar_sdk.SecurityError`
+- `polar_sdk.UnsupportedError`
 
-Mapping intent:
-- connection attempt timeout → `TimeoutError`
-- operation without active ready link → `NotConnectedError`
-- ATT/PMD protocol rejection or missing required GATT path → `ProtocolError`
-- transport/internal failures not fitting above → `Error`
+Canonical mapping intent from `polar_status_t`:
+- timeout → `TimeoutError`
+- not connected/ready → `NotConnectedError`
+- protocol rejection/missing required GATT path → `ProtocolError`
+- bounded-memory overflow → `BufferOverflowError`
+- pairing/encryption/security policy failure → `SecurityError`
+- unsupported capability/operation → `UnsupportedError`
+- other transport/internal failures → `Error`
 
-Current ECG overflow behavior is lossy-ring with telemetry (`ecg_drop_bytes_total`), not an exception in the hot path.
+Error detail policy:
+- exception class names are stable,
+- when available, exceptions may expose structured details such as `code`, `op`, `att_status`, `hci_status`, `pmd_status`, `psftp_error`.
+
+Current ECG/ACC ring overflow behavior remains lossy-ring + telemetry (`*_drop_bytes_total`) for hot paths unless operation contract explicitly requires hard overflow failure.
 
 ---
 
 ## 9) Observability requirements (`stats()`)
 
-`stats()` must remain rich enough to debug KI-01/KI-02/KI-03 class failures.
+`stats()` must remain rich enough to debug transport/security/protocol issues.
 At minimum include:
 - transport state + connect/disconnect counters,
 - last HCI/ATT statuses,
 - connection-update fields and latest negotiated params,
 - security fields (encryption key size, bonded flag, SM counters),
-- required/discovered handles for HR/PMD/PSFTP,
-- HR counters + parser counters,
-- ECG ring counters (`available`, parse errors, dropped bytes, high-water).
+- required/discovered handles and capability map,
+- per-stream counters (notifications, frames, samples, parse errors),
+- ring counters (`available`, dropped bytes, high-water) for high-rate streams,
+- recording/PSFTP operation counters and last-result diagnostics.
 
 ---
 
 ## 10) Acceptance criteria
 
-### 10.1 Current task acceptance (current baseline)
+### 10.1 Transport and baseline stream acceptance
 1. HR-only soak: stable for 20 minutes under normal RF conditions.
 2. ECG soak: stable for 10 minutes with bounded buffering and observable drop/high-water counters.
-3. Forced disconnect: successful re-use/reconnect path without reboot.
-4. No hard-crash/watchdog/reset/heap-failure during validation scripts.
+3. ACC soak: stable for 10 minutes with bounded buffering and observable drop/high-water counters.
+4. Forced disconnect: successful re-use/reconnect path without reboot.
+5. No hard-crash/watchdog/reset/heap-failure during validation scripts.
 
 Validation procedure reference: `../howto/validation.md`.
 
-### 10.2 PSFTP validation acceptance (current implementation)
-5. PSFTP list/download end-to-end succeeds repeatedly with the nanopb workflow in place.
-6. Oversize `download(max_bytes=...)` path raises bounded-memory overflow (`BufferOverflowError`) instead of overrunning buffers.
-7. Forced-disconnect during PSFTP yields clean failure and reconnect recovery.
+### 10.2 Expanded PMD acceptance
+6. Capability query accurately reports available PMD stream kinds for tested devices.
+7. Compressed/delta decode paths produce validated sample output for supported kinds/devices.
+8. Raw format mode remains available for diagnostics and unsupported decode cases.
 
-Current caveat (to remove in follow-up): in some intensive MicroPython repeat loops, PSFTP can enter a pairing-failed state (`sm_last_pairing_status=19`, `enc=0`) that currently requires board reset for recovery.
+### 10.3 Recording + PSFTP acceptance
+9. Recording control APIs (start/stop/status/list/trigger/settings) operate end-to-end on supported devices.
+10. PSFTP list/download/delete (and other supported mutations) succeed repeatedly with bounded memory.
+11. Oversize transfers raise bounded-memory overflow (`BufferOverflowError`) instead of overrunning buffers.
+12. Forced-disconnect during recording/PSFTP yields clean failure and reconnect recovery.
+
+### 10.4 Multi-device acceptance
+13. At least two Polar device families are validated via the same API surface with capability gating.
 
 ---
 
 ## 11) Out of scope (current milestone)
 
-- Multi-device family support beyond Polar H10 focus.
-- Full PMD compressed/delta frame decoding and all measurement types.
-- Full offline-recording control surface.
 - Legacy API compatibility shims.
-- Support of targets other than RP2350 + CYW43/RM2
+- Desktop asyncio push-first API as primary interface.
+- Support of targets other than RP2350 + CYW43/RM2.
