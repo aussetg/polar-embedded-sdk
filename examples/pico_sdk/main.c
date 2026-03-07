@@ -68,6 +68,10 @@
 #define H10_PMD_SECURITY_ROUNDS 3
 #define H10_PMD_SECURITY_WAIT_MS 3500
 #define H10_PMD_CCC_ATTEMPTS 4
+#define H10_PMD_QUERY_SETTINGS_CMD 0x01
+#define H10_PMD_QUERY_STATUS_CMD 0x05
+#define H10_PMD_RECORDING_TYPE_OFFLINE_BIT 0x80
+#define H10_PMD_MEAS_OFFLINE_HR 0x0E
 #define H10_PMD_ECG_SAMPLE_RATE 130
 #define H10_PMD_ECG_RESOLUTION 14
 #define H10_PMD_IMU_SAMPLE_RATE 50
@@ -157,7 +161,11 @@ static bool pmd_cp_response_waiting = false;
 static bool pmd_cp_response_done = false;
 static uint8_t pmd_cp_response_expected_opcode = 0;
 static uint8_t pmd_cp_response_expected_type = 0;
+static uint8_t pmd_cp_response_type = 0xff;
 static uint8_t pmd_cp_response_status = 0xff;
+static uint8_t pmd_cp_response_more = 0;
+static uint8_t pmd_cp_response_params[128];
+static uint8_t pmd_cp_response_params_len = 0;
 
 static bool mtu_exchange_pending = false;
 static bool mtu_exchange_done = false;
@@ -523,68 +531,250 @@ static int pmd_ensure_minimum_mtu_cb(void *ctx, uint16_t minimum_mtu) {
     return POLAR_SDK_PMD_OP_OK;
 }
 
+static const char *pmd_measurement_name(uint8_t measurement_type) {
+    switch ((uint8_t)(measurement_type & 0x3fu)) {
+        case POLAR_SDK_PMD_MEASUREMENT_ECG:
+            return "ecg";
+        case POLAR_SDK_PMD_MEASUREMENT_ACC:
+            return "acc";
+        case H10_PMD_MEAS_OFFLINE_HR:
+            return "offline_hr";
+        case 0x01:
+            return "ppg";
+        case 0x03:
+            return "ppi";
+        case 0x05:
+            return "gyro";
+        case 0x06:
+            return "mag";
+        case 0x07:
+            return "skin_temp";
+        case 0x0a:
+            return "location";
+        case 0x0b:
+            return "pressure";
+        case 0x0c:
+            return "temperature";
+        case 0x0d:
+            return "offline_recording";
+        default:
+            return "unknown";
+    }
+}
+
+static const char *pmd_active_state_name(uint8_t status_byte) {
+    switch ((status_byte >> 6) & 0x03u) {
+        case 0x00u:
+            return "none";
+        case 0x01u:
+            return "online";
+        case 0x02u:
+            return "offline";
+        case 0x03u:
+            return "both";
+        default:
+            return "?";
+    }
+}
+
+static void pmd_log_measurement_status_params(const uint8_t *params, size_t params_len) {
+    printf("[h10probe] PMD status raw len=%u hex=", (unsigned)params_len);
+    for (size_t i = 0; i < params_len; ++i) {
+        printf("%02x", params[i]);
+        if (i + 1u < params_len) {
+            putchar(' ');
+        }
+    }
+    printf("\n");
+
+    for (size_t i = 0; i < params_len; ++i) {
+        uint8_t b = params[i];
+        printf("[h10probe] PMD status[%u] meas=%s type=0x%02x active=%s raw=0x%02x\n",
+               (unsigned)i,
+               pmd_measurement_name(b),
+               (unsigned)(b & 0x3fu),
+               pmd_active_state_name(b),
+               (unsigned)b);
+    }
+}
+
+static int pmd_write_cp_command_and_wait_response(
+    const uint8_t *cmd,
+    size_t cmd_len,
+    uint8_t expected_opcode,
+    uint8_t expected_type,
+    uint8_t *out_response_type,
+    uint8_t *out_status,
+    uint8_t *out_params,
+    size_t out_params_capacity,
+    size_t *out_params_len) {
+    if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
+        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
+    }
+    if (cmd == NULL || cmd_len == 0 || cmd_len > UINT16_MAX) {
+        return POLAR_SDK_PMD_OP_TRANSPORT;
+    }
+
+    pmd_cp_response_waiting = true;
+    pmd_cp_response_done = false;
+    pmd_cp_response_expected_opcode = expected_opcode;
+    pmd_cp_response_expected_type = expected_type;
+    pmd_cp_response_type = 0xff;
+    pmd_cp_response_status = 0xff;
+    pmd_cp_response_more = 0;
+    pmd_cp_response_params_len = 0;
+
+    pmd_write_pending = true;
+    pmd_write_done = false;
+    pmd_write_att_status = ATT_ERROR_SUCCESS;
+
+    printf("[h10probe] PMD CP write handle=0x%04x opcode=0x%02x type=0x%02x len=%u\n",
+           pmd_cp_char.value_handle,
+           cmd_len > 0 ? cmd[0] : 0u,
+           cmd_len > 1 ? cmd[1] : 0xffu,
+           (unsigned)cmd_len);
+
+    int err = gatt_client_write_value_of_characteristic(
+        handle_gatt_event,
+        conn_handle,
+        pmd_cp_char.value_handle,
+        (uint16_t)cmd_len,
+        (uint8_t *)cmd);
+    if (err) {
+        pmd_write_pending = false;
+        printf("[h10probe] PMD CP write transport err=%d\n", err);
+        return POLAR_SDK_PMD_OP_TRANSPORT;
+    }
+
+    if (!wait_flag_until_true(&pmd_write_done, 2000)) {
+        pmd_write_pending = false;
+        printf("[h10probe] PMD CP write timeout opcode=0x%02x\n", expected_opcode);
+        return POLAR_SDK_PMD_OP_TIMEOUT;
+    }
+    if (pmd_write_att_status != ATT_ERROR_SUCCESS) {
+        printf("[h10probe] PMD CP write ATT reject=0x%02x\n", pmd_write_att_status);
+        return pmd_write_att_status;
+    }
+
+    if (!wait_flag_until_true(&pmd_cp_response_done, 2000)) {
+        pmd_cp_response_waiting = false;
+        printf("[h10probe] PMD CP response timeout opcode=0x%02x expected_type=0x%02x\n",
+               expected_opcode,
+               expected_type);
+        return POLAR_SDK_PMD_OP_TIMEOUT;
+    }
+
+    if (out_response_type != NULL) {
+        *out_response_type = pmd_cp_response_type;
+    }
+    if (out_status != NULL) {
+        *out_status = pmd_cp_response_status;
+    }
+    if (out_params_len != NULL) {
+        *out_params_len = pmd_cp_response_params_len;
+    }
+    if (out_params != NULL && out_params_capacity > 0 && pmd_cp_response_params_len > 0) {
+        size_t copy_len = pmd_cp_response_params_len;
+        if (copy_len > out_params_capacity) {
+            copy_len = out_params_capacity;
+        }
+        memcpy(out_params, pmd_cp_response_params, copy_len);
+    }
+
+    printf("[h10probe] PMD CP response opcode=0x%02x type=0x%02x status=0x%02x more=0x%02x params_len=%u\n",
+           expected_opcode,
+           pmd_cp_response_type,
+           pmd_cp_response_status,
+           pmd_cp_response_more,
+           (unsigned)pmd_cp_response_params_len);
+    return POLAR_SDK_PMD_OP_OK;
+}
+
+static void pmd_probe_query_status(void) {
+    uint8_t cmd[1] = { H10_PMD_QUERY_STATUS_CMD };
+    uint8_t response_type = 0xff;
+    uint8_t response_status = 0xff;
+    uint8_t params[128];
+    size_t params_len = 0;
+    int r = pmd_write_cp_command_and_wait_response(
+        cmd,
+        sizeof(cmd),
+        H10_PMD_QUERY_STATUS_CMD,
+        0xffu,
+        &response_type,
+        &response_status,
+        params,
+        sizeof(params),
+        &params_len);
+    printf("[h10probe] PMD GET_MEASUREMENT_STATUS result=%d type=0x%02x status=0x%02x\n",
+           r,
+           response_type,
+           response_status);
+    if (r == POLAR_SDK_PMD_OP_OK && response_status == POLAR_SDK_PMD_RESPONSE_SUCCESS) {
+        pmd_log_measurement_status_params(params, params_len);
+    }
+}
+
+static void pmd_probe_query_settings(const char *label, uint8_t request_type) {
+    uint8_t cmd[2] = { H10_PMD_QUERY_SETTINGS_CMD, request_type };
+    uint8_t response_type = 0xff;
+    uint8_t response_status = 0xff;
+    uint8_t params[128];
+    size_t params_len = 0;
+    int r = pmd_write_cp_command_and_wait_response(
+        cmd,
+        sizeof(cmd),
+        H10_PMD_QUERY_SETTINGS_CMD,
+        request_type,
+        &response_type,
+        &response_status,
+        params,
+        sizeof(params),
+        &params_len);
+
+    printf("[h10probe] PMD GET_MEASUREMENT_SETTINGS label=%s request_type=0x%02x result=%d response_type=0x%02x status=0x%02x params_len=%u hex=",
+           label,
+           request_type,
+           r,
+           response_type,
+           response_status,
+           (unsigned)params_len);
+    for (size_t i = 0; i < params_len; ++i) {
+        printf("%02x", params[i]);
+        if (i + 1u < params_len) {
+            putchar(' ');
+        }
+    }
+    printf("\n");
+}
+
 static int pmd_start_measurement_and_wait_response_cb(
     void *ctx,
     const uint8_t *start_cmd,
     size_t start_cmd_len,
     uint8_t *out_status) {
     UNUSED(ctx);
-    if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
-    }
-    if (start_cmd == NULL || start_cmd_len < 2 || start_cmd_len > UINT16_MAX) {
+    if (start_cmd == NULL || start_cmd_len < 2) {
         return POLAR_SDK_PMD_OP_TRANSPORT;
     }
 
-    uint8_t measurement_type = start_cmd[1];
-
-    pmd_cp_response_waiting = true;
-    pmd_cp_response_done = false;
-    pmd_cp_response_expected_opcode = POLAR_SDK_PMD_OPCODE_START_MEASUREMENT;
-    pmd_cp_response_expected_type = measurement_type;
-    pmd_cp_response_status = 0xff;
-
-    pmd_write_pending = true;
-    pmd_write_done = false;
-    pmd_write_att_status = ATT_ERROR_SUCCESS;
-    printf("[h10probe] PMD START write handle=0x%04x type=0x%02x len=%u\n",
-           pmd_cp_char.value_handle,
-           measurement_type,
-           (unsigned)start_cmd_len);
-    int err = gatt_client_write_value_of_characteristic(
-        handle_gatt_event,
-        conn_handle,
-        pmd_cp_char.value_handle,
-        (uint16_t)start_cmd_len,
-        (uint8_t *)start_cmd);
-    if (err) {
-        pmd_write_pending = false;
-        printf("[h10probe] PMD START write transport err=%d\n", err);
-        return POLAR_SDK_PMD_OP_TRANSPORT;
+    uint8_t response_type = 0xff;
+    int r = pmd_write_cp_command_and_wait_response(
+        start_cmd,
+        start_cmd_len,
+        POLAR_SDK_PMD_OPCODE_START_MEASUREMENT,
+        start_cmd[1],
+        &response_type,
+        out_status,
+        NULL,
+        0,
+        NULL);
+    if (r == POLAR_SDK_PMD_OP_OK) {
+        printf("[h10probe] PMD START response type=0x%02x status=0x%02x\n",
+               response_type,
+               out_status != NULL ? *out_status : pmd_cp_response_status);
     }
-
-    if (!wait_flag_until_true(&pmd_write_done, 2000)) {
-        pmd_write_pending = false;
-        printf("[h10probe] PMD START write timeout\n");
-        return POLAR_SDK_PMD_OP_TIMEOUT;
-    }
-    if (pmd_write_att_status != ATT_ERROR_SUCCESS) {
-        printf("[h10probe] PMD START write ATT reject=0x%02x\n", pmd_write_att_status);
-        return pmd_write_att_status;
-    }
-
-    if (!wait_flag_until_true(&pmd_cp_response_done, 2000)) {
-        pmd_cp_response_waiting = false;
-        printf("[h10probe] PMD START response timeout type=0x%02x\n", measurement_type);
-        return POLAR_SDK_PMD_OP_TIMEOUT;
-    }
-
-    if (out_status != NULL) {
-        *out_status = pmd_cp_response_status;
-    }
-    printf("[h10probe] PMD START response type=0x%02x status=0x%02x\n", measurement_type, pmd_cp_response_status);
-
-    return POLAR_SDK_PMD_OP_OK;
+    return r;
 }
 
 static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -837,8 +1027,19 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                    response.status);
             if (pmd_cp_response_waiting &&
                 response.opcode == pmd_cp_response_expected_opcode &&
-                response.measurement_type == pmd_cp_response_expected_type) {
+                (pmd_cp_response_expected_type == 0xffu || response.measurement_type == pmd_cp_response_expected_type)) {
+                pmd_cp_response_type = response.measurement_type;
                 pmd_cp_response_status = response.status;
+                pmd_cp_response_more = response.has_more ? response.more : 0;
+                pmd_cp_response_params_len = 0;
+                if (response.status == POLAR_SDK_PMD_RESPONSE_SUCCESS && value_event.value_len > 5u) {
+                    size_t params_len = (size_t)value_event.value_len - 5u;
+                    if (params_len > sizeof(pmd_cp_response_params)) {
+                        params_len = sizeof(pmd_cp_response_params);
+                    }
+                    memcpy(pmd_cp_response_params, value_event.value + 5u, params_len);
+                    pmd_cp_response_params_len = (uint8_t)params_len;
+                }
                 pmd_cp_response_waiting = false;
                 pmd_cp_response_done = true;
             }
@@ -909,7 +1110,10 @@ static void maybe_start_pmd_policy_pipeline(void) {
 
     pmd_cp_response_waiting = false;
     pmd_cp_response_done = false;
+    pmd_cp_response_type = 0xff;
     pmd_cp_response_status = 0xff;
+    pmd_cp_response_more = 0;
+    pmd_cp_response_params_len = 0;
 
     att_mtu = ATT_DEFAULT_MTU;
     mtu_exchange_pending = false;
@@ -964,6 +1168,11 @@ static void run_pmd_policy_tick(void) {
         .ensure_minimum_mtu = pmd_ensure_minimum_mtu_cb,
         .start_ecg_and_wait_response = pmd_start_measurement_and_wait_response_cb,
     };
+
+    pmd_probe_query_status();
+    pmd_probe_query_settings("online_ecg", POLAR_SDK_PMD_MEASUREMENT_ECG);
+    pmd_probe_query_settings("offline_ecg", (uint8_t)(H10_PMD_RECORDING_TYPE_OFFLINE_BIT | POLAR_SDK_PMD_MEASUREMENT_ECG));
+    pmd_probe_query_settings("offline_hr", (uint8_t)(H10_PMD_RECORDING_TYPE_OFFLINE_BIT | H10_PMD_MEAS_OFFLINE_HR));
 
     polar_sdk_pmd_start_policy_t ecg_policy = {
         .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
@@ -1032,6 +1241,10 @@ static void run_pmd_policy_tick(void) {
 
     if (imu_result == POLAR_SDK_PMD_START_RESULT_OK) {
         imu_start_success_total += 1;
+        pmd_probe_query_settings("poststart_online_ecg", POLAR_SDK_PMD_MEASUREMENT_ECG);
+        pmd_probe_query_settings("poststart_offline_ecg", (uint8_t)(H10_PMD_RECORDING_TYPE_OFFLINE_BIT | POLAR_SDK_PMD_MEASUREMENT_ECG));
+        pmd_probe_query_settings("poststart_offline_hr", (uint8_t)(H10_PMD_RECORDING_TYPE_OFFLINE_BIT | H10_PMD_MEAS_OFFLINE_HR));
+        pmd_probe_query_status();
         app_state = APP_STREAMING;
     } else {
         app_state = APP_CONNECTED;
@@ -1089,7 +1302,10 @@ static void on_disconnect_cleanup(void) {
     pmd_write_att_status = ATT_ERROR_SUCCESS;
     pmd_cp_response_waiting = false;
     pmd_cp_response_done = false;
+    pmd_cp_response_type = 0xff;
     pmd_cp_response_status = 0xff;
+    pmd_cp_response_more = 0;
+    pmd_cp_response_params_len = 0;
 
     mtu_exchange_pending = false;
     mtu_exchange_done = false;

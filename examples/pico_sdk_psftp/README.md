@@ -6,6 +6,8 @@ Current scope:
 - discover PSFTP service/chars,
 - force security/pairing,
 - enable PSFTP notifications,
+- query H10 legacy recording status via public PSFTP query helpers,
+- optionally run an H10 legacy recording start/status/stop/status smoke cycle,
 - send `GET "/"` and attempt one file download per round,
 - reconnect between rounds and print counters.
 
@@ -58,7 +60,28 @@ openocd -f interface/cmsis-dap.cfg -f target/rp2350.cfg \
   - `>1` => synthetic long GET path of requested length (useful for multi-frame TX cadence tests)
 - `H10_PSFTP_PRE_TX_DELAY_MS` (default `0`)
   - optional pause after channel prep/CCC and before first PSFTP frame TX
+- `H10_RECORDING_QUERY_STATUS` (default `1`)
+  - query H10 legacy recording status every round.
+- `H10_RECORDING_START_STOP` (default `0`)
+  - when the device is idle, run a legacy H10 recording start/status/stop/status cycle.
+  - disabled by default to avoid mutating device state during normal smoke runs.
+- `H10_RECORDING_EXERCISE_ID` (default `SDKPROBE`)
+  - identifier used for the optional legacy H10 recording start query.
+- `H10_RECORDING_SAMPLE_TYPE` (default `0`)
+  - `0` = HR, `1` = RR.
+- `H10_RECORDING_INTERVAL_S` (default `1`)
+  - HR interval for the optional start query; valid values are `1` or `5`.
 - `POLAR_PROTO_GENERATED_DIR` (default `build/polar_proto`)
+
+## Public SDK API usage
+
+The probe now exercises the public PSFTP helper surface for H10 legacy recording control:
+
+- `polar_sdk_psftp_encode_h10_start_recording_params(...)`
+- `polar_sdk_psftp_execute_query_operation(...)`
+- `polar_sdk_psftp_decode_h10_recording_status_result(...)`
+
+That keeps the probe aligned with the intended C SDK surface instead of hand-building legacy query frames inside the example.
 
 ## Methodical runbook
 

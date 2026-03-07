@@ -116,6 +116,31 @@ polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_get_operation(
     int *out_prepare_status,
     int *out_write_status);
 
+polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_query_operation(
+    const polar_sdk_psftp_get_ops_t *ops,
+    uint16_t query_id,
+    const uint8_t *query_payload,
+    size_t query_payload_len,
+    uint8_t *response,
+    size_t response_capacity,
+    uint32_t timeout_ms,
+    size_t *out_response_len,
+    uint16_t *out_error_code,
+    int *out_prepare_status,
+    int *out_write_status);
+
+polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_proto_operation(
+    const polar_sdk_psftp_get_ops_t *ops,
+    const uint8_t *proto_payload,
+    size_t proto_payload_len,
+    uint8_t *response,
+    size_t response_capacity,
+    uint32_t timeout_ms,
+    size_t *out_response_len,
+    uint16_t *out_error_code,
+    int *out_prepare_status,
+    int *out_write_status);
+
 #ifdef __cplusplus
 }
 #endif

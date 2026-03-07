@@ -110,6 +110,11 @@ set(H10_PSFTP_TX_HEX_DUMP_BYTES "24" CACHE STRING "Max TX bytes printed in hex")
 set(H10_PSFTP_RX_HEX_DUMP_BYTES "24" CACHE STRING "Max RX bytes printed in hex")
 set(H10_PSFTP_TEST_PATH_LEN "1" CACHE STRING "1='/' normal; >1 uses synthetic long GET path length")
 set(H10_PSFTP_PRE_TX_DELAY_MS "0" CACHE STRING "Optional delay between channel prep and first PSFTP TX")
+set(H10_RECORDING_QUERY_STATUS "1" CACHE STRING "Query H10 legacy recording status each round (1/0)")
+set(H10_RECORDING_START_STOP "0" CACHE STRING "When idle, issue H10 legacy recording start/status/stop/status smoke cycle (1/0)")
+set(H10_RECORDING_EXERCISE_ID "SDKPROBE" CACHE STRING "H10 legacy recording identifier used when start/stop smoke is enabled")
+set(H10_RECORDING_SAMPLE_TYPE "0" CACHE STRING "H10 recording sample type: 0=HR, 1=RR")
+set(H10_RECORDING_INTERVAL_S "1" CACHE STRING "H10 recording interval seconds for HR sample type: 1 or 5")
 
 
 target_compile_definitions(h10_btstack_psftp_probe PRIVATE
@@ -125,6 +130,11 @@ target_compile_definitions(h10_btstack_psftp_probe PRIVATE
     H10_PSFTP_RX_HEX_DUMP_BYTES=${H10_PSFTP_RX_HEX_DUMP_BYTES}
     H10_PSFTP_TEST_PATH_LEN=${H10_PSFTP_TEST_PATH_LEN}
     H10_PSFTP_PRE_TX_DELAY_MS=${H10_PSFTP_PRE_TX_DELAY_MS}
+    H10_RECORDING_QUERY_STATUS=${H10_RECORDING_QUERY_STATUS}
+    H10_RECORDING_START_STOP=${H10_RECORDING_START_STOP}
+    H10_RECORDING_EXERCISE_ID="${H10_RECORDING_EXERCISE_ID}"
+    H10_RECORDING_SAMPLE_TYPE=${H10_RECORDING_SAMPLE_TYPE}
+    H10_RECORDING_INTERVAL_S=${H10_RECORDING_INTERVAL_S}
     POLAR_CFG_ENABLE_PSFTP=1
 )
 

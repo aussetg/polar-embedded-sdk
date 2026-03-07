@@ -57,5 +57,9 @@ bool polar_sdk_sm_event_matches_handle(
 
 void polar_sdk_btstack_sm_apply_default_auth_policy(void) {
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
-    sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+    uint8_t auth = SM_AUTHREQ_BONDING;
+#if defined(ENABLE_LE_SECURE_CONNECTIONS)
+    auth |= SM_AUTHREQ_SECURE_CONNECTION;
+#endif
+    sm_set_authentication_requirements(auth);
 }

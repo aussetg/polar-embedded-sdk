@@ -12,7 +12,22 @@ extern "C" {
 
 #define POLAR_SDK_PSFTP_MAX_PATH_BYTES (255u)
 #define POLAR_SDK_PSFTP_MAX_ENTRY_NAME_BYTES (95u)
+#define POLAR_SDK_H10_RECORDING_ID_MAX_BYTES (64u)
 #define POLAR_SDK_PSFTP_PFTP_AIR_PACKET_LOST_ERROR (303u)
+
+#define POLAR_SDK_PSFTP_QUERY_REQUEST_START_RECORDING (14u)
+#define POLAR_SDK_PSFTP_QUERY_REQUEST_STOP_RECORDING (15u)
+#define POLAR_SDK_PSFTP_QUERY_REQUEST_RECORDING_STATUS (16u)
+
+typedef enum {
+    POLAR_SDK_H10_RECORDING_SAMPLE_HEART_RATE = 1,
+    POLAR_SDK_H10_RECORDING_SAMPLE_RR_INTERVAL = 16,
+} polar_sdk_h10_recording_sample_type_t;
+
+typedef enum {
+    POLAR_SDK_H10_RECORDING_INTERVAL_1S = 1,
+    POLAR_SDK_H10_RECORDING_INTERVAL_5S = 5,
+} polar_sdk_h10_recording_interval_t;
 
 typedef enum {
     POLAR_SDK_PSFTP_RX_MORE = 0,
@@ -58,6 +73,13 @@ size_t polar_sdk_psftp_build_rfc60_request(
     uint8_t *out,
     size_t out_capacity);
 
+size_t polar_sdk_psftp_build_rfc60_query(
+    uint16_t query_id,
+    const uint8_t *payload,
+    size_t payload_len,
+    uint8_t *out,
+    size_t out_capacity);
+
 void polar_sdk_psftp_tx_init(
     polar_sdk_psftp_tx_state_t *state,
     const uint8_t *stream,
@@ -88,6 +110,30 @@ bool polar_sdk_psftp_encode_get_operation(
     uint8_t *out_payload,
     size_t out_payload_capacity,
     size_t *out_payload_len);
+
+bool polar_sdk_psftp_encode_remove_operation(
+    const char *path,
+    size_t path_len,
+    uint8_t *out_payload,
+    size_t out_payload_capacity,
+    size_t *out_payload_len);
+
+bool polar_sdk_psftp_encode_h10_start_recording_params(
+    const char *recording_id,
+    size_t recording_id_len,
+    polar_sdk_h10_recording_sample_type_t sample_type,
+    polar_sdk_h10_recording_interval_t interval,
+    uint8_t *out_payload,
+    size_t out_payload_capacity,
+    size_t *out_payload_len);
+
+bool polar_sdk_psftp_decode_h10_recording_status_result(
+    const uint8_t *payload,
+    size_t payload_len,
+    bool *out_recording_on,
+    char *out_recording_id,
+    size_t out_recording_id_capacity,
+    size_t *out_recording_id_len);
 
 polar_sdk_psftp_dir_decode_result_t polar_sdk_psftp_decode_directory(
     const uint8_t *payload,

@@ -13,6 +13,12 @@ bool polar_sdk_transport_adapter_handle_link_event(
 
     switch (event->type) {
         case POLAR_SDK_LINK_EVENT_CONN_COMPLETE:
+            if (event->status == 0 &&
+                link->connected &&
+                link->conn_handle != invalid_conn_handle &&
+                event->handle == link->conn_handle) {
+                return false;
+            }
             polar_sdk_runtime_on_connection_complete(
                 link,
                 invalid_conn_handle,

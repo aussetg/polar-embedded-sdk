@@ -121,10 +121,10 @@ static bool polar_sdk_psftp_get_ops_ready(const polar_sdk_psftp_get_ops_t *ops) 
         ops->rx_state != 0;
 }
 
-polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_get_operation(
+static polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_rfc60_stream(
     const polar_sdk_psftp_get_ops_t *ops,
-    const char *path,
-    size_t path_len,
+    const uint8_t *request_stream,
+    size_t request_len,
     uint8_t *response,
     size_t response_capacity,
     uint32_t timeout_ms,
@@ -145,7 +145,7 @@ polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_get_operation(
         *out_write_status = POLAR_SDK_PSFTP_OP_OK;
     }
 
-    if (!polar_sdk_psftp_get_ops_ready(ops) || path == 0) {
+    if (!polar_sdk_psftp_get_ops_ready(ops) || request_stream == 0 || request_len == 0u) {
         return POLAR_SDK_PSFTP_TRANS_NOTIFY_FAILED;
     }
 
@@ -167,22 +167,6 @@ polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_get_operation(
     }
     if (prep > 0) {
         return POLAR_SDK_PSFTP_TRANS_NOTIFY_ATT_REJECTED;
-    }
-
-    uint8_t proto_payload[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES];
-    size_t proto_payload_len = 0;
-    if (!polar_sdk_psftp_encode_get_operation(path, path_len, proto_payload, sizeof(proto_payload), &proto_payload_len)) {
-        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
-    }
-
-    uint8_t request_stream[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES + 2u];
-    size_t request_len = polar_sdk_psftp_build_rfc60_request(
-        proto_payload,
-        proto_payload_len,
-        request_stream,
-        sizeof(request_stream));
-    if (request_len == 0) {
-        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
     }
 
     ops->begin_response(ops->ctx, response, response_capacity);
@@ -271,4 +255,125 @@ polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_get_operation(
     }
 
     return POLAR_SDK_PSFTP_TRANS_PROTOCOL_ERROR;
+}
+
+polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_proto_operation(
+    const polar_sdk_psftp_get_ops_t *ops,
+    const uint8_t *proto_payload,
+    size_t proto_payload_len,
+    uint8_t *response,
+    size_t response_capacity,
+    uint32_t timeout_ms,
+    size_t *out_response_len,
+    uint16_t *out_error_code,
+    int *out_prepare_status,
+    int *out_write_status) {
+    if (!polar_sdk_psftp_get_ops_ready(ops) || proto_payload == 0 || proto_payload_len == 0) {
+        return POLAR_SDK_PSFTP_TRANS_NOTIFY_FAILED;
+    }
+
+    uint8_t request_stream[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES + 2u];
+    size_t request_len = polar_sdk_psftp_build_rfc60_request(
+        proto_payload,
+        proto_payload_len,
+        request_stream,
+        sizeof(request_stream));
+    if (request_len == 0) {
+        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+    }
+
+    return polar_sdk_psftp_execute_rfc60_stream(
+        ops,
+        request_stream,
+        request_len,
+        response,
+        response_capacity,
+        timeout_ms,
+        out_response_len,
+        out_error_code,
+        out_prepare_status,
+        out_write_status);
+}
+
+polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_query_operation(
+    const polar_sdk_psftp_get_ops_t *ops,
+    uint16_t query_id,
+    const uint8_t *query_payload,
+    size_t query_payload_len,
+    uint8_t *response,
+    size_t response_capacity,
+    uint32_t timeout_ms,
+    size_t *out_response_len,
+    uint16_t *out_error_code,
+    int *out_prepare_status,
+    int *out_write_status) {
+    if (!polar_sdk_psftp_get_ops_ready(ops) ||
+        (query_payload_len > 0u && query_payload == 0)) {
+        return POLAR_SDK_PSFTP_TRANS_NOTIFY_FAILED;
+    }
+
+    uint8_t request_stream[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES + 2u];
+    size_t request_len = polar_sdk_psftp_build_rfc60_query(
+        query_id,
+        query_payload,
+        query_payload_len,
+        request_stream,
+        sizeof(request_stream));
+    if (request_len == 0) {
+        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+    }
+
+    return polar_sdk_psftp_execute_rfc60_stream(
+        ops,
+        request_stream,
+        request_len,
+        response,
+        response_capacity,
+        timeout_ms,
+        out_response_len,
+        out_error_code,
+        out_prepare_status,
+        out_write_status);
+}
+
+polar_sdk_psftp_trans_result_t polar_sdk_psftp_execute_get_operation(
+    const polar_sdk_psftp_get_ops_t *ops,
+    const char *path,
+    size_t path_len,
+    uint8_t *response,
+    size_t response_capacity,
+    uint32_t timeout_ms,
+    size_t *out_response_len,
+    uint16_t *out_error_code,
+    int *out_prepare_status,
+    int *out_write_status) {
+    uint8_t proto_payload[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES];
+    size_t proto_payload_len = 0;
+    if (!polar_sdk_psftp_encode_get_operation(path, path_len, proto_payload, sizeof(proto_payload), &proto_payload_len)) {
+        if (out_response_len != 0) {
+            *out_response_len = 0;
+        }
+        if (out_error_code != 0) {
+            *out_error_code = 0;
+        }
+        if (out_prepare_status != 0) {
+            *out_prepare_status = POLAR_SDK_PSFTP_OP_OK;
+        }
+        if (out_write_status != 0) {
+            *out_write_status = POLAR_SDK_PSFTP_OP_OK;
+        }
+        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+    }
+
+    return polar_sdk_psftp_execute_proto_operation(
+        ops,
+        proto_payload,
+        proto_payload_len,
+        response,
+        response_capacity,
+        timeout_ms,
+        out_response_len,
+        out_error_code,
+        out_prepare_status,
+        out_write_status);
 }
