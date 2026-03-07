@@ -43,11 +43,13 @@ I2C address: `0x52`.
 | MISO | `GP20` (physical pin 26) | `SPI0 RX` |
 | CS | `GP17` (physical pin 22) | RP2-1 default chip-select |
 
-### LiPo SHIM for Pico
+### LiPo SHIM for Pico ( Not connected )
+
+Note: I killed the LiPo SHIM stupidly so right now it's not there.
 
 LiPo SHIM is power-path hardware and does not require firmware pin configuration.
 
-From the shim schematic in notes (`lipo_shim_for_pico_schematic.pdf`), it interfaces with Pico power rails:
+From the shim schematic, it interfaces with Pico power rails:
 
 - `VBUS` (physical pin 40)
 - `VSYS` (physical pin 39)
