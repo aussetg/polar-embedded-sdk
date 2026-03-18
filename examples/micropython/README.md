@@ -33,6 +33,34 @@ mpremote connect /dev/ttyACM0 run :hello_polar.py
 Current behavior depends on radio conditions and whether a matching Polar device is advertising.
 The example also demonstrates capability scoping via `required_capabilities`.
 
+## capabilities_demo.py
+
+`capabilities_demo.py` connects to a Polar device and prints the public
+capability surface (`capabilities()`, stream defaults, and basic security state).
+
+Run with `mpremote`:
+
+```bash
+mpremote connect /dev/ttyACM0 fs cp examples/micropython/capabilities_demo.py :capabilities_demo.py
+mpremote connect /dev/ttyACM0 run :capabilities_demo.py
+```
+
+If multiple Polar devices are nearby, edit `TARGET_ADDR` near the top of the
+script to pin the intended device.
+
+## stream_probe.py
+
+`stream_probe.py` is a generic capability-driven live-stream probe for non-H10
+validation. Set `KIND` near the top of the script to one of the supported kinds
+reported by `capabilities_demo.py`.
+
+Run with `mpremote`:
+
+```bash
+mpremote connect /dev/ttyACM0 fs cp examples/micropython/stream_probe.py :stream_probe.py
+mpremote connect /dev/ttyACM0 run :stream_probe.py
+```
+
 ## hr_read_demo.py
 
 `hr_read_demo.py` is an HR API demo (`start_hr`, `read_hr`, `stop_hr`).

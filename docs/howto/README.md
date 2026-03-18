@@ -11,6 +11,7 @@ Procedural guides for building and development workflows.
 - **Build the pure pico-sdk BTstack probe (`examples/pico_sdk`):** [`build_pico_sdk_probe.md`](./build_pico_sdk_probe.md)
 - **Validate the MicroPython module (HR + ECG soak tests):** [`validation.md`](./validation.md)
 - **MicroPython package acceptance pass:** [`package_acceptance.md`](./package_acceptance.md)
+- **Minimal Polar Verity Sense validation:** [`verity_sense_validation.md`](./verity_sense_validation.md)
 - **BLE stability checklist (Pico 2 W / CYW43):** [`pico2w_ble_stability.md`](./pico2w_ble_stability.md)
 - **MicroPython BTstack config in this repo:** [`micropython_btstack_config.md`](./micropython_btstack_config.md)
 - **BTstack debug/config flags shortlist:** [`btstack_debug_flags.md`](./btstack_debug_flags.md)
