@@ -100,6 +100,32 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 - `docs/reference/polar_psftp.md`
 - `docs/howto/mpy_psftp_probe_air_capture_comparison.md`
 
+## KI-05 — H10 HR recording start is rejected while a stopped H10 recording is still stored
+
+**Observed on:** Polar H10 exercise-recording path via the MicroPython `polar_sdk` module.
+
+### Symptoms
+- `recording_start("hr", ...)` fails when the sensor already contains a stopped H10 recording.
+- The older/raw device-visible failure was:
+  - `ProtocolError: PSFTP error code 106`
+- The current MicroPython behavior intentionally converts this into a clearer user-facing error:
+  - `Error: delete existing recording before starting a new one`
+
+### How to confirm
+- `recording_status()` reports inactive.
+- `recording_list()` is non-empty and shows at least one stopped H10 recording.
+- Starting a new HR recording fails until the existing stopped recording is deleted.
+
+### Mitigations / best practices
+- Before starting a new H10 HR recording, check `recording_list()`.
+- If a stopped H10 recording is present, delete it explicitly with:
+  - `recording_delete(recording_id)`
+- The acceptance/demo flow now treats an empty recording list as a precondition instead of deleting user/device data implicitly.
+
+### Current state
+- This behavior is currently treated as a shipped limitation / known issue for the MicroPython package.
+- Unique recording ID generation is working; the remaining rejection is not explained by simple ID collision.
+
 ## Vendor-reported device issues (Polar; informational)
 
 These issues are reported by Polar (SDK/device docs) and are included here for awareness.
