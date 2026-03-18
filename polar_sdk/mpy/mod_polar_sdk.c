@@ -663,6 +663,20 @@ typedef struct _polar_h10_obj_t polar_h10_obj_t;
 
 static void polar_require_ready(polar_h10_obj_t *self);
 static void polar_require_no_active_download_handle(polar_h10_obj_t *self);
+static polar_sdk_psftp_trans_result_t polar_psftp_execute_get(
+    polar_h10_obj_t *self,
+    const char *path,
+    size_t path_len,
+    uint8_t *response,
+    size_t response_capacity,
+    uint32_t timeout_ms,
+    size_t *out_response_len);
+static polar_sdk_psftp_trans_result_t polar_psftp_execute_remove(
+    polar_h10_obj_t *self,
+    const char *path,
+    size_t path_len,
+    uint32_t timeout_ms);
+static NORETURN void polar_raise_for_psftp_result(polar_h10_obj_t *self, polar_sdk_psftp_trans_result_t result);
 
 // -----------------------------------------------------------------------------
 // Device object
@@ -683,6 +697,7 @@ typedef struct _polar_h10_obj_t {
     uint16_t ecg_sample_rate_hz;
     uint16_t acc_sample_rate_hz;
     uint16_t acc_range;
+    uint32_t acc_start_ms;
 
     polar_sdk_runtime_link_t runtime_link;
 
@@ -784,6 +799,7 @@ typedef struct _polar_h10_obj_t {
     uint8_t pmd_cp_response_params_len;
 
     bool ecg_enabled;
+    bool ecg_companion_active;
     uint8_t ecg_ring_storage[POLAR_SDK_ECG_RING_BYTES];
     polar_sdk_ecg_ring_t ecg_ring;
 
@@ -1321,8 +1337,143 @@ static void polar_h10_recording_write_hex_u32(char *dst, uint32_t value) {
     }
 }
 
+static bool polar_psftp_dir_contains_entry_or_raise(
+    polar_h10_obj_t *self,
+    const char *path,
+    const char *entry_name,
+    size_t entry_name_len) {
+    if (self == NULL || path == NULL || entry_name == NULL || entry_name_len == 0u) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid recording id lookup"));
+    }
+
+    size_t path_len = strlen(path);
+    bool add_trailing_slash = path_len > 0u && path[path_len - 1] != '/';
+    size_t normalized_len = path_len + (add_trailing_slash ? 1u : 0u);
+    if (normalized_len == 0u || normalized_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid recording directory lookup path"));
+    }
+
+    char normalized_path[POLAR_SDK_PSFTP_MAX_PATH_BYTES + 1u];
+    memcpy(normalized_path, path, path_len);
+    if (add_trailing_slash) {
+        normalized_path[path_len] = '/';
+    }
+    normalized_path[normalized_len] = '\0';
+
+    uint8_t *response = m_new(uint8_t, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
+    size_t response_len = 0;
+    polar_sdk_psftp_trans_result_t r = polar_psftp_execute_get(
+        self,
+        normalized_path,
+        normalized_len,
+        response,
+        POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES,
+        POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS,
+        &response_len);
+    if (r != POLAR_SDK_PSFTP_TRANS_OK) {
+        m_del(uint8_t, response, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
+        polar_raise_for_psftp_result(self, r);
+    }
+
+    polar_sdk_psftp_dir_entry_t *entries = m_new(
+        polar_sdk_psftp_dir_entry_t,
+        POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+    size_t entry_count = 0;
+    polar_sdk_psftp_dir_decode_result_t decode_result = polar_sdk_psftp_decode_directory(
+        response,
+        response_len,
+        entries,
+        POLAR_SDK_PSFTP_MAX_DIR_ENTRIES,
+        &entry_count);
+
+    m_del(uint8_t, response, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
+
+    if (decode_result == POLAR_SDK_PSFTP_DIR_DECODE_TOO_MANY_ENTRIES) {
+        m_del(polar_sdk_psftp_dir_entry_t, entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+        polar_raise_exc(&polar_type_BufferOverflowError, MP_ERROR_TEXT("PSFTP directory entry overflow"));
+    }
+    if (decode_result != POLAR_SDK_PSFTP_DIR_DECODE_OK) {
+        m_del(polar_sdk_psftp_dir_entry_t, entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+        polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("failed to decode PSFTP directory"));
+    }
+
+    bool found = false;
+    for (size_t i = 0; i < entry_count; ++i) {
+        size_t name_len = strlen(entries[i].name);
+        if (name_len > 0u && entries[i].name[name_len - 1] == '/') {
+            name_len -= 1u;
+        }
+        if (name_len == entry_name_len && memcmp(entries[i].name, entry_name, entry_name_len) == 0) {
+            found = true;
+            break;
+        }
+    }
+
+    m_del(polar_sdk_psftp_dir_entry_t, entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+    return found;
+}
+
+static void polar_psftp_fetch_directory_entries_or_raise(
+    polar_h10_obj_t *self,
+    const char *path,
+    polar_sdk_psftp_dir_entry_t *entries,
+    size_t entries_capacity,
+    size_t *out_entry_count) {
+    if (self == NULL || path == NULL || entries == NULL || entries_capacity == 0u || out_entry_count == NULL) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid PSFTP directory fetch"));
+    }
+
+    size_t path_len = strlen(path);
+    bool add_trailing_slash = path_len > 0u && path[path_len - 1] != '/';
+    size_t normalized_len = path_len + (add_trailing_slash ? 1u : 0u);
+    if (normalized_len == 0u || normalized_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid PSFTP directory path"));
+    }
+
+    char normalized_path[POLAR_SDK_PSFTP_MAX_PATH_BYTES + 1u];
+    memcpy(normalized_path, path, path_len);
+    if (add_trailing_slash) {
+        normalized_path[path_len] = '/';
+    }
+    normalized_path[normalized_len] = '\0';
+
+    uint8_t *response = m_new(uint8_t, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
+    size_t response_len = 0;
+    polar_sdk_psftp_trans_result_t r = polar_psftp_execute_get(
+        self,
+        normalized_path,
+        normalized_len,
+        response,
+        POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES,
+        POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS,
+        &response_len);
+    if (r != POLAR_SDK_PSFTP_TRANS_OK) {
+        m_del(uint8_t, response, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
+        polar_raise_for_psftp_result(self, r);
+    }
+
+    size_t entry_count = 0;
+    polar_sdk_psftp_dir_decode_result_t decode_result = polar_sdk_psftp_decode_directory(
+        response,
+        response_len,
+        entries,
+        entries_capacity,
+        &entry_count);
+
+    m_del(uint8_t, response, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
+
+    if (decode_result == POLAR_SDK_PSFTP_DIR_DECODE_TOO_MANY_ENTRIES) {
+        polar_raise_exc(&polar_type_BufferOverflowError, MP_ERROR_TEXT("PSFTP directory entry overflow"));
+    }
+    if (decode_result != POLAR_SDK_PSFTP_DIR_DECODE_OK) {
+        polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("failed to decode PSFTP directory"));
+    }
+
+    *out_entry_count = entry_count;
+}
+
 static void polar_h10_recording_make_auto_id(polar_h10_obj_t *self, char *out, size_t out_capacity) {
-    if (out == NULL || out_capacity < 12u) {
+    if (out == NULL || out_capacity < 25u) {
         polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("recording id buffer too small"));
     }
 
@@ -1330,10 +1481,37 @@ static void polar_h10_recording_make_auto_id(polar_h10_obj_t *self, char *out, s
         self->recording_hr_id_next = 1u;
     }
 
-    memcpy(out, "REC", 3u);
-    polar_h10_recording_write_hex_u32(out + 3u, self->recording_hr_id_next);
-    out[11] = '\0';
+    memcpy(out, "H10_EX_", 7u);
+#if POLAR_SDK_HAS_BTSTACK
+    pico_unique_board_id_t board_id;
+    pico_get_unique_board_id(&board_id);
+    uint32_t board_tag = ((uint32_t)board_id.id[0] << 24) |
+        ((uint32_t)board_id.id[1] << 16) |
+        ((uint32_t)board_id.id[2] << 8) |
+        (uint32_t)board_id.id[3];
+#else
+    uint32_t board_tag = 0u;
+#endif
+
+    polar_h10_recording_write_hex_u32(out + 7u, board_tag);
+    out[15] = '_';
+    polar_h10_recording_write_hex_u32(out + 16u, self->recording_hr_id_next);
+    out[24] = '\0';
     self->recording_hr_id_next += 1u;
+}
+
+static void polar_h10_recording_make_unique_auto_id_or_raise(
+    polar_h10_obj_t *self,
+    char *out,
+    size_t out_capacity) {
+    for (size_t attempts = 0; attempts < 1024u; ++attempts) {
+        polar_h10_recording_make_auto_id(self, out, out_capacity);
+        if (!polar_psftp_dir_contains_entry_or_raise(self, "/", out, strlen(out))) {
+            return;
+        }
+    }
+
+    polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("failed to allocate unique recording id"));
 }
 
 static bool polar_h10_recording_local_config_matches(
@@ -1368,6 +1546,63 @@ static void polar_h10_recording_prepare_or_raise(polar_h10_obj_t *self) {
         polar_raise_exc(&polar_type_SecurityError, MP_ERROR_TEXT("PSFTP security setup failed"));
     }
     polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PSFTP channel preparation failed"));
+}
+
+static bool polar_h10_recording_find_any_stored_id_or_raise(
+    polar_h10_obj_t *self,
+    char *out_recording_id,
+    size_t out_recording_id_capacity) {
+    polar_sdk_psftp_dir_entry_t *root_entries = m_new(
+        polar_sdk_psftp_dir_entry_t,
+        POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+    size_t root_count = 0;
+    polar_psftp_fetch_directory_entries_or_raise(self, "/", root_entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES, &root_count);
+
+    bool found = false;
+    for (size_t i = 0; i < root_count && !found; ++i) {
+        size_t dir_name_len = strlen(root_entries[i].name);
+        if (dir_name_len == 0u || root_entries[i].name[dir_name_len - 1] != '/') {
+            continue;
+        }
+        dir_name_len -= 1u;
+        if (dir_name_len == 0u) {
+            continue;
+        }
+
+        char dir_name[POLAR_SDK_PSFTP_MAX_ENTRY_NAME_BYTES + 1u];
+        memcpy(dir_name, root_entries[i].name, dir_name_len);
+        dir_name[dir_name_len] = '\0';
+
+        char dir_path[POLAR_SDK_PSFTP_MAX_PATH_BYTES + 1u];
+        size_t dir_path_len = 1u + dir_name_len;
+        if (dir_path_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+            continue;
+        }
+        dir_path[0] = '/';
+        memcpy(dir_path + 1u, dir_name, dir_name_len);
+        dir_path[dir_path_len] = '\0';
+
+        polar_sdk_psftp_dir_entry_t sub_entries[POLAR_SDK_PSFTP_MAX_DIR_ENTRIES];
+        size_t sub_count = 0;
+        polar_psftp_fetch_directory_entries_or_raise(self, dir_path, sub_entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES, &sub_count);
+
+        for (size_t j = 0; j < sub_count; ++j) {
+            if (strcmp(sub_entries[j].name, "SAMPLES.BPB") == 0) {
+                if (out_recording_id != NULL && out_recording_id_capacity > 0u) {
+                    if (dir_name_len >= out_recording_id_capacity) {
+                        m_del(polar_sdk_psftp_dir_entry_t, root_entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+                        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("recording id buffer too small"));
+                    }
+                    memcpy(out_recording_id, dir_name, dir_name_len + 1u);
+                }
+                found = true;
+                break;
+            }
+        }
+    }
+
+    m_del(polar_sdk_psftp_dir_entry_t, root_entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+    return found;
 }
 
 static bool polar_wait_for_mtu_exchange(polar_h10_obj_t *self, uint32_t timeout_ms) {
@@ -1713,8 +1948,12 @@ static void polar_pmd_parse_cp_notification(polar_h10_obj_t *self, const uint8_t
 }
 
 static void polar_pmd_parse_data(polar_h10_obj_t *self, const uint8_t *value, uint16_t value_len) {
-    polar_sdk_ecg_parse_pmd_notification(&self->ecg_ring, POLAR_SDK_PMD_MEAS_ECG, value, value_len);
-    polar_sdk_imu_parse_pmd_notification(&self->imu_ring, POLAR_SDK_PMD_MEAS_ACC, value, value_len);
+    if (self->ecg_enabled) {
+        polar_sdk_ecg_parse_pmd_notification(&self->ecg_ring, POLAR_SDK_PMD_MEAS_ECG, value, value_len);
+    }
+    if (self->imu_enabled) {
+        polar_sdk_imu_parse_pmd_notification(&self->imu_ring, POLAR_SDK_PMD_MEAS_ACC, value, value_len);
+    }
 }
 
 static bool polar_psftp_wait_cfg_complete(polar_h10_obj_t *self, uint32_t timeout_ms) {
@@ -2734,7 +2973,9 @@ static void polar_session_reset_feature_state(polar_h10_obj_t *self) {
     self->hr_raw_last_len = 0;
     self->hr_raw_consumed_seq = self->hr_raw_seq;
     self->ecg_enabled = false;
+    self->ecg_companion_active = false;
     self->imu_enabled = false;
+    self->acc_start_ms = 0;
     self->recording_hr_active = false;
     self->recording_hr_config_known = false;
     self->recording_hr_interval_s = 1u;
@@ -3329,7 +3570,7 @@ static void polar_hci_packet_handler_and_discovery(uint8_t packet_type, uint16_t
         .pmd_cp_value_handle = self->pmd_cp_handle,
         .pmd_cp_listening = self->pmd_cp_notification_listening,
         .pmd_data_value_handle = self->pmd_data_handle,
-        .ecg_enabled = self->ecg_enabled,
+        .pmd_data_listening = self->pmd_data_notification_listening,
         .psftp_mtu_value_handle = self->psftp_mtu_handle,
         .psftp_mtu_listening = self->psftp_mtu_notification_listening,
         .psftp_d2h_value_handle = self->psftp_d2h_handle,
@@ -3698,6 +3939,7 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->ecg_sample_rate_hz = 130;
     self->acc_sample_rate_hz = 50;
     self->acc_range = POLAR_SDK_IMU_DEFAULT_RANGE_G;
+    self->acc_start_ms = 0;
     polar_sdk_runtime_link_init(&self->runtime_link, HCI_CON_HANDLE_INVALID);
     self->runtime_link.state = POLAR_SDK_STATE_IDLE;
     self->runtime_link.connected = false;
@@ -3785,6 +4027,7 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->pmd_cp_response_params_len = 0;
 
     self->ecg_enabled = false;
+    self->ecg_companion_active = false;
     polar_sdk_ecg_ring_init(&self->ecg_ring, self->ecg_ring_storage, POLAR_SDK_ECG_RING_BYTES);
 
     self->imu_enabled = false;
@@ -4007,7 +4250,7 @@ static mp_obj_t polar_h10_capabilities(mp_obj_t self_in) {
     }
     mp_obj_dict_store(recording, mp_obj_new_str("kinds", 5), recording_kinds);
     mp_obj_dict_store(recording, mp_obj_new_str("max_parallel_kinds", 18), mp_obj_new_int(recording_supported ? 1 : 0));
-    mp_obj_dict_store(recording, mp_obj_new_str("features", 8), polar_capability_bool_dict4(recording_supported, recording_supported, false, false));
+    mp_obj_dict_store(recording, mp_obj_new_str("features", 8), polar_capability_bool_dict4(recording_supported, recording_supported, recording_supported, recording_supported));
     mp_obj_dict_store(recording, mp_obj_new_str("by_kind", 7), recording_by_kind);
     mp_obj_dict_store(root, mp_obj_new_str("recording", 9), recording);
 
@@ -4409,7 +4652,9 @@ static mp_obj_t polar_h10_disconnect(size_t n_args, const mp_obj_t *args, mp_map
     self->hr_raw_last_len = 0;
     self->hr_raw_consumed_seq = self->hr_raw_seq;
     self->ecg_enabled = false;
+    self->ecg_companion_active = false;
     self->imu_enabled = false;
+    self->acc_start_ms = 0;
     self->runtime_link.connected = false;
     self->runtime_link.conn_handle = HCI_CON_HANDLE_INVALID;
     self->runtime_link.conn_update_pending = false;
@@ -4709,6 +4954,130 @@ static int polar_pmd_policy_start_measurement_and_wait_response(
         out_status);
 }
 
+static void polar_raise_for_pmd_start_result(
+    polar_sdk_pmd_start_result_t start_result,
+    bool is_ecg) {
+    switch (start_result) {
+        case POLAR_SDK_PMD_START_RESULT_OK:
+            return;
+        case POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED:
+            polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+            break;
+        case POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT:
+            polar_raise_exc(&polar_type_SecurityError, MP_ERROR_TEXT("failed to establish secure link for PMD"));
+            break;
+        case POLAR_SDK_PMD_START_RESULT_CCC_TIMEOUT:
+            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD CCC timeout"));
+            break;
+        case POLAR_SDK_PMD_START_RESULT_CCC_REJECTED:
+            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD CCC rejected"));
+            break;
+        case POLAR_SDK_PMD_START_RESULT_MTU_FAILED:
+            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD requires larger ATT MTU"));
+            break;
+        case POLAR_SDK_PMD_START_RESULT_START_TIMEOUT:
+            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD start response timeout"));
+            break;
+        case POLAR_SDK_PMD_START_RESULT_START_REJECTED:
+            polar_raise_exc(&polar_type_ProtocolError, is_ecg ? MP_ERROR_TEXT("PMD start ECG rejected") : MP_ERROR_TEXT("PMD start ACC rejected"));
+            break;
+        case POLAR_SDK_PMD_START_RESULT_TRANSPORT_ERROR:
+        default:
+            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PMD start transport failure"));
+            break;
+    }
+}
+
+static polar_sdk_pmd_start_result_t polar_h10_start_ecg_raw(
+    polar_h10_obj_t *self,
+    uint16_t sample_rate,
+    uint8_t *out_start_response_status,
+    int *out_last_ccc_att_status) {
+    polar_sdk_pmd_start_policy_t policy = {
+        .ccc_attempts = POLAR_SDK_PMD_CCC_ATTEMPTS,
+        .security_rounds_per_attempt = POLAR_SDK_PMD_SECURITY_ROUNDS,
+        .security_wait_ms = POLAR_SDK_PMD_SECURITY_WAIT_MS,
+        .minimum_mtu = POLAR_SDK_PMD_MIN_MTU,
+        .sample_rate = sample_rate,
+        .include_resolution = true,
+        .resolution = 14,
+        .include_range = false,
+        .range = 0,
+    };
+    polar_sdk_pmd_start_ops_t ops = {
+        .ctx = self,
+        .is_connected = polar_pmd_policy_is_connected,
+        .encryption_key_size = polar_pmd_policy_encryption_key_size,
+        .request_pairing = polar_pmd_policy_request_pairing,
+        .sleep_ms = polar_pmd_policy_sleep_ms,
+        .enable_notifications = polar_pmd_policy_enable_notifications,
+        .ensure_minimum_mtu = polar_pmd_policy_ensure_minimum_mtu,
+        .start_ecg_and_wait_response = polar_pmd_policy_start_measurement_and_wait_response,
+    };
+
+    uint8_t start_response_status = 0xff;
+    int last_ccc_att_status = 0;
+    polar_sdk_pmd_start_result_t start_result = polar_sdk_pmd_start_ecg_with_policy(
+        &policy,
+        &ops,
+        &start_response_status,
+        &last_ccc_att_status);
+
+    if (last_ccc_att_status > 0) {
+        self->pmd_cfg_att_status = (uint8_t)last_ccc_att_status;
+        self->last_att_status = (uint8_t)last_ccc_att_status;
+    }
+    self->pmd_cp_response_status = start_response_status;
+
+    if (out_start_response_status != NULL) {
+        *out_start_response_status = start_response_status;
+    }
+    if (out_last_ccc_att_status != NULL) {
+        *out_last_ccc_att_status = last_ccc_att_status;
+    }
+    return start_result;
+}
+
+static void polar_h10_stop_underlying_ecg_or_raise(polar_h10_obj_t *self) {
+    if (self == NULL) {
+        return;
+    }
+    if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+        self->ecg_enabled = false;
+        self->ecg_companion_active = false;
+        return;
+    }
+    if (!self->ecg_enabled && !self->ecg_companion_active) {
+        return;
+    }
+
+    uint8_t stop_cmd[2] = {
+        POLAR_SDK_PMD_OP_STOP_MEASUREMENT,
+        POLAR_SDK_PMD_MEAS_ECG,
+    };
+
+    polar_pmd_expect_response(self, POLAR_SDK_PMD_OP_STOP_MEASUREMENT, POLAR_SDK_PMD_MEAS_ECG);
+    polar_pmd_write_command(self, stop_cmd, (uint16_t)sizeof(stop_cmd));
+
+    if (polar_pmd_wait_response(self, POLAR_SDK_GATT_OP_TIMEOUT_MS)) {
+        if (!polar_sdk_pmd_response_status_ok(self->pmd_cp_response_status)) {
+            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD stop ECG rejected"));
+        }
+    }
+}
+
+static void polar_h10_start_hidden_ecg_companion_or_raise(polar_h10_obj_t *self) {
+    if (self == NULL || self->ecg_enabled || self->ecg_companion_active) {
+        return;
+    }
+
+    polar_sdk_pmd_start_result_t start_result = polar_h10_start_ecg_raw(self, 130u, NULL, NULL);
+    polar_raise_for_pmd_start_result(start_result, true);
+    self->ecg_sample_rate_hz = 130u;
+    self->ecg_companion_active = true;
+    polar_ecg_ring_reset(self);
+}
+
 static mp_obj_t polar_h10_start_ecg(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
     enum {
         ARG_sample_rate,
@@ -4748,71 +5117,26 @@ static mp_obj_t polar_h10_start_ecg(size_t n_args, const mp_obj_t *args, mp_map_
         polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("ECG stream already active with different config"));
     }
 
-    polar_sdk_pmd_start_policy_t policy = {
-        .ccc_attempts = POLAR_SDK_PMD_CCC_ATTEMPTS,
-        .security_rounds_per_attempt = POLAR_SDK_PMD_SECURITY_ROUNDS,
-        .security_wait_ms = POLAR_SDK_PMD_SECURITY_WAIT_MS,
-        .minimum_mtu = POLAR_SDK_PMD_MIN_MTU,
-        .sample_rate = (uint16_t)sample_rate,
-        .include_resolution = true,
-        .resolution = 14,
-        .include_range = false,
-        .range = 0,
-    };
-    polar_sdk_pmd_start_ops_t ops = {
-        .ctx = self,
-        .is_connected = polar_pmd_policy_is_connected,
-        .encryption_key_size = polar_pmd_policy_encryption_key_size,
-        .request_pairing = polar_pmd_policy_request_pairing,
-        .sleep_ms = polar_pmd_policy_sleep_ms,
-        .enable_notifications = polar_pmd_policy_enable_notifications,
-        .ensure_minimum_mtu = polar_pmd_policy_ensure_minimum_mtu,
-        .start_ecg_and_wait_response = polar_pmd_policy_start_measurement_and_wait_response,
-    };
-
-    uint8_t start_response_status = 0xff;
-    int last_ccc_att_status = 0;
-    polar_sdk_pmd_start_result_t start_result = polar_sdk_pmd_start_ecg_with_policy(
-        &policy,
-        &ops,
-        &start_response_status,
-        &last_ccc_att_status);
-
-    if (last_ccc_att_status > 0) {
-        self->pmd_cfg_att_status = (uint8_t)last_ccc_att_status;
-        self->last_att_status = (uint8_t)last_ccc_att_status;
+    if (self->ecg_companion_active) {
+        if (self->ecg_stream_format == POLAR_STREAM_FORMAT_DECODED && self->ecg_sample_rate_hz == (uint16_t)sample_rate) {
+            self->ecg_enabled = true;
+            self->ecg_companion_active = false;
+            polar_ecg_ring_reset(self);
+            return mp_const_none;
+        }
+        if (self->imu_enabled) {
+            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("cannot change ECG config while ACC stream is active"));
+        }
+        polar_h10_stop_underlying_ecg_or_raise(self);
+        self->ecg_companion_active = false;
     }
-    self->pmd_cp_response_status = start_response_status;
 
-    switch (start_result) {
-        case POLAR_SDK_PMD_START_RESULT_OK:
-            break;
-        case POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED:
-            polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT:
-            polar_raise_exc(&polar_type_SecurityError, MP_ERROR_TEXT("failed to establish secure link for PMD"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_CCC_TIMEOUT:
-            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD CCC timeout"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_CCC_REJECTED:
-            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD CCC rejected"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_MTU_FAILED:
-            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD requires larger ATT MTU"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_START_TIMEOUT:
-            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD start response timeout"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_START_REJECTED:
-            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD start ECG rejected"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_TRANSPORT_ERROR:
-        default:
-            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PMD start transport failure"));
-            break;
-    }
+    polar_sdk_pmd_start_result_t start_result = polar_h10_start_ecg_raw(
+        self,
+        (uint16_t)sample_rate,
+        NULL,
+        NULL);
+    polar_raise_for_pmd_start_result(start_result, true);
 
     self->ecg_enabled = true;
     self->ecg_sample_rate_hz = (uint16_t)sample_rate;
@@ -4870,26 +5194,25 @@ static mp_obj_t polar_h10_stop_ecg(mp_obj_t self_in) {
 
     if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         self->ecg_enabled = false;
+        self->ecg_companion_active = false;
         return mp_const_none;
     }
 
-    if (self->ecg_enabled) {
-        uint8_t stop_cmd[2] = {
-            POLAR_SDK_PMD_OP_STOP_MEASUREMENT,
-            POLAR_SDK_PMD_MEAS_ECG,
-        };
-
-        polar_pmd_expect_response(self, POLAR_SDK_PMD_OP_STOP_MEASUREMENT, POLAR_SDK_PMD_MEAS_ECG);
-        polar_pmd_write_command(self, stop_cmd, (uint16_t)sizeof(stop_cmd));
-
-        if (polar_pmd_wait_response(self, POLAR_SDK_GATT_OP_TIMEOUT_MS)) {
-            if (!polar_sdk_pmd_response_status_ok(self->pmd_cp_response_status)) {
-                polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD stop ECG rejected"));
-            }
-        }
+    if (!self->ecg_enabled) {
+        return mp_const_none;
     }
 
+    if (self->imu_enabled) {
+        self->ecg_enabled = false;
+        self->ecg_companion_active = true;
+        polar_ecg_ring_reset(self);
+        return mp_const_none;
+    }
+
+    polar_h10_stop_underlying_ecg_or_raise(self);
+
     self->ecg_enabled = false;
+    self->ecg_companion_active = false;
 
     if (!self->imu_enabled) {
         polar_pmd_disable_notifications_best_effort(self);
@@ -5062,39 +5385,12 @@ static mp_obj_t polar_h10_start_imu(size_t n_args, const mp_obj_t *args, mp_map_
     }
     self->pmd_cp_response_status = start_response_status;
 
-    switch (start_result) {
-        case POLAR_SDK_PMD_START_RESULT_OK:
-            break;
-        case POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED:
-            polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT:
-            polar_raise_exc(&polar_type_SecurityError, MP_ERROR_TEXT("failed to establish secure link for PMD"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_CCC_TIMEOUT:
-            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD CCC timeout"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_CCC_REJECTED:
-            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD CCC rejected"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_MTU_FAILED:
-            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD requires larger ATT MTU"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_START_TIMEOUT:
-            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD start response timeout"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_START_REJECTED:
-            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD start ACC rejected"));
-            break;
-        case POLAR_SDK_PMD_START_RESULT_TRANSPORT_ERROR:
-        default:
-            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PMD start transport failure"));
-            break;
-    }
+    polar_raise_for_pmd_start_result(start_result, false);
 
     self->imu_enabled = true;
     self->acc_sample_rate_hz = (uint16_t)sample_rate;
     self->acc_range = (uint16_t)range;
+    self->acc_start_ms = polar_now_ms();
     polar_imu_ring_reset(self);
     return mp_const_none;
 #endif
@@ -5116,6 +5412,8 @@ static mp_obj_t polar_h10_stop_imu(mp_obj_t self_in) {
 
     if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         self->imu_enabled = false;
+        self->acc_start_ms = 0;
+        self->ecg_companion_active = false;
         return mp_const_none;
     }
 
@@ -5136,8 +5434,15 @@ static mp_obj_t polar_h10_stop_imu(mp_obj_t self_in) {
     }
 
     self->imu_enabled = false;
+    self->acc_start_ms = 0;
 
-    if (!self->ecg_enabled) {
+    if (self->ecg_companion_active) {
+        polar_h10_stop_underlying_ecg_or_raise(self);
+        self->ecg_companion_active = false;
+        polar_ecg_ring_reset(self);
+    }
+
+    if (!self->ecg_enabled && !self->ecg_companion_active) {
         polar_pmd_disable_notifications_best_effort(self);
     }
 
@@ -5192,12 +5497,21 @@ static mp_obj_t polar_h10_read_imu(size_t n_args, const mp_obj_t *args, mp_map_t
 
     if (polar_imu_ring_available(self) == 0 && timeout_ms > 0 && self->imu_enabled) {
         uint32_t start_ms = polar_now_ms();
+        bool companion_checked = false;
         while (!polar_elapsed_ms(start_ms, (uint32_t)timeout_ms)) {
             if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
                 break;
             }
             if (polar_imu_ring_available(self) > 0) {
                 break;
+            }
+            if (!companion_checked &&
+                !self->ecg_enabled &&
+                !self->ecg_companion_active &&
+                self->acc_start_ms != 0 &&
+                polar_elapsed_ms(self->acc_start_ms, 300u)) {
+                polar_h10_start_hidden_ecg_companion_or_raise(self);
+                companion_checked = true;
             }
             mp_event_wait_ms(5);
         }
@@ -5259,42 +5573,11 @@ static mp_obj_t polar_h10_list_dir(mp_obj_t self_in, mp_obj_t path_in) {
     }
     normalized_path[normalized_len] = '\0';
 
-    uint8_t *response = m_new(uint8_t, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
-    size_t response_len = 0;
-    polar_sdk_psftp_trans_result_t r = polar_psftp_execute_get(
-        self,
-        normalized_path,
-        normalized_len,
-        response,
-        POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES,
-        POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS,
-        &response_len);
-    if (r != POLAR_SDK_PSFTP_TRANS_OK) {
-        m_del(uint8_t, response, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
-        polar_raise_for_psftp_result(self, r);
-    }
-
     polar_sdk_psftp_dir_entry_t *entries = m_new(
         polar_sdk_psftp_dir_entry_t,
         POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
     size_t entry_count = 0;
-    polar_sdk_psftp_dir_decode_result_t decode_result = polar_sdk_psftp_decode_directory(
-        response,
-        response_len,
-        entries,
-        POLAR_SDK_PSFTP_MAX_DIR_ENTRIES,
-        &entry_count);
-
-    m_del(uint8_t, response, POLAR_SDK_PSFTP_MAX_DIR_RESPONSE_BYTES);
-
-    if (decode_result == POLAR_SDK_PSFTP_DIR_DECODE_TOO_MANY_ENTRIES) {
-        m_del(polar_sdk_psftp_dir_entry_t, entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
-        polar_raise_exc(&polar_type_BufferOverflowError, MP_ERROR_TEXT("PSFTP directory entry overflow"));
-    }
-    if (decode_result != POLAR_SDK_PSFTP_DIR_DECODE_OK) {
-        m_del(polar_sdk_psftp_dir_entry_t, entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
-        polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("failed to decode PSFTP directory"));
-    }
+    polar_psftp_fetch_directory_entries_or_raise(self, normalized_path, entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES, &entry_count);
 
     mp_obj_t out_list = mp_obj_new_list(0, NULL);
     for (size_t i = 0; i < entry_count; ++i) {
@@ -5624,8 +5907,13 @@ static mp_obj_t polar_h10_recording_start(size_t n_args, const mp_obj_t *args, m
         return mp_const_none;
     }
 
+    char existing_recording_id[POLAR_SDK_H10_RECORDING_ID_MAX_BYTES + 1u];
+    if (polar_h10_recording_find_any_stored_id_or_raise(self, existing_recording_id, sizeof(existing_recording_id))) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("delete existing recording before starting a new one"));
+    }
+
     char recording_id[POLAR_SDK_H10_RECORDING_ID_MAX_BYTES + 1u];
-    polar_h10_recording_make_auto_id(self, recording_id, sizeof(recording_id));
+    polar_h10_recording_make_unique_auto_id_or_raise(self, recording_id, sizeof(recording_id));
 
     uint8_t query_payload[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES];
     size_t query_payload_len = 0;
@@ -5741,7 +6029,85 @@ static mp_obj_t polar_h10_recording_list(mp_obj_t self_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
     polar_require_ready(self);
     polar_require_no_active_download_handle(self);
-    polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording is unsupported"));
+
+    if (!polar_h10_recording_is_supported(self)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording is unsupported"));
+    }
+
+    polar_h10_recording_prepare_or_raise(self);
+    polar_h10_recording_query_status_or_raise(self);
+
+    polar_sdk_psftp_dir_entry_t *root_entries = m_new(
+        polar_sdk_psftp_dir_entry_t,
+        POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+    size_t root_count = 0;
+    polar_psftp_fetch_directory_entries_or_raise(self, "/", root_entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES, &root_count);
+
+    mp_obj_t out_list = mp_obj_new_list(0, NULL);
+    for (size_t i = 0; i < root_count; ++i) {
+        size_t dir_name_len = strlen(root_entries[i].name);
+        if (dir_name_len == 0u || root_entries[i].name[dir_name_len - 1] != '/') {
+            continue;
+        }
+        dir_name_len -= 1u;
+        if (dir_name_len == 0u) {
+            continue;
+        }
+
+        char dir_name[POLAR_SDK_PSFTP_MAX_ENTRY_NAME_BYTES + 1u];
+        memcpy(dir_name, root_entries[i].name, dir_name_len);
+        dir_name[dir_name_len] = '\0';
+
+        char dir_path[POLAR_SDK_PSFTP_MAX_PATH_BYTES + 1u];
+        size_t dir_path_len = 1u + dir_name_len;
+        if (dir_path_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+            continue;
+        }
+        dir_path[0] = '/';
+        memcpy(dir_path + 1u, dir_name, dir_name_len);
+        dir_path[dir_path_len] = '\0';
+
+        polar_sdk_psftp_dir_entry_t sub_entries[POLAR_SDK_PSFTP_MAX_DIR_ENTRIES];
+        size_t sub_count = 0;
+        polar_psftp_fetch_directory_entries_or_raise(self, dir_path, sub_entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES, &sub_count);
+
+        uint64_t bytes_total = 0u;
+        bool has_samples = false;
+        for (size_t j = 0; j < sub_count; ++j) {
+            if (strcmp(sub_entries[j].name, "SAMPLES.BPB") == 0) {
+                bytes_total = sub_entries[j].size;
+                has_samples = true;
+                break;
+            }
+        }
+        if (!has_samples) {
+            continue;
+        }
+
+        bool is_active = self->recording_hr_active && strcmp(self->recording_hr_id, dir_name) == 0;
+        mp_obj_t entry = mp_obj_new_dict(6);
+        mp_obj_dict_store(entry, mp_obj_new_str("recording_id", 12), mp_obj_new_str(dir_name, dir_name_len));
+        mp_obj_dict_store(entry, mp_obj_new_str("kind", 4), mp_obj_new_str("hr", 2));
+        mp_obj_dict_store(entry, mp_obj_new_str("state", 5), mp_obj_new_str(is_active ? "active" : "stopped", is_active ? 6 : 7));
+        mp_obj_dict_store(entry, mp_obj_new_str("bytes_total", 11), mp_obj_new_int_from_ull(bytes_total));
+        mp_obj_dict_store(entry, mp_obj_new_str("start_time_ns", 13), mp_const_none);
+        mp_obj_dict_store(entry, mp_obj_new_str("time_base", 9), mp_obj_new_str("unknown", 7));
+
+        static const char samples_name[] = "/SAMPLES.BPB";
+        char sample_path[POLAR_SDK_PSFTP_MAX_PATH_BYTES + 1u];
+        size_t sample_path_len = 1u + dir_name_len + (sizeof(samples_name) - 1u);
+        if (sample_path_len <= POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+            sample_path[0] = '/';
+            memcpy(sample_path + 1u, dir_name, dir_name_len);
+            memcpy(sample_path + 1u + dir_name_len, samples_name, sizeof(samples_name));
+            mp_obj_dict_store(entry, mp_obj_new_str("path", 4), mp_obj_new_str(sample_path, sample_path_len));
+        }
+
+        mp_obj_list_append(out_list, entry);
+    }
+
+    m_del(polar_sdk_psftp_dir_entry_t, root_entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
+    return out_list;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_recording_list_obj, polar_h10_recording_list);
 
@@ -5777,10 +6143,47 @@ static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_recording_default_config_obj, polar_h
 
 static mp_obj_t polar_h10_recording_delete(mp_obj_t self_in, mp_obj_t recording_id_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    (void)recording_id_in;
     polar_require_ready(self);
     polar_require_no_active_download_handle(self);
-    polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording is unsupported"));
+
+    if (!polar_h10_recording_is_supported(self)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording is unsupported"));
+    }
+    if (!mp_obj_is_str(recording_id_in)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("recording_id must be str"));
+    }
+
+    size_t recording_id_len = 0;
+    const char *recording_id = mp_obj_str_get_data(recording_id_in, &recording_id_len);
+    if (recording_id_len == 0u || recording_id_len > POLAR_SDK_H10_RECORDING_ID_MAX_BYTES) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid recording_id"));
+    }
+
+    polar_h10_recording_prepare_or_raise(self);
+    polar_h10_recording_query_status_or_raise(self);
+    if (self->recording_hr_active && strlen(self->recording_hr_id) == recording_id_len && memcmp(self->recording_hr_id, recording_id, recording_id_len) == 0) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("cannot delete active recording"));
+    }
+
+    static const char samples_name[] = "/SAMPLES.BPB";
+    char sample_path[POLAR_SDK_PSFTP_MAX_PATH_BYTES + 1u];
+    size_t sample_path_len = 1u + recording_id_len + (sizeof(samples_name) - 1u);
+    if (sample_path_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("recording path too long"));
+    }
+    sample_path[0] = '/';
+    memcpy(sample_path + 1u, recording_id, recording_id_len);
+    memcpy(sample_path + 1u + recording_id_len, samples_name, sizeof(samples_name));
+
+    polar_sdk_psftp_trans_result_t r = polar_psftp_execute_remove(
+        self,
+        sample_path,
+        sample_path_len,
+        POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS);
+    if (r != POLAR_SDK_PSFTP_TRANS_OK) {
+        polar_raise_for_psftp_result(self, r);
+    }
+    return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_recording_delete_obj, polar_h10_recording_delete);
 

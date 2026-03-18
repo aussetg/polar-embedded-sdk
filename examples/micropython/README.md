@@ -143,6 +143,11 @@ mpremote connect /dev/ttyACM0 run :psftp_chunked_download_demo.py
 `recording_hr_demo.py` exercises H10 HR recording control (`recording_default_config`,
 `recording_start`, `recording_status`, `recording_stop`).
 
+Precondition:
+- `recording_list()` must be empty before running this demo
+- if stopped H10 recordings already exist, delete them explicitly with
+  `recording_delete(recording_id)` first
+
 Run with `mpremote`:
 
 ```bash

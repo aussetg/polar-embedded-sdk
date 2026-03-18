@@ -33,7 +33,7 @@ bool polar_sdk_btstack_route_gatt_event(
             out->kind = POLAR_SDK_GATT_ROUTE_PMD_CP_VALUE;
             return true;
         }
-        if (out->value.value_handle == state->pmd_data_value_handle && state->ecg_enabled) {
+        if (out->value.value_handle == state->pmd_data_value_handle && state->pmd_data_listening) {
             out->kind = POLAR_SDK_GATT_ROUTE_PMD_DATA_VALUE;
             return true;
         }

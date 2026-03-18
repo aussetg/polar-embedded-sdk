@@ -19,6 +19,7 @@ try:
     h10.connect(timeout_ms=20000)
     print("connected", h10.state())
     print("recording default", h10.recording_default_config("hr"))
+    print("recordings before", h10.recording_list())
 
     status = h10.recording_status()
     print("initial status", status)
@@ -27,6 +28,12 @@ try:
         print("stopping existing HR recording first")
         h10.recording_stop("hr")
         print("status after pre-stop", h10.recording_status())
+
+    remaining = h10.recording_list()
+    if remaining:
+        raise RuntimeError(
+            "existing H10 recording(s) present; delete explicitly with recording_delete() before running this demo"
+        )
 
     print("starting HR recording")
     h10.recording_start("hr", sample_type="hr", interval_s=1)

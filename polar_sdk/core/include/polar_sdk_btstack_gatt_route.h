@@ -33,7 +33,7 @@ typedef struct {
     bool pmd_cp_listening;
 
     uint16_t pmd_data_value_handle;
-    bool ecg_enabled;
+    bool pmd_data_listening;
 
     uint16_t psftp_mtu_value_handle;
     bool psftp_mtu_listening;

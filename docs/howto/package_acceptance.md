@@ -146,6 +146,11 @@ Pass:
 
 ### Step 9 — recording control
 
+Precondition:
+- no stopped H10 recording is already stored on the device
+- if `recording_list()` is non-empty, delete the old recording(s) explicitly with
+  `recording_delete(recording_id)` before running this step
+
 ```bash
 mpremote connect /dev/ttyACM1 run examples/micropython/recording_hr_demo.py
 ```
@@ -179,6 +184,10 @@ for i in $(seq 1 5); do
   mpremote connect /dev/ttyACM1 run examples/micropython/recording_hr_demo.py || break
 done
 ```
+
+Use the recording-oriented loop only when you also clear the previous stopped H10
+recording between runs; otherwise H10 recording start may be rejected until the
+existing recording is explicitly deleted.
 
 Pass:
 - repeated runs reconnect successfully
