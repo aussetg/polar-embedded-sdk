@@ -143,7 +143,7 @@ Expected side effects:
 4. Record:
    - disconnect reason/status,
    - ATT status from query-complete,
-   - pairing counters/status,
+   - pairing status/reason (and completion counts where available),
    - success/failure rate across N attempts.
 5. Port stable findings to MicroPython via patch stack (not direct vendor edits).
 6. Re-run both validation paths:

@@ -1,0 +1,54 @@
+From 5c605b4c1c8e2297425e6f8b3944d3e0d459b37f Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Fri, 13 Mar 2026 23:59:06 +0100
+Subject: [PATCH] ports/rp2: reserve top flash for BTstack TLV bank
+
+---
+ ports/rp2/rp2_flash.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/ports/rp2/rp2_flash.c b/ports/rp2/rp2_flash.c
+index 4d41d4573..89e50b093 100644
+--- a/ports/rp2/rp2_flash.c
++++ b/ports/rp2/rp2_flash.c
+@@ -34,6 +34,9 @@
+ #include "hardware/flash.h"
+ #include "pico/binary_info.h"
+ #include "rp2_psram.h"
++#if MICROPY_PY_BLUETOOTH && MICROPY_BLUETOOTH_BTSTACK && defined(MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV) && MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV
++#include "pico/btstack_flash_bank.h"
++#endif
+ #ifdef PICO_RP2350
+ #include "hardware/structs/ioqspi.h"
+ #include "hardware/structs/qmi.h"
+@@ -62,15 +65,25 @@ static_assert(MICROPY_HW_FLASH_STORAGE_BYTES % 4096 == 0, "Flash storage size mu
+ #endif
+ #endif
+ 
++#if MICROPY_PY_BLUETOOTH && MICROPY_BLUETOOTH_BTSTACK && defined(MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV) && MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV
++    #if PICO_RP2350 && PICO_RP2350_A2_SUPPORTED
++    #define MICROPY_HW_BTSTACK_TLV_RESERVED_BYTES (PICO_FLASH_BANK_TOTAL_SIZE + FLASH_SECTOR_SIZE)
++    #else
++    #define MICROPY_HW_BTSTACK_TLV_RESERVED_BYTES (PICO_FLASH_BANK_TOTAL_SIZE)
++    #endif
++#else
++#define MICROPY_HW_BTSTACK_TLV_RESERVED_BYTES (0)
++#endif
++
+ #ifndef MICROPY_HW_FLASH_STORAGE_BASE
+-#define MICROPY_HW_FLASH_STORAGE_BASE (PICO_FLASH_SIZE_BYTES - MICROPY_HW_FLASH_STORAGE_BYTES)
++#define MICROPY_HW_FLASH_STORAGE_BASE (PICO_FLASH_SIZE_BYTES - MICROPY_HW_BTSTACK_TLV_RESERVED_BYTES - MICROPY_HW_FLASH_STORAGE_BYTES)
+ #endif
+ 
+ // Put ROMFS at the upper end of the code space.
+ #define MICROPY_HW_ROMFS_BASE (MICROPY_HW_FLASH_STORAGE_BASE - MICROPY_HW_ROMFS_BYTES)
+ 
+ static_assert(MICROPY_HW_FLASH_STORAGE_BYTES <= PICO_FLASH_SIZE_BYTES, "MICROPY_HW_FLASH_STORAGE_BYTES too big");
+-static_assert(MICROPY_HW_FLASH_STORAGE_BASE + MICROPY_HW_FLASH_STORAGE_BYTES <= PICO_FLASH_SIZE_BYTES, "MICROPY_HW_FLASH_STORAGE_BYTES too big");
++static_assert(MICROPY_HW_FLASH_STORAGE_BASE + MICROPY_HW_FLASH_STORAGE_BYTES + MICROPY_HW_BTSTACK_TLV_RESERVED_BYTES <= PICO_FLASH_SIZE_BYTES, "MICROPY_HW_FLASH_STORAGE_BYTES too big");
+ 
+ typedef struct _rp2_flash_obj_t {
+     mp_obj_base_t base;
+-- 
+2.53.0
+

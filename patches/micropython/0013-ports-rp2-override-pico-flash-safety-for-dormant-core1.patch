@@ -1,0 +1,64 @@
+From b7fa7d062f807b829749f982d21f437b25dd7490 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Wed, 18 Mar 2026 18:13:14 +0100
+Subject: [PATCH] ports/rp2: override pico flash safety for dormant core1
+
+---
+ ports/rp2/rp2_flash.c | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/ports/rp2/rp2_flash.c b/ports/rp2/rp2_flash.c
+index 89e50b093..797ddc483 100644
+--- a/ports/rp2/rp2_flash.c
++++ b/ports/rp2/rp2_flash.c
+@@ -32,6 +32,7 @@
+ #include "extmod/vfs.h"
+ #include "modrp2.h"
+ #include "hardware/flash.h"
++#include "pico/flash.h"
+ #include "pico/binary_info.h"
+ #include "rp2_psram.h"
+ #if MICROPY_PY_BLUETOOTH && MICROPY_BLUETOOTH_BTSTACK && defined(MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV) && MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV
+@@ -138,6 +139,39 @@ static bool use_multicore_lockout(void) {
+     ;
+ }
+ 
++static uint32_t rp2_flash_safe_execute_irq_state[2];
++
++static bool rp2_flash_safe_execute_core_init_deinit(bool init) {
++    (void)init;
++    return true;
++}
++
++static int rp2_flash_safe_execute_enter_safe_zone_timeout_ms(uint32_t timeout_ms) {
++    if (use_multicore_lockout() && !multicore_lockout_start_timeout_us((uint64_t)timeout_ms * 1000ull)) {
++        return PICO_ERROR_TIMEOUT;
++    }
++    rp2_flash_safe_execute_irq_state[get_core_num()] = save_and_disable_interrupts();
++    return PICO_OK;
++}
++
++static int rp2_flash_safe_execute_exit_safe_zone_timeout_ms(uint32_t timeout_ms) {
++    restore_interrupts_from_disabled(rp2_flash_safe_execute_irq_state[get_core_num()]);
++    if (use_multicore_lockout() && !multicore_lockout_end_timeout_us((uint64_t)timeout_ms * 1000ull)) {
++        return PICO_ERROR_TIMEOUT;
++    }
++    return PICO_OK;
++}
++
++static flash_safety_helper_t rp2_flash_safety_helper = {
++    .core_init_deinit = rp2_flash_safe_execute_core_init_deinit,
++    .enter_safe_zone_timeout_ms = rp2_flash_safe_execute_enter_safe_zone_timeout_ms,
++    .exit_safe_zone_timeout_ms = rp2_flash_safe_execute_exit_safe_zone_timeout_ms,
++};
++
++flash_safety_helper_t *get_flash_safety_helper(void) {
++    return &rp2_flash_safety_helper;
++}
++
+ // Function to set the flash divisor to the correct divisor, assumes interrupts disabled
+ // and core1 locked out if relevant.
+ static void __no_inline_not_in_flash_func(rp2_flash_set_timing_internal)(int clock_hz) {
+-- 
+2.53.0
+

@@ -1,0 +1,81 @@
+From 3c2ec7d14b87f9dc0d3f7bb4e6c77b0d9a2518c4 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Fri, 13 Mar 2026 17:05:00 +0100
+Subject: [PATCH] ports/rp2: run all pending BTstack run-loop work
+
+The rp2 BTstack port implemented only a partial custom run loop:
+- it kept its own timer list,
+- polled BTstack data sources,
+- and processed timers.
+
+But it omitted three pieces that BTstack's embedded run loop normally
+provides:
+- btstack_run_loop_base_init()
+- btstack_run_loop_base_execute_callbacks()
+- execute_on_main_thread support
+
+That omission leaves deferred BTstack callbacks undrained on rp2. Newer
+BTstack code uses execute_on_main_thread for deferred GATT/L2CAP work,
+and on Pico 2 W + CYW43 this also correlates with security-sensitive H10
+sessions stalling after Just Works confirmation without advancing the SMP
+exchange on air.
+
+Align the rp2 port with BTstack's embedded execute-once semantics by:
+- initializing the BTstack base run-loop state,
+- executing pending callbacks on each scheduled poll,
+- wiring execute_on_main_thread to queue callbacks and reschedule an
+  immediate HCI poll.
+
+This keeps the existing MicroPython scheduler-driven model, but makes the
+rp2 BTstack run loop complete the same categories of pending work as the
+reference embedded BTstack run loop.
+
+---
+ ports/rp2/mpbtstackport.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/ports/rp2/mpbtstackport.c b/ports/rp2/mpbtstackport.c
+index 4d907be..d4f03c3 100644
+--- a/ports/rp2/mpbtstackport.c
++++ b/ports/rp2/mpbtstackport.c
+@@ -45,6 +45,7 @@ void mp_bluetooth_hci_poll_in_ms(uint32_t ms);
+ static btstack_linked_list_t mp_btstack_runloop_timers;
+ 
+ static void mp_btstack_runloop_init(void) {
++    btstack_run_loop_base_init();
+     mp_btstack_runloop_timers = NULL;
+ }
+ 
+@@ -88,6 +89,11 @@ static uint32_t mp_btstack_runloop_get_time_ms(void) {
+     return mp_hal_ticks_ms();
+ }
+ 
++static void mp_btstack_runloop_execute_on_main_thread(btstack_context_callback_registration_t *callback_registration) {
++    btstack_run_loop_base_add_callback(callback_registration);
++    mp_bluetooth_hci_poll_now();
++}
++
+ static const btstack_run_loop_t mp_btstack_runloop_rp2 = {
+     &mp_btstack_runloop_init,
+     &btstack_run_loop_base_add_data_source,
+@@ -101,7 +107,7 @@ static const btstack_run_loop_t mp_btstack_runloop_rp2 = {
+     NULL, // dump_timer
+     &mp_btstack_runloop_get_time_ms,
+     &mp_bluetooth_hci_poll_now, // poll_data_sources_from_irq
+-    NULL, // execute_on_main_thread
++    &mp_btstack_runloop_execute_on_main_thread,
+     NULL, // trigger_exit
+ };
+ 
+@@ -115,6 +121,9 @@ void mp_bluetooth_hci_poll(void) {
+         btstack_run_loop_base_poll_data_sources();
+     }
+ 
++    // Execute deferred BTstack callbacks queued via execute_on_main_thread.
++    btstack_run_loop_base_execute_callbacks();
++
+     // Process any BTstack timers.
+     while (mp_btstack_runloop_timers != NULL) {
+         btstack_timer_source_t *tim = (btstack_timer_source_t *)mp_btstack_runloop_timers;
+-- 
+2.49.0

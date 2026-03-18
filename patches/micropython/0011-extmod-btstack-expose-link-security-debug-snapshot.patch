@@ -1,0 +1,87 @@
+From 4cd669733e99f6320c490f2014587fde486060e7 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Fri, 13 Mar 2026 18:38:50 +0100
+Subject: [PATCH] extmod/btstack: expose link security debug snapshot
+
+---
+ extmod/btstack/modbluetooth_btstack.c | 29 +++++++++++++++++++++++++++
+ extmod/btstack/modbluetooth_btstack.h | 17 +++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/extmod/btstack/modbluetooth_btstack.c b/extmod/btstack/modbluetooth_btstack.c
+index 1aba2c8a1..ea170be9d 100644
+--- a/extmod/btstack/modbluetooth_btstack.c
++++ b/extmod/btstack/modbluetooth_btstack.c
+@@ -34,6 +34,7 @@
+ #include "extmod/modbluetooth.h"
+ 
+ #include "lib/btstack/src/btstack.h"
++#include "lib/btstack/src/ble/le_device_db.h"
+ #if MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV
+ #include "lib/btstack/src/btstack_tlv.h"
+ #include "lib/btstack/src/ble/le_device_db_tlv.h"
+@@ -58,6 +59,34 @@ static void btstack_setup_tlv(void) {
+ }
+ #endif
+ 
++void mp_bluetooth_btstack_get_connection_debug(
++    uint16_t conn_handle,
++    mp_bluetooth_btstack_connection_debug_t *out_debug) {
++    memset(out_debug, 0, sizeof(*out_debug));
++    out_debug->conn_handle = conn_handle;
++    out_debug->sm_le_db_index = -1;
++    out_debug->le_device_db_count = (uint32_t)le_device_db_count();
++
++    if (conn_handle == HCI_CON_HANDLE_INVALID) {
++        return;
++    }
++
++    hci_connection_t *conn = hci_connection_for_handle(conn_handle);
++    if (conn == NULL) {
++        return;
++    }
++
++    sm_connection_t *sm_conn = &conn->sm_connection;
++    out_debug->available = true;
++    out_debug->sm_engine_state = sm_conn->sm_engine_state;
++    out_debug->sm_irk_lookup_state = sm_conn->sm_irk_lookup_state;
++    out_debug->sm_le_db_index = sm_conn->sm_le_db_index;
++    out_debug->sm_connection_encrypted = sm_conn->sm_connection_encrypted;
++    out_debug->sm_actual_encryption_key_size = sm_conn->sm_actual_encryption_key_size;
++    out_debug->sm_connection_authenticated = sm_conn->sm_connection_authenticated;
++    out_debug->sm_pairing_requested = sm_conn->sm_pairing_requested;
++}
++
+ // Optional debug mode: temporarily overload disconnect addr_type with HCI reason
+ // for compatibility with old Python-side debugging scripts.
+ #ifndef MICROPY_PY_BLUETOOTH_BTSTACK_DEBUG_DISCONNECT_REASON_IN_ADDR_TYPE
+diff --git a/extmod/btstack/modbluetooth_btstack.h b/extmod/btstack/modbluetooth_btstack.h
+index 7f4a18207..856fe2d80 100644
+--- a/extmod/btstack/modbluetooth_btstack.h
++++ b/extmod/btstack/modbluetooth_btstack.h
+@@ -61,6 +61,23 @@ enum {
+ 
+ extern volatile int mp_bluetooth_btstack_state;
+ 
++typedef struct _mp_bluetooth_btstack_connection_debug_t {
++    bool available;
++    uint16_t conn_handle;
++    uint8_t sm_engine_state;
++    uint8_t sm_irk_lookup_state;
++    int sm_le_db_index;
++    uint8_t sm_connection_encrypted;
++    uint8_t sm_actual_encryption_key_size;
++    bool sm_connection_authenticated;
++    bool sm_pairing_requested;
++    uint32_t le_device_db_count;
++} mp_bluetooth_btstack_connection_debug_t;
++
++void mp_bluetooth_btstack_get_connection_debug(
++    uint16_t conn_handle,
++    mp_bluetooth_btstack_connection_debug_t *out_debug);
++
+ void mp_bluetooth_btstack_port_init(void);
+ void mp_bluetooth_btstack_port_deinit(void);
+ void mp_bluetooth_btstack_port_start(void);
+-- 
+2.53.0

@@ -10,6 +10,15 @@ Order:
 3. `0003-extmod-btstack-tune-central-connect-latency-and-supe.patch`
 4. `0004-extmod-btstack-central-post-connect-HCI-param-update.patch`
 5. `0005-extmod-btstack-include-hci-event-sources-for-newer-btstack.patch`
+6. `0006-ports-rp2-btstack-run-all-pending-run-loop-work.patch`
+7. `0007-ports-rp2-reset-hci-scheduler-state-across-soft-reset.patch`
+8. `0008-ports-rp2-power-cycle-cyw43-on-soft-reset.patch`
+9. `0009-extmod-btstack-enable-tlv-backed-bond-storage-on-rp2-cyw43.patch`
+10. `0010-extmod-btstack-add-embedded-platform-includes-for-tlv.patch`
+11. `0011-extmod-btstack-expose-link-security-debug-snapshot.patch`
+12. `0012-ports-rp2-reserve-top-flash-for-btstack-tlv-bank.patch`
+13. `0013-ports-rp2-override-pico-flash-safety-for-dormant-core1.patch`
+14. `0014-extmod-btstack-remove-link-security-debug-snapshot.patch`
 
 Apply (recommended, preserves commit metadata):
 
@@ -29,10 +38,10 @@ Abort if needed:
 git -C vendors/micropython am --abort
 ```
 
-Undo after apply (drop last 5 commits):
+Undo after apply (drop last 14 commits):
 
 ```bash
-git -C vendors/micropython reset --hard HEAD~5
+git -C vendors/micropython reset --hard HEAD~14
 ```
 
 ## What they do
@@ -55,6 +64,32 @@ git -C vendors/micropython reset --hard HEAD~5
   - `src/hci_event.c` (always)
   - `src/hci_event_builder.c` when present
   (required by newer BTstack versions, including 1.8)
+- Fix the rp2 BTstack run loop to match BTstack embedded semantics better:
+  - call `btstack_run_loop_base_init()`
+  - execute deferred BTstack callbacks on each scheduled poll
+  - implement `execute_on_main_thread` by queueing the callback and scheduling an immediate poll
+- Reset rp2 HCI scheduler state across MicroPython soft resets:
+  - clear the static HCI scheduler node on init
+  - remove the outstanding HCI soft timer on deinit
+  - invoke the HCI deinit hook from BTstack rp2 shutdown
+- Power-cycle the CYW43 device on rp2 soft reset after Bluetooth deinit,
+  so the next interpreter instance starts from a clean shared-bus BT state
+- Enable TLV-backed LE bond storage on rp2 CYW43 BTstack builds so pairing
+  state survives MicroPython soft resets
+- Add BTstack embedded platform include paths needed by the TLV flash-bank
+  backend on rp2
+- Expose a small BTstack link-security debug snapshot from the MicroPython
+  BTstack backend so project-side diagnostics can inspect SM engine state,
+  IRK lookup state, LE device-db index, and current encryption metadata
+- Reserve the rp2 top-of-flash BTstack TLV bank area from the MicroPython
+  filesystem region so persisted LE bond data can use the default Pico BTstack
+  flash-bank location without overlapping VFS sectors
+- Override pico-sdk flash-safe execution on rp2 to match MicroPython's dynamic
+  core1 usage: use multicore lockout only when core1 is actually running, and
+  otherwise allow safe flash operations with IRQ disable only so BTstack TLV
+  flash writes are not rejected while the second core is dormant
+- Remove the temporary BTstack link-security debug snapshot hook once bond
+  persistence debugging is complete
 
 Note: the `hids_client` -> `hids_host` rename for MicroPython’s vendored
 `lib/pico-sdk` is handled by the pico-sdk patch stack, applied with:

@@ -132,7 +132,7 @@ SDK core behavior must include:
 - detecting ATT security-style failures (notably `0x05`, `0x08`, and related encryption/auth statuses),
 - requesting pairing/encryption,
 - retrying protected operations,
-- surfacing security outcomes via `stats()` (e.g., encryption key size, bonded flag, pairing counters).
+- surfacing security outcomes via `stats()` (e.g., encryption key size, bonded flag, pairing status/reason).
 
 See `../KNOWN_ISSUES.md` (KI-03).
 

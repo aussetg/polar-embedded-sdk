@@ -1,7 +1,7 @@
 # Known issues
 
 Status: Living document
-Last updated: 2026-03-03
+Last updated: 2026-03-18
 
 This file collects **confirmed, user-visible issues** encountered while developing the Polar H10 stack (SDK core + MicroPython module) on **Pico 2 W (RP2350 + CYW43)** using **BTstack**.
 
@@ -94,12 +94,11 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 
 ### Current state
 - Dedicated C PSFTP probe (`examples/pico_sdk_psftp`) is stable after auth-policy alignment, with repeated successful `list_dir("/")` + `download("/DEVICE.BPB")` runs.
-- MicroPython path can still enter a sticky pairing-failed state during intensive repeated PSFTP runs:
-  - typical signature: `sm_last_pairing_status=19`, `conn_encryption_key_size=0`, `conn_bonded=False`, `psftp_tx_frames_total=0`, `psftp_rx_frames_total=0`, followed by `TimeoutError: PSFTP timeout`.
-  - practical recovery: reset the board (soft reset via `mpremote reset` or hardware reset), then retry.
+- The earlier MicroPython sticky pairing-failed state observed during repeated PSFTP runs is now addressed by the rp2 BTstack TLV persistence fixes; see `Resolved` R-02 below.
 
 ### Investigation references
 - `docs/reference/polar_psftp.md`
+- `docs/howto/mpy_psftp_probe_air_capture_comparison.md`
 
 ## Vendor-reported device issues (Polar; informational)
 
@@ -173,3 +172,27 @@ Source:
 **Fix:** set non-zero C heap on affected presets (currently `MICROPY_C_HEAP_SIZE=8192` on `fw-pico2w-picographics`, `fw-rp2-1`, and `fw-rp2-1-debug`).
 
 **Reference:** `CMakePresets.json`, `docs/howto/build_micropython_with_polar_module.md`.
+
+### R-02 — rp2 BTstack bond persistence was lost across MicroPython soft resets
+
+**Affected path:** Pico 2 W / rp2 / CYW43 MicroPython builds using BTstack TLV-backed bond storage.
+
+**Symptoms before fix:**
+- pairing could succeed for the current runtime,
+- but the local bond database did not survive soft reset,
+- repeated secured reconnects/PSFTP runs could fall back into `enc=0`, `conn_bonded=false`, and pairing-failure signatures.
+
+**Root cause:** two issues combined:
+- the default BTstack TLV bank overlapped the top-of-flash MicroPython filesystem region, and
+- pico-sdk flash-safe execution rejected BTstack TLV flash writes on rp2 when core1 was dormant.
+
+**Fix:**
+- reserve the rp2 top-of-flash BTstack TLV bank away from VFS, and
+- override rp2 flash-safe execution so BTstack TLV writes are allowed when core1 is dormant and still use multicore lockout when core1 is active.
+
+**Result:** TLV headers and bond entries now persist in flash, and repeated bonded reconnects across MicroPython soft resets work on the Pico 2 W test path.
+
+**References:**
+- `patches/micropython/0012-ports-rp2-reserve-top-flash-for-btstack-tlv-bank.patch`
+- `patches/micropython/0013-ports-rp2-override-pico-flash-safety-for-dormant-core1.patch`
+- `docs/howto/mpy_psftp_probe_air_capture_comparison.md`

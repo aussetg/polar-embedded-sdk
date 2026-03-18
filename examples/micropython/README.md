@@ -126,7 +126,5 @@ mpremote connect /dev/ttyACM0 fs cp examples/micropython/psftp_download_demo.py 
 mpremote connect /dev/ttyACM0 run :psftp_download_demo.py
 ```
 
-PSFTP recovery note (current known issue): if repeated PSFTP runs get stuck in a pairing-failed state (`PSFTP timeout`, `enc=0`, `sm_last_pairing_status=19` in `stats()`), reset the board (`mpremote reset` or hardware reset) and retry.
-
-Legacy investigation notes/logs live under:
-- `.agent/archive/investigations/`
+For current PSFTP/platform caveats, see:
+- `docs/KNOWN_ISSUES.md`

@@ -1,0 +1,43 @@
+From 8aaeb262fd07e7708913a95a3f246f91f723d737 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Fri, 13 Mar 2026 18:05:00 +0100
+Subject: [PATCH] ports/rp2: power-cycle CYW43 on soft reset
+
+After fixing the rp2 BTstack run loop and HCI scheduler state, Polar H10
+PSFTP pairing became reliable after hard reset, but could still regress
+across repeated MicroPython soft-reset cycles.
+
+On rp2, cyw43_state is initialised once at power-up and survives
+interpreter soft resets. With lwIP enabled, mod_network_deinit() does not
+deinitialise CYW43 on soft reset, and the BTstack shutdown path also does
+not power-cycle the shared CYW43 Wi-Fi/Bluetooth device.
+
+That leaves the CYW43 shared-bus Bluetooth side warm across interpreter
+lifetimes, which can preserve stale controller/bus state and correlates
+with SMP pairing stalling again on the next run.
+
+Reset the CYW43 device during rp2 soft reset, after Bluetooth deinit has
+completed. cyw43_deinit() powers the chip down and reinitialises driver
+state, giving the next interpreter instance a clean controller state
+without requiring a physical reset.
+
+---
+ ports/rp2/main.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/ports/rp2/main.c b/ports/rp2/main.c
+index 7788d820f..9a79e7209 100644
+--- a/ports/rp2/main.c
++++ b/ports/rp2/main.c
+@@ -258,6 +258,9 @@ soft_reset_exit:
+         #if MICROPY_PY_BLUETOOTH
+         mp_bluetooth_deinit();
+         #endif
++        #if MICROPY_PY_BLUETOOTH_CYW43
++        cyw43_deinit(&cyw43_state);
++        #endif
+         #if MICROPY_PY_MACHINE_PWM
+         machine_pwm_deinit_all();
+         #endif
+-- 
+2.49.0

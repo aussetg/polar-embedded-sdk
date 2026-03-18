@@ -195,6 +195,7 @@ target_sources(usermod_polar_sdk INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_wait.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_session.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_runtime_context.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_transport_adapter.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_btstack_link.c
@@ -225,6 +226,12 @@ target_sources(usermod_polar_sdk INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_pmd_start.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_psftp.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_psftp_runtime.c
+    # Keep the MicroPython BTstack firmware aligned with the pico-sdk probe
+    # builds used in this repo for H10 security-sensitive paths.
+    # The local btstack config enables software AES + micro-ecc, so add the
+    # matching implementation units here instead of relying on vendor defaults.
+    ${POLAR_MICROPY_SUBMODULE_DIR}/lib/btstack/3rd-party/rijndael/rijndael.c
+    ${POLAR_MICROPY_SUBMODULE_DIR}/lib/btstack/3rd-party/micro-ecc/uECC.c
 )
 
 if(POLAR_ENABLE_PSFTP)
@@ -243,6 +250,8 @@ endif()
 target_include_directories(usermod_polar_sdk INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/../core/include
+    ${POLAR_MICROPY_SUBMODULE_DIR}/lib/btstack/3rd-party/rijndael
+    ${POLAR_MICROPY_SUBMODULE_DIR}/lib/btstack/3rd-party/micro-ecc
 )
 
 if(POLAR_ENABLE_PSFTP)
@@ -260,6 +269,18 @@ target_compile_definitions(usermod_polar_sdk INTERFACE
     POLAR_BUILD_GIT_DIRTY=\"${POLAR_BUILD_GIT_DIRTY}\"
     POLAR_BUILD_PRESET=\"${POLAR_BUILD_PRESET}\"
     POLAR_BUILD_TYPE=\"${POLAR_BUILD_TYPE}\"
+)
+
+target_compile_options(usermod_polar_sdk INTERFACE
+    -UMICROPY_BLUETOOTH_BTSTACK_CONFIG_FILE
+    -DMICROPY_BLUETOOTH_BTSTACK_CONFIG_FILE=\"${CMAKE_CURRENT_LIST_DIR}/btstack_inc/btstack_config.h\"
+    # The rp2 port otherwise injects its own immediate post-connect parameter
+    # update for every central connection (24/24/0/72). Our Polar transport
+    # layer already performs its own deterministic post-connect update aligned
+    # with the working pico-sdk probes, so disable the generic MicroPython one
+    # to avoid a competing early HCI update on the same link.
+    -UMICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_PARAM_UPDATE
+    -DMICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_PARAM_UPDATE=0
 )
 
 # Link our INTERFACE library to the usermod target (provided by MicroPython build).

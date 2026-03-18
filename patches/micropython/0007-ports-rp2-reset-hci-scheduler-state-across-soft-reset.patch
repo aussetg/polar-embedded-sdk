@@ -1,0 +1,79 @@
+From a31b8f11d3b8140e9831d4f281a9a839bdf2aa21 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Fri, 13 Mar 2026 17:45:00 +0100
+Subject: [PATCH] ports/rp2: reset HCI scheduler state across soft reset
+
+After fixing the rp2 BTstack run loop to execute deferred callbacks, H10
+PSFTP pairing became reliable immediately after a hard reset, but still
+regressed across MicroPython soft resets.
+
+The rp2 HCI scheduling glue keeps two pieces of state outside the
+MicroPython VM heap:
+- the one-shot soft timer used to reschedule polls
+- the static scheduler node used for immediate poll requests
+
+If a soft reset happens while Bluetooth work is pending, that state can
+leak across interpreter lifetimes. On the next run the rp2 BTstack path
+can then miss immediate polls or keep stale timer state, which correlates
+with pairing stalling again after Just Works confirmation.
+
+Reset that scheduling state explicitly by:
+- clearing the static scheduler node on HCI init
+- removing the outstanding HCI soft timer on HCI deinit
+- calling the new HCI deinit hook from the BTstack rp2 port shutdown path
+
+This keeps the rp2 HCI scheduler state aligned with the surrounding
+MicroPython soft-reset lifecycle.
+
+---
+ ports/rp2/mpbthciport.c | 6 ++++++
+ ports/rp2/mpbthciport.h | 3 ++-
+ ports/rp2/mpbtstackport.c | 1 +
+ 3 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/ports/rp2/mpbthciport.c b/ports/rp2/mpbthciport.c
+index 0112304..1243b87 100644
+--- a/ports/rp2/mpbthciport.c
++++ b/ports/rp2/mpbthciport.c
+@@ -57,6 +57,12 @@ void mp_bluetooth_hci_init(void) {
+         0,
+         mp_bluetooth_hci_soft_timer_callback
+         );
++    mp_bluetooth_hci_sched_node.callback = NULL;
++    mp_bluetooth_hci_sched_node.next = NULL;
++}
++
++void mp_bluetooth_hci_deinit(void) {
++    soft_timer_remove(&mp_bluetooth_hci_soft_timer);
+ }
+ 
+ void mp_bluetooth_hci_poll_in_ms(uint32_t ms) {
+diff --git a/ports/rp2/mpbthciport.h b/ports/rp2/mpbthciport.h
+index fdf46c5..e1c2222 100644
+--- a/ports/rp2/mpbthciport.h
++++ b/ports/rp2/mpbthciport.h
+@@ -26,8 +26,9 @@
+ #ifndef MICROPY_INCLUDED_RP2_MPBTHCIPORT_H
+ #define MICROPY_INCLUDED_RP2_MPBTHCIPORT_H
+ 
+-// Initialise the HCI subsystem (should be called once, early on).
++// Initialise/deinitialise the HCI scheduling subsystem.
+ void mp_bluetooth_hci_init(void);
++void mp_bluetooth_hci_deinit(void);
+ 
+ // Poll the HCI now, or after a certain timeout.
+ void mp_bluetooth_hci_poll_now(void);
+diff --git a/ports/rp2/mpbtstackport.c b/ports/rp2/mpbtstackport.c
+index d4f03c3..a4c57c1 100644
+--- a/ports/rp2/mpbtstackport.c
++++ b/ports/rp2/mpbtstackport.c
+@@ -150,6 +150,7 @@ void mp_bluetooth_btstack_port_init(void) {
+ }
+ 
+ void mp_bluetooth_btstack_port_deinit(void) {
++    mp_bluetooth_hci_deinit();
+     hci_power_control(HCI_POWER_OFF);
+     // We really need hci to be closed or else we might get a BT interrupt going off and
+     // this will cause a crash when calling btstack_run_loop_poll_data_sources_from_irq after the btstack run loop has been deleted
+-- 
+2.49.0

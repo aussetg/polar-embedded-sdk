@@ -17,9 +17,9 @@
 //   - PMD start/stop ECG control path
 //   - PMD ECG frame-type-0 parsing to packed int32 ring buffer
 //   - read_ecg(max_bytes=..., timeout_ms=...)
-// - IMU support (H10 ACC raw frame type 0x01):
-//   - PMD start/stop IMU(ACC) control path
-//   - read_imu(max_bytes=..., timeout_ms=...)
+// - ACC support (H10 ACC raw frame type 0x01):
+//   - PMD start/stop ACC control path
+//   - read_acc(max_bytes=..., timeout_ms=...)
 //
 // Notes:
 // - BLE implementation targets MicroPython rp2 + BTstack central mode.
@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include "polar_sdk_common.h"
+#include "polar_sdk_session.h"
 #include "polar_sdk_connect.h"
 #include "polar_sdk_discovery.h"
 #include "polar_sdk_discovery_orchestrator.h"
@@ -68,6 +69,7 @@
 #include "py/mperrno.h"
 #include "py/mphal.h"
 #include "py/objexcept.h"
+#include "py/objstr.h"
 #include "py/runtime.h"
 
 // Feature flags (normally provided by the build system via CMake).
@@ -103,7 +105,9 @@
 #if MICROPY_PY_BLUETOOTH && MICROPY_BLUETOOTH_BTSTACK
 #define POLAR_SDK_HAS_BTSTACK (1)
 #include "extmod/modbluetooth.h"
+#include "extmod/btstack/modbluetooth_btstack.h"
 #include "btstack.h"
+#include "pico/unique_id.h"
 #else
 #define POLAR_SDK_HAS_BTSTACK (0)
 #endif
@@ -112,7 +116,7 @@
 #define POLAR_SDK_SERVICE_ECG (0x02)
 #define POLAR_SDK_SERVICE_PSFTP (0x04)
 #define POLAR_SDK_SERVICE_ALL (POLAR_SDK_SERVICE_HR | POLAR_SDK_SERVICE_ECG | POLAR_SDK_SERVICE_PSFTP)
-#define POLAR_SDK_DEFAULT_REQUIRED_SERVICES     ((POLAR_CFG_ENABLE_HR ? POLAR_SDK_SERVICE_HR : 0) |     (POLAR_CFG_ENABLE_ECG ? POLAR_SDK_SERVICE_ECG : 0) |     (POLAR_CFG_ENABLE_PSFTP ? POLAR_SDK_SERVICE_PSFTP : 0))
+#define POLAR_SDK_CAP_STREAM_PMD_MASK (POLAR_CAP_STREAM_ECG | POLAR_CAP_STREAM_ACC | POLAR_CAP_STREAM_PPG | POLAR_CAP_STREAM_PPI | POLAR_CAP_STREAM_GYRO | POLAR_CAP_STREAM_MAG)
 
 // Conservative defaults for connect scan and retry behavior.
 #define POLAR_SDK_SCAN_INTERVAL_UNITS (0x0030) // 30 ms
@@ -131,8 +135,11 @@
 
 #define POLAR_SDK_PMD_OP_REQUEST_MEASUREMENT_START (POLAR_SDK_PMD_OPCODE_START_MEASUREMENT)
 #define POLAR_SDK_PMD_OP_STOP_MEASUREMENT (POLAR_SDK_PMD_OPCODE_STOP_MEASUREMENT)
+#define POLAR_SDK_PMD_OP_GET_MEASUREMENT_SETTINGS (0x01)
+#define POLAR_SDK_PMD_OP_GET_MEASUREMENT_STATUS (0x05)
 #define POLAR_SDK_PMD_MEAS_ECG (POLAR_SDK_PMD_MEASUREMENT_ECG)
 #define POLAR_SDK_PMD_MEAS_ACC (POLAR_SDK_PMD_MEASUREMENT_ACC)
+#define POLAR_SDK_PMD_MEAS_OFFLINE_HR (0x0Eu)
 
 #define POLAR_SDK_PMD_MIN_MTU (70)
 #define POLAR_SDK_PMD_SECURITY_ROUNDS (3)
@@ -156,14 +163,47 @@
 #define POLAR_SDK_STATE_READY (POLAR_SDK_RUNTIME_STATE_READY)
 #define POLAR_SDK_STATE_RECOVERING (POLAR_SDK_RUNTIME_STATE_RECOVERING)
 
-static const qstr polar_state_qstrs[] = {
-    MP_QSTR_IDLE,
-    MP_QSTR_SCANNING,
-    MP_QSTR_CONNECTING,
-    MP_QSTR_DISCOVERING,
-    MP_QSTR_READY,
-    MP_QSTR_RECOVERING,
+static const char *const polar_state_strs[] = {
+    "idle",
+    "scanning",
+    "connecting",
+    "discovering",
+    "ready",
+    "recovering",
 };
+
+#if POLAR_SDK_HAS_BTSTACK
+static void polar_fill_btstack_host_key(sm_key_t out_key, uint8_t salt_a, uint8_t salt_b) {
+    pico_unique_board_id_t board_id;
+    pico_get_unique_board_id(&board_id);
+
+    for (size_t i = 0; i < sizeof(sm_key_t); ++i) {
+        uint8_t src = board_id.id[i % PICO_UNIQUE_BOARD_ID_SIZE_BYTES];
+        uint8_t mix = (uint8_t)(src ^ (uint8_t)(salt_a + (uint8_t)(i * 29u)) ^ (uint8_t)(salt_b * (uint8_t)(i + 1u)));
+        if (mix == 0) {
+            mix = (uint8_t)(0x5Au ^ salt_a ^ (uint8_t)i);
+        }
+        out_key[i] = mix;
+    }
+}
+
+static void polar_apply_btstack_host_identity_keys(void) {
+    // MicroPython's BTstack init path overwrites BTstack's built-in default ER/IR
+    // values with all-zero dummy keys to silence warnings. For our central-only
+    // H10 PSFTP flows that is a bad trade: it removes a stable non-zero local
+    // identity basis and can destabilize pairing/bonding behavior.
+    //
+    // Restore deterministic per-board non-zero keys after stack init without
+    // editing vendors/. These keys are local host identity material for the
+    // BTstack Security Manager, not user-facing API state.
+    sm_key_t er;
+    sm_key_t ir;
+    polar_fill_btstack_host_key(er, 0x41u, 0x97u);
+    polar_fill_btstack_host_key(ir, 0xA5u, 0x2Fu);
+    sm_set_er(er);
+    sm_set_ir(ir);
+}
+#endif
 
 static bool polar_service_mask_is_valid(uint32_t mask) {
     uint32_t allowed = POLAR_SDK_SERVICE_ALL;
@@ -177,6 +217,333 @@ static bool polar_service_mask_is_valid(uint32_t mask) {
         allowed &= ~POLAR_SDK_SERVICE_PSFTP;
     }
     return polar_sdk_service_mask_is_valid(mask, allowed);
+}
+
+static polar_capability_mask_t polar_build_available_capabilities_mask(void) {
+    polar_capability_mask_t mask = 0;
+    if (POLAR_CFG_ENABLE_HR) {
+        mask |= POLAR_CAP_STREAM_HR;
+    }
+    if (POLAR_CFG_ENABLE_ECG) {
+        mask |= POLAR_CAP_STREAM_ECG;
+        mask |= POLAR_CAP_STREAM_ACC;
+    }
+    if (POLAR_CFG_ENABLE_PSFTP) {
+        mask |= POLAR_CAP_PSFTP_READ;
+        mask |= POLAR_CAP_PSFTP_DELETE;
+        if (POLAR_CFG_ENABLE_HR) {
+            mask |= POLAR_CAP_RECORDING;
+        }
+    }
+    return mask;
+}
+
+static uint8_t polar_capability_mask_to_service_mask(polar_capability_mask_t mask) {
+    uint8_t service_mask = 0;
+    if (mask & POLAR_CAP_STREAM_HR) {
+        service_mask |= POLAR_SDK_SERVICE_HR;
+    }
+    if (mask & POLAR_SDK_CAP_STREAM_PMD_MASK) {
+        service_mask |= POLAR_SDK_SERVICE_ECG;
+    }
+    if (mask & (POLAR_CAP_RECORDING | POLAR_CAP_PSFTP_READ | POLAR_CAP_PSFTP_DELETE)) {
+        service_mask |= POLAR_SDK_SERVICE_PSFTP;
+    }
+    return service_mask;
+}
+
+static uint8_t polar_build_default_services_mask(void) {
+    return polar_capability_mask_to_service_mask(polar_build_available_capabilities_mask());
+}
+
+static bool polar_capability_name_to_bit(const char *name, size_t len, polar_capability_mask_t *out_bit) {
+    if (len == 9 && memcmp(name, "stream:hr", 9) == 0) {
+        *out_bit = POLAR_CAP_STREAM_HR;
+        return true;
+    }
+    if (len == 10 && memcmp(name, "stream:ecg", 10) == 0) {
+        *out_bit = POLAR_CAP_STREAM_ECG;
+        return true;
+    }
+    if (len == 10 && memcmp(name, "stream:acc", 10) == 0) {
+        *out_bit = POLAR_CAP_STREAM_ACC;
+        return true;
+    }
+    if (len == 10 && memcmp(name, "stream:ppg", 10) == 0) {
+        *out_bit = POLAR_CAP_STREAM_PPG;
+        return true;
+    }
+    if (len == 10 && memcmp(name, "stream:ppi", 10) == 0) {
+        *out_bit = POLAR_CAP_STREAM_PPI;
+        return true;
+    }
+    if (len == 11 && memcmp(name, "stream:gyro", 11) == 0) {
+        *out_bit = POLAR_CAP_STREAM_GYRO;
+        return true;
+    }
+    if (len == 10 && memcmp(name, "stream:mag", 10) == 0) {
+        *out_bit = POLAR_CAP_STREAM_MAG;
+        return true;
+    }
+    if (len == 9 && memcmp(name, "recording", 9) == 0) {
+        *out_bit = POLAR_CAP_RECORDING;
+        return true;
+    }
+    if (len == 10 && memcmp(name, "psftp:read", 10) == 0) {
+        *out_bit = POLAR_CAP_PSFTP_READ;
+        return true;
+    }
+    if (len == 12 && memcmp(name, "psftp:delete", 12) == 0) {
+        *out_bit = POLAR_CAP_PSFTP_DELETE;
+        return true;
+    }
+    return false;
+}
+
+static bool polar_required_capabilities_parse(
+    mp_obj_t caps_obj,
+    polar_capability_mask_t *out_caps,
+    uint8_t *out_services_mask) {
+    polar_capability_mask_t caps = 0;
+
+    if (caps_obj == mp_const_none) {
+        caps = 0;
+    } else {
+        if (!mp_obj_is_type(caps_obj, &mp_type_tuple) && !mp_obj_is_type(caps_obj, &mp_type_list)) {
+            mp_raise_TypeError(MP_ERROR_TEXT("required_capabilities must be tuple/list or None"));
+        }
+
+        mp_obj_t *items = NULL;
+        size_t n_items = 0;
+        mp_obj_get_array(caps_obj, &n_items, &items);
+        for (size_t i = 0; i < n_items; i++) {
+            if (!mp_obj_is_str(items[i])) {
+                mp_raise_TypeError(MP_ERROR_TEXT("required_capabilities entries must be str"));
+            }
+            size_t len = 0;
+            const char *name = mp_obj_str_get_data(items[i], &len);
+            polar_capability_mask_t bit = 0;
+            if (!polar_capability_name_to_bit(name, len, &bit)) {
+                mp_raise_ValueError(MP_ERROR_TEXT("unknown capability"));
+            }
+            caps |= bit;
+        }
+    }
+
+    if ((caps & ~polar_build_available_capabilities_mask()) != 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("required capabilities unavailable in this build"));
+    }
+
+    uint8_t services_mask = polar_capability_mask_to_service_mask(caps);
+    if (!polar_service_mask_is_valid(services_mask)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("required capabilities unavailable in this build"));
+    }
+
+    *out_caps = caps;
+    *out_services_mask = services_mask;
+    return true;
+}
+
+static mp_obj_t polar_capabilities_tuple_from_mask(polar_capability_mask_t mask) {
+    mp_obj_t items[10];
+    size_t n = 0;
+    if (mask & POLAR_CAP_STREAM_HR) {
+        items[n++] = mp_obj_new_str("stream:hr", 9);
+    }
+    if (mask & POLAR_CAP_STREAM_ECG) {
+        items[n++] = mp_obj_new_str("stream:ecg", 10);
+    }
+    if (mask & POLAR_CAP_STREAM_ACC) {
+        items[n++] = mp_obj_new_str("stream:acc", 10);
+    }
+    if (mask & POLAR_CAP_STREAM_PPG) {
+        items[n++] = mp_obj_new_str("stream:ppg", 10);
+    }
+    if (mask & POLAR_CAP_STREAM_PPI) {
+        items[n++] = mp_obj_new_str("stream:ppi", 10);
+    }
+    if (mask & POLAR_CAP_STREAM_GYRO) {
+        items[n++] = mp_obj_new_str("stream:gyro", 11);
+    }
+    if (mask & POLAR_CAP_STREAM_MAG) {
+        items[n++] = mp_obj_new_str("stream:mag", 10);
+    }
+    if (mask & POLAR_CAP_RECORDING) {
+        items[n++] = mp_obj_new_str("recording", 9);
+    }
+    if (mask & POLAR_CAP_PSFTP_READ) {
+        items[n++] = mp_obj_new_str("psftp:read", 10);
+    }
+    if (mask & POLAR_CAP_PSFTP_DELETE) {
+        items[n++] = mp_obj_new_str("psftp:delete", 12);
+    }
+    return mp_obj_new_tuple(n, items);
+}
+
+typedef enum {
+    POLAR_STREAM_KIND_KEY_INVALID = -1,
+    POLAR_STREAM_KIND_KEY_HR = 0,
+    POLAR_STREAM_KIND_KEY_ECG,
+    POLAR_STREAM_KIND_KEY_ACC,
+    POLAR_STREAM_KIND_KEY_PPG,
+    POLAR_STREAM_KIND_KEY_PPI,
+    POLAR_STREAM_KIND_KEY_GYRO,
+    POLAR_STREAM_KIND_KEY_MAG,
+} polar_stream_kind_key_t;
+
+static polar_stream_kind_key_t polar_parse_stream_kind_key(mp_obj_t kind_obj) {
+    if (!mp_obj_is_str(kind_obj)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("kind must be str"));
+    }
+
+    size_t len = 0;
+    const char *kind = mp_obj_str_get_data(kind_obj, &len);
+    if (len == 2 && memcmp(kind, "hr", 2) == 0) {
+        return POLAR_STREAM_KIND_KEY_HR;
+    }
+    if (len == 3 && memcmp(kind, "ecg", 3) == 0) {
+        return POLAR_STREAM_KIND_KEY_ECG;
+    }
+    if (len == 3 && memcmp(kind, "acc", 3) == 0) {
+        return POLAR_STREAM_KIND_KEY_ACC;
+    }
+    if (len == 3 && memcmp(kind, "ppg", 3) == 0) {
+        return POLAR_STREAM_KIND_KEY_PPG;
+    }
+    if (len == 3 && memcmp(kind, "ppi", 3) == 0) {
+        return POLAR_STREAM_KIND_KEY_PPI;
+    }
+    if (len == 4 && memcmp(kind, "gyro", 4) == 0) {
+        return POLAR_STREAM_KIND_KEY_GYRO;
+    }
+    if (len == 3 && memcmp(kind, "mag", 3) == 0) {
+        return POLAR_STREAM_KIND_KEY_MAG;
+    }
+    return POLAR_STREAM_KIND_KEY_INVALID;
+}
+
+static polar_stream_format_t polar_default_stream_format_for_kind(polar_stream_kind_key_t kind) {
+    (void)kind;
+    return POLAR_STREAM_FORMAT_DECODED;
+}
+
+static polar_stream_format_t polar_parse_stream_format_or_default(
+    mp_obj_t format_obj,
+    polar_stream_format_t default_format) {
+    if (format_obj == mp_const_none) {
+        return default_format;
+    }
+    if (!mp_obj_is_str(format_obj)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("format must be str or None"));
+    }
+
+    size_t len = 0;
+    const char *fmt = mp_obj_str_get_data(format_obj, &len);
+    if (len == 3 && memcmp(fmt, "raw", 3) == 0) {
+        return POLAR_STREAM_FORMAT_RAW;
+    }
+    if (len == 7 && memcmp(fmt, "decoded", 7) == 0) {
+        return POLAR_STREAM_FORMAT_DECODED;
+    }
+    mp_raise_ValueError(MP_ERROR_TEXT("invalid format"));
+}
+
+static inline void polar_store_u32_le(uint8_t *dst, uint32_t value) {
+    dst[0] = (uint8_t)(value & 0xffu);
+    dst[1] = (uint8_t)((value >> 8) & 0xffu);
+    dst[2] = (uint8_t)((value >> 16) & 0xffu);
+    dst[3] = (uint8_t)((value >> 24) & 0xffu);
+}
+
+static inline void polar_store_u64_le(uint8_t *dst, uint64_t value) {
+    dst[0] = (uint8_t)(value & 0xffu);
+    dst[1] = (uint8_t)((value >> 8) & 0xffu);
+    dst[2] = (uint8_t)((value >> 16) & 0xffu);
+    dst[3] = (uint8_t)((value >> 24) & 0xffu);
+    dst[4] = (uint8_t)((value >> 32) & 0xffu);
+    dst[5] = (uint8_t)((value >> 40) & 0xffu);
+    dst[6] = (uint8_t)((value >> 48) & 0xffu);
+    dst[7] = (uint8_t)((value >> 56) & 0xffu);
+}
+
+static inline void polar_store_i32_le(uint8_t *dst, int32_t value) {
+    polar_store_u32_le(dst, (uint32_t)value);
+}
+
+static inline void polar_store_i64_le(uint8_t *dst, int64_t value) {
+    polar_store_u64_le(dst, (uint64_t)value);
+}
+
+static mp_obj_t polar_build_decoded_chunk_v1(
+    uint8_t kind_code,
+    uint8_t unit_code,
+    uint8_t time_base_code,
+    uint8_t flags,
+    int64_t t0_ns,
+    int32_t dt_ns,
+    uint32_t sample_size_bytes,
+    const uint8_t *payload,
+    size_t payload_len) {
+    const size_t header_len = 28;
+    const size_t total_len = header_len + payload_len;
+    uint8_t *tmp = m_new(uint8_t, total_len);
+
+    tmp[0] = 1; // version
+    tmp[1] = kind_code;
+    tmp[2] = unit_code;
+    tmp[3] = time_base_code;
+    tmp[4] = flags;
+    tmp[5] = 0;
+    tmp[6] = 0;
+    tmp[7] = 0;
+    polar_store_u32_le(&tmp[8], sample_size_bytes == 0 ? 0u : (uint32_t)(payload_len / sample_size_bytes));
+    polar_store_i64_le(&tmp[12], (flags & 0x01u) != 0 ? t0_ns : 0);
+    polar_store_i32_le(&tmp[20], (flags & 0x02u) != 0 ? dt_ns : 0);
+    polar_store_u32_le(&tmp[24], sample_size_bytes);
+
+    if (payload_len > 0) {
+        memcpy(&tmp[28], payload, payload_len);
+    }
+
+    mp_obj_t out = mp_obj_new_bytes(tmp, total_len);
+    m_del(uint8_t, tmp, total_len);
+    return out;
+}
+
+static uint8_t polar_hr_public_flags(const polar_sdk_hr_state_t *state) {
+    uint8_t flags = 0;
+    if (state->last_contact != 0) {
+        flags |= 0x01u;
+    }
+    if ((state->last_flags & 0x04u) != 0) {
+        flags |= 0x02u;
+    }
+    return flags;
+}
+
+static mp_obj_t polar_build_decoded_hr_chunk(const polar_sdk_hr_state_t *state) {
+    uint8_t payload[12] = {0};
+    uint16_t bpm = state->last_bpm;
+    payload[0] = (uint8_t)(bpm & 0xffu);
+    payload[1] = (uint8_t)((bpm >> 8) & 0xffu);
+    payload[2] = polar_hr_public_flags(state);
+    payload[3] = state->last_rr_count;
+    for (size_t i = 0; i < 4; ++i) {
+        uint16_t rr_ms = state->last_rr_ms[i];
+        payload[4 + i * 2] = (uint8_t)(rr_ms & 0xffu);
+        payload[5 + i * 2] = (uint8_t)((rr_ms >> 8) & 0xffu);
+    }
+
+    return polar_build_decoded_chunk_v1(
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        12,
+        payload,
+        sizeof(payload));
 }
 
 #if POLAR_SDK_HAS_BTSTACK
@@ -268,12 +635,37 @@ static MP_DEFINE_CONST_OBJ_TYPE(
     parent, &polar_type_Error
     );
 
+static MP_DEFINE_CONST_OBJ_TYPE(
+    polar_type_SecurityError,
+    MP_QSTR_SecurityError,
+    MP_TYPE_FLAG_NONE,
+    make_new, mp_obj_exception_make_new,
+    print, mp_obj_exception_print,
+    attr, mp_obj_exception_attr,
+    parent, &polar_type_Error
+    );
+
+static MP_DEFINE_CONST_OBJ_TYPE(
+    polar_type_UnsupportedError,
+    MP_QSTR_UnsupportedError,
+    MP_TYPE_FLAG_NONE,
+    make_new, mp_obj_exception_make_new,
+    print, mp_obj_exception_print,
+    attr, mp_obj_exception_attr,
+    parent, &polar_type_Error
+    );
+
 static NORETURN void polar_raise_exc(const mp_obj_type_t *type, mp_rom_error_text_t msg) {
     nlr_raise(mp_obj_new_exception_msg(type, msg));
 }
 
+typedef struct _polar_h10_obj_t polar_h10_obj_t;
+
+static void polar_require_ready(polar_h10_obj_t *self);
+static void polar_require_no_active_download_handle(polar_h10_obj_t *self);
+
 // -----------------------------------------------------------------------------
-// H10 object
+// Device object
 
 typedef struct _polar_h10_obj_t {
     mp_obj_base_t base;
@@ -283,7 +675,14 @@ typedef struct _polar_h10_obj_t {
     // Generic stats
     uint32_t connect_calls;
     uint32_t disconnect_calls;
-    uint8_t required_services_mask;
+    polar_capability_mask_t required_capabilities_mask;
+    uint8_t required_services_mask; // internal discovery mapping
+    polar_stream_format_t hr_stream_format;
+    polar_stream_format_t ecg_stream_format;
+    polar_stream_format_t acc_stream_format;
+    uint16_t ecg_sample_rate_hz;
+    uint16_t acc_sample_rate_hz;
+    uint16_t acc_range;
 
     polar_sdk_runtime_link_t runtime_link;
 
@@ -310,9 +709,6 @@ typedef struct _polar_h10_obj_t {
     bool mtu_exchange_done;
     uint32_t mtu_exchange_total;
 
-    uint32_t sm_just_works_total;
-    uint32_t sm_numeric_comparison_total;
-    uint32_t sm_authorization_requests_total;
     uint32_t sm_pairing_complete_total;
     uint8_t sm_last_pairing_status;
     uint8_t sm_last_pairing_reason;
@@ -361,6 +757,10 @@ typedef struct _polar_h10_obj_t {
     uint32_t hr_last_resubscribe_ms;
     uint32_t hr_consumed_seq;
     polar_sdk_hr_state_t hr_state;
+    uint8_t hr_raw_last[24];
+    uint8_t hr_raw_last_len;
+    uint32_t hr_raw_seq;
+    uint32_t hr_raw_consumed_seq;
 
     // PMD/ECG runtime
     gatt_client_notification_t pmd_cp_notification;
@@ -380,6 +780,8 @@ typedef struct _polar_h10_obj_t {
     uint8_t pmd_cp_response_expected_type;
     uint8_t pmd_cp_response_status;
     uint8_t pmd_cp_response_more;
+    uint8_t pmd_cp_response_params[128];
+    uint8_t pmd_cp_response_params_len;
 
     bool ecg_enabled;
     uint8_t ecg_ring_storage[POLAR_SDK_ECG_RING_BYTES];
@@ -388,6 +790,18 @@ typedef struct _polar_h10_obj_t {
     bool imu_enabled;
     uint8_t imu_ring_storage[POLAR_SDK_IMU_RING_BYTES];
     polar_sdk_imu_ring_t imu_ring;
+
+    bool recording_hr_active;
+    bool recording_hr_config_known;
+    uint8_t recording_hr_interval_s;
+    polar_sdk_h10_recording_sample_type_t recording_hr_sample_type;
+    char recording_hr_id[POLAR_SDK_H10_RECORDING_ID_MAX_BYTES + 1u];
+    uint32_t recording_hr_id_next;
+    bool recording_ecg_active;
+    bool recording_acc_active;
+    uint16_t recording_ecg_sample_rate_hz;
+    uint16_t recording_acc_sample_rate_hz;
+    uint16_t recording_acc_range;
 
     uint32_t pmd_cp_notifications_total;
     uint32_t pmd_cp_response_total;
@@ -418,10 +832,38 @@ typedef struct _polar_h10_obj_t {
     uint16_t psftp_last_error_code;
     uint8_t psftp_last_att_status;
     uint32_t psftp_last_response_bytes;
+    bool psftp_last_security_related_failure;
+    bool psftp_bond_clear_done;
+
+    bool download_handle_active;
+    uint32_t download_handle_id;
+    uint32_t download_handle_next_id;
+    uint8_t *download_blob;
+    size_t download_blob_len;
+    size_t download_blob_off;
+    size_t download_blob_alloc;
 
     polar_sdk_discovery_stage_t discovery_stage;
 #endif
 } polar_h10_obj_t;
+
+static void polar_require_ready(polar_h10_obj_t *self) {
+    if (self->runtime_link.state != POLAR_SDK_STATE_READY ||
+        !self->runtime_link.connected ||
+        self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+        polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+    }
+}
+
+static void polar_require_no_active_download_handle(polar_h10_obj_t *self) {
+#if POLAR_SDK_HAS_BTSTACK
+    if (self->download_handle_active) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("download handle already active"));
+    }
+#else
+    (void)self;
+#endif
+}
 
 #if POLAR_SDK_HAS_BTSTACK
 
@@ -474,6 +916,57 @@ static void polar_clear_discovery_cache(polar_h10_obj_t *self) {
     self->last_att_status = ATT_ERROR_SUCCESS;
 }
 
+static void polar_download_blob_reset(polar_h10_obj_t *self) {
+    if (self == NULL) {
+        return;
+    }
+    if (self->download_blob != NULL && self->download_blob_alloc > 0) {
+        m_del(uint8_t, self->download_blob, self->download_blob_alloc);
+    }
+    self->download_blob = NULL;
+    self->download_blob_len = 0;
+    self->download_blob_off = 0;
+    self->download_blob_alloc = 0;
+    self->download_handle_active = false;
+    self->download_handle_id = 0;
+
+    self->psftp_response_waiting = false;
+    self->psftp_response_done = false;
+    self->psftp_response_result = POLAR_SDK_PSFTP_RX_MORE;
+    polar_sdk_psftp_rx_reset(&self->psftp_rx_state, NULL, 0);
+}
+
+static size_t polar_download_blob_available(const polar_h10_obj_t *self) {
+    if (self == NULL) {
+        return 0;
+    }
+    if (self->download_blob_off >= self->psftp_rx_state.length) {
+        return 0;
+    }
+    return self->psftp_rx_state.length - self->download_blob_off;
+}
+
+static void polar_download_blob_compact_for_frame(polar_h10_obj_t *self, size_t incoming_frame_len) {
+    if (self == NULL || self->download_blob == NULL || self->download_blob_alloc == 0) {
+        return;
+    }
+    if (self->download_blob_off == 0 || self->download_blob_off > self->psftp_rx_state.length) {
+        return;
+    }
+
+    size_t free_tail = self->download_blob_alloc - self->psftp_rx_state.length;
+    if (free_tail >= incoming_frame_len) {
+        return;
+    }
+
+    size_t remaining = self->psftp_rx_state.length - self->download_blob_off;
+    if (remaining > 0) {
+        memmove(self->download_blob, self->download_blob + self->download_blob_off, remaining);
+    }
+    self->download_blob_off = 0;
+    self->psftp_rx_state.length = remaining;
+}
+
 static void polar_mark_attempt_failed(polar_h10_obj_t *self) {
     polar_sdk_runtime_mark_attempt_failed(&self->runtime_link);
 }
@@ -484,6 +977,8 @@ static void polar_discovery_start(polar_h10_obj_t *self);
 static uint8_t polar_discovery_cmd_hr_chars(void *ctx);
 static uint8_t polar_discovery_cmd_pmd_chars(void *ctx);
 static uint8_t polar_discovery_cmd_psftp_chars(void *ctx);
+static bool polar_psftp_security_ready(polar_h10_obj_t *self);
+static int polar_psftp_prepare_result(polar_h10_obj_t *self);
 static bool polar_psftp_reconnect_after_security_failure(polar_h10_obj_t *self, uint32_t timeout_ms);
 static void polar_wait_conn_update_settle(polar_h10_obj_t *self, uint32_t timeout_ms);
 
@@ -509,6 +1004,10 @@ static void polar_wait_flag_sleep_ms(void *ctx, uint32_t ms) {
 static bool polar_wait_flag_is_done(void *ctx) {
     polar_wait_flag_ctx_t *w = (polar_wait_flag_ctx_t *)ctx;
     return *w->done_flag;
+}
+
+static void polar_btstack_pump_sleep_ms(uint32_t ms) {
+    mp_event_wait_ms(ms);
 }
 
 static bool polar_wait_flag_is_connected(void *ctx) {
@@ -719,6 +1218,156 @@ static bool polar_pmd_wait_write_complete(polar_h10_obj_t *self, uint32_t timeou
 
 static bool polar_pmd_wait_response(polar_h10_obj_t *self, uint32_t timeout_ms) {
     return polar_wait_for_flag_or_disconnect(self, &self->pmd_cp_response_done, timeout_ms);
+}
+
+static int polar_pmd_write_command_result(polar_h10_obj_t *self, const uint8_t *cmd, uint16_t cmd_len);
+static int polar_pmd_set_notify_for_char_result(
+    polar_h10_obj_t *self,
+    gatt_client_characteristic_t *chr,
+    gatt_client_notification_t *notification,
+    bool *listening,
+    bool enable);
+static void polar_raise_for_pmd_notify_status(int status, bool missing_char);
+static void polar_pmd_expect_response(polar_h10_obj_t *self, uint8_t opcode, uint8_t type);
+
+static bool polar_pmd_policy_is_connected(void *ctx);
+static uint8_t polar_pmd_policy_encryption_key_size(void *ctx);
+static void polar_pmd_policy_request_pairing(void *ctx);
+static void polar_pmd_policy_sleep_ms(void *ctx, uint32_t ms);
+
+typedef enum {
+    POLAR_RECORDING_KIND_KEY_INVALID = -1,
+    POLAR_RECORDING_KIND_KEY_HR = 0,
+    POLAR_RECORDING_KIND_KEY_ECG,
+    POLAR_RECORDING_KIND_KEY_ACC,
+} polar_recording_kind_key_t;
+
+static polar_recording_kind_key_t polar_parse_recording_kind_key(mp_obj_t kind_obj) {
+    polar_stream_kind_key_t stream_kind = polar_parse_stream_kind_key(kind_obj);
+    switch (stream_kind) {
+        case POLAR_STREAM_KIND_KEY_HR:
+            return POLAR_RECORDING_KIND_KEY_HR;
+        case POLAR_STREAM_KIND_KEY_ECG:
+            return POLAR_RECORDING_KIND_KEY_ECG;
+        case POLAR_STREAM_KIND_KEY_ACC:
+            return POLAR_RECORDING_KIND_KEY_ACC;
+        default:
+            return POLAR_RECORDING_KIND_KEY_INVALID;
+    }
+}
+
+static bool polar_recording_kind_is_supported_build(polar_recording_kind_key_t kind) {
+    switch (kind) {
+        case POLAR_RECORDING_KIND_KEY_HR:
+            return POLAR_CFG_ENABLE_HR;
+        default:
+            return false;
+    }
+}
+
+static bool polar_h10_recording_is_supported(polar_h10_obj_t *self) {
+    return self != NULL &&
+        POLAR_CFG_ENABLE_PSFTP &&
+        POLAR_CFG_ENABLE_HR &&
+        self->psftp_mtu_char_found &&
+        self->psftp_h2d_char_found &&
+        self->psftp_mtu_handle != 0 &&
+        self->psftp_h2d_handle != 0;
+}
+
+static polar_sdk_h10_recording_sample_type_t polar_parse_h10_recording_sample_type(mp_obj_t obj) {
+    if (!mp_obj_is_str(obj)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("sample_type must be str"));
+    }
+
+    size_t len = 0;
+    const char *value = mp_obj_str_get_data(obj, &len);
+    if (len == 2 && memcmp(value, "hr", 2) == 0) {
+        return POLAR_SDK_H10_RECORDING_SAMPLE_HEART_RATE;
+    }
+    if (len == 2 && memcmp(value, "rr", 2) == 0) {
+        return POLAR_SDK_H10_RECORDING_SAMPLE_RR_INTERVAL;
+    }
+
+    mp_raise_ValueError(MP_ERROR_TEXT("invalid sample_type"));
+}
+
+static void polar_h10_recording_clear_local_state(polar_h10_obj_t *self) {
+    self->recording_hr_active = false;
+    self->recording_hr_config_known = false;
+    self->recording_hr_interval_s = 1u;
+    self->recording_hr_sample_type = POLAR_SDK_H10_RECORDING_SAMPLE_HEART_RATE;
+    self->recording_hr_id[0] = '\0';
+}
+
+static void polar_h10_recording_store_id(polar_h10_obj_t *self, const char *recording_id, size_t recording_id_len) {
+    if (recording_id == NULL || recording_id_len == 0u) {
+        self->recording_hr_id[0] = '\0';
+        return;
+    }
+
+    if (recording_id_len > POLAR_SDK_H10_RECORDING_ID_MAX_BYTES) {
+        recording_id_len = POLAR_SDK_H10_RECORDING_ID_MAX_BYTES;
+    }
+    memcpy(self->recording_hr_id, recording_id, recording_id_len);
+    self->recording_hr_id[recording_id_len] = '\0';
+}
+
+static void polar_h10_recording_write_hex_u32(char *dst, uint32_t value) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 8u; ++i) {
+        unsigned shift = (unsigned)((7u - i) * 4u);
+        dst[i] = hex[(value >> shift) & 0x0fu];
+    }
+}
+
+static void polar_h10_recording_make_auto_id(polar_h10_obj_t *self, char *out, size_t out_capacity) {
+    if (out == NULL || out_capacity < 12u) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("recording id buffer too small"));
+    }
+
+    if (self->recording_hr_id_next == 0u) {
+        self->recording_hr_id_next = 1u;
+    }
+
+    memcpy(out, "REC", 3u);
+    polar_h10_recording_write_hex_u32(out + 3u, self->recording_hr_id_next);
+    out[11] = '\0';
+    self->recording_hr_id_next += 1u;
+}
+
+static bool polar_h10_recording_local_config_matches(
+    const polar_h10_obj_t *self,
+    polar_sdk_h10_recording_sample_type_t sample_type,
+    uint8_t interval_s) {
+    return self->recording_hr_active &&
+        self->recording_hr_config_known &&
+        self->recording_hr_sample_type == sample_type &&
+        self->recording_hr_interval_s == interval_s;
+}
+
+static void polar_h10_recording_prepare_or_raise(polar_h10_obj_t *self) {
+    if (!POLAR_CFG_ENABLE_PSFTP || !polar_h10_recording_is_supported(self)) {
+        return;
+    }
+
+    if (self->psftp_mtu_enabled && (self->psftp_d2h_enabled || !self->psftp_d2h_char_found) && polar_psftp_security_ready(self)) {
+        return;
+    }
+
+    int prepare_status = polar_psftp_prepare_result(self);
+    if (prepare_status == POLAR_SDK_PSFTP_OP_OK) {
+        self->psftp_last_security_related_failure = false;
+        return;
+    }
+
+    self->psftp_last_security_related_failure = polar_sdk_psftp_prepare_failure_is_security_related(
+        prepare_status,
+        polar_psftp_security_ready(self));
+    if (self->psftp_last_security_related_failure) {
+        polar_raise_exc(&polar_type_SecurityError, MP_ERROR_TEXT("PSFTP security setup failed"));
+    }
+    polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PSFTP channel preparation failed"));
 }
 
 static bool polar_wait_for_mtu_exchange(polar_h10_obj_t *self, uint32_t timeout_ms) {
@@ -939,6 +1588,7 @@ static void polar_pmd_expect_response(polar_h10_obj_t *self, uint8_t opcode, uin
     self->pmd_cp_response_expected_type = type;
     self->pmd_cp_response_status = 0xff;
     self->pmd_cp_response_more = 0;
+    self->pmd_cp_response_params_len = 0;
     self->pmd_cp_response_done = false;
     self->pmd_cp_response_waiting = true;
 }
@@ -1045,9 +1695,18 @@ static void polar_pmd_parse_cp_notification(polar_h10_obj_t *self, const uint8_t
 
     if (self->pmd_cp_response_waiting &&
         response.opcode == self->pmd_cp_response_expected_opcode &&
-        response.measurement_type == self->pmd_cp_response_expected_type) {
+        (self->pmd_cp_response_expected_type == 0xffu || response.measurement_type == self->pmd_cp_response_expected_type)) {
         self->pmd_cp_response_status = response.status;
         self->pmd_cp_response_more = response.has_more ? response.more : 0;
+        self->pmd_cp_response_params_len = 0;
+        if (response.status == POLAR_SDK_PMD_RESPONSE_SUCCESS && value_len > 5u) {
+            size_t params_len = (size_t)value_len - 5u;
+            if (params_len > sizeof(self->pmd_cp_response_params)) {
+                params_len = sizeof(self->pmd_cp_response_params);
+            }
+            memcpy(self->pmd_cp_response_params, value + 5u, params_len);
+            self->pmd_cp_response_params_len = (uint8_t)params_len;
+        }
         self->pmd_cp_response_done = true;
         self->pmd_cp_response_waiting = false;
     }
@@ -1110,11 +1769,35 @@ static void polar_psftp_security_request_pairing_cb(const void *ctx) {
 
 static void polar_psftp_security_sleep_ms_cb(const void *ctx, uint32_t ms) {
     (void)ctx;
-    mp_event_wait_ms(ms);
+    polar_btstack_pump_sleep_ms(ms);
 }
 
 static bool polar_psftp_security_is_secure_prepare_cb(void *ctx) {
     return polar_psftp_security_is_secure_cb((const void *)ctx);
+}
+
+static void polar_clear_local_bond_for_addr_once(
+    polar_h10_obj_t *self,
+    bd_addr_type_t addr_type,
+    const bd_addr_t addr) {
+    if (self->psftp_bond_clear_done) {
+        return;
+    }
+
+    (void)addr_type;
+    (void)addr;
+    self->psftp_bond_clear_done = true;
+}
+
+static void polar_psftp_clear_local_bond_once(polar_h10_obj_t *self) {
+    if (self->psftp_bond_clear_done) {
+        return;
+    }
+    if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+        return;
+    }
+
+    polar_clear_local_bond_for_addr_once(self, self->peer_addr_type, self->peer_addr);
 }
 
 static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
@@ -1127,6 +1810,7 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
     }
 
     polar_sdk_btstack_sm_apply_default_auth_policy();
+    polar_psftp_clear_local_bond_once(self);
 
     polar_sdk_security_policy_t policy = {
         .rounds = 1,
@@ -1534,6 +2218,122 @@ static bool polar_psftp_get_is_remote_success_cb(void *ctx, uint16_t error_code)
 #endif
 }
 
+static polar_sdk_psftp_trans_result_t polar_psftp_map_prepare_status_to_result(int prepare_status) {
+    if (prepare_status == POLAR_SDK_PSFTP_OP_NOT_CONNECTED) {
+        return POLAR_SDK_PSFTP_TRANS_NOT_CONNECTED;
+    }
+    if (prepare_status == POLAR_SDK_PSFTP_OP_MISSING_CHAR || prepare_status == POLAR_SDK_PSFTP_OP_NO_NOTIFY_PROP) {
+        return POLAR_SDK_PSFTP_TRANS_MISSING_CHARACTERISTICS;
+    }
+    if (prepare_status == POLAR_SDK_PSFTP_OP_TIMEOUT) {
+        return POLAR_SDK_PSFTP_TRANS_NOTIFY_TIMEOUT;
+    }
+    if (prepare_status == POLAR_SDK_PSFTP_OP_TRANSPORT) {
+        return POLAR_SDK_PSFTP_TRANS_NOTIFY_FAILED;
+    }
+    if (prepare_status > 0) {
+        return POLAR_SDK_PSFTP_TRANS_NOTIFY_ATT_REJECTED;
+    }
+    return POLAR_SDK_PSFTP_TRANS_NOTIFY_FAILED;
+}
+
+static polar_sdk_psftp_trans_result_t polar_psftp_map_write_status_to_result(int write_status) {
+    if (write_status == POLAR_SDK_PSFTP_OP_NOT_CONNECTED) {
+        return POLAR_SDK_PSFTP_TRANS_NOT_CONNECTED;
+    }
+    if (write_status == POLAR_SDK_PSFTP_OP_TIMEOUT) {
+        return POLAR_SDK_PSFTP_TRANS_WRITE_TIMEOUT;
+    }
+    if (write_status == POLAR_SDK_PSFTP_OP_TRANSPORT) {
+        return POLAR_SDK_PSFTP_TRANS_WRITE_FAILED;
+    }
+    if (write_status > 0) {
+        return POLAR_SDK_PSFTP_TRANS_WRITE_ATT_REJECTED;
+    }
+    return POLAR_SDK_PSFTP_TRANS_WRITE_FAILED;
+}
+
+static polar_sdk_psftp_trans_result_t polar_psftp_begin_get_stream(
+    polar_h10_obj_t *self,
+    const char *path,
+    size_t path_len) {
+    if (self == NULL || path == NULL || self->download_blob == NULL || self->download_blob_alloc == 0) {
+        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+    }
+
+    int prepare_status = polar_psftp_prepare_result(self);
+    if (prepare_status != POLAR_SDK_PSFTP_OP_OK) {
+        if (prepare_status > 0) {
+            self->psftp_last_att_status = (uint8_t)prepare_status;
+        }
+        return polar_psftp_map_prepare_status_to_result(prepare_status);
+    }
+
+    uint8_t proto_payload[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES];
+    size_t proto_payload_len = 0;
+    if (!polar_sdk_psftp_encode_get_operation(path, path_len, proto_payload, sizeof(proto_payload), &proto_payload_len)) {
+        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+    }
+
+    uint8_t request_stream[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES + 2u];
+    size_t request_len = polar_sdk_psftp_build_rfc60_request(
+        proto_payload,
+        proto_payload_len,
+        request_stream,
+        sizeof(request_stream));
+    if (request_len == 0) {
+        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+    }
+
+    uint16_t frame_capacity = polar_psftp_frame_capacity(self);
+    uint8_t frame[520];
+    if (frame_capacity == 0 || frame_capacity > sizeof(frame)) {
+        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+    }
+
+    self->psftp_last_error_code = 0;
+    self->psftp_last_response_bytes = 0;
+    self->psftp_response_waiting = true;
+    self->psftp_response_done = false;
+    self->psftp_response_result = POLAR_SDK_PSFTP_RX_MORE;
+    self->download_blob_off = 0;
+    polar_sdk_psftp_rx_reset(&self->psftp_rx_state, self->download_blob, self->download_blob_alloc);
+
+    polar_sdk_psftp_tx_state_t tx;
+    polar_sdk_psftp_tx_init(&tx, request_stream, request_len);
+
+    while (polar_sdk_psftp_tx_has_more(&tx)) {
+        bool is_last = false;
+        size_t frame_len = polar_sdk_psftp_tx_build_next_frame(
+            &tx,
+            frame_capacity,
+            frame,
+            sizeof(frame),
+            &is_last);
+        (void)is_last;
+
+        if (frame_len == 0 || frame_len > UINT16_MAX) {
+            self->psftp_response_waiting = false;
+            self->psftp_response_done = false;
+            return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+        }
+
+        int write_status = polar_psftp_write_frame_result(self, frame, (uint16_t)frame_len);
+        if (write_status != POLAR_SDK_PSFTP_OP_OK) {
+            if (write_status > 0) {
+                self->psftp_last_att_status = (uint8_t)write_status;
+            }
+            self->psftp_response_waiting = false;
+            self->psftp_response_done = false;
+            return polar_psftp_map_write_status_to_result(write_status);
+        }
+
+        self->psftp_tx_frames_total += 1;
+    }
+
+    return POLAR_SDK_PSFTP_TRANS_OK;
+}
+
 static polar_sdk_psftp_trans_result_t polar_psftp_execute_get(
     polar_h10_obj_t *self,
     const char *path,
@@ -1559,6 +2359,7 @@ static polar_sdk_psftp_trans_result_t polar_psftp_execute_get(
         .is_remote_success = polar_psftp_get_is_remote_success_cb,
     };
 
+    self->psftp_last_security_related_failure = false;
     bool retried_after_reconnect = false;
     for (;;) {
         int prepare_status = POLAR_SDK_PSFTP_OP_OK;
@@ -1581,6 +2382,7 @@ static polar_sdk_psftp_trans_result_t polar_psftp_execute_get(
 
         if (result == POLAR_SDK_PSFTP_TRANS_OK) {
             self->psftp_response_waiting = false;
+            self->psftp_last_security_related_failure = false;
             return result;
         }
 
@@ -1592,6 +2394,7 @@ static polar_sdk_psftp_trans_result_t polar_psftp_execute_get(
         bool security_related = polar_sdk_psftp_prepare_failure_is_security_related(
             prepare_status,
             polar_psftp_security_ready(self));
+        self->psftp_last_security_related_failure = security_related;
 
         if (!retried_after_reconnect && security_related &&
             polar_psftp_reconnect_after_security_failure(self, POLAR_SDK_PSFTP_RECONNECT_TIMEOUT_MS)) {
@@ -1602,6 +2405,177 @@ static polar_sdk_psftp_trans_result_t polar_psftp_execute_get(
         self->psftp_response_waiting = false;
         return result;
     }
+}
+
+static polar_sdk_psftp_trans_result_t polar_psftp_execute_proto(
+    polar_h10_obj_t *self,
+    const uint8_t *proto_payload,
+    size_t proto_payload_len,
+    uint8_t *response,
+    size_t response_capacity,
+    uint32_t timeout_ms,
+    size_t *out_response_len) {
+    if (out_response_len != NULL) {
+        *out_response_len = 0;
+    }
+
+    polar_sdk_psftp_get_ops_t ops = {
+        .ctx = self,
+        .prepare_channels = polar_psftp_get_prepare_channels_cb,
+        .frame_capacity = polar_psftp_get_frame_capacity_cb,
+        .write_frame = polar_psftp_get_write_frame_cb,
+        .on_tx_frame_ok = polar_psftp_get_on_tx_frame_ok_cb,
+        .begin_response = polar_psftp_get_begin_response_cb,
+        .wait_response = polar_psftp_get_wait_response_cb,
+        .response_result = polar_psftp_get_response_result_cb,
+        .rx_state = polar_psftp_get_rx_state_cb,
+        .is_remote_success = polar_psftp_get_is_remote_success_cb,
+    };
+
+    self->psftp_last_security_related_failure = false;
+    bool retried_after_reconnect = false;
+    for (;;) {
+        int prepare_status = POLAR_SDK_PSFTP_OP_OK;
+        int write_status = POLAR_SDK_PSFTP_OP_OK;
+        uint16_t error_code = 0;
+
+        polar_sdk_psftp_trans_result_t result = polar_sdk_psftp_execute_proto_operation(
+            &ops,
+            proto_payload,
+            proto_payload_len,
+            response,
+            response_capacity,
+            timeout_ms,
+            out_response_len,
+            &error_code,
+            &prepare_status,
+            &write_status);
+
+        self->psftp_last_response_bytes = (uint32_t)self->psftp_rx_state.length;
+
+        if (result == POLAR_SDK_PSFTP_TRANS_OK) {
+            self->psftp_response_waiting = false;
+            self->psftp_last_security_related_failure = false;
+            return result;
+        }
+
+        if (prepare_status > 0 || write_status > 0) {
+            self->psftp_last_att_status = (uint8_t)(write_status > 0 ? write_status : prepare_status);
+        }
+        self->psftp_last_error_code = error_code;
+
+        bool security_related = polar_sdk_psftp_prepare_failure_is_security_related(
+            prepare_status,
+            polar_psftp_security_ready(self));
+        self->psftp_last_security_related_failure = security_related;
+
+        if (!retried_after_reconnect && security_related &&
+            polar_psftp_reconnect_after_security_failure(self, POLAR_SDK_PSFTP_RECONNECT_TIMEOUT_MS)) {
+            retried_after_reconnect = true;
+            continue;
+        }
+
+        self->psftp_response_waiting = false;
+        return result;
+    }
+}
+
+static polar_sdk_psftp_trans_result_t polar_psftp_execute_query(
+    polar_h10_obj_t *self,
+    uint16_t query_id,
+    const uint8_t *query_payload,
+    size_t query_payload_len,
+    uint8_t *response,
+    size_t response_capacity,
+    uint32_t timeout_ms,
+    size_t *out_response_len) {
+    if (out_response_len != NULL) {
+        *out_response_len = 0;
+    }
+
+    polar_sdk_psftp_get_ops_t ops = {
+        .ctx = self,
+        .prepare_channels = polar_psftp_get_prepare_channels_cb,
+        .frame_capacity = polar_psftp_get_frame_capacity_cb,
+        .write_frame = polar_psftp_get_write_frame_cb,
+        .on_tx_frame_ok = polar_psftp_get_on_tx_frame_ok_cb,
+        .begin_response = polar_psftp_get_begin_response_cb,
+        .wait_response = polar_psftp_get_wait_response_cb,
+        .response_result = polar_psftp_get_response_result_cb,
+        .rx_state = polar_psftp_get_rx_state_cb,
+        .is_remote_success = polar_psftp_get_is_remote_success_cb,
+    };
+
+    self->psftp_last_security_related_failure = false;
+    bool retried_after_reconnect = false;
+    for (;;) {
+        int prepare_status = POLAR_SDK_PSFTP_OP_OK;
+        int write_status = POLAR_SDK_PSFTP_OP_OK;
+        uint16_t error_code = 0;
+
+        polar_sdk_psftp_trans_result_t result = polar_sdk_psftp_execute_query_operation(
+            &ops,
+            query_id,
+            query_payload,
+            query_payload_len,
+            response,
+            response_capacity,
+            timeout_ms,
+            out_response_len,
+            &error_code,
+            &prepare_status,
+            &write_status);
+
+        self->psftp_last_response_bytes = (uint32_t)self->psftp_rx_state.length;
+
+        if (result == POLAR_SDK_PSFTP_TRANS_OK) {
+            self->psftp_response_waiting = false;
+            self->psftp_last_security_related_failure = false;
+            return result;
+        }
+
+        if (prepare_status > 0 || write_status > 0) {
+            self->psftp_last_att_status = (uint8_t)(write_status > 0 ? write_status : prepare_status);
+        }
+        self->psftp_last_error_code = error_code;
+
+        bool security_related = polar_sdk_psftp_prepare_failure_is_security_related(
+            prepare_status,
+            polar_psftp_security_ready(self));
+        self->psftp_last_security_related_failure = security_related;
+
+        if (!retried_after_reconnect && security_related &&
+            polar_psftp_reconnect_after_security_failure(self, POLAR_SDK_PSFTP_RECONNECT_TIMEOUT_MS)) {
+            retried_after_reconnect = true;
+            continue;
+        }
+
+        self->psftp_response_waiting = false;
+        return result;
+    }
+}
+
+static polar_sdk_psftp_trans_result_t polar_psftp_execute_remove(
+    polar_h10_obj_t *self,
+    const char *path,
+    size_t path_len,
+    uint32_t timeout_ms) {
+    uint8_t proto_payload[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES];
+    size_t proto_payload_len = 0;
+    if (!polar_sdk_psftp_encode_remove_operation(path, path_len, proto_payload, sizeof(proto_payload), &proto_payload_len)) {
+        return POLAR_SDK_PSFTP_TRANS_ENCODE_FAILED;
+    }
+
+    uint8_t response[64] = {0};
+    size_t response_len = 0;
+    return polar_psftp_execute_proto(
+        self,
+        proto_payload,
+        proto_payload_len,
+        response,
+        sizeof(response),
+        timeout_ms,
+        &response_len);
 }
 
 static NORETURN void polar_raise_psftp_remote_error(uint16_t error_code) {
@@ -1619,9 +2593,11 @@ static NORETURN void polar_raise_psftp_remote_error(uint16_t error_code) {
 }
 
 static NORETURN void polar_raise_for_psftp_result(polar_h10_obj_t *self, polar_sdk_psftp_trans_result_t result) {
-    (void)self;
     if (result == POLAR_SDK_PSFTP_TRANS_NOT_CONNECTED) {
         polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+    }
+    if (self->psftp_last_security_related_failure) {
+        polar_raise_exc(&polar_type_SecurityError, MP_ERROR_TEXT("PSFTP security setup failed"));
     }
     if (result == POLAR_SDK_PSFTP_TRANS_MISSING_CHARACTERISTICS) {
         polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PSFTP characteristics missing"));
@@ -1645,6 +2621,66 @@ static NORETURN void polar_raise_for_psftp_result(polar_h10_obj_t *self, polar_s
     }
     if (result == POLAR_SDK_PSFTP_TRANS_REMOTE_ERROR) {
         polar_raise_psftp_remote_error(self->psftp_last_error_code);
+    }
+
+    polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PSFTP transport failure"));
+}
+
+static void polar_h10_recording_query_status_or_raise(polar_h10_obj_t *self) {
+    uint8_t response[96];
+    size_t response_len = 0;
+    polar_sdk_psftp_trans_result_t result = polar_psftp_execute_query(
+        self,
+        POLAR_SDK_PSFTP_QUERY_REQUEST_RECORDING_STATUS,
+        NULL,
+        0,
+        response,
+        sizeof(response),
+        POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS,
+        &response_len);
+    if (result != POLAR_SDK_PSFTP_TRANS_OK) {
+        polar_raise_for_psftp_result(self, result);
+    }
+
+    bool recording_on = false;
+    size_t recording_id_len = 0;
+    char recording_id[POLAR_SDK_H10_RECORDING_ID_MAX_BYTES + 1u];
+    if (!polar_sdk_psftp_decode_h10_recording_status_result(
+            response,
+            response_len,
+            &recording_on,
+            recording_id,
+            sizeof(recording_id),
+            &recording_id_len)) {
+        polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("failed to decode recording status"));
+    }
+
+    if (!recording_on) {
+        polar_h10_recording_clear_local_state(self);
+        return;
+    }
+
+    bool keep_local_config = self->recording_hr_active &&
+        self->recording_hr_config_known &&
+        strlen(self->recording_hr_id) == recording_id_len &&
+        memcmp(self->recording_hr_id, recording_id, recording_id_len) == 0;
+    self->recording_hr_active = true;
+    self->recording_hr_config_known = keep_local_config;
+    polar_h10_recording_store_id(self, recording_id, recording_id_len);
+}
+
+static NORETURN void polar_raise_for_psftp_rx_result(polar_h10_obj_t *self, polar_sdk_psftp_rx_result_t result) {
+    if (result == POLAR_SDK_PSFTP_RX_ERROR_FRAME) {
+        polar_raise_psftp_remote_error(self->psftp_last_error_code);
+    }
+    if (result == POLAR_SDK_PSFTP_RX_SEQUENCE_ERROR) {
+        polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PSFTP sequence error"));
+    }
+    if (result == POLAR_SDK_PSFTP_RX_PROTOCOL_ERROR) {
+        polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PSFTP protocol error"));
+    }
+    if (result == POLAR_SDK_PSFTP_RX_OVERFLOW) {
+        polar_raise_exc(&polar_type_BufferOverflowError, MP_ERROR_TEXT("PSFTP response overflow"));
     }
 
     polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PSFTP transport failure"));
@@ -1689,10 +2725,27 @@ static void polar_session_reset_feature_state(polar_h10_obj_t *self) {
     self->pmd_write_att_status = ATT_ERROR_SUCCESS;
     self->pmd_cp_response_waiting = false;
     self->pmd_cp_response_done = false;
+    self->pmd_cp_response_expected_opcode = 0;
+    self->pmd_cp_response_expected_type = 0;
+    self->pmd_cp_response_status = 0xff;
+    self->pmd_cp_response_more = 0;
+    self->pmd_cp_response_params_len = 0;
+    self->hr_enabled = false;
+    self->hr_raw_last_len = 0;
+    self->hr_raw_consumed_seq = self->hr_raw_seq;
     self->ecg_enabled = false;
     self->imu_enabled = false;
+    self->recording_hr_active = false;
+    self->recording_hr_config_known = false;
+    self->recording_hr_interval_s = 1u;
+    self->recording_hr_sample_type = POLAR_SDK_H10_RECORDING_SAMPLE_HEART_RATE;
+    self->recording_hr_id[0] = '\0';
+    self->recording_ecg_active = false;
+    self->recording_acc_active = false;
     polar_ecg_ring_reset(self);
     polar_imu_ring_reset(self);
+
+    polar_download_blob_reset(self);
 
     self->psftp_mtu_enabled = false;
     self->psftp_d2h_enabled = false;
@@ -1708,6 +2761,7 @@ static void polar_session_reset_feature_state(polar_h10_obj_t *self) {
     self->psftp_last_att_status = ATT_ERROR_SUCCESS;
     self->psftp_last_error_code = 0;
     self->psftp_last_response_bytes = 0;
+    self->psftp_last_security_related_failure = false;
     polar_sdk_psftp_rx_reset(&self->psftp_rx_state, NULL, 0);
 
     self->runtime_link.conn_update_pending = false;
@@ -1759,6 +2813,7 @@ static void polar_adv_runtime_on_match(void *ctx, const polar_sdk_btstack_adv_re
     self->adv_match_total += 1;
     memcpy(self->peer_addr, report->addr, sizeof(bd_addr_t));
     self->peer_addr_type = report->addr_type;
+    polar_clear_local_bond_for_addr_once(self, report->addr_type, report->addr);
 }
 
 static int polar_adv_runtime_stop_scan(void *ctx) {
@@ -1873,22 +2928,18 @@ static void polar_hci_packet_handler(uint8_t packet_type, uint16_t channel, uint
 }
 
 static void polar_sm_on_just_works_request(void *ctx, uint16_t handle) {
-    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
-    self->sm_just_works_total += 1;
+    (void)ctx;
     sm_just_works_confirm(handle);
 }
 
 static void polar_sm_on_numeric_comparison_request(void *ctx, uint16_t handle) {
-    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
-    self->sm_numeric_comparison_total += 1;
+    (void)ctx;
     sm_numeric_comparison_confirm(handle);
 }
 
 static void polar_sm_on_authorization_request(void *ctx, uint16_t handle) {
-    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    (void)ctx;
     // Current embedded policy is permissive: auto-grant authorization requests.
-    // Keep this explicit in code + stats so security behavior is auditable.
-    self->sm_authorization_requests_total += 1;
     sm_authorization_grant(handle);
 }
 
@@ -2102,6 +3153,17 @@ static bool polar_handle_gatt_route_event(polar_h10_obj_t *self, const polar_sdk
         } else {
             self->hr_indications_total += 1;
         }
+
+        size_t raw_len = route->value.value_len;
+        if (raw_len > sizeof(self->hr_raw_last)) {
+            raw_len = sizeof(self->hr_raw_last);
+        }
+        if (raw_len > 0) {
+            memcpy(self->hr_raw_last, route->value.value, raw_len);
+        }
+        self->hr_raw_last_len = (uint8_t)raw_len;
+        self->hr_raw_seq += 1;
+
         polar_hr_parse_notification(self, route->value.value, route->value.value_len);
         return true;
     }
@@ -2120,11 +3182,21 @@ static bool polar_handle_gatt_route_event(polar_h10_obj_t *self, const polar_sdk
         self->psftp_rx_frames_total += 1;
 
         if (self->psftp_response_waiting) {
+            if (self->download_handle_active) {
+                polar_download_blob_compact_for_frame(self, route->value.value_len);
+            }
+
             polar_sdk_psftp_rx_result_t r = polar_sdk_psftp_rx_feed_frame(
                 &self->psftp_rx_state,
                 route->value.value,
                 route->value.value_len);
             self->psftp_response_result = r;
+
+            if (self->download_handle_active &&
+                (r == POLAR_SDK_PSFTP_RX_MORE || r == POLAR_SDK_PSFTP_RX_COMPLETE) &&
+                route->value.value_len > 1u) {
+                self->psftp_last_response_bytes += (uint32_t)(route->value.value_len - 1u);
+            }
 
             if (r == POLAR_SDK_PSFTP_RX_SEQUENCE_ERROR) {
                 self->psftp_rx_seq_errors_total += 1;
@@ -2145,7 +3217,13 @@ static bool polar_handle_gatt_route_event(polar_h10_obj_t *self, const polar_sdk
                 self->psftp_response_waiting = false;
                 return true;
             }
-            if (r == POLAR_SDK_PSFTP_RX_ERROR_FRAME || r == POLAR_SDK_PSFTP_RX_COMPLETE) {
+            if (r == POLAR_SDK_PSFTP_RX_ERROR_FRAME) {
+                self->psftp_last_error_code = self->psftp_rx_state.error_code;
+                self->psftp_response_done = true;
+                self->psftp_response_waiting = false;
+                return true;
+            }
+            if (r == POLAR_SDK_PSFTP_RX_COMPLETE) {
                 self->psftp_response_done = true;
                 self->psftp_response_waiting = false;
                 return true;
@@ -2398,6 +3476,8 @@ static void polar_ensure_ble_ready(void) {
         mp_event_wait_ms(1200);
     }
 
+    polar_apply_btstack_host_identity_keys();
+
     // Keep Security Manager defaults aligned with probe/examples.
     // Apply after BLE stack is active so all subsequent pairing requests follow
     // the same bonding + secure-connection policy.
@@ -2415,9 +3495,13 @@ static void polar_ensure_ble_ready(void) {
         polar_gatt_client_initialized = true;
     }
     #endif
-    // Keep MTU negotiation behavior deterministic for our direct GATT calls,
-    // regardless of upstream defaults.
-    gatt_client_mtu_enable_auto_negotiation(false);
+    // Align direct GATT-client sequencing with the working pico-sdk probe.
+    // The probe keeps BTstack's default automatic MTU exchange enabled, and
+    // the on-air comparison showed that the probe reaches an early ATT MTU
+    // exchange phase that the MPY path was skipping. Re-enable auto MTU
+    // negotiation here after MicroPython's init path disables it so discovery
+    // and the first secured PSFTP operation follow the probe more closely.
+    gatt_client_mtu_enable_auto_negotiation(true);
 }
 
 static void polar_register_hci_handler_refresh(void) {
@@ -2457,7 +3541,16 @@ static bool polar_transport_start_attempt(void *ctx) {
     self->runtime_link.conn_update_pending = false;
     self->runtime_link.last_hci_status = ERROR_CODE_SUCCESS;
     self->last_att_status = ATT_ERROR_SUCCESS;
+    self->psftp_bond_clear_done = false;
     self->runtime_link.state = POLAR_SDK_STATE_SCANNING;
+
+    if (self->addr != mp_const_none) {
+        bd_addr_t target_addr;
+        const char *addr_str = mp_obj_str_get_str(self->addr);
+        if (sscanf_bd_addr(addr_str, target_addr) != 0) {
+            polar_clear_local_bond_for_addr_once(self, BD_ADDR_TYPE_UNKNOWN, target_addr);
+        }
+    }
 
     gap_set_scan_params(1, POLAR_SDK_SCAN_INTERVAL_UNITS, POLAR_SDK_SCAN_WINDOW_UNITS, 0);
     gap_start_scan();
@@ -2544,7 +3637,14 @@ static bool polar_psftp_reconnect_after_security_failure(polar_h10_obj_t *self, 
         polar_active_h10 = self;
     }
 
+    polar_capability_mask_t saved_caps_mask = self->required_capabilities_mask;
+    uint8_t saved_services_mask = self->required_services_mask;
+    self->required_capabilities_mask |= POLAR_CAP_PSFTP_READ;
+    self->required_services_mask |= POLAR_SDK_SERVICE_PSFTP;
+
     polar_sdk_transport_connect_result_t connect_result = polar_transport_connect_with_timeout(self, timeout_ms);
+    self->required_capabilities_mask = saved_caps_mask;
+    self->required_services_mask = saved_services_mask;
     if (connect_result == POLAR_SDK_TRANSPORT_CONNECT_OK) {
         return true;
     }
@@ -2563,12 +3663,12 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     enum {
         ARG_addr,
         ARG_name_prefix,
-        ARG_required_services,
+        ARG_required_capabilities,
     };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_addr, MP_ARG_OBJ, { .u_obj = mp_const_none } },
         { MP_QSTR_name_prefix, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = MP_OBJ_NEW_QSTR(MP_QSTR_Polar) } },
-        { MP_QSTR_required_services, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = POLAR_SDK_DEFAULT_REQUIRED_SERVICES } },
+        { MP_QSTR_required_capabilities, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = mp_const_empty_tuple } },
     };
 
     mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
@@ -2581,15 +3681,23 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
         mp_raise_TypeError(MP_ERROR_TEXT("name_prefix must be str or None"));
     }
 
-    uint32_t required_services_mask = parsed_args[ARG_required_services].u_int;
-    if (!polar_service_mask_is_valid(required_services_mask)) {
-        mp_raise_ValueError(MP_ERROR_TEXT("invalid required_services mask"));
+    polar_capability_mask_t required_caps = 0;
+    uint8_t required_services_mask = 0;
+    if (!polar_required_capabilities_parse(parsed_args[ARG_required_capabilities].u_obj, &required_caps, &required_services_mask)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid required_capabilities"));
     }
 
     polar_h10_obj_t *self = mp_obj_malloc(polar_h10_obj_t, type);
     self->addr = parsed_args[ARG_addr].u_obj;
     self->name_prefix = parsed_args[ARG_name_prefix].u_obj;
-    self->required_services_mask = (uint8_t)required_services_mask;
+    self->required_capabilities_mask = required_caps;
+    self->required_services_mask = required_services_mask;
+    self->hr_stream_format = POLAR_STREAM_FORMAT_DECODED;
+    self->ecg_stream_format = POLAR_STREAM_FORMAT_DECODED;
+    self->acc_stream_format = POLAR_STREAM_FORMAT_DECODED;
+    self->ecg_sample_rate_hz = 130;
+    self->acc_sample_rate_hz = 50;
+    self->acc_range = POLAR_SDK_IMU_DEFAULT_RANGE_G;
     polar_sdk_runtime_link_init(&self->runtime_link, HCI_CON_HANDLE_INVALID);
     self->runtime_link.state = POLAR_SDK_STATE_IDLE;
     self->runtime_link.connected = false;
@@ -2635,9 +3743,6 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->runtime_link.disconnect_reason_0x3e_total = 0;
     self->runtime_link.disconnect_reason_other_total = 0;
 
-    self->sm_just_works_total = 0;
-    self->sm_numeric_comparison_total = 0;
-    self->sm_authorization_requests_total = 0;
     self->sm_pairing_complete_total = 0;
     self->sm_last_pairing_status = 0;
     self->sm_last_pairing_reason = 0;
@@ -2656,6 +3761,10 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->hr_last_resubscribe_ms = 0;
     self->hr_consumed_seq = 0;
     polar_sdk_hr_reset(&self->hr_state);
+    memset(self->hr_raw_last, 0, sizeof(self->hr_raw_last));
+    self->hr_raw_last_len = 0;
+    self->hr_raw_seq = 0;
+    self->hr_raw_consumed_seq = 0;
 
     memset(&self->pmd_cp_notification, 0, sizeof(self->pmd_cp_notification));
     memset(&self->pmd_data_notification, 0, sizeof(self->pmd_data_notification));
@@ -2673,12 +3782,24 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->pmd_cp_response_expected_type = 0;
     self->pmd_cp_response_status = 0xff;
     self->pmd_cp_response_more = 0;
+    self->pmd_cp_response_params_len = 0;
 
     self->ecg_enabled = false;
     polar_sdk_ecg_ring_init(&self->ecg_ring, self->ecg_ring_storage, POLAR_SDK_ECG_RING_BYTES);
 
     self->imu_enabled = false;
     polar_sdk_imu_ring_init(&self->imu_ring, self->imu_ring_storage, POLAR_SDK_IMU_RING_BYTES);
+    self->recording_hr_active = false;
+    self->recording_hr_config_known = false;
+    self->recording_hr_interval_s = 1u;
+    self->recording_hr_sample_type = POLAR_SDK_H10_RECORDING_SAMPLE_HEART_RATE;
+    self->recording_hr_id[0] = '\0';
+    self->recording_hr_id_next = 1u;
+    self->recording_ecg_active = false;
+    self->recording_acc_active = false;
+    self->recording_ecg_sample_rate_hz = 130;
+    self->recording_acc_sample_rate_hz = 50;
+    self->recording_acc_range = POLAR_SDK_IMU_DEFAULT_RANGE_G;
 
     self->pmd_cp_notifications_total = 0;
     self->pmd_cp_response_total = 0;
@@ -2708,6 +3829,16 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
     self->psftp_last_error_code = 0;
     self->psftp_last_att_status = ATT_ERROR_SUCCESS;
     self->psftp_last_response_bytes = 0;
+    self->psftp_last_security_related_failure = false;
+    self->psftp_bond_clear_done = false;
+
+    self->download_handle_active = false;
+    self->download_handle_id = 0;
+    self->download_handle_next_id = 1;
+    self->download_blob = NULL;
+    self->download_blob_len = 0;
+    self->download_blob_off = 0;
+    self->download_blob_alloc = 0;
 
     polar_clear_discovery_cache(self);
 #endif
@@ -2717,32 +3848,193 @@ static mp_obj_t polar_h10_make_new(const mp_obj_type_t *type, size_t n_args, siz
 
 static mp_obj_t polar_h10_state(mp_obj_t self_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    return MP_OBJ_NEW_QSTR(polar_state_qstrs[self->runtime_link.state]);
+    return mp_obj_new_str(polar_state_strs[self->runtime_link.state], strlen(polar_state_strs[self->runtime_link.state]));
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_state_obj, polar_h10_state);
 
 static mp_obj_t polar_h10_is_connected(mp_obj_t self_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    return mp_obj_new_bool(self->runtime_link.connected);
+    return mp_obj_new_bool(self->runtime_link.state == POLAR_SDK_STATE_READY);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_is_connected_obj, polar_h10_is_connected);
 
-static mp_obj_t polar_h10_set_required_services(mp_obj_t self_in, mp_obj_t mask_in) {
+static mp_obj_t polar_h10_set_required_capabilities(mp_obj_t self_in, mp_obj_t caps_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    mp_int_t mask = mp_obj_get_int(mask_in);
-    if (mask < 0 || !polar_service_mask_is_valid((uint32_t)mask)) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid required_services mask"));
+    polar_capability_mask_t caps_mask = 0;
+    uint8_t services_mask = 0;
+    if (!polar_required_capabilities_parse(caps_in, &caps_mask, &services_mask)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid required_capabilities"));
     }
-    self->required_services_mask = (uint8_t)mask;
+
+    self->required_capabilities_mask = caps_mask;
+    self->required_services_mask = services_mask;
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_set_required_services_obj, polar_h10_set_required_services);
+static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_set_required_capabilities_obj, polar_h10_set_required_capabilities);
 
-static mp_obj_t polar_h10_required_services(mp_obj_t self_in) {
+static mp_obj_t polar_h10_required_capabilities(mp_obj_t self_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    return mp_obj_new_int_from_uint(self->required_services_mask);
+    return polar_capabilities_tuple_from_mask(self->required_capabilities_mask);
 }
-static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_required_services_obj, polar_h10_required_services);
+static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_required_capabilities_obj, polar_h10_required_capabilities);
+
+static mp_obj_t polar_stream_kind_capabilities_dict(
+    bool supported,
+    bool has_raw,
+    bool has_decoded,
+    const char *default_format,
+    const char *units,
+    mp_obj_t decoded_sample_size,
+    mp_obj_t config) {
+    mp_obj_t dict = mp_obj_new_dict(config == MP_OBJ_NULL ? 5 : 6);
+    mp_obj_dict_store(dict, mp_obj_new_str("supported", 9), mp_obj_new_bool(supported));
+
+    mp_obj_t formats = mp_obj_new_list(0, NULL);
+    if (has_raw) {
+        mp_obj_list_append(formats, mp_obj_new_str("raw", 3));
+    }
+    if (has_decoded) {
+        mp_obj_list_append(formats, mp_obj_new_str("decoded", 7));
+    }
+    mp_obj_dict_store(dict, mp_obj_new_str("formats", 7), formats);
+    mp_obj_dict_store(dict, mp_obj_new_str("default_format", 14), mp_obj_new_str(default_format, strlen(default_format)));
+    mp_obj_dict_store(dict, mp_obj_new_str("units", 5), mp_obj_new_str(units, strlen(units)));
+    mp_obj_dict_store(dict, mp_obj_new_str("decoded_sample_size_bytes", 25), decoded_sample_size);
+    if (config != MP_OBJ_NULL) {
+        mp_obj_dict_store(dict, mp_obj_new_str("config", 6), config);
+    }
+    return dict;
+}
+
+static mp_obj_t polar_config_desc_range(mp_int_t min_v, mp_int_t max_v, mp_int_t step_v) {
+    mp_obj_t dict = mp_obj_new_dict(4);
+    mp_obj_dict_store(dict, mp_obj_new_str("type", 4), mp_obj_new_str("range", 5));
+    mp_obj_dict_store(dict, mp_obj_new_str("min", 3), mp_obj_new_int(min_v));
+    mp_obj_dict_store(dict, mp_obj_new_str("max", 3), mp_obj_new_int(max_v));
+    mp_obj_dict_store(dict, mp_obj_new_str("step", 4), mp_obj_new_int(step_v));
+    return dict;
+}
+
+static mp_obj_t polar_config_desc_enum(const char *const *choices, size_t choice_count) {
+    mp_obj_t dict = mp_obj_new_dict(2);
+    mp_obj_t list = mp_obj_new_list(0, NULL);
+    for (size_t i = 0; i < choice_count; ++i) {
+        mp_obj_list_append(list, mp_obj_new_str(choices[i], strlen(choices[i])));
+    }
+    mp_obj_dict_store(dict, mp_obj_new_str("type", 4), mp_obj_new_str("enum", 4));
+    mp_obj_dict_store(dict, mp_obj_new_str("choices", 7), list);
+    return dict;
+}
+
+static mp_obj_t polar_capability_bool_dict4(bool control, bool status, bool list, bool delete_) {
+    mp_obj_t dict = mp_obj_new_dict(4);
+    mp_obj_dict_store(dict, mp_obj_new_str("control", 7), mp_obj_new_bool(control));
+    mp_obj_dict_store(dict, mp_obj_new_str("status", 6), mp_obj_new_bool(status));
+    mp_obj_dict_store(dict, mp_obj_new_str("list", 4), mp_obj_new_bool(list));
+    mp_obj_dict_store(dict, mp_obj_new_str("delete", 6), mp_obj_new_bool(delete_));
+    return dict;
+}
+
+static mp_obj_t polar_h10_capabilities(mp_obj_t self_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    polar_require_ready(self);
+
+    mp_obj_t root = mp_obj_new_dict(6);
+    mp_obj_dict_store(root, mp_obj_new_str("schema_version", 14), mp_obj_new_int(0));
+
+    mp_obj_t device = mp_obj_new_dict(5);
+    if (self->addr == mp_const_none) {
+        mp_obj_dict_store(device, mp_obj_new_str("id", 2), mp_const_none);
+        mp_obj_dict_store(device, mp_obj_new_str("address", 7), mp_const_none);
+    } else {
+        mp_obj_dict_store(device, mp_obj_new_str("id", 2), self->addr);
+        mp_obj_dict_store(device, mp_obj_new_str("address", 7), self->addr);
+    }
+    mp_obj_dict_store(device, mp_obj_new_str("model", 5), mp_obj_new_str("unknown", 7));
+    mp_obj_dict_store(device, mp_obj_new_str("family", 6), mp_obj_new_str("polar", 5));
+    mp_obj_dict_store(device, mp_obj_new_str("firmware", 8), mp_const_none);
+    mp_obj_dict_store(root, mp_obj_new_str("device", 6), device);
+
+    mp_obj_t kinds = mp_obj_new_list(0, NULL);
+    mp_obj_t by_kind = mp_obj_new_dict(3);
+    if (POLAR_CFG_ENABLE_HR) {
+        mp_obj_list_append(kinds, mp_obj_new_str("hr", 2));
+        mp_obj_dict_store(
+            by_kind,
+            mp_obj_new_str("hr", 2),
+            polar_stream_kind_capabilities_dict(true, true, true, "decoded", "bpm", mp_obj_new_int(12), MP_OBJ_NULL));
+    }
+    if (POLAR_CFG_ENABLE_ECG) {
+        mp_obj_t ecg_cfg = mp_obj_new_dict(1);
+        mp_obj_dict_store(ecg_cfg, mp_obj_new_str("sample_rate_hz", 14), polar_config_desc_range(1, 65535, 1));
+        mp_obj_list_append(kinds, mp_obj_new_str("ecg", 3));
+        mp_obj_dict_store(
+            by_kind,
+            mp_obj_new_str("ecg", 3),
+            polar_stream_kind_capabilities_dict(true, false, true, "decoded", "uV", mp_obj_new_int(4), ecg_cfg));
+
+        mp_obj_t acc_cfg = mp_obj_new_dict(2);
+        mp_obj_dict_store(acc_cfg, mp_obj_new_str("sample_rate_hz", 14), polar_config_desc_range(1, 65535, 1));
+        mp_obj_dict_store(acc_cfg, mp_obj_new_str("range", 5), polar_config_desc_range(1, 65535, 1));
+        mp_obj_list_append(kinds, mp_obj_new_str("acc", 3));
+        mp_obj_dict_store(
+            by_kind,
+            mp_obj_new_str("acc", 3),
+            polar_stream_kind_capabilities_dict(true, false, true, "decoded", "mg", mp_obj_new_int(6), acc_cfg));
+    }
+
+    mp_obj_t streams = mp_obj_new_dict(3);
+    mp_obj_dict_store(streams, mp_obj_new_str("kinds", 5), kinds);
+    mp_obj_dict_store(streams, mp_obj_new_str("max_parallel_pmd_streams", 24), mp_obj_new_int(POLAR_CFG_ENABLE_ECG ? 2 : 0));
+    mp_obj_dict_store(streams, mp_obj_new_str("by_kind", 7), by_kind);
+    mp_obj_dict_store(root, mp_obj_new_str("streams", 7), streams);
+
+    bool recording_supported = polar_h10_recording_is_supported(self);
+    mp_obj_t recording = mp_obj_new_dict(5);
+    mp_obj_dict_store(recording, mp_obj_new_str("supported", 9), mp_obj_new_bool(recording_supported));
+    mp_obj_t recording_kinds = mp_obj_new_list(0, NULL);
+    mp_obj_t recording_by_kind = mp_obj_new_dict(1);
+    if (recording_supported) {
+        static const char *const h10_recording_sample_type_choices[] = { "hr", "rr" };
+        mp_obj_t hr_desc = mp_obj_new_dict(2);
+        mp_obj_t hr_cfg = mp_obj_new_dict(2);
+        mp_obj_dict_store(hr_cfg, mp_obj_new_str("sample_type", 11), polar_config_desc_enum(h10_recording_sample_type_choices, 2));
+        mp_obj_dict_store(hr_cfg, mp_obj_new_str("interval_s", 10), polar_config_desc_range(1, 5, 4));
+        mp_obj_dict_store(hr_desc, mp_obj_new_str("units", 5), mp_const_none);
+        mp_obj_dict_store(hr_desc, mp_obj_new_str("config", 6), hr_cfg);
+        mp_obj_list_append(recording_kinds, mp_obj_new_str("hr", 2));
+        mp_obj_dict_store(recording_by_kind, mp_obj_new_str("hr", 2), hr_desc);
+    }
+    mp_obj_dict_store(recording, mp_obj_new_str("kinds", 5), recording_kinds);
+    mp_obj_dict_store(recording, mp_obj_new_str("max_parallel_kinds", 18), mp_obj_new_int(recording_supported ? 1 : 0));
+    mp_obj_dict_store(recording, mp_obj_new_str("features", 8), polar_capability_bool_dict4(recording_supported, recording_supported, false, false));
+    mp_obj_dict_store(recording, mp_obj_new_str("by_kind", 7), recording_by_kind);
+    mp_obj_dict_store(root, mp_obj_new_str("recording", 9), recording);
+
+    mp_obj_t psftp = mp_obj_new_dict(4);
+    mp_obj_dict_store(psftp, mp_obj_new_str("read", 4), mp_obj_new_bool(POLAR_CFG_ENABLE_PSFTP));
+    mp_obj_dict_store(psftp, mp_obj_new_str("delete", 6), mp_obj_new_bool(POLAR_CFG_ENABLE_PSFTP));
+    mp_obj_dict_store(psftp, mp_obj_new_str("chunked_download", 16), mp_obj_new_bool(POLAR_CFG_ENABLE_PSFTP));
+    mp_obj_dict_store(psftp, mp_obj_new_str("max_chunk_bytes", 15), mp_obj_new_int_from_uint(POLAR_SDK_PSFTP_MAX_DOWNLOAD_BYTES));
+    mp_obj_dict_store(root, mp_obj_new_str("psftp", 5), psftp);
+
+    mp_obj_t security = mp_obj_new_dict(3);
+    bool bonded = false;
+    uint8_t key_size = 0;
+#if POLAR_SDK_HAS_BTSTACK
+    if (self->runtime_link.connected && self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID) {
+        bonded = gap_bonded(self->runtime_link.conn_handle);
+        key_size = gap_encryption_key_size(self->runtime_link.conn_handle);
+    }
+#endif
+    mp_obj_dict_store(security, mp_obj_new_str("bonded", 6), mp_obj_new_bool(bonded));
+    mp_obj_dict_store(security, mp_obj_new_str("encryption_key_size", 19), mp_obj_new_int_from_uint(key_size));
+    mp_obj_dict_store(security, mp_obj_new_str("pairing_method", 14), mp_const_none);
+    mp_obj_dict_store(root, mp_obj_new_str("security", 8), security);
+
+    return root;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_capabilities_obj, polar_h10_capabilities);
 
 #if POLAR_SDK_HAS_BTSTACK
 static uint32_t polar_btstack_cfg_feature_mask(void) {
@@ -2811,12 +4103,6 @@ static mp_obj_t polar_btstack_config_snapshot_dict(void) {
     #if defined(HCI_ACL_PAYLOAD_SIZE)
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_hci_acl_payload_size), mp_obj_new_int_from_uint((uint32_t)HCI_ACL_PAYLOAD_SIZE));
     #endif
-    #if defined(HCI_HOST_ACL_PACKET_LEN)
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_hci_host_acl_packet_len), mp_obj_new_int_from_uint((uint32_t)HCI_HOST_ACL_PACKET_LEN));
-    #endif
-    #if defined(HCI_HOST_ACL_PACKET_NUM)
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_hci_host_acl_packet_num), mp_obj_new_int_from_uint((uint32_t)HCI_HOST_ACL_PACKET_NUM));
-    #endif
     #if defined(MAX_NR_HCI_CONNECTIONS)
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_hci_connections), mp_obj_new_int_from_uint((uint32_t)MAX_NR_HCI_CONNECTIONS));
     #endif
@@ -2838,15 +4124,6 @@ static mp_obj_t polar_btstack_config_snapshot_dict(void) {
     #if defined(MAX_NR_LE_DEVICE_DB_ENTRIES)
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_le_device_db_entries), mp_obj_new_int_from_uint((uint32_t)MAX_NR_LE_DEVICE_DB_ENTRIES));
     #endif
-    #if defined(MAX_NR_CONTROLLER_ACL_BUFFERS)
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_nr_controller_acl_buffers), mp_obj_new_int_from_uint((uint32_t)MAX_NR_CONTROLLER_ACL_BUFFERS));
-    #endif
-    #if defined(NVM_NUM_DEVICE_DB_ENTRIES)
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_nvm_num_device_db_entries), mp_obj_new_int_from_uint((uint32_t)NVM_NUM_DEVICE_DB_ENTRIES));
-    #endif
-    #if defined(NVM_NUM_LINK_KEYS)
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_nvm_num_link_keys), mp_obj_new_int_from_uint((uint32_t)NVM_NUM_LINK_KEYS));
-    #endif
     #if defined(MAX_ATT_DB_SIZE)
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_cfg_max_att_db_size), mp_obj_new_int_from_uint((uint32_t)MAX_ATT_DB_SIZE));
     #endif
@@ -2856,20 +4133,21 @@ static mp_obj_t polar_btstack_config_snapshot_dict(void) {
 
     return dict;
 }
+
 #endif
 
 static mp_obj_t polar_h10_stats(mp_obj_t self_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
     mp_obj_t dict = mp_obj_new_dict(96);
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_state), MP_OBJ_NEW_QSTR(polar_state_qstrs[self->runtime_link.state]));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_state), mp_obj_new_str(polar_state_strs[self->runtime_link.state], strlen(polar_state_strs[self->runtime_link.state])));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_connected), mp_obj_new_bool(self->runtime_link.connected));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_connect_calls), mp_obj_new_int_from_uint(self->connect_calls));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_disconnect_calls), mp_obj_new_int_from_uint(self->disconnect_calls));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_feature_hr), mp_obj_new_bool(POLAR_CFG_ENABLE_HR));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_feature_ecg), mp_obj_new_bool(POLAR_CFG_ENABLE_ECG));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_feature_psftp), mp_obj_new_bool(POLAR_CFG_ENABLE_PSFTP));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_required_services), mp_obj_new_int_from_uint(self->required_services_mask));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_required_capabilities), polar_capabilities_tuple_from_mask(self->required_capabilities_mask));
 
 #if POLAR_SDK_HAS_BTSTACK
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_btstack_config), polar_btstack_config_snapshot_dict());
@@ -2906,9 +4184,6 @@ static mp_obj_t polar_h10_stats(mp_obj_t self_in) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_disconnect_reason_0x08_total), mp_obj_new_int_from_uint(self->runtime_link.disconnect_reason_0x08_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_disconnect_reason_0x3e_total), mp_obj_new_int_from_uint(self->runtime_link.disconnect_reason_0x3e_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_disconnect_reason_other_total), mp_obj_new_int_from_uint(self->runtime_link.disconnect_reason_other_total));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_just_works_total), mp_obj_new_int_from_uint(self->sm_just_works_total));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_numeric_comparison_total), mp_obj_new_int_from_uint(self->sm_numeric_comparison_total));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_authorization_requests_total), mp_obj_new_int_from_uint(self->sm_authorization_requests_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_pairing_complete_total), mp_obj_new_int_from_uint(self->sm_pairing_complete_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_last_pairing_status), mp_obj_new_int_from_uint(self->sm_last_pairing_status));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_sm_last_pairing_reason), mp_obj_new_int_from_uint(self->sm_last_pairing_reason));
@@ -2944,14 +4219,14 @@ static mp_obj_t polar_h10_stats(mp_obj_t self_in) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_ecg_parse_errors_total), mp_obj_new_int_from_uint(self->ecg_ring.parse_errors_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_ecg_drop_bytes_total), mp_obj_new_int_from_uint(self->ecg_ring.drop_bytes_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_ecg_ring_high_water), mp_obj_new_int_from_uint(self->ecg_ring.ring_high_water));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_enabled), mp_obj_new_bool(self->imu_enabled));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_available_bytes), mp_obj_new_int_from_uint(self->imu_ring.count));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_notifications_total), mp_obj_new_int_from_uint(self->imu_ring.notifications_total));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_frames_total), mp_obj_new_int_from_uint(self->imu_ring.frames_total));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_samples_total), mp_obj_new_int_from_uint(self->imu_ring.samples_total));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_parse_errors_total), mp_obj_new_int_from_uint(self->imu_ring.parse_errors_total));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_drop_bytes_total), mp_obj_new_int_from_uint(self->imu_ring.drop_bytes_total));
-    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_imu_ring_high_water), mp_obj_new_int_from_uint(self->imu_ring.ring_high_water));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_acc_enabled), mp_obj_new_bool(self->imu_enabled));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_acc_available_bytes), mp_obj_new_int_from_uint(self->imu_ring.count));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_acc_notifications_total), mp_obj_new_int_from_uint(self->imu_ring.notifications_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_acc_frames_total), mp_obj_new_int_from_uint(self->imu_ring.frames_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_acc_samples_total), mp_obj_new_int_from_uint(self->imu_ring.samples_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_acc_parse_errors_total), mp_obj_new_int_from_uint(self->imu_ring.parse_errors_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_acc_drop_bytes_total), mp_obj_new_int_from_uint(self->imu_ring.drop_bytes_total));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_acc_ring_high_water), mp_obj_new_int_from_uint(self->imu_ring.ring_high_water));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_pmd_cp_notifications_total), mp_obj_new_int_from_uint(self->pmd_cp_notifications_total));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_pmd_cp_response_total), mp_obj_new_int_from_uint(self->pmd_cp_response_total));
 
@@ -2980,11 +4255,11 @@ static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_stats_obj, polar_h10_stats);
 static mp_obj_t polar_h10_connect(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
     enum {
         ARG_timeout_ms,
-        ARG_required_services,
+        ARG_required_capabilities,
     };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_timeout_ms, MP_ARG_INT, { .u_int = 10000 } },
-        { MP_QSTR_required_services, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = -1 } },
+        { MP_QSTR_required_capabilities, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = mp_const_none } },
     };
 
     mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
@@ -2999,15 +4274,16 @@ static mp_obj_t polar_h10_connect(size_t n_args, const mp_obj_t *args, mp_map_t 
 #else
     mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
     if (timeout_ms <= 0) {
-        polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("connect timeout"));
+        mp_raise_ValueError(MP_ERROR_TEXT("timeout_ms must be > 0"));
     }
 
-    mp_int_t required_services_arg = parsed_args[ARG_required_services].u_int;
-    if (required_services_arg >= 0) {
-        if (!polar_service_mask_is_valid((uint32_t)required_services_arg)) {
-            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid required_services mask"));
-        }
-        self->required_services_mask = (uint8_t)required_services_arg;
+    polar_capability_mask_t connect_caps_mask = self->required_capabilities_mask;
+    uint8_t connect_services_mask = self->required_services_mask;
+    if (parsed_args[ARG_required_capabilities].u_obj != mp_const_none) {
+        (void)polar_required_capabilities_parse(parsed_args[ARG_required_capabilities].u_obj, &connect_caps_mask, &connect_services_mask);
+    }
+    if (connect_services_mask == 0) {
+        connect_services_mask = polar_build_default_services_mask();
     }
 
     if (self->runtime_link.connected && self->runtime_link.state == POLAR_SDK_STATE_READY) {
@@ -3015,7 +4291,7 @@ static mp_obj_t polar_h10_connect(size_t n_args, const mp_obj_t *args, mp_map_t 
     }
 
     if (polar_active_h10 != NULL && polar_active_h10 != self) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("another polar.H10 transport is active"));
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("another polar.Device transport is active"));
     }
 
     // Validate addr format up front if provided.
@@ -3023,12 +4299,17 @@ static mp_obj_t polar_h10_connect(size_t n_args, const mp_obj_t *args, mp_map_t 
         bd_addr_t addr_tmp;
         const char *addr_str = mp_obj_str_get_str(self->addr);
         if (sscanf_bd_addr(addr_str, addr_tmp) == 0) {
-            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid addr format"));
+            mp_raise_ValueError(MP_ERROR_TEXT("invalid addr format"));
         }
     }
 
     polar_ensure_ble_ready();
     polar_register_hci_handler_refresh();
+
+    polar_capability_mask_t saved_caps_mask = self->required_capabilities_mask;
+    uint8_t saved_services_mask = self->required_services_mask;
+    self->required_capabilities_mask = connect_caps_mask;
+    self->required_services_mask = connect_services_mask;
 
     polar_active_h10 = self;
 
@@ -3037,9 +4318,13 @@ static mp_obj_t polar_h10_connect(size_t n_args, const mp_obj_t *args, mp_map_t 
         (uint32_t)timeout_ms);
 
     if (connect_result == POLAR_SDK_TRANSPORT_CONNECT_OK) {
+        self->required_capabilities_mask = saved_caps_mask;
+        self->required_services_mask = saved_services_mask;
         return mp_const_none;
     }
 
+    self->required_capabilities_mask = saved_caps_mask;
+    self->required_services_mask = saved_services_mask;
     self->runtime_link.conn_update_pending = false;
     self->runtime_link.state = POLAR_SDK_STATE_IDLE;
     if (polar_active_h10 == self) {
@@ -3054,15 +4339,31 @@ static mp_obj_t polar_h10_connect(size_t n_args, const mp_obj_t *args, mp_map_t 
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_connect_obj, 1, polar_h10_connect);
 
-static mp_obj_t polar_h10_disconnect(mp_obj_t self_in) {
-    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+static mp_obj_t polar_h10_disconnect(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+    enum {
+        ARG_timeout_ms,
+    };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_timeout_ms, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = 10000 } },
+    };
+
+    mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     self->disconnect_calls += 1;
 
 #if !POLAR_SDK_HAS_BTSTACK
+    (void)parsed_args;
     self->runtime_link.connected = false;
     self->runtime_link.state = POLAR_SDK_STATE_IDLE;
     return mp_const_none;
 #else
+    mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
+    if (timeout_ms <= 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("timeout_ms must be > 0"));
+    }
+
     self->user_disconnect_requested = true;
     self->connect_intent = false;
 
@@ -3081,7 +4382,7 @@ static mp_obj_t polar_h10_disconnect(mp_obj_t self_in) {
         }
 
         uint32_t start_ms = polar_now_ms();
-        while (!polar_elapsed_ms(start_ms, POLAR_SDK_DISCONNECT_WAIT_MS)) {
+        while (!polar_elapsed_ms(start_ms, (uint32_t)timeout_ms)) {
             if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
                 break;
             }
@@ -3102,6 +4403,11 @@ static mp_obj_t polar_h10_disconnect(mp_obj_t self_in) {
         self->pmd_data_notification_listening = false;
     }
 
+    polar_download_blob_reset(self);
+
+    self->hr_enabled = false;
+    self->hr_raw_last_len = 0;
+    self->hr_raw_consumed_seq = self->hr_raw_seq;
     self->ecg_enabled = false;
     self->imu_enabled = false;
     self->runtime_link.connected = false;
@@ -3116,7 +4422,7 @@ static mp_obj_t polar_h10_disconnect(mp_obj_t self_in) {
     return mp_const_none;
 #endif
 }
-static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_disconnect_obj, polar_h10_disconnect);
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_disconnect_obj, 1, polar_h10_disconnect);
 
 static mp_obj_t polar_h10_start_hr(mp_obj_t self_in) {
     polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
@@ -3126,9 +4432,19 @@ static mp_obj_t polar_h10_start_hr(mp_obj_t self_in) {
     polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("Bluetooth BTstack is not available in this build"));
 #else
     if (!POLAR_CFG_ENABLE_HR) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("HR feature disabled at build time"));
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("HR feature disabled at build time"));
     }
+    polar_require_no_active_download_handle(self);
+    if (self->hr_enabled) {
+        if (self->hr_stream_format == POLAR_STREAM_FORMAT_DECODED) {
+            return mp_const_none;
+        }
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("HR stream already active with different format"));
+    }
+    self->hr_stream_format = POLAR_STREAM_FORMAT_DECODED;
     polar_hr_set_notify(self, true);
+    self->hr_consumed_seq = self->hr_state.sample_seq;
+    self->hr_raw_consumed_seq = self->hr_raw_seq;
     return mp_const_none;
 #endif
 }
@@ -3142,12 +4458,16 @@ static mp_obj_t polar_h10_stop_hr(mp_obj_t self_in) {
     return mp_const_none;
 #else
     if (!POLAR_CFG_ENABLE_HR) {
-        return mp_const_none;
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("HR feature disabled at build time"));
     }
+    polar_require_no_active_download_handle(self);
     if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         self->hr_enabled = false;
         self->hr_cfg_pending = false;
         self->hr_cfg_done = false;
+        self->hr_raw_last_len = 0;
+        self->hr_consumed_seq = self->hr_state.sample_seq;
+        self->hr_raw_consumed_seq = self->hr_raw_seq;
         return mp_const_none;
     }
 
@@ -3162,6 +4482,9 @@ static mp_obj_t polar_h10_stop_hr(mp_obj_t self_in) {
         self->hr_cfg_pending = false;
         self->hr_cfg_done = false;
     }
+    self->hr_raw_last_len = 0;
+    self->hr_consumed_seq = self->hr_state.sample_seq;
+    self->hr_raw_consumed_seq = self->hr_raw_seq;
     return mp_const_none;
 #endif
 }
@@ -3185,18 +4508,16 @@ static mp_obj_t polar_h10_read_hr(size_t n_args, const mp_obj_t *args, mp_map_t 
     return mp_const_none;
 #else
     if (!POLAR_CFG_ENABLE_HR) {
-        return mp_const_none;
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("HR feature disabled at build time"));
     }
-    if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-        polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
-    }
-    if (!self->hr_enabled) {
-        return mp_const_none;
+    polar_require_ready(self);
+    if (!self->hr_enabled || self->hr_stream_format != POLAR_STREAM_FORMAT_DECODED) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("decoded HR stream is not active"));
     }
 
     mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
     if (timeout_ms < 0) {
-        timeout_ms = 0;
+        mp_raise_ValueError(MP_ERROR_TEXT("timeout_ms must be >= 0"));
     }
 
     if (self->hr_consumed_seq >= self->hr_state.sample_seq && timeout_ms > 0) {
@@ -3241,17 +4562,18 @@ static mp_obj_t polar_h10_read_hr(size_t n_args, const mp_obj_t *args, mp_map_t 
 
     self->hr_consumed_seq = self->hr_state.sample_seq;
 
-    mp_obj_t out[8] = {
-        mp_obj_new_int_from_uint(self->hr_state.last_ts_ms),
+    mp_obj_t out[9] = {
+        mp_obj_new_str("unknown", 7),
+        mp_const_none,
         mp_obj_new_int_from_uint(self->hr_state.last_bpm),
+        mp_obj_new_int_from_uint(polar_hr_public_flags(&self->hr_state)),
         mp_obj_new_int_from_uint(self->hr_state.last_rr_count),
         mp_obj_new_int_from_uint(self->hr_state.last_rr_ms[0]),
         mp_obj_new_int_from_uint(self->hr_state.last_rr_ms[1]),
         mp_obj_new_int_from_uint(self->hr_state.last_rr_ms[2]),
         mp_obj_new_int_from_uint(self->hr_state.last_rr_ms[3]),
-        mp_obj_new_int_from_uint(self->hr_state.last_contact),
     };
-    return mp_obj_new_tuple(8, out);
+    return mp_obj_new_tuple(9, out);
 #endif
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_read_hr_obj, 1, polar_h10_read_hr);
@@ -3405,21 +4727,25 @@ static mp_obj_t polar_h10_start_ecg(size_t n_args, const mp_obj_t *args, mp_map_
     polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("Bluetooth BTstack is not available in this build"));
 #else
     if (!POLAR_CFG_ENABLE_ECG) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("ECG feature disabled at build time"));
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("ECG feature disabled at build time"));
     }
+    polar_require_no_active_download_handle(self);
     if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
     }
     if (!self->pmd_cp_char_found || !self->pmd_data_char_found || self->pmd_cp_handle == 0 || self->pmd_data_handle == 0) {
         polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD characteristics missing"));
     }
-    if (self->ecg_enabled) {
-        return mp_const_none;
-    }
 
     mp_int_t sample_rate = parsed_args[ARG_sample_rate].u_int;
     if (sample_rate <= 0 || sample_rate > 65535) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid ECG sample_rate"));
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid ECG sample_rate"));
+    }
+    if (self->ecg_enabled) {
+        if (self->ecg_stream_format == POLAR_STREAM_FORMAT_DECODED && self->ecg_sample_rate_hz == (uint16_t)sample_rate) {
+            return mp_const_none;
+        }
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("ECG stream already active with different config"));
     }
 
     polar_sdk_pmd_start_policy_t policy = {
@@ -3465,7 +4791,7 @@ static mp_obj_t polar_h10_start_ecg(size_t n_args, const mp_obj_t *args, mp_map_
             polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
             break;
         case POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT:
-            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("failed to establish secure link for PMD"));
+            polar_raise_exc(&polar_type_SecurityError, MP_ERROR_TEXT("failed to establish secure link for PMD"));
             break;
         case POLAR_SDK_PMD_START_RESULT_CCC_TIMEOUT:
             polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD CCC timeout"));
@@ -3489,6 +4815,7 @@ static mp_obj_t polar_h10_start_ecg(size_t n_args, const mp_obj_t *args, mp_map_
     }
 
     self->ecg_enabled = true;
+    self->ecg_sample_rate_hz = (uint16_t)sample_rate;
     polar_ecg_ring_reset(self);
     return mp_const_none;
 #endif
@@ -3536,8 +4863,10 @@ static mp_obj_t polar_h10_stop_ecg(mp_obj_t self_in) {
     return mp_const_none;
 #else
     if (!POLAR_CFG_ENABLE_ECG) {
-        return mp_const_none;
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("ECG feature disabled at build time"));
     }
+
+    polar_require_no_active_download_handle(self);
 
     if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         self->ecg_enabled = false;
@@ -3591,15 +4920,16 @@ static mp_obj_t polar_h10_read_ecg(size_t n_args, const mp_obj_t *args, mp_map_t
     return mp_obj_new_bytes((const uint8_t *)"", 0);
 #else
     if (!POLAR_CFG_ENABLE_ECG) {
-        return mp_obj_new_bytes((const uint8_t *)"", 0);
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("ECG feature disabled at build time"));
     }
-    if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-        polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+    polar_require_ready(self);
+    if (!self->ecg_enabled) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("ECG stream is not active"));
     }
 
     mp_int_t max_bytes = parsed_args[ARG_max_bytes].u_int;
     if (max_bytes <= 0) {
-        return mp_obj_new_bytes((const uint8_t *)"", 0);
+        mp_raise_ValueError(MP_ERROR_TEXT("max_bytes must be > 0"));
     }
     if (max_bytes > POLAR_SDK_ECG_RING_BYTES) {
         max_bytes = POLAR_SDK_ECG_RING_BYTES;
@@ -3611,7 +4941,7 @@ static mp_obj_t polar_h10_read_ecg(size_t n_args, const mp_obj_t *args, mp_map_t
 
     mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
     if (timeout_ms < 0) {
-        timeout_ms = 0;
+        mp_raise_ValueError(MP_ERROR_TEXT("timeout_ms must be >= 0"));
     }
 
     if (polar_ecg_ring_available(self) == 0 && timeout_ms > 0 && self->ecg_enabled) {
@@ -3668,26 +4998,32 @@ static mp_obj_t polar_h10_start_imu(size_t n_args, const mp_obj_t *args, mp_map_
     polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("Bluetooth BTstack is not available in this build"));
 #else
     if (!POLAR_CFG_ENABLE_ECG) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("IMU feature disabled at build time"));
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("ACC feature disabled at build time"));
     }
+    polar_require_no_active_download_handle(self);
     if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
     }
     if (!self->pmd_cp_char_found || !self->pmd_data_char_found || self->pmd_cp_handle == 0 || self->pmd_data_handle == 0) {
         polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD characteristics missing"));
     }
-    if (self->imu_enabled) {
-        return mp_const_none;
-    }
 
     mp_int_t sample_rate = parsed_args[ARG_sample_rate].u_int;
     if (sample_rate <= 0 || sample_rate > 65535) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid IMU sample_rate"));
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid ACC sample_rate"));
     }
 
     mp_int_t range = parsed_args[ARG_range].u_int;
     if (range <= 0 || range > 65535) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid IMU range"));
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid ACC range"));
+    }
+    if (self->imu_enabled) {
+        if (self->acc_stream_format == POLAR_STREAM_FORMAT_DECODED &&
+            self->acc_sample_rate_hz == (uint16_t)sample_rate &&
+            self->acc_range == (uint16_t)range) {
+            return mp_const_none;
+        }
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("ACC stream already active with different config"));
     }
 
     polar_sdk_pmd_start_policy_t policy = {
@@ -3733,7 +5069,7 @@ static mp_obj_t polar_h10_start_imu(size_t n_args, const mp_obj_t *args, mp_map_
             polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
             break;
         case POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT:
-            polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("failed to establish secure link for PMD"));
+            polar_raise_exc(&polar_type_SecurityError, MP_ERROR_TEXT("failed to establish secure link for PMD"));
             break;
         case POLAR_SDK_PMD_START_RESULT_CCC_TIMEOUT:
             polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD CCC timeout"));
@@ -3748,7 +5084,7 @@ static mp_obj_t polar_h10_start_imu(size_t n_args, const mp_obj_t *args, mp_map_
             polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("PMD start response timeout"));
             break;
         case POLAR_SDK_PMD_START_RESULT_START_REJECTED:
-            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD start IMU rejected"));
+            polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD start ACC rejected"));
             break;
         case POLAR_SDK_PMD_START_RESULT_TRANSPORT_ERROR:
         default:
@@ -3757,6 +5093,8 @@ static mp_obj_t polar_h10_start_imu(size_t n_args, const mp_obj_t *args, mp_map_
     }
 
     self->imu_enabled = true;
+    self->acc_sample_rate_hz = (uint16_t)sample_rate;
+    self->acc_range = (uint16_t)range;
     polar_imu_ring_reset(self);
     return mp_const_none;
 #endif
@@ -3771,8 +5109,10 @@ static mp_obj_t polar_h10_stop_imu(mp_obj_t self_in) {
     return mp_const_none;
 #else
     if (!POLAR_CFG_ENABLE_ECG) {
-        return mp_const_none;
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("ACC feature disabled at build time"));
     }
+
+    polar_require_no_active_download_handle(self);
 
     if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         self->imu_enabled = false;
@@ -3790,7 +5130,7 @@ static mp_obj_t polar_h10_stop_imu(mp_obj_t self_in) {
 
         if (polar_pmd_wait_response(self, POLAR_SDK_GATT_OP_TIMEOUT_MS)) {
             if (!polar_sdk_pmd_response_status_ok(self->pmd_cp_response_status)) {
-                polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD stop IMU rejected"));
+                polar_raise_exc(&polar_type_ProtocolError, MP_ERROR_TEXT("PMD stop ACC rejected"));
             }
         }
     }
@@ -3826,15 +5166,16 @@ static mp_obj_t polar_h10_read_imu(size_t n_args, const mp_obj_t *args, mp_map_t
     return mp_obj_new_bytes((const uint8_t *)"", 0);
 #else
     if (!POLAR_CFG_ENABLE_ECG) {
-        return mp_obj_new_bytes((const uint8_t *)"", 0);
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("ACC feature disabled at build time"));
     }
-    if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-        polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+    polar_require_ready(self);
+    if (!self->imu_enabled) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("ACC stream is not active"));
     }
 
     mp_int_t max_bytes = parsed_args[ARG_max_bytes].u_int;
     if (max_bytes <= 0) {
-        return mp_obj_new_bytes((const uint8_t *)"", 0);
+        mp_raise_ValueError(MP_ERROR_TEXT("max_bytes must be > 0"));
     }
     if (max_bytes > POLAR_SDK_IMU_RING_BYTES) {
         max_bytes = POLAR_SDK_IMU_RING_BYTES;
@@ -3846,7 +5187,7 @@ static mp_obj_t polar_h10_read_imu(size_t n_args, const mp_obj_t *args, mp_map_t
 
     mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
     if (timeout_ms < 0) {
-        timeout_ms = 0;
+        mp_raise_ValueError(MP_ERROR_TEXT("timeout_ms must be >= 0"));
     }
 
     if (polar_imu_ring_available(self) == 0 && timeout_ms > 0 && self->imu_enabled) {
@@ -3889,7 +5230,11 @@ static mp_obj_t polar_h10_list_dir(mp_obj_t self_in, mp_obj_t path_in) {
     polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("Bluetooth BTstack is not available in this build"));
 #else
     if (!POLAR_CFG_ENABLE_PSFTP) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PSFTP feature disabled at build time"));
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("PSFTP feature disabled at build time"));
+    }
+    polar_require_ready(self);
+    if (self->download_handle_active) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("download handle already active"));
     }
     if (!mp_obj_is_str(path_in)) {
         mp_raise_TypeError(MP_ERROR_TEXT("path must be str"));
@@ -3897,14 +5242,14 @@ static mp_obj_t polar_h10_list_dir(mp_obj_t self_in, mp_obj_t path_in) {
 
     size_t path_len = 0;
     const char *path = mp_obj_str_get_data(path_in, &path_len);
-    if (path_len == 0) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("path must not be empty"));
+    if (path_len == 0 || path[0] != '/') {
+        mp_raise_ValueError(MP_ERROR_TEXT("path must be absolute"));
     }
 
     bool add_trailing_slash = path[path_len - 1] != '/';
     size_t normalized_len = path_len + (add_trailing_slash ? 1u : 0u);
     if (normalized_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("path too long"));
+        mp_raise_ValueError(MP_ERROR_TEXT("path too long"));
     }
 
     char normalized_path[POLAR_SDK_PSFTP_MAX_PATH_BYTES + 1u];
@@ -3953,11 +5298,18 @@ static mp_obj_t polar_h10_list_dir(mp_obj_t self_in, mp_obj_t path_in) {
 
     mp_obj_t out_list = mp_obj_new_list(0, NULL);
     for (size_t i = 0; i < entry_count; ++i) {
-        mp_obj_t tuple_items[2] = {
-            mp_obj_new_str(entries[i].name, strlen(entries[i].name)),
-            mp_obj_new_int_from_ull(entries[i].size),
-        };
-        mp_obj_list_append(out_list, mp_obj_new_tuple(2, tuple_items));
+        size_t name_len = strlen(entries[i].name);
+        bool is_dir = false;
+        if (name_len > 0 && entries[i].name[name_len - 1] == '/') {
+            is_dir = true;
+            name_len -= 1;
+        }
+
+        mp_obj_t entry = mp_obj_new_dict(3);
+        mp_obj_dict_store(entry, mp_obj_new_str("name", 4), mp_obj_new_str(entries[i].name, name_len));
+        mp_obj_dict_store(entry, mp_obj_new_str("size", 4), mp_obj_new_int_from_ull(entries[i].size));
+        mp_obj_dict_store(entry, mp_obj_new_str("is_dir", 6), mp_obj_new_bool(is_dir));
+        mp_obj_list_append(out_list, entry);
     }
 
     m_del(polar_sdk_psftp_dir_entry_t, entries, POLAR_SDK_PSFTP_MAX_DIR_ENTRIES);
@@ -3988,7 +5340,11 @@ static mp_obj_t polar_h10_download(size_t n_args, const mp_obj_t *args, mp_map_t
     polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("Bluetooth BTstack is not available in this build"));
 #else
     if (!POLAR_CFG_ENABLE_PSFTP) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("PSFTP feature disabled at build time"));
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("PSFTP feature disabled at build time"));
+    }
+    polar_require_ready(self);
+    if (self->download_handle_active) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("download handle already active"));
     }
     if (!mp_obj_is_str(parsed_args[ARG_path].u_obj)) {
         mp_raise_TypeError(MP_ERROR_TEXT("path must be str"));
@@ -3996,18 +5352,18 @@ static mp_obj_t polar_h10_download(size_t n_args, const mp_obj_t *args, mp_map_t
 
     mp_int_t max_bytes = parsed_args[ARG_max_bytes].u_int;
     if (max_bytes <= 0 || max_bytes > POLAR_SDK_PSFTP_MAX_DOWNLOAD_BYTES) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid max_bytes"));
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid max_bytes"));
     }
 
     mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
     if (timeout_ms <= 0) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid timeout_ms"));
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid timeout_ms"));
     }
 
     size_t path_len = 0;
     const char *path = mp_obj_str_get_data(parsed_args[ARG_path].u_obj, &path_len);
-    if (path_len == 0 || path_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
-        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("invalid path"));
+    if (path_len == 0 || path[0] != '/' || path_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid path"));
     }
 
     uint8_t *response = m_new(uint8_t, (size_t)max_bytes);
@@ -4032,79 +5388,857 @@ static mp_obj_t polar_h10_download(size_t n_args, const mp_obj_t *args, mp_map_t
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_download_obj, 2, polar_h10_download);
 
-static mp_obj_t polar_h10_start_streams(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+static mp_obj_t polar_h10_download_open(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
     enum {
-        ARG_ecg,
-        ARG_imu,
-        ARG_hr,
+        ARG_path,
+        ARG_timeout_ms,
     };
     static const mp_arg_t allowed_args[] = {
-        { MP_QSTR_ecg, MP_ARG_KW_ONLY | MP_ARG_BOOL, { .u_bool = false } },
-        { MP_QSTR_imu, MP_ARG_KW_ONLY | MP_ARG_BOOL, { .u_bool = false } },
-        { MP_QSTR_hr, MP_ARG_KW_ONLY | MP_ARG_BOOL, { .u_bool = false } },
+        { MP_QSTR_path, MP_ARG_REQUIRED | MP_ARG_OBJ, { .u_obj = MP_OBJ_NULL } },
+        { MP_QSTR_timeout_ms, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS } },
     };
 
     mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
 
-    if (parsed_args[ARG_hr].u_bool) {
-        (void)polar_h10_start_hr(args[0]);
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+#if !POLAR_SDK_HAS_BTSTACK
+    (void)self;
+    polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("Bluetooth BTstack is not available in this build"));
+#else
+    if (!POLAR_CFG_ENABLE_PSFTP) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("PSFTP feature disabled at build time"));
+    }
+    polar_require_ready(self);
+    if (self->download_handle_active) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("download handle already active"));
+    }
+    if (!mp_obj_is_str(parsed_args[ARG_path].u_obj)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("path must be str"));
     }
 
-    mp_map_t empty_kw = {
+    mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
+    if (timeout_ms <= 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid timeout_ms"));
+    }
+
+    size_t path_len = 0;
+    const char *path = mp_obj_str_get_data(parsed_args[ARG_path].u_obj, &path_len);
+    if (path_len == 0 || path[0] != '/' || path_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid path"));
+    }
+
+    polar_download_blob_reset(self);
+
+    self->download_blob = m_new(uint8_t, POLAR_SDK_PSFTP_MAX_DOWNLOAD_BYTES);
+    self->download_blob_alloc = POLAR_SDK_PSFTP_MAX_DOWNLOAD_BYTES;
+    self->download_blob_len = 0;
+    self->download_blob_off = 0;
+    self->download_handle_active = true;
+
+    polar_sdk_psftp_trans_result_t r = polar_psftp_begin_get_stream(self, path, path_len);
+    if (r != POLAR_SDK_PSFTP_TRANS_OK) {
+        polar_download_blob_reset(self);
+        polar_raise_for_psftp_result(self, r);
+    }
+
+    if (timeout_ms > 0) {
+        uint32_t start_ms = polar_now_ms();
+        while (!polar_elapsed_ms(start_ms, (uint32_t)timeout_ms)) {
+            if (polar_download_blob_available(self) > 0 || self->psftp_response_done) {
+                break;
+            }
+            if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+                polar_download_blob_reset(self);
+                polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+            }
+            mp_event_wait_ms(10);
+        }
+
+        if (self->psftp_response_done && polar_download_blob_available(self) == 0 && self->psftp_response_result != POLAR_SDK_PSFTP_RX_COMPLETE) {
+            polar_sdk_psftp_rx_result_t rx_result = self->psftp_response_result;
+            polar_download_blob_reset(self);
+            polar_raise_for_psftp_rx_result(self, rx_result);
+        }
+    }
+
+    if (self->download_handle_next_id == 0) {
+        self->download_handle_next_id = 1;
+    }
+    self->download_handle_id = self->download_handle_next_id;
+    self->download_handle_next_id += 1;
+
+    return mp_obj_new_int_from_uint(self->download_handle_id);
+#endif
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_download_open_obj, 2, polar_h10_download_open);
+
+static mp_obj_t polar_h10_download_read(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+    enum {
+        ARG_handle,
+        ARG_buf,
+        ARG_timeout_ms,
+    };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_handle, MP_ARG_REQUIRED | MP_ARG_INT, { .u_int = 0 } },
+        { MP_QSTR_buf, MP_ARG_REQUIRED | MP_ARG_OBJ, { .u_obj = MP_OBJ_NULL } },
+        { MP_QSTR_timeout_ms, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS } },
+    };
+
+    mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    mp_int_t handle = parsed_args[ARG_handle].u_int;
+    mp_int_t timeout_ms = parsed_args[ARG_timeout_ms].u_int;
+    if (timeout_ms < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid timeout_ms"));
+    }
+    if (handle <= 0 || !self->download_handle_active || (uint32_t)handle != self->download_handle_id) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid handle"));
+    }
+
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(parsed_args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_WRITE);
+    if (bufinfo.len == 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("buffer must not be empty"));
+    }
+
+    size_t available = polar_download_blob_available(self);
+    if (available == 0 && timeout_ms > 0 && !self->psftp_response_done) {
+        uint32_t start_ms = polar_now_ms();
+        while (!polar_elapsed_ms(start_ms, (uint32_t)timeout_ms)) {
+            if (polar_download_blob_available(self) > 0 || self->psftp_response_done) {
+                break;
+            }
+            if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+                polar_download_blob_reset(self);
+                polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+            }
+            mp_event_wait_ms(10);
+        }
+        available = polar_download_blob_available(self);
+    }
+
+    if (available == 0 && self->psftp_response_done) {
+        polar_sdk_psftp_rx_result_t result = self->psftp_response_result;
+        if (result == POLAR_SDK_PSFTP_RX_COMPLETE) {
+            polar_download_blob_reset(self);
+            return mp_obj_new_int(0);
+        }
+
+        polar_download_blob_reset(self);
+        polar_raise_for_psftp_rx_result(self, result);
+    }
+
+    if (available == 0) {
+        if (!self->runtime_link.connected || self->runtime_link.state != POLAR_SDK_STATE_READY || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
+            polar_download_blob_reset(self);
+            polar_raise_exc(&polar_type_NotConnectedError, MP_ERROR_TEXT("not connected"));
+        }
+        polar_raise_exc(&polar_type_TimeoutError, MP_ERROR_TEXT("download read timeout"));
+    }
+
+    size_t n = bufinfo.len;
+    if (n > available) {
+        n = available;
+    }
+    memcpy(bufinfo.buf, self->download_blob + self->download_blob_off, n);
+    self->download_blob_off += n;
+
+    if (self->download_blob_off == self->psftp_rx_state.length) {
+        self->download_blob_off = 0;
+        self->psftp_rx_state.length = 0;
+    }
+
+    return mp_obj_new_int_from_uint((mp_uint_t)n);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_download_read_obj, 3, polar_h10_download_read);
+
+static mp_obj_t polar_h10_download_close(mp_obj_t self_in, mp_obj_t handle_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    mp_int_t handle = mp_obj_get_int(handle_in);
+    if (handle <= 0 || !self->download_handle_active || (uint32_t)handle != self->download_handle_id) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid handle"));
+    }
+
+    polar_download_blob_reset(self);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_download_close_obj, polar_h10_download_close);
+
+static mp_obj_t polar_h10_recording_start(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+    enum {
+        ARG_kind,
+        ARG_sample_type,
+        ARG_interval_s,
+    };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_kind, MP_ARG_REQUIRED | MP_ARG_OBJ, { .u_obj = MP_OBJ_NULL } },
+        { MP_QSTR_sample_type, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = mp_const_none } },
+        { MP_QSTR_interval_s, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = 1 } },
+    };
+
+    mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    polar_require_ready(self);
+    polar_require_no_active_download_handle(self);
+
+    polar_recording_kind_key_t kind = polar_parse_recording_kind_key(parsed_args[ARG_kind].u_obj);
+    if (kind == POLAR_RECORDING_KIND_KEY_INVALID) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid recording kind"));
+    }
+    if (!polar_recording_kind_is_supported_build(kind)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording kind unsupported"));
+    }
+    if (!polar_h10_recording_is_supported(self)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording control unsupported"));
+    }
+
+    polar_h10_recording_prepare_or_raise(self);
+
+    polar_sdk_h10_recording_sample_type_t sample_type =
+        parsed_args[ARG_sample_type].u_obj == mp_const_none
+            ? POLAR_SDK_H10_RECORDING_SAMPLE_HEART_RATE
+            : polar_parse_h10_recording_sample_type(parsed_args[ARG_sample_type].u_obj);
+    mp_int_t interval_value = parsed_args[ARG_interval_s].u_int;
+    if (interval_value != 1 && interval_value != 5) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid interval_s"));
+    }
+    if (sample_type == POLAR_SDK_H10_RECORDING_SAMPLE_RR_INTERVAL && interval_value != 1) {
+        mp_raise_ValueError(MP_ERROR_TEXT("interval_s is unsupported for RR recording"));
+    }
+    uint8_t interval_s = (uint8_t)interval_value;
+
+    polar_h10_recording_query_status_or_raise(self);
+    if (self->recording_hr_active) {
+        if (!self->recording_hr_config_known) {
+            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("recording already active with unknown config"));
+        }
+        if (!polar_h10_recording_local_config_matches(self, sample_type, interval_s)) {
+            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("recording already active with different or unknown config"));
+        }
+        return mp_const_none;
+    }
+
+    char recording_id[POLAR_SDK_H10_RECORDING_ID_MAX_BYTES + 1u];
+    polar_h10_recording_make_auto_id(self, recording_id, sizeof(recording_id));
+
+    uint8_t query_payload[POLAR_SDK_PSFTP_RUNTIME_MAX_PROTO_REQUEST_BYTES];
+    size_t query_payload_len = 0;
+    polar_sdk_h10_recording_interval_t interval =
+        interval_s == 5u ? POLAR_SDK_H10_RECORDING_INTERVAL_5S : POLAR_SDK_H10_RECORDING_INTERVAL_1S;
+    if (!polar_sdk_psftp_encode_h10_start_recording_params(
+            recording_id,
+            strlen(recording_id),
+            sample_type,
+            interval,
+            query_payload,
+            sizeof(query_payload),
+            &query_payload_len)) {
+        polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("failed to encode recording start"));
+    }
+
+    uint8_t response[32];
+    size_t response_len = 0;
+    polar_sdk_psftp_trans_result_t result = polar_psftp_execute_query(
+        self,
+        POLAR_SDK_PSFTP_QUERY_REQUEST_START_RECORDING,
+        query_payload,
+        query_payload_len,
+        response,
+        sizeof(response),
+        POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS,
+        &response_len);
+    if (result != POLAR_SDK_PSFTP_TRANS_OK) {
+        polar_raise_for_psftp_result(self, result);
+    }
+
+    self->recording_hr_active = true;
+    self->recording_hr_config_known = true;
+    self->recording_hr_sample_type = sample_type;
+    self->recording_hr_interval_s = interval_s;
+    polar_h10_recording_store_id(self, recording_id, strlen(recording_id));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_recording_start_obj, 2, polar_h10_recording_start);
+
+static mp_obj_t polar_h10_recording_stop(mp_obj_t self_in, mp_obj_t kind_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    polar_require_ready(self);
+    polar_require_no_active_download_handle(self);
+
+    polar_recording_kind_key_t kind = polar_parse_recording_kind_key(kind_in);
+    if (kind == POLAR_RECORDING_KIND_KEY_INVALID) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid recording kind"));
+    }
+    if (!polar_recording_kind_is_supported_build(kind)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording kind unsupported"));
+    }
+    if (!polar_h10_recording_is_supported(self)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording control unsupported"));
+    }
+
+    polar_h10_recording_prepare_or_raise(self);
+
+    polar_h10_recording_query_status_or_raise(self);
+    if (!self->recording_hr_active) {
+        return mp_const_none;
+    }
+
+    uint8_t response[32];
+    size_t response_len = 0;
+    polar_sdk_psftp_trans_result_t result = polar_psftp_execute_query(
+        self,
+        POLAR_SDK_PSFTP_QUERY_REQUEST_STOP_RECORDING,
+        NULL,
+        0,
+        response,
+        sizeof(response),
+        POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS,
+        &response_len);
+    if (result != POLAR_SDK_PSFTP_TRANS_OK) {
+        polar_raise_for_psftp_result(self, result);
+    }
+
+    polar_h10_recording_clear_local_state(self);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_recording_stop_obj, polar_h10_recording_stop);
+
+static mp_obj_t polar_h10_recording_status(mp_obj_t self_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    polar_require_ready(self);
+    polar_require_no_active_download_handle(self);
+
+    if (!polar_h10_recording_is_supported(self)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording status unsupported"));
+    }
+
+    polar_h10_recording_prepare_or_raise(self);
+
+    polar_h10_recording_query_status_or_raise(self);
+    mp_obj_t by_kind = mp_obj_new_dict(1);
+    mp_obj_dict_store(by_kind, mp_obj_new_str("hr", 2), mp_obj_new_bool(self->recording_hr_active));
+
+    mp_obj_t active_kinds = mp_obj_new_list(0, NULL);
+    if (self->recording_hr_active) {
+        mp_obj_list_append(active_kinds, mp_obj_new_str("hr", 2));
+    }
+
+    mp_obj_t out = mp_obj_new_dict(3);
+    mp_obj_dict_store(out, mp_obj_new_str("active", 6), mp_obj_new_bool(self->recording_hr_active));
+    mp_obj_dict_store(out, mp_obj_new_str("by_kind", 7), by_kind);
+    mp_obj_dict_store(out, mp_obj_new_str("active_kinds", 12), active_kinds);
+    return out;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_recording_status_obj, polar_h10_recording_status);
+
+static mp_obj_t polar_h10_recording_list(mp_obj_t self_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    polar_require_ready(self);
+    polar_require_no_active_download_handle(self);
+    polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording is unsupported"));
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(polar_h10_recording_list_obj, polar_h10_recording_list);
+
+static mp_obj_t polar_h10_recording_default_config(mp_obj_t self_in, mp_obj_t kind_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    polar_require_ready(self);
+    polar_require_no_active_download_handle(self);
+
+    polar_recording_kind_key_t kind = polar_parse_recording_kind_key(kind_in);
+    if (kind == POLAR_RECORDING_KIND_KEY_INVALID) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid recording kind"));
+    }
+    if (!polar_recording_kind_is_supported_build(kind)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording kind unsupported"));
+    }
+    if (!polar_h10_recording_is_supported(self)) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording control unsupported"));
+    }
+
+    mp_obj_t dict = mp_obj_new_dict(2);
+    switch (kind) {
+        case POLAR_RECORDING_KIND_KEY_HR:
+            mp_obj_dict_store(dict, mp_obj_new_str("sample_type", 11), mp_obj_new_str("hr", 2));
+            mp_obj_dict_store(dict, mp_obj_new_str("interval_s", 10), mp_obj_new_int(1));
+            return dict;
+        default:
+            polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording kind unsupported"));
+            break;
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_recording_default_config_obj, polar_h10_recording_default_config);
+
+static mp_obj_t polar_h10_recording_delete(mp_obj_t self_in, mp_obj_t recording_id_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    (void)recording_id_in;
+    polar_require_ready(self);
+    polar_require_no_active_download_handle(self);
+    polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("recording is unsupported"));
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_recording_delete_obj, polar_h10_recording_delete);
+
+static mp_obj_t polar_h10_delete(mp_obj_t self_in, mp_obj_t path_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    polar_require_ready(self);
+    polar_require_no_active_download_handle(self);
+    if (!mp_obj_is_str(path_in)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("path must be str"));
+    }
+    size_t path_len = 0;
+    const char *path = mp_obj_str_get_data(path_in, &path_len);
+    if (path_len == 0 || path[0] != '/' || path_len > POLAR_SDK_PSFTP_MAX_PATH_BYTES) {
+        mp_raise_ValueError(MP_ERROR_TEXT("path must be absolute"));
+    }
+
+#if !POLAR_SDK_HAS_BTSTACK
+    polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("Bluetooth BTstack is not available in this build"));
+#else
+    if (!POLAR_CFG_ENABLE_PSFTP) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("filesystem delete is unsupported"));
+    }
+
+    polar_sdk_psftp_trans_result_t r = polar_psftp_execute_remove(
+        self,
+        path,
+        path_len,
+        POLAR_SDK_PSFTP_DEFAULT_TIMEOUT_MS);
+    if (r != POLAR_SDK_PSFTP_TRANS_OK) {
+        polar_raise_for_psftp_result(self, r);
+    }
+    return mp_const_none;
+#endif
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_delete_obj, polar_h10_delete);
+
+static mp_obj_t polar_call_typed_read_ecg(polar_h10_obj_t *self, mp_int_t max_bytes, mp_int_t timeout_ms) {
+    mp_obj_t argv[1] = { MP_OBJ_FROM_PTR(self) };
+    mp_map_elem_t kw_table[2] = {
+        { MP_OBJ_NEW_QSTR(MP_QSTR_max_bytes), mp_obj_new_int(max_bytes) },
+        { MP_OBJ_NEW_QSTR(MP_QSTR_timeout_ms), mp_obj_new_int(timeout_ms) },
+    };
+    mp_map_t kw_args = {
         .all_keys_are_qstrs = 1,
         .is_fixed = 1,
         .is_ordered = 1,
-        .used = 0,
-        .alloc = 0,
-        .table = NULL,
+        .used = 2,
+        .alloc = 2,
+        .table = kw_table,
     };
+    return polar_h10_read_ecg(1, argv, &kw_args);
+}
 
-    if (parsed_args[ARG_ecg].u_bool) {
-        (void)polar_h10_start_ecg(1, args, &empty_kw);
-    }
-    if (parsed_args[ARG_imu].u_bool) {
-        (void)polar_h10_start_imu(1, args, &empty_kw);
+static mp_obj_t polar_call_typed_read_acc(polar_h10_obj_t *self, mp_int_t max_bytes, mp_int_t timeout_ms) {
+    mp_obj_t argv[1] = { MP_OBJ_FROM_PTR(self) };
+    mp_map_elem_t kw_table[2] = {
+        { MP_OBJ_NEW_QSTR(MP_QSTR_max_bytes), mp_obj_new_int(max_bytes) },
+        { MP_OBJ_NEW_QSTR(MP_QSTR_timeout_ms), mp_obj_new_int(timeout_ms) },
+    };
+    mp_map_t kw_args = {
+        .all_keys_are_qstrs = 1,
+        .is_fixed = 1,
+        .is_ordered = 1,
+        .used = 2,
+        .alloc = 2,
+        .table = kw_table,
+    };
+    return polar_h10_read_imu(1, argv, &kw_args);
+}
+
+static mp_obj_t polar_h10_stream_default_config(mp_obj_t self_in, mp_obj_t kind_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    polar_require_ready(self);
+    polar_require_no_active_download_handle(self);
+    polar_stream_kind_key_t kind = polar_parse_stream_kind_key(kind_in);
+
+    mp_obj_t dict = mp_obj_new_dict(2);
+    switch (kind) {
+        case POLAR_STREAM_KIND_KEY_HR:
+            return dict;
+        case POLAR_STREAM_KIND_KEY_ECG:
+            mp_obj_dict_store(dict, mp_obj_new_str("sample_rate_hz", 14), mp_obj_new_int(130));
+            return dict;
+        case POLAR_STREAM_KIND_KEY_ACC:
+            mp_obj_dict_store(dict, mp_obj_new_str("sample_rate_hz", 14), mp_obj_new_int(50));
+            mp_obj_dict_store(dict, mp_obj_new_str("range", 5), mp_obj_new_int(POLAR_SDK_IMU_DEFAULT_RANGE_G));
+            return dict;
+        case POLAR_STREAM_KIND_KEY_PPG:
+        case POLAR_STREAM_KIND_KEY_PPI:
+        case POLAR_STREAM_KIND_KEY_GYRO:
+        case POLAR_STREAM_KIND_KEY_MAG:
+            polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("stream kind unsupported"));
+            break;
+        case POLAR_STREAM_KIND_KEY_INVALID:
+        default:
+            mp_raise_ValueError(MP_ERROR_TEXT("invalid stream kind"));
+            break;
     }
 
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_start_streams_obj, 1, polar_h10_start_streams);
+static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_stream_default_config_obj, polar_h10_stream_default_config);
 
-static mp_obj_t polar_h10_stop_streams(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+static mp_obj_t polar_h10_start_stream(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
     enum {
-        ARG_ecg,
-        ARG_imu,
-        ARG_hr,
+        ARG_kind,
+        ARG_format,
+        ARG_sample_rate_hz,
+        ARG_range,
     };
     static const mp_arg_t allowed_args[] = {
-        { MP_QSTR_ecg, MP_ARG_KW_ONLY | MP_ARG_BOOL, { .u_bool = true } },
-        { MP_QSTR_imu, MP_ARG_KW_ONLY | MP_ARG_BOOL, { .u_bool = true } },
-        { MP_QSTR_hr, MP_ARG_KW_ONLY | MP_ARG_BOOL, { .u_bool = true } },
+        { MP_QSTR_kind, MP_ARG_REQUIRED | MP_ARG_OBJ, { .u_obj = MP_OBJ_NULL } },
+        { MP_QSTR_format, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = mp_const_none } },
+        { MP_QSTR_sample_rate_hz, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = mp_const_none } },
+        { MP_QSTR_range, MP_ARG_KW_ONLY | MP_ARG_OBJ, { .u_obj = mp_const_none } },
     };
 
     mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
 
-    if (parsed_args[ARG_ecg].u_bool) {
-        (void)polar_h10_stop_ecg(args[0]);
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    polar_require_no_active_download_handle(self);
+    polar_stream_kind_key_t kind = polar_parse_stream_kind_key(parsed_args[ARG_kind].u_obj);
+    if (kind == POLAR_STREAM_KIND_KEY_INVALID) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid stream kind"));
     }
-    if (parsed_args[ARG_hr].u_bool) {
-        (void)polar_h10_stop_hr(args[0]);
-    }
-    if (parsed_args[ARG_imu].u_bool) {
-        (void)polar_h10_stop_imu(args[0]);
+
+    polar_stream_format_t requested_format = polar_parse_stream_format_or_default(
+        parsed_args[ARG_format].u_obj,
+        polar_default_stream_format_for_kind(kind));
+
+    mp_obj_t argv[1] = { args[0] };
+    switch (kind) {
+        case POLAR_STREAM_KIND_KEY_HR:
+            if (parsed_args[ARG_sample_rate_hz].u_obj != mp_const_none || parsed_args[ARG_range].u_obj != mp_const_none) {
+                mp_raise_ValueError(MP_ERROR_TEXT("unsupported HR stream config"));
+            }
+            if (!POLAR_CFG_ENABLE_HR) {
+                polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("HR feature disabled at build time"));
+            }
+            if (self->hr_enabled) {
+                if (self->hr_stream_format == requested_format) {
+                    return mp_const_none;
+                }
+                polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("HR stream already active with different format"));
+            }
+            self->hr_stream_format = requested_format;
+            polar_hr_set_notify(self, true);
+            if (requested_format == POLAR_STREAM_FORMAT_DECODED) {
+                self->hr_consumed_seq = self->hr_state.sample_seq;
+            } else {
+                self->hr_raw_consumed_seq = self->hr_raw_seq;
+            }
+            return mp_const_none;
+
+        case POLAR_STREAM_KIND_KEY_ECG: {
+            if (requested_format != POLAR_STREAM_FORMAT_DECODED) {
+                polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("ECG raw stream format not implemented"));
+            }
+            self->ecg_stream_format = requested_format;
+
+            mp_map_elem_t kw_table[1];
+            mp_map_t ecg_kw = {
+                .all_keys_are_qstrs = 1,
+                .is_fixed = 1,
+                .is_ordered = 1,
+                .used = 0,
+                .alloc = 1,
+                .table = kw_table,
+            };
+            if (parsed_args[ARG_sample_rate_hz].u_obj != mp_const_none) {
+                kw_table[0].key = MP_OBJ_NEW_QSTR(MP_QSTR_sample_rate);
+                kw_table[0].value = parsed_args[ARG_sample_rate_hz].u_obj;
+                ecg_kw.used = 1;
+            }
+            return polar_h10_start_ecg(1, argv, &ecg_kw);
+        }
+
+        case POLAR_STREAM_KIND_KEY_ACC: {
+            if (requested_format != POLAR_STREAM_FORMAT_DECODED) {
+                polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("ACC raw stream format not implemented"));
+            }
+            self->acc_stream_format = requested_format;
+
+            mp_map_elem_t kw_table[2];
+            size_t used = 0;
+            if (parsed_args[ARG_sample_rate_hz].u_obj != mp_const_none) {
+                kw_table[used].key = MP_OBJ_NEW_QSTR(MP_QSTR_sample_rate);
+                kw_table[used].value = parsed_args[ARG_sample_rate_hz].u_obj;
+                used += 1;
+            }
+            if (parsed_args[ARG_range].u_obj != mp_const_none) {
+                kw_table[used].key = MP_OBJ_NEW_QSTR(MP_QSTR_range);
+                kw_table[used].value = parsed_args[ARG_range].u_obj;
+                used += 1;
+            }
+
+            mp_map_t acc_kw = {
+                .all_keys_are_qstrs = 1,
+                .is_fixed = 1,
+                .is_ordered = 1,
+                .used = used,
+                .alloc = 2,
+                .table = kw_table,
+            };
+            return polar_h10_start_imu(1, argv, &acc_kw);
+        }
+
+        case POLAR_STREAM_KIND_KEY_PPG:
+        case POLAR_STREAM_KIND_KEY_PPI:
+        case POLAR_STREAM_KIND_KEY_GYRO:
+        case POLAR_STREAM_KIND_KEY_MAG:
+            polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("stream kind unsupported"));
+            break;
+        case POLAR_STREAM_KIND_KEY_INVALID:
+        default:
+            mp_raise_ValueError(MP_ERROR_TEXT("invalid stream kind"));
+            break;
     }
 
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_stop_streams_obj, 1, polar_h10_stop_streams);
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_start_stream_obj, 1, polar_h10_start_stream);
+
+static mp_obj_t polar_h10_stop_stream(mp_obj_t self_in, mp_obj_t kind_in) {
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    polar_require_no_active_download_handle(self);
+    polar_stream_kind_key_t kind = polar_parse_stream_kind_key(kind_in);
+
+    switch (kind) {
+        case POLAR_STREAM_KIND_KEY_HR:
+            return polar_h10_stop_hr(self_in);
+        case POLAR_STREAM_KIND_KEY_ECG:
+            return polar_h10_stop_ecg(self_in);
+        case POLAR_STREAM_KIND_KEY_ACC:
+            return polar_h10_stop_imu(self_in);
+        case POLAR_STREAM_KIND_KEY_PPG:
+        case POLAR_STREAM_KIND_KEY_PPI:
+        case POLAR_STREAM_KIND_KEY_GYRO:
+        case POLAR_STREAM_KIND_KEY_MAG:
+            polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("stream kind unsupported"));
+            break;
+        case POLAR_STREAM_KIND_KEY_INVALID:
+        default:
+            mp_raise_ValueError(MP_ERROR_TEXT("invalid stream kind"));
+            break;
+    }
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(polar_h10_stop_stream_obj, polar_h10_stop_stream);
+
+static mp_obj_t polar_h10_read_stream_core(
+    polar_h10_obj_t *self,
+    polar_stream_kind_key_t kind,
+    mp_int_t max_bytes,
+    mp_int_t timeout_ms) {
+    if (max_bytes <= 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("max_bytes must be > 0"));
+    }
+    if (timeout_ms < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("timeout_ms must be >= 0"));
+    }
+
+    if (kind == POLAR_STREAM_KIND_KEY_HR) {
+        if (!POLAR_CFG_ENABLE_HR) {
+            polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("HR feature disabled at build time"));
+        }
+        polar_require_ready(self);
+        if (!self->hr_enabled) {
+            polar_raise_exc(&polar_type_Error, MP_ERROR_TEXT("HR stream is not active"));
+        }
+
+        if (self->hr_stream_format == POLAR_STREAM_FORMAT_DECODED) {
+            if (self->hr_consumed_seq >= self->hr_state.sample_seq && timeout_ms > 0) {
+                uint32_t start_ms = polar_now_ms();
+                while (!polar_elapsed_ms(start_ms, (uint32_t)timeout_ms)) {
+                    polar_require_ready(self);
+                    if (self->hr_consumed_seq < self->hr_state.sample_seq) {
+                        break;
+                    }
+                    mp_event_wait_ms(10);
+                }
+            }
+
+            if (self->hr_consumed_seq >= self->hr_state.sample_seq) {
+                return mp_obj_new_bytes((const uint8_t *)"", 0);
+            }
+
+            const size_t frame_len = 28u + 12u;
+            if ((size_t)max_bytes < frame_len) {
+                polar_raise_exc(&polar_type_BufferOverflowError, MP_ERROR_TEXT("buffer too small for decoded HR sample"));
+            }
+
+            self->hr_consumed_seq = self->hr_state.sample_seq;
+            return polar_build_decoded_hr_chunk(&self->hr_state);
+        }
+
+        if (self->hr_raw_consumed_seq >= self->hr_raw_seq && timeout_ms > 0) {
+            uint32_t start_ms = polar_now_ms();
+            while (!polar_elapsed_ms(start_ms, (uint32_t)timeout_ms)) {
+                polar_require_ready(self);
+                if (self->hr_raw_consumed_seq < self->hr_raw_seq) {
+                    break;
+                }
+                mp_event_wait_ms(10);
+            }
+        }
+
+        if (self->hr_raw_consumed_seq >= self->hr_raw_seq || self->hr_raw_last_len == 0) {
+            return mp_obj_new_bytes((const uint8_t *)"", 0);
+        }
+
+        size_t framed_len = (size_t)self->hr_raw_last_len + 2u;
+        if ((size_t)max_bytes < framed_len) {
+            polar_raise_exc(&polar_type_BufferOverflowError, MP_ERROR_TEXT("buffer too small for raw HR sample"));
+        }
+
+        uint8_t *tmp = m_new(uint8_t, framed_len);
+        uint16_t raw_len = self->hr_raw_last_len;
+        tmp[0] = (uint8_t)(raw_len & 0xffu);
+        tmp[1] = (uint8_t)((raw_len >> 8) & 0xffu);
+        memcpy(&tmp[2], self->hr_raw_last, raw_len);
+
+        self->hr_raw_consumed_seq = self->hr_raw_seq;
+        mp_obj_t out = mp_obj_new_bytes(tmp, framed_len);
+        m_del(uint8_t, tmp, framed_len);
+        return out;
+    }
+
+    if (kind == POLAR_STREAM_KIND_KEY_ECG || kind == POLAR_STREAM_KIND_KEY_ACC) {
+        const bool is_ecg = (kind == POLAR_STREAM_KIND_KEY_ECG);
+        polar_stream_format_t selected = is_ecg ? self->ecg_stream_format : self->acc_stream_format;
+        const uint32_t sample_size = is_ecg ? 4u : 6u;
+        if (selected == POLAR_STREAM_FORMAT_RAW) {
+            polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("raw stream format not implemented for this kind"));
+        }
+
+        const size_t header_len = 28;
+        if ((size_t)max_bytes < header_len + sample_size) {
+            polar_raise_exc(&polar_type_BufferOverflowError, MP_ERROR_TEXT("buffer too small for decoded stream sample"));
+        }
+
+        size_t payload_budget = (size_t)max_bytes - header_len;
+        payload_budget -= (payload_budget % sample_size);
+
+        mp_obj_t payload_obj = is_ecg
+            ? polar_call_typed_read_ecg(self, (mp_int_t)payload_budget, timeout_ms)
+            : polar_call_typed_read_acc(self, (mp_int_t)payload_budget, timeout_ms);
+
+        size_t payload_len = 0;
+        const uint8_t *payload = (const uint8_t *)mp_obj_str_get_data(payload_obj, &payload_len);
+        if (payload_len == 0) {
+            return payload_obj;
+        }
+
+        return polar_build_decoded_chunk_v1(
+            is_ecg ? 1 : 2,
+            is_ecg ? 2 : 3,
+            0,
+            0,
+            0,
+            0,
+            sample_size,
+            payload,
+            payload_len);
+    }
+
+    if (kind == POLAR_STREAM_KIND_KEY_PPG || kind == POLAR_STREAM_KIND_KEY_PPI ||
+        kind == POLAR_STREAM_KIND_KEY_GYRO || kind == POLAR_STREAM_KIND_KEY_MAG) {
+        polar_raise_exc(&polar_type_UnsupportedError, MP_ERROR_TEXT("stream kind unsupported"));
+    }
+
+    mp_raise_ValueError(MP_ERROR_TEXT("invalid stream kind"));
+    return mp_const_none;
+}
+
+static mp_obj_t polar_h10_read_stream(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+    enum {
+        ARG_kind,
+        ARG_max_bytes,
+        ARG_timeout_ms,
+    };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_kind, MP_ARG_REQUIRED | MP_ARG_OBJ, { .u_obj = MP_OBJ_NULL } },
+        { MP_QSTR_max_bytes, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = 1024 } },
+        { MP_QSTR_timeout_ms, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = 0 } },
+    };
+
+    mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    polar_stream_kind_key_t kind = polar_parse_stream_kind_key(parsed_args[ARG_kind].u_obj);
+    if (kind == POLAR_STREAM_KIND_KEY_INVALID) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid stream kind"));
+    }
+
+    return polar_h10_read_stream_core(
+        self,
+        kind,
+        parsed_args[ARG_max_bytes].u_int,
+        parsed_args[ARG_timeout_ms].u_int);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_read_stream_obj, 1, polar_h10_read_stream);
+
+static mp_obj_t polar_h10_read_stream_into(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+    enum {
+        ARG_kind,
+        ARG_buf,
+        ARG_timeout_ms,
+    };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_kind, MP_ARG_REQUIRED | MP_ARG_OBJ, { .u_obj = MP_OBJ_NULL } },
+        { MP_QSTR_buf, MP_ARG_REQUIRED | MP_ARG_OBJ, { .u_obj = MP_OBJ_NULL } },
+        { MP_QSTR_timeout_ms, MP_ARG_KW_ONLY | MP_ARG_INT, { .u_int = 0 } },
+    };
+
+    mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+
+    polar_h10_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    polar_stream_kind_key_t kind = polar_parse_stream_kind_key(parsed_args[ARG_kind].u_obj);
+    if (kind == POLAR_STREAM_KIND_KEY_INVALID) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid stream kind"));
+    }
+
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(parsed_args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_WRITE);
+    if (bufinfo.len == 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("buffer must not be empty"));
+    }
+
+    mp_obj_t chunk = polar_h10_read_stream_core(
+        self,
+        kind,
+        (mp_int_t)bufinfo.len,
+        parsed_args[ARG_timeout_ms].u_int);
+
+    size_t n = 0;
+    const uint8_t *src = (const uint8_t *)mp_obj_str_get_data(chunk, &n);
+    if (n > bufinfo.len) {
+        n = bufinfo.len;
+    }
+    if (n > 0) {
+        memcpy(bufinfo.buf, src, n);
+    }
+
+    return mp_obj_new_int_from_uint((mp_uint_t)n);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(polar_h10_read_stream_into_obj, 1, polar_h10_read_stream_into);
 
 static const mp_rom_map_elem_t polar_h10_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_state), MP_ROM_PTR(&polar_h10_state_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_connected), MP_ROM_PTR(&polar_h10_is_connected_obj) },
-    { MP_ROM_QSTR(MP_QSTR_required_services), MP_ROM_PTR(&polar_h10_required_services_obj) },
-    { MP_ROM_QSTR(MP_QSTR_set_required_services), MP_ROM_PTR(&polar_h10_set_required_services_obj) },
+    { MP_ROM_QSTR(MP_QSTR_required_capabilities), MP_ROM_PTR(&polar_h10_required_capabilities_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_required_capabilities), MP_ROM_PTR(&polar_h10_set_required_capabilities_obj) },
+    { MP_ROM_QSTR(MP_QSTR_capabilities), MP_ROM_PTR(&polar_h10_capabilities_obj) },
     { MP_ROM_QSTR(MP_QSTR_stats), MP_ROM_PTR(&polar_h10_stats_obj) },
     { MP_ROM_QSTR(MP_QSTR_connect), MP_ROM_PTR(&polar_h10_connect_obj) },
     { MP_ROM_QSTR(MP_QSTR_disconnect), MP_ROM_PTR(&polar_h10_disconnect_obj) },
@@ -4114,19 +6248,32 @@ static const mp_rom_map_elem_t polar_h10_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_start_ecg), MP_ROM_PTR(&polar_h10_start_ecg_obj) },
     { MP_ROM_QSTR(MP_QSTR_stop_ecg), MP_ROM_PTR(&polar_h10_stop_ecg_obj) },
     { MP_ROM_QSTR(MP_QSTR_read_ecg), MP_ROM_PTR(&polar_h10_read_ecg_obj) },
-    { MP_ROM_QSTR(MP_QSTR_start_imu), MP_ROM_PTR(&polar_h10_start_imu_obj) },
-    { MP_ROM_QSTR(MP_QSTR_stop_imu), MP_ROM_PTR(&polar_h10_stop_imu_obj) },
-    { MP_ROM_QSTR(MP_QSTR_read_imu), MP_ROM_PTR(&polar_h10_read_imu_obj) },
+    { MP_ROM_QSTR(MP_QSTR_start_acc), MP_ROM_PTR(&polar_h10_start_imu_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stop_acc), MP_ROM_PTR(&polar_h10_stop_imu_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_acc), MP_ROM_PTR(&polar_h10_read_imu_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stream_default_config), MP_ROM_PTR(&polar_h10_stream_default_config_obj) },
+    { MP_ROM_QSTR(MP_QSTR_start_stream), MP_ROM_PTR(&polar_h10_start_stream_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stop_stream), MP_ROM_PTR(&polar_h10_stop_stream_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_stream), MP_ROM_PTR(&polar_h10_read_stream_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_stream_into), MP_ROM_PTR(&polar_h10_read_stream_into_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recording_start), MP_ROM_PTR(&polar_h10_recording_start_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recording_stop), MP_ROM_PTR(&polar_h10_recording_stop_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recording_status), MP_ROM_PTR(&polar_h10_recording_status_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recording_list), MP_ROM_PTR(&polar_h10_recording_list_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recording_default_config), MP_ROM_PTR(&polar_h10_recording_default_config_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recording_delete), MP_ROM_PTR(&polar_h10_recording_delete_obj) },
     { MP_ROM_QSTR(MP_QSTR_list_dir), MP_ROM_PTR(&polar_h10_list_dir_obj) },
+    { MP_ROM_QSTR(MP_QSTR_delete), MP_ROM_PTR(&polar_h10_delete_obj) },
     { MP_ROM_QSTR(MP_QSTR_download), MP_ROM_PTR(&polar_h10_download_obj) },
-    { MP_ROM_QSTR(MP_QSTR_start_streams), MP_ROM_PTR(&polar_h10_start_streams_obj) },
-    { MP_ROM_QSTR(MP_QSTR_stop_streams), MP_ROM_PTR(&polar_h10_stop_streams_obj) },
+    { MP_ROM_QSTR(MP_QSTR_download_open), MP_ROM_PTR(&polar_h10_download_open_obj) },
+    { MP_ROM_QSTR(MP_QSTR_download_read), MP_ROM_PTR(&polar_h10_download_read_obj) },
+    { MP_ROM_QSTR(MP_QSTR_download_close), MP_ROM_PTR(&polar_h10_download_close_obj) },
 };
 static MP_DEFINE_CONST_DICT(polar_h10_locals_dict, polar_h10_locals_dict_table);
 
 MP_DEFINE_CONST_OBJ_TYPE(
     polar_h10_type,
-    MP_QSTR_H10,
+    MP_QSTR_Device,
     MP_TYPE_FLAG_NONE,
     make_new, polar_h10_make_new,
     locals_dict, &polar_h10_locals_dict
@@ -4158,6 +6305,18 @@ static mp_obj_t polar_build_info(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(polar_build_info_obj, polar_build_info);
 
+static MP_DEFINE_STR_OBJ(polar_cap_stream_hr_obj, "stream:hr");
+static MP_DEFINE_STR_OBJ(polar_cap_stream_ecg_obj, "stream:ecg");
+static MP_DEFINE_STR_OBJ(polar_cap_stream_acc_obj, "stream:acc");
+static MP_DEFINE_STR_OBJ(polar_cap_stream_ppg_obj, "stream:ppg");
+static MP_DEFINE_STR_OBJ(polar_cap_stream_ppi_obj, "stream:ppi");
+static MP_DEFINE_STR_OBJ(polar_cap_stream_gyro_obj, "stream:gyro");
+static MP_DEFINE_STR_OBJ(polar_cap_stream_mag_obj, "stream:mag");
+static MP_DEFINE_STR_OBJ(polar_cap_recording_obj, "recording");
+static MP_DEFINE_STR_OBJ(polar_cap_psftp_read_obj, "psftp:read");
+static MP_DEFINE_STR_OBJ(polar_cap_psftp_delete_obj, "psftp:delete");
+static MP_DEFINE_STR_OBJ(polar_device_key_obj, "Device");
+
 // -----------------------------------------------------------------------------
 // Module definition
 
@@ -4165,7 +6324,7 @@ static const mp_rom_map_elem_t polar_sdk_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_polar_sdk) },
     { MP_ROM_QSTR(MP_QSTR_version), MP_ROM_PTR(&polar_version_obj) },
     { MP_ROM_QSTR(MP_QSTR_build_info), MP_ROM_PTR(&polar_build_info_obj) },
-    { MP_ROM_QSTR(MP_QSTR_H10), MP_ROM_PTR(&polar_h10_type) },
+    { MP_ROM_PTR(&polar_device_key_obj), MP_ROM_PTR(&polar_h10_type) },
 
     // Error model
     { MP_ROM_QSTR(MP_QSTR_Error), MP_ROM_PTR(&polar_type_Error) },
@@ -4173,6 +6332,8 @@ static const mp_rom_map_elem_t polar_sdk_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_NotConnectedError), MP_ROM_PTR(&polar_type_NotConnectedError) },
     { MP_ROM_QSTR(MP_QSTR_ProtocolError), MP_ROM_PTR(&polar_type_ProtocolError) },
     { MP_ROM_QSTR(MP_QSTR_BufferOverflowError), MP_ROM_PTR(&polar_type_BufferOverflowError) },
+    { MP_ROM_QSTR(MP_QSTR_SecurityError), MP_ROM_PTR(&polar_type_SecurityError) },
+    { MP_ROM_QSTR(MP_QSTR_UnsupportedError), MP_ROM_PTR(&polar_type_UnsupportedError) },
 
     // Build-time feature flags
     { MP_ROM_QSTR(MP_QSTR_FEATURE_HR), MP_ROM_INT(POLAR_CFG_ENABLE_HR) },
@@ -4180,13 +6341,29 @@ static const mp_rom_map_elem_t polar_sdk_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_FEATURE_PSFTP), MP_ROM_INT(POLAR_CFG_ENABLE_PSFTP) },
     { MP_ROM_QSTR(MP_QSTR_HAS_BTSTACK), MP_ROM_INT(POLAR_SDK_HAS_BTSTACK) },
 
-    // Runtime service mask bits
-    { MP_ROM_QSTR(MP_QSTR_SERVICE_HR), MP_ROM_INT(POLAR_SDK_SERVICE_HR) },
-    { MP_ROM_QSTR(MP_QSTR_SERVICE_ECG), MP_ROM_INT(POLAR_SDK_SERVICE_ECG) },
-    { MP_ROM_QSTR(MP_QSTR_SERVICE_PSFTP), MP_ROM_INT(POLAR_SDK_SERVICE_PSFTP) },
-    { MP_ROM_QSTR(MP_QSTR_SERVICE_ALL), MP_ROM_INT(POLAR_SDK_SERVICE_ALL) },
+    // Capability constants
+    { MP_ROM_QSTR(MP_QSTR_CAP_STREAM_HR), MP_ROM_PTR(&polar_cap_stream_hr_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_STREAM_ECG), MP_ROM_PTR(&polar_cap_stream_ecg_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_STREAM_ACC), MP_ROM_PTR(&polar_cap_stream_acc_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_STREAM_PPG), MP_ROM_PTR(&polar_cap_stream_ppg_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_STREAM_PPI), MP_ROM_PTR(&polar_cap_stream_ppi_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_STREAM_GYRO), MP_ROM_PTR(&polar_cap_stream_gyro_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_STREAM_MAG), MP_ROM_PTR(&polar_cap_stream_mag_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_RECORDING), MP_ROM_PTR(&polar_cap_recording_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_PSFTP_READ), MP_ROM_PTR(&polar_cap_psftp_read_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAP_PSFTP_DELETE), MP_ROM_PTR(&polar_cap_psftp_delete_obj) },
 };
-static MP_DEFINE_CONST_DICT(polar_sdk_module_globals, polar_sdk_module_globals_table);
+static const mp_obj_dict_t polar_sdk_module_globals = {
+    .base = { &mp_type_dict },
+    .map = {
+        .all_keys_are_qstrs = 0,
+        .is_fixed = 1,
+        .is_ordered = 1,
+        .used = MP_ARRAY_SIZE(polar_sdk_module_globals_table),
+        .alloc = MP_ARRAY_SIZE(polar_sdk_module_globals_table),
+        .table = (mp_map_elem_t *)(mp_rom_map_elem_t *)polar_sdk_module_globals_table,
+    },
+};
 
 const mp_obj_module_t polar_sdk_user_cmodule = {
     .base = { &mp_type_module },

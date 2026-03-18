@@ -1,0 +1,141 @@
+From 34b5150f3f3d9f542dbda8bda1e7e9a6b43e01fb Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Fri, 13 Mar 2026 18:40:00 +0100
+Subject: [PATCH] extmod/btstack: enable TLV-backed bond storage on rp2 CYW43
+
+Repeated Polar H10 PSFTP pairing runs on rp2 + CYW43 can succeed on the
+first interpreter instance and then fail after a soft reset with:
+- Just Works request observed
+- no pairing-complete event
+- no encryption key on the new run
+
+After the run-loop and HCI scheduling fixes, the remaining pattern points
+to lost local bonding state across MicroPython soft resets: the H10 keeps
+its bond, but the local BTstack LE device DB is recreated from volatile
+memory on each new interpreter run.
+
+Use BTstack's TLV-backed LE device database on rp2 CYW43 builds so bond
+state survives soft reset. This mirrors the pico-sdk BTstack CYW43 setup,
+using the Pico flash-bank backend for persistent storage.
+
+---
+ extmod/btstack/btstack.cmake | 16 ++++++++++++++--
+ extmod/btstack/modbluetooth_btstack.c | 24 ++++++++++++++++++++++++
+ ports/rp2/CMakeLists.txt | 4 ++++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/extmod/btstack/btstack.cmake b/extmod/btstack/btstack.cmake
+index 3a133a1..fede880 100644
+--- a/extmod/btstack/btstack.cmake
++++ b/extmod/btstack/btstack.cmake
+@@ -13,6 +13,10 @@ target_include_directories(micropy_extmod_btstack INTERFACE
+     ${BTSTACK_LIB_DIR}/3rd-party/md5
+     ${BTSTACK_LIB_DIR}/3rd-party/yxml
+ )
++if (MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV)
++    target_include_directories(micropy_extmod_btstack INTERFACE
++        ${MICROPY_DIR}/lib/pico-sdk/src/rp2_common/pico_btstack/include)
++endif()
+ 
+ target_sources(micropy_extmod_btstack INTERFACE
+     ${BTSTACK_LIB_DIR}/platform/embedded/hci_dump_embedded_stdout.c
+@@ -33,7 +37,10 @@ target_sources(micropy_extmod_btstack INTERFACE
+     ${BTSTACK_LIB_DIR}/src/ble/gatt-service/nordic_spp_service_server.c
+     ${BTSTACK_LIB_DIR}/src/ble/gatt-service/ublox_spp_service_server.c
+     ${BTSTACK_LIB_DIR}/src/ble/gatt_client.c
+-    ${BTSTACK_LIB_DIR}/src/ble/le_device_db_memory.c
++    ${BTSTACK_LIB_DIR}/src/btstack_tlv_builder.c
++    ${BTSTACK_LIB_DIR}/platform/embedded/btstack_tlv_flash_bank.c
++    ${BTSTACK_LIB_DIR}/src/ble/le_device_db_tlv.c
++    ${MICROPY_DIR}/lib/pico-sdk/src/rp2_common/pico_btstack/btstack_flash_bank.c
+     ${BTSTACK_LIB_DIR}/src/ble/sm.c
+     ${BTSTACK_LIB_DIR}/src/btstack_audio.c
+     ${BTSTACK_LIB_DIR}/src/btstack_base64_decoder.c
+@@ -48,7 +55,6 @@ target_sources(micropy_extmod_btstack INTERFACE
+     ${BTSTACK_LIB_DIR}/src/btstack_run_loop_base.c
+     ${BTSTACK_LIB_DIR}/src/btstack_slip.c
+     ${BTSTACK_LIB_DIR}/src/btstack_tlv.c
+-    ${BTSTACK_LIB_DIR}/src/btstack_tlv_none.c
+     ${BTSTACK_LIB_DIR}/src/btstack_util.c
+     ${BTSTACK_LIB_DIR}/src/hci.c
+     ${BTSTACK_LIB_DIR}/src/hci_cmd.c
+@@ -59,6 +65,11 @@ target_sources(micropy_extmod_btstack INTERFACE
+     ${BTSTACK_LIB_DIR}/src/l2cap.c
+     ${BTSTACK_LIB_DIR}/src/l2cap_signaling.c
+ )
++if (NOT MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV)
++    target_sources(micropy_extmod_btstack INTERFACE
++        ${BTSTACK_LIB_DIR}/src/btstack_tlv_none.c
++        ${BTSTACK_LIB_DIR}/src/ble/le_device_db_memory.c)
++endif()
+ 
+ # Added in BTstack >= v1.6.2
+ if (EXISTS ${BTSTACK_LIB_DIR}/src/hci_event_builder.c)
+diff --git a/extmod/btstack/modbluetooth_btstack.c b/extmod/btstack/modbluetooth_btstack.c
+index dcfbb45..1aba2c8 100644
+--- a/extmod/btstack/modbluetooth_btstack.c
++++ b/extmod/btstack/modbluetooth_btstack.c
+@@ -34,9 +34,30 @@
+ #include "extmod/modbluetooth.h"
+ 
+ #include "lib/btstack/src/btstack.h"
++#if MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV
++#include "lib/btstack/src/btstack_tlv.h"
++#include "lib/btstack/src/ble/le_device_db_tlv.h"
++#include "lib/btstack/platform/embedded/btstack_tlv_flash_bank.h"
++#include "lib/pico-sdk/src/rp2_common/pico_btstack/include/pico/btstack_flash_bank.h"
++#endif
+ 
+ #define DEBUG_printf(...) // printf("btstack: " __VA_ARGS__)
+ 
++#ifndef MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV
++#define MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV (0)
++#endif
++
++#if MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV
++static void btstack_setup_tlv(void) {
++    static btstack_tlv_flash_bank_t btstack_tlv_flash_bank_context;
++    const hal_flash_bank_t *hal_flash_bank_impl = pico_flash_bank_instance();
++    const btstack_tlv_t *btstack_tlv_impl = btstack_tlv_flash_bank_init_instance(
++        &btstack_tlv_flash_bank_context, hal_flash_bank_impl, NULL);
++    btstack_tlv_set_instance(btstack_tlv_impl, &btstack_tlv_flash_bank_context);
++    le_device_db_tlv_configure(btstack_tlv_impl, &btstack_tlv_flash_bank_context);
++}
++#endif
++
+ // Optional debug mode: temporarily overload disconnect addr_type with HCI reason
+ // for compatibility with old Python-side debugging scripts.
+ #ifndef MICROPY_PY_BLUETOOTH_BTSTACK_DEBUG_DISCONNECT_REASON_IN_ADDR_TYPE
+@@ -712,6 +733,10 @@ int mp_bluetooth_init(void) {
+     mp_bluetooth_btstack_port_init();
+     mp_bluetooth_btstack_state = MP_BLUETOOTH_BTSTACK_STATE_STARTING;
+ 
++    #if MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV
++    btstack_setup_tlv();
++    #endif
++
+     l2cap_init();
+     le_device_db_init();
+     sm_init();
+diff --git a/ports/rp2/CMakeLists.txt b/ports/rp2/CMakeLists.txt
+index 7e2a751..f6eef54 100644
+--- a/ports/rp2/CMakeLists.txt
++++ b/ports/rp2/CMakeLists.txt
+@@ -351,11 +351,15 @@ if (MICROPY_BLUETOOTH_BTSTACK)
+ 
+     list(APPEND MICROPY_SOURCE_PORT mpbtstackport.c)
+ 
++    set(MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV 1)
++
+     include(${MICROPY_DIR}/extmod/btstack/btstack.cmake)
+     target_link_libraries(${MICROPY_TARGET} micropy_extmod_btstack)
+ 
+     target_compile_definitions(${MICROPY_TARGET} PRIVATE
+         MICROPY_BLUETOOTH_BTSTACK=1
++        MICROPY_PY_BLUETOOTH_BTSTACK_USE_TLV=1
++        NVM_NUM_DEVICE_DB_ENTRIES=4
+         MICROPY_BLUETOOTH_BTSTACK_CONFIG_FILE=\"btstack_inc/btstack_config.h\"
+         MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_PARAM_UPDATE=1
+         MICROPY_PY_BLUETOOTH_BTSTACK_CENTRAL_POST_CONNECT_CONN_INTERVAL_MIN=24
+-- 
+2.49.0

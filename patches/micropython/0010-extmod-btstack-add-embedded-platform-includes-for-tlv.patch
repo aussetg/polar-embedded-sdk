@@ -1,0 +1,29 @@
+From 667fbec91b1dc7c7f0f9d8ca3e4a91a78028bd8c Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Fri, 13 Mar 2026 18:55:00 +0100
+Subject: [PATCH] extmod/btstack: add embedded platform includes for TLV
+
+The rp2 CYW43 TLV bond-storage wiring pulls in BTstack's embedded flash
+bank backend, which includes hal_flash_bank.h from BTstack's embedded
+platform directory.
+
+Expose that include directory to the MicroPython BTstack extension target.
+
+---
+ extmod/btstack/btstack.cmake | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/extmod/btstack/btstack.cmake b/extmod/btstack/btstack.cmake
+index fede880..92a4f2a 100644
+--- a/extmod/btstack/btstack.cmake
++++ b/extmod/btstack/btstack.cmake
+@@ -8,6 +8,7 @@ target_include_directories(micropy_extmod_btstack INTERFACE
+     ${MICROPY_PORT_DIR}/
+     ${BTSTACK_EXTMOD_DIR}/
+     ${BTSTACK_LIB_DIR}/src
++    ${BTSTACK_LIB_DIR}/platform/embedded
+     ${BTSTACK_LIB_DIR}/3rd-party/bluedroid/decoder/include
+     ${BTSTACK_LIB_DIR}/3rd-party/bluedroid/encoder/include
+     ${BTSTACK_LIB_DIR}/3rd-party/md5
+-- 
+2.49.0
