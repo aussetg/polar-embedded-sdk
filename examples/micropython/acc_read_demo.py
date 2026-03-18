@@ -1,17 +1,18 @@
-# ECG streaming demo: connect, start ECG, stream for a fixed window, stop.
+#!/usr/bin/env python3
+# ACC streaming demo: connect, start ACC, stream for a fixed window, stop.
 
 import time
 import polar_sdk
 
-DURATION_S = 120
+DURATION_S = 30
 READ_MAX_BYTES = 1024
 READ_TIMEOUT_MS = 1000
-STATS_PERIOD_MS = 10000
+STATS_PERIOD_MS = 5000
 STALE_DATA_TIMEOUT_MS = 5000
 
 h10 = polar_sdk.Device(
     name_prefix="Polar",
-    required_capabilities=(polar_sdk.CAP_STREAM_ECG,),
+    required_capabilities=(polar_sdk.CAP_STREAM_ACC,),
 )
 print("version", polar_sdk.version())
 print("required capabilities", h10.required_capabilities())
@@ -23,8 +24,8 @@ try:
     h10.connect(timeout_ms=15000)
     print("connected", h10.state())
 
-    h10.start_ecg(sample_rate=130)
-    print("ecg started")
+    h10.start_acc(sample_rate=50, range=8)
+    print("acc started")
 
     start_ms = time.ticks_ms()
     last_stats_ms = start_ms
@@ -32,7 +33,7 @@ try:
 
     while time.ticks_diff(time.ticks_ms(), start_ms) < DURATION_S * 1000:
         try:
-            chunk = h10.read_ecg(max_bytes=READ_MAX_BYTES, timeout_ms=READ_TIMEOUT_MS)
+            chunk = h10.read_acc(max_bytes=READ_MAX_BYTES, timeout_ms=READ_TIMEOUT_MS)
         except polar_sdk.NotConnectedError as exc:
             print("read stopped (not connected):", exc)
             break
@@ -45,7 +46,7 @@ try:
         now = time.ticks_ms()
 
         if time.ticks_diff(now, last_data_ms) > STALE_DATA_TIMEOUT_MS:
-            print("stale ECG data timeout", STALE_DATA_TIMEOUT_MS, "ms")
+            print("stale ACC data timeout", STALE_DATA_TIMEOUT_MS, "ms")
             print("stats", h10.stats())
             break
 
@@ -60,11 +61,11 @@ try:
                 "bytes",
                 bytes_total,
                 "avail",
-                s.get("ecg_available_bytes", -1),
+                s.get("acc_available_bytes", -1),
                 "drop",
-                s.get("ecg_drop_bytes_total", -1),
+                s.get("acc_drop_bytes_total", -1),
                 "hi",
-                s.get("ecg_ring_high_water", -1),
+                s.get("acc_ring_high_water", -1),
             )
             last_stats_ms = now
 
@@ -72,8 +73,8 @@ try:
     print("final stats", h10.stats())
 
     try:
-        h10.stop_ecg()
-        print("ecg stopped")
+        h10.stop_acc()
+        print("acc stopped")
     except polar_sdk.NotConnectedError:
         pass
 finally:

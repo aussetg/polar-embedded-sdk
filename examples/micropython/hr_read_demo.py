@@ -5,7 +5,7 @@ import polar_sdk
 SAMPLES = 10
 MAX_EMPTY = 20
 
-h10 = polar_sdk.H10(name_prefix="Polar")
+h10 = polar_sdk.Device(name_prefix="Polar")
 print("version", polar_sdk.version())
 
 try:

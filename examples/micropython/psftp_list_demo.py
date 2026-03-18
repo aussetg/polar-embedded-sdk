@@ -3,7 +3,7 @@ import polar_sdk
 
 TARGET_DIR = "/"
 
-h10 = polar_sdk.H10(required_services=polar_sdk.SERVICE_PSFTP)
+h10 = polar_sdk.Device(required_capabilities=(polar_sdk.CAP_PSFTP_READ,))
 
 try:
     print("connecting...")
@@ -23,8 +23,8 @@ try:
         raise RuntimeError("list_dir failed after retries")
 
     print("entries:", len(entries))
-    for name, size in entries:
-        print(" ", name, size)
+    for entry in entries:
+        print(" ", entry)
 
     print("psftp stats:", {
         "tx": h10.stats().get("psftp_tx_frames_total"),

@@ -35,4 +35,4 @@ Acronyms and terms used throughout this repository.
 - **CYW43**: Broadcom/Cypress radio used on Pico W / Pico 2 W.
 - **BTstack**: BLE stack used by MicroPython on rp2.
 - **SDK core** (a.k.a. “portable core”): `polar_sdk/core/` code that contains no MicroPython-specific types. This is a **Polar BLE SDK reimplementation layer** (Polar-specific, BTstack-backed), not a generic BLE driver.
-- **MicroPython module / binding layer**: `polar_sdk/mpy/` MicroPython C module glue that exposes the user-facing `polar_sdk.H10` API.
+- **MicroPython module / binding layer**: `polar_sdk/mpy/` MicroPython C module glue that exposes the user-facing `polar_sdk.Device` API.

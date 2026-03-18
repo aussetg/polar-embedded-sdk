@@ -420,9 +420,12 @@ def yq_pop():
 
 
 # ---------- Polar ----------
-h10 = polar_sdk.H10(
+h10 = polar_sdk.Device(
     name_prefix="Polar",
-    required_services=(polar_sdk.SERVICE_HR | polar_sdk.SERVICE_ECG),
+    required_capabilities=(
+        polar_sdk.CAP_STREAM_HR,
+        polar_sdk.CAP_STREAM_ECG,
+    ),
 )
 
 last_hr = 0

@@ -1,14 +1,14 @@
-# Spec — Polar SDK core + MicroPython module (C core + binding)
+# Spec — Polar SDK core + MicroPython module (implementation-oriented)
 
-Status: Active development (**canonical spec**)
-Last updated: 2026-03-03
+Status: Active development (**implementation companion spec**)
+Last updated: 2026-03-18
 
 Targets:
 - **Primary runtime:** MicroPython `rp2` on Pico 2 W (RP2350 + CYW43), BLE stack = **BTstack**
 - **SDK core portability target:** same C SDK core code reusable from pure pico-sdk/BTstack apps (see `examples/pico_sdk/`)
 
 Related:
-- API design draft: [`polar_sdk_api_design.md`](./polar_sdk_api_design.md)
+- Public API truth: [`polar_sdk_api_design.md`](./polar_sdk_api_design.md)
 
 Terminology (important):
 - **SDK core**: `polar_sdk/core/` — Polar-specific, BTstack-backed C core.
@@ -35,16 +35,16 @@ Project target is now:
 | Area | Status | Notes |
 |---|---|---|
 | Transport core (scan/connect/discovery/retry) | Implemented baseline | Capability-oriented requirement filtering supported |
-| HR (0x2A37 parse + pull API) | Implemented baseline | Fixed-width tuple API |
-| PMD ECG online stream | Implemented baseline | Raw frame-type-0 decode path implemented |
-| PMD ACC online stream | Implemented baseline | Raw ACC frame type `0x01` implemented |
+| HR (0x2A37 parse + pull API) | Implemented baseline | Pull-based typed + generic stream surface |
+| PMD ECG online stream | Implemented baseline | Decoded stream path implemented |
+| PMD ACC online stream | Implemented baseline | Decoded stream path implemented |
 | PMD pairing/encryption retry policy | Implemented baseline | ATT auth/encryption retry behavior present |
 | PMD additional stream types (PPG/PPI/GYRO/MAG/...) | In scope (planned) | Capability-gated by device |
 | PMD compressed/delta frame decode | In scope (planned) | Raw + decoded formats both required |
-| Multi-device family support | In scope (planned) | Runtime capability discovery is required |
+| Multi-device family support | Required target | Runtime capability discovery is required |
 | PSFTP list/download | Implemented baseline | RFC60/RFC76 + nanopb GET path |
 | PSFTP mutation ops (delete/write/merge/...) | In scope (planned) | Bounded-memory operation required |
-| Offline recording control surface | In scope (planned) | Start/stop/status/triggers/settings |
+| Offline recording control surface | In scope (planned) | Start/stop/status/list/default-config/delete baseline target |
 
 ---
 
@@ -151,11 +151,13 @@ Latest negotiated/update status must be observable in `stats()`.
 
 ---
 
-## 7) Public APIs (canonical target)
+## 7) Public APIs (summary; canonical contract lives in API design spec)
 
 Module: `polar_sdk`
 
-Normative C/API contract details are defined in `polar_sdk_api_design.md` sections 5.2–5.7 and 7 (capabilities schema, decoded/raw framing, recording metadata, chunked-transfer semantics, exception details) and are part of this target API.
+Normative public C/API contract details are defined in `polar_sdk_api_design.md`.
+
+This document intentionally avoids restating every schema and per-method rule. If there is any disagreement between this file and `polar_sdk_api_design.md`, the API design spec wins.
 
 ### 7.1 C API shape (session + stream based)
 
@@ -194,7 +196,10 @@ Schema-version policy:
 Public naming policy:
 - old public names `H10` and `imu` are removed from the target API surface.
 
-### 7.3 Generic stream API (canonical)
+Public state strings returned by `state()` are lowercase (for example: `"idle"`, `"ready"`).
+Uppercase transport-state names elsewhere in this document describe the internal state model only.
+
+### 7.3 Generic stream API (summary)
 
 - `stream_default_config(kind: str) -> dict`
 - `start_stream(kind: str, *, format: str | None = None, **cfg) -> None`
@@ -209,43 +214,16 @@ Canonical format values:
 - `"decoded"` (normalized sample payload)
 - `"raw"` (raw framed record path)
 
-Format-selection rules:
-- if `start_stream(..., format=None)`, stream default format from capabilities is used,
-- for `hr`, v1 default format is `raw`,
-- read methods use the active stream format selected by `start_stream(...)`.
+Canonical schema and behavior for stream methods, format selection, default formats, concurrency, and binary framing are defined in `polar_sdk_api_design.md`.
 
-Decoded format contract:
-- payloads use `decoded_chunk_v1` envelope (24-byte header + packed samples),
-- timestamps are Unix epoch nanoseconds,
-- per-kind sample packing is fixed-width and little-endian.
+Important highlights:
+- `format=None` means use the default from `capabilities()`.
+- Decoded stream reads use the `decoded_chunk_v1` envelope with a **28-byte** header.
+- Time metadata is **source-time-first** (`time_base` + `*_ns`), not implicitly Unix-normalized.
+- Raw stream reads use framed records (`u16_le record_len` + payload).
+- Exact per-kind payload layouts, overflow semantics, and concurrency rules are defined by the API design spec.
 
-Raw format contract:
-- stream reads return framed records: `u16_le record_len` + `record_len` bytes,
-- PMD kinds use exact PMD notification bytes as framed payload,
-- HR raw mode uses exact 0x2A37 payload bytes as framed payload.
-
-HR stream policy (v1):
-- canonical decoded HR read API is `read_hr()`,
-- `start_stream("hr")` / `stop_stream("hr")` are valid,
-- `start_stream("hr", format="decoded")` is unsupported unless a compact binary HR stream format is explicitly specified.
-
-Timestamp/units policy:
-- outward-facing timestamps use Unix epoch,
-- stream units are frozen per kind using the most common/default unit.
-
-Decoded sample layouts (v1 target):
-- `ecg`: `<i4` repeated, units `uV`
-- `acc`: `<hhh` repeated (`x,y,z`), units `mg`
-- `ppg`: interleaved signed int32 channels, units `counts`
-- `ppi`: packed samples (`hr_bpm:u8`, `ppi_ms:u16`, `error_estimate_ms:u16`, `flags:u8`)
-- `gyro`: `<iii` repeated (`x,y,z`), units `mdps`
-- `mag`: `<iii` repeated (`x,y,z`), units `uT`
-
-Concurrency policy (v1 default):
-- allow `hr` + at most one PMD stream unless capability map explicitly advertises broader combinations,
-- unsupported combinations raise `UnsupportedError`.
-
-### 7.4 Typed convenience methods
+### 7.4 Typed convenience methods (summary)
 
 Convenience wrappers over generic stream API:
 - `start_hr()`, `stop_hr()`, `read_hr(timeout_ms=0) -> tuple | None`
@@ -254,40 +232,42 @@ Convenience wrappers over generic stream API:
 
 `acc` is canonical naming (not `imu`).
 
-`read_hr()` return shape (current contract):
-- `(ts_ms, bpm, rr_count, rr0, rr1, rr2, rr3, contact)`
-- `ts_ms` is Unix epoch milliseconds.
-- RR values are integer milliseconds; missing RR slots are `0`; `contact` is `0/1`.
+`read_hr()` canonical tuple layout is defined in `polar_sdk_api_design.md`:
+- `(time_base, t0_ns, bpm, flags, rr_count, rr_ms0, rr_ms1, rr_ms2, rr_ms3)`
 
-### 7.5 Recording + PSFTP
+Typed ECG/ACC methods are convenience wrappers over the generic stream machinery. Exact argument names and behavior are part of the public API contract in `polar_sdk_api_design.md`.
+
+### 7.5 Recording + PSFTP (summary)
 
 Recording control surface (capability-gated):
+- `recording_default_config(kind: str) -> dict`
 - `recording_start(kind: str, **cfg) -> None`
 - `recording_stop(kind: str) -> None`
 - `recording_status() -> dict`
-- `recording_list() -> list`
-- `recording_get_settings(kind: str) -> dict`
-- `recording_set_trigger(kind: str, **cfg) -> None`
+- `recording_list() -> list[dict]`
+- `recording_delete(recording_id: str) -> None`
 
 Recording data model policy:
 - recordings expose a stable opaque `recording_id`,
 - metadata is returned via normalized dict fields,
-- retrieval can be by id/path as indicated by capability map.
+- canonical metadata keys and semantics are defined in `polar_sdk_api_design.md`.
 
 PSFTP/file operations (capability-gated):
-- `list_dir(path: str) -> list[tuple[str, int]]`
+- `list_dir(path: str) -> list[dict]`
 - `download(path: str, *, max_bytes=8192, timeout_ms=12000) -> bytes`
 - `delete(path: str, *, timeout_ms=12000) -> None`
 - chunked-transfer path:
   - `download_open(path: str, *, timeout_ms=12000) -> int`
   - `download_read(handle: int, buf, *, timeout_ms=12000) -> int` (`0` means EOF)
   - `download_close(handle: int) -> None`
-- additional write/merge/stat operations as supported by device capability map.
+- additional operations may be added only as reflected by the capability map and public API design spec.
 
 Chunked-transfer policy (v1):
 - one active download handle per `Device` instance,
 - opening while a handle is active raises `polar_sdk.Error`,
 - invalid/closed handle raises `ValueError`.
+
+Finite-transfer EOF/timeout semantics, `list_dir()` entry shape, and recording metadata requirements are defined in `polar_sdk_api_design.md`.
 
 ### 7.6 Module functions/constants
 
@@ -303,7 +283,7 @@ Chunked-transfer policy (v1):
   - `CAP_STREAM_MAG = "stream:mag"`
   - `CAP_RECORDING = "recording"`
   - `CAP_PSFTP_READ = "psftp:read"`
-  - `CAP_PSFTP_WRITE = "psftp:write"`
+  - `CAP_PSFTP_DELETE = "psftp:delete"`
 
 ---
 
@@ -367,7 +347,7 @@ Validation procedure reference: `../howto/validation.md`.
 8. Raw format mode remains available for diagnostics and unsupported decode cases.
 
 ### 10.3 Recording + PSFTP acceptance
-9. Recording control APIs (start/stop/status/list/trigger/settings) operate end-to-end on supported devices.
+9. Recording control APIs defined by the canonical public API contract operate end-to-end on supported devices.
 10. PSFTP list/download/delete (and other supported mutations) succeed repeatedly with bounded memory.
 11. Oversize transfers raise bounded-memory overflow (`BufferOverflowError`) instead of overrunning buffers.
 12. Forced-disconnect during recording/PSFTP yields clean failure and reconnect recovery.

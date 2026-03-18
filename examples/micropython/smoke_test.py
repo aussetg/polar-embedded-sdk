@@ -14,17 +14,17 @@ print(
     polar_sdk.FEATURE_PSFTP,
 )
 print(
-    "service bits =",
-    polar_sdk.SERVICE_HR,
-    polar_sdk.SERVICE_ECG,
-    polar_sdk.SERVICE_PSFTP,
-    polar_sdk.SERVICE_ALL,
+    "capability constants =",
+    polar_sdk.CAP_STREAM_HR,
+    polar_sdk.CAP_STREAM_ECG,
+    polar_sdk.CAP_PSFTP_READ,
+    polar_sdk.CAP_PSFTP_DELETE,
 )
 print("HAS_BTSTACK =", polar_sdk.HAS_BTSTACK)
 
-h10 = polar_sdk.H10(None, required_services=polar_sdk.SERVICE_ALL)
+h10 = polar_sdk.Device(None)
 print("h10.state() =", h10.state())
-print("h10.required_services() =", h10.required_services())
+print("h10.required_capabilities() =", h10.required_capabilities())
 print("h10.is_connected() =", h10.is_connected())
 print("h10.stats() =", h10.stats())
 
@@ -39,7 +39,7 @@ print(
 
 try:
     # Keep timeout small for smoke checks.
-    h10.connect(timeout_ms=200, required_services=polar_sdk.SERVICE_HR)
+    h10.connect(timeout_ms=200, required_capabilities=(polar_sdk.CAP_STREAM_HR,))
     print("connect() succeeded")
 except polar_sdk.TimeoutError as e:
     print("connect() TimeoutError OK for smoke:", e)

@@ -35,7 +35,7 @@ Suggested MicroPython script:
 import time
 import polar_sdk
 
-h10 = polar_sdk.H10(None, required_services=polar_sdk.SERVICE_HR)
+h10 = polar_sdk.Device(None, required_capabilities=(polar_sdk.CAP_STREAM_HR,))
 h10.connect(timeout_ms=15000)
 h10.start_hr()
 
@@ -45,7 +45,7 @@ last_dump = start
 while time.ticks_diff(time.ticks_ms(), start) < 20 * 60 * 1000:
     hr = h10.read_hr(timeout_ms=2000)
     if hr is not None:
-        # hr = (ts_ms, bpm, rr_count, rr0, rr1, rr2, rr3, contact)
+        # hr = (time_base, t0_ns, bpm, flags, rr_count, rr0, rr1, rr2, rr3)
         pass
 
     # dump stats every ~30s
@@ -72,7 +72,7 @@ Suggested MicroPython script:
 import time
 import polar_sdk
 
-h10 = polar_sdk.H10(None, required_services=polar_sdk.SERVICE_ECG)
+h10 = polar_sdk.Device(None, required_capabilities=(polar_sdk.CAP_STREAM_ECG,))
 h10.connect(timeout_ms=15000)
 
 # ECG requires pairing/encryption on H10 in practice.

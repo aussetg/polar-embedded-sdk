@@ -14,7 +14,7 @@ mpremote connect /dev/ttyACM0 run :smoke_test.py
 Expected output (current baseline):
 - `polar_sdk.version()` prints `0.1.0-dev`
 - `polar_sdk.build_info()` returns preset/SHA/build-type metadata
-- `h10.state()` prints `IDLE`
+- `h10.state()` prints `idle`
 - `h10.stats()` includes transport counters + discovered handle fields
 - `connect(timeout_ms=200)` either succeeds quickly (if target is visible) or raises `polar_sdk.TimeoutError`
 - `disconnect()` returns cleanly
@@ -31,18 +31,7 @@ mpremote connect /dev/ttyACM0 run :hello_polar.py
 ```
 
 Current behavior depends on radio conditions and whether a matching Polar device is advertising.
-The example also demonstrates runtime service scoping via `required_services`.
-
-## transport_connect_cycles.py
-
-`transport_connect_cycles.py` is a transport validation helper for repeated connect/disconnect runs.
-
-Run with `mpremote`:
-
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/transport_connect_cycles.py :transport_connect_cycles.py
-mpremote connect /dev/ttyACM0 run :transport_connect_cycles.py
-```
+The example also demonstrates capability scoping via `required_capabilities`.
 
 ## hr_read_demo.py
 
@@ -89,6 +78,17 @@ mpremote connect /dev/ttyACM0 fs cp examples/micropython/ecg_read_demo.py :ecg_r
 mpremote connect /dev/ttyACM0 run :ecg_read_demo.py
 ```
 
+## acc_read_demo.py
+
+`acc_read_demo.py` is an ACC control/read demo (`start_acc`, `read_acc`, `stop_acc`).
+
+Run with `mpremote`:
+
+```bash
+mpremote connect /dev/ttyACM0 fs cp examples/micropython/acc_read_demo.py :acc_read_demo.py
+mpremote connect /dev/ttyACM0 run :acc_read_demo.py
+```
+
 ## ecg_hr_lcd_gfx_demo.py
 
 `ecg_hr_lcd_gfx_demo.py` renders live HR text (top-left) and an ECG waveform on a Pimoroni LCD via `picographics`.
@@ -126,5 +126,32 @@ mpremote connect /dev/ttyACM0 fs cp examples/micropython/psftp_download_demo.py 
 mpremote connect /dev/ttyACM0 run :psftp_download_demo.py
 ```
 
+## psftp_chunked_download_demo.py
+
+`psftp_chunked_download_demo.py` lists a directory, opens one small file with
+`download_open`, reads it in chunks with `download_read`, and validates EOF handling.
+
+Run with `mpremote`:
+
+```bash
+mpremote connect /dev/ttyACM0 fs cp examples/micropython/psftp_chunked_download_demo.py :psftp_chunked_download_demo.py
+mpremote connect /dev/ttyACM0 run :psftp_chunked_download_demo.py
+```
+
+## recording_hr_demo.py
+
+`recording_hr_demo.py` exercises H10 HR recording control (`recording_default_config`,
+`recording_start`, `recording_status`, `recording_stop`).
+
+Run with `mpremote`:
+
+```bash
+mpremote connect /dev/ttyACM0 fs cp examples/micropython/recording_hr_demo.py :recording_hr_demo.py
+mpremote connect /dev/ttyACM0 run :recording_hr_demo.py
+```
+
 For current PSFTP/platform caveats, see:
 - `docs/KNOWN_ISSUES.md`
+
+For the broader package-level validation sequence, see:
+- `docs/howto/package_acceptance.md`

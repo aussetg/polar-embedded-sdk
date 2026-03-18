@@ -4,7 +4,7 @@ import polar_sdk
 ROOT_DIR = "/"
 MAX_BYTES = 4096
 
-h10 = polar_sdk.H10(required_services=polar_sdk.SERVICE_PSFTP)
+h10 = polar_sdk.Device(required_capabilities=(polar_sdk.CAP_PSFTP_READ,))
 
 try:
     print("connecting...")
@@ -23,8 +23,10 @@ try:
         raise RuntimeError("list_dir failed after retries")
 
     candidates = []
-    for name, size in entries:
-        if not name.endswith("/") and size <= MAX_BYTES:
+    for entry in entries:
+        name = entry.get("name")
+        size = entry.get("size")
+        if not entry.get("is_dir") and size <= MAX_BYTES:
             candidates.append((name, size))
 
     if not candidates:

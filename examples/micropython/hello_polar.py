@@ -1,8 +1,11 @@
-# Minimal "hello polar" script for polar_sdk.H10.
+# Minimal "hello polar" script for polar_sdk.Device.
 
 import polar_sdk
 
-h10 = polar_sdk.H10(name_prefix="Polar", required_services=polar_sdk.SERVICE_HR)
+h10 = polar_sdk.Device(
+    name_prefix="Polar",
+    required_capabilities=(polar_sdk.CAP_STREAM_HR,),
+)
 
 print("polar_sdk.version() =", polar_sdk.version())
 print(
@@ -12,13 +15,12 @@ print(
     polar_sdk.FEATURE_PSFTP,
 )
 print(
-    "service bits:",
-    polar_sdk.SERVICE_HR,
-    polar_sdk.SERVICE_ECG,
-    polar_sdk.SERVICE_PSFTP,
-    polar_sdk.SERVICE_ALL,
+    "capability constants:",
+    polar_sdk.CAP_STREAM_HR,
+    polar_sdk.CAP_STREAM_ECG,
+    polar_sdk.CAP_PSFTP_READ,
 )
-print("required services mask:", h10.required_services())
+print("required capabilities:", h10.required_capabilities())
 print("initial state:", h10.state())
 
 try:

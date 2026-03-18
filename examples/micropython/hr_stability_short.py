@@ -1,7 +1,7 @@
 import polar_sdk
 import time
 
-h10 = polar_sdk.H10(name_prefix="Polar")
+h10 = polar_sdk.Device(name_prefix="Polar")
 print("version", polar_sdk.version())
 
 try:
