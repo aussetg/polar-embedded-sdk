@@ -45,6 +45,29 @@ static void logger_print_boot_banner(const logger_app_t *app) {
            (unsigned)LOGGER_BATTERY_OFF_CHARGER_UPLOAD_MIN_MV);
 }
 
+static logger_fault_code_t logger_app_storage_fault_code(const logger_storage_status_t *storage) {
+    if (!storage->card_present || !storage->mounted || !storage->writable ||
+        !storage->logger_root_ready || strcmp(storage->filesystem, "fat32") != 0) {
+        return LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE;
+    }
+    if (!storage->reserve_ok) {
+        return LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET;
+    }
+    return LOGGER_FAULT_NONE;
+}
+
+static const char *logger_app_boot_gesture_name(logger_boot_gesture_t gesture) {
+    switch (gesture) {
+        case LOGGER_BOOT_GESTURE_SERVICE:
+            return "service";
+        case LOGGER_BOOT_GESTURE_FACTORY_RESET:
+            return "factory_reset";
+        case LOGGER_BOOT_GESTURE_NONE:
+        default:
+            return "none";
+    }
+}
+
 static void logger_app_refresh_observations(logger_app_t *app, uint32_t now_ms) {
     if (app->last_observation_mono_ms != 0u && (now_ms - app->last_observation_mono_ms) < 1000u) {
         return;
@@ -52,6 +75,7 @@ static void logger_app_refresh_observations(logger_app_t *app, uint32_t now_ms) 
 
     logger_battery_sample(&app->battery);
     logger_clock_sample(&app->clock);
+    (void)logger_storage_refresh(&app->storage);
 
     app->runtime.charger_present = app->battery.vbus_present;
     app->runtime.wall_clock_valid = app->clock.valid;
@@ -66,6 +90,18 @@ static void logger_app_maybe_latch_new_fault(logger_app_t *app, logger_fault_cod
 
     app->persisted.current_fault_code = code;
     (void)logger_config_store_save(&app->persisted);
+
+    char details[96];
+    snprintf(details,
+             sizeof(details),
+             "{\"code\":\"%s\"}",
+             logger_fault_code_name(code));
+    (void)logger_system_log_append(
+        &app->system_log,
+        app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+        "fault_latched",
+        LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+        details);
 }
 
 static bool logger_app_local_time_evaluable(const logger_app_t *app) {
@@ -154,11 +190,35 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms, logger_boot_gesture_t b
 
     logger_battery_init();
     logger_clock_init();
+    logger_storage_init();
     logger_button_init(&app->button, now_ms);
     logger_service_cli_init(&app->cli);
+    logger_session_init(&app->session);
+    logger_system_log_init(&app->system_log, app->persisted.boot_counter);
+
     logger_app_refresh_observations(app, now_ms);
     logger_print_boot_banner(app);
     app->boot_banner_printed = true;
+
+    char boot_details[128];
+    snprintf(boot_details,
+             sizeof(boot_details),
+             "{\"gesture\":\"%s\"}",
+             logger_app_boot_gesture_name(boot_gesture));
+    (void)logger_system_log_append(
+        &app->system_log,
+        app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+        "boot",
+        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        boot_details);
+    if (app->clock.lost_power) {
+        (void)logger_system_log_append(
+            &app->system_log,
+            app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+            "rtc_lost_power",
+            LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+            "{}");
+    }
 }
 
 static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
@@ -166,6 +226,12 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
 
     if (app->boot_gesture == LOGGER_BOOT_GESTURE_FACTORY_RESET) {
         printf("[logger] boot gesture: factory reset\n");
+        (void)logger_system_log_append(
+            &app->system_log,
+            app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+            "factory_reset",
+            LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+            "{\"source\":\"boot_gesture\"}");
         (void)logger_config_store_factory_reset(&app->persisted);
         app->reboot_pending = true;
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "factory_reset_reboot_pending", now_ms);
@@ -181,6 +247,13 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
     if (!app->runtime.provisioning_complete) {
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_CONFIG_INCOMPLETE);
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "config_incomplete", now_ms);
+        return;
+    }
+
+    const logger_fault_code_t storage_fault = logger_app_storage_fault_code(&app->storage);
+    if (storage_fault != LOGGER_FAULT_NONE) {
+        logger_app_maybe_latch_new_fault(app, storage_fault);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "storage_not_ready", now_ms);
         return;
     }
 
@@ -212,21 +285,70 @@ static void logger_step_log_wait_h10(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
     logger_service_cli_poll(&app->cli, app, now_ms);
 
+    const logger_fault_code_t storage_fault = logger_app_storage_fault_code(&app->storage);
+    if (storage_fault != LOGGER_FAULT_NONE) {
+        logger_app_maybe_latch_new_fault(app, storage_fault);
+        logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "storage_fault", now_ms);
+        return;
+    }
+
     if (logger_battery_low_start_blocked(&app->battery)) {
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_LOW_BATTERY_BLOCKED_START);
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER, "battery_dropped_below_start_threshold", now_ms);
         return;
     }
 
+    if (app->session.active &&
+        (app->last_session_snapshot_mono_ms == 0u || (now_ms - app->last_session_snapshot_mono_ms) >= 300000u)) {
+        if (!logger_session_write_status_snapshot(
+                &app->session,
+                &app->clock,
+                &app->battery,
+                &app->storage,
+                app->persisted.current_fault_code,
+                app->persisted.boot_counter,
+                now_ms)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_snapshot_write_failed", now_ms);
+            return;
+        }
+        app->last_session_snapshot_mono_ms = now_ms;
+    }
+
     const logger_button_event_t event = logger_button_poll(&app->button, now_ms);
     if (event == LOGGER_BUTTON_EVENT_SHORT_PRESS) {
-        printf("[logger] marker ignored: no active session/span\n");
+        if (app->session.active) {
+            if (!logger_session_write_marker(
+                    &app->session,
+                    &app->clock,
+                    app->persisted.boot_counter,
+                    now_ms)) {
+                logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+                logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "marker_write_failed", now_ms);
+                return;
+            }
+            printf("[logger] marker recorded\n");
+        } else {
+            printf("[logger] marker ignored: no active session/span\n");
+        }
     } else if (event == LOGGER_BUTTON_EVENT_LONG_PRESS) {
         logger_app_transition_via_stopping(app, LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE, "manual_long_press", now_ms);
     }
 }
 
 static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
+    if (app->session.active) {
+        if (!logger_session_stop_debug(
+                &app->session,
+                &app->system_log,
+                &app->clock,
+                app->persisted.boot_counter,
+                now_ms)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_stop_write_failed", now_ms);
+            return;
+        }
+    }
     logger_app_state_transition(&app->runtime, app->runtime.planned_next_state, "log_stopping_complete", now_ms);
 }
 
@@ -237,7 +359,7 @@ static void logger_step_idle_common(logger_app_t *app, uint32_t now_ms) {
 }
 
 void logger_app_step(logger_app_t *app, uint32_t now_ms) {
-    app->runtime.step_counter += 1;
+    app->runtime.step_counter += 1u;
 
     switch (app->runtime.current_state) {
         case LOGGER_RUNTIME_BOOT:
@@ -272,11 +394,7 @@ void logger_app_step(logger_app_t *app, uint32_t now_ms) {
         default:
             printf("[logger] unhandled state=%s; returning to service\n",
                    logger_runtime_state_name(app->runtime.current_state));
-            logger_app_state_transition(
-                &app->runtime,
-                LOGGER_RUNTIME_SERVICE,
-                "scaffold_unhandled_state",
-                now_ms);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "scaffold_unhandled_state", now_ms);
             break;
     }
 

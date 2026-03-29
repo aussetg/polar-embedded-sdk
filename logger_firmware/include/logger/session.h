@@ -1,0 +1,71 @@
+#ifndef LOGGER_FIRMWARE_SESSION_H
+#define LOGGER_FIRMWARE_SESSION_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "logger/battery.h"
+#include "logger/clock.h"
+#include "logger/config_store.h"
+#include "logger/faults.h"
+#include "logger/storage.h"
+#include "logger/system_log.h"
+
+#define LOGGER_SESSION_ID_HEX_LEN 32
+
+typedef struct {
+    bool active;
+    bool span_active;
+    bool quarantined;
+    char clock_state[8];
+    char session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+    char current_span_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+    char study_day_local[11];
+    char session_dir_name[64];
+    char session_dir_path[LOGGER_STORAGE_PATH_MAX];
+    char journal_path[LOGGER_STORAGE_PATH_MAX];
+    char live_path[LOGGER_STORAGE_PATH_MAX];
+    uint64_t next_record_seq;
+    uint64_t journal_size_bytes;
+    uint32_t span_index_in_session;
+    uint32_t span_count;
+} logger_session_state_t;
+
+void logger_session_init(logger_session_state_t *session);
+bool logger_session_start_debug(
+    logger_session_state_t *session,
+    logger_system_log_t *system_log,
+    const char *hardware_id,
+    const logger_persisted_state_t *persisted,
+    const logger_clock_status_t *clock,
+    const logger_battery_status_t *battery,
+    const logger_storage_status_t *storage,
+    logger_fault_code_t current_fault,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    const char **error_code_out,
+    const char **error_message_out);
+
+bool logger_session_write_status_snapshot(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    const logger_battery_status_t *battery,
+    const logger_storage_status_t *storage,
+    logger_fault_code_t current_fault,
+    uint32_t boot_counter,
+    uint32_t now_ms);
+
+bool logger_session_write_marker(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms);
+
+bool logger_session_stop_debug(
+    logger_session_state_t *session,
+    logger_system_log_t *system_log,
+    const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms);
+
+#endif

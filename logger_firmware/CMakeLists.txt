@@ -40,17 +40,25 @@ add_executable(logger_appliance
     src/config_store.c
     src/faults.c
     src/identity.c
+    src/journal.c
+    src/session.c
     src/service_cli.c
+    src/storage.c
+    src/system_log.c
+    ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ff.c
+    ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ffunicode.c
 )
 
 target_include_directories(logger_appliance PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CURRENT_LIST_DIR}/boards/rp2_2
+    ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source
 )
 
 target_link_libraries(logger_appliance PRIVATE
     pico_stdlib
     pico_cyw43_arch_none
+    pico_rand
     pico_unique_id
     hardware_adc
     hardware_flash

@@ -2,8 +2,19 @@
 #define LOGGER_FIRMWARE_CLOCK_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #define LOGGER_CLOCK_RFC3339_UTC_LEN 30
+
+typedef struct {
+    int year;
+    int month;
+    int day;
+    int weekday;
+    int hour;
+    int minute;
+    int second;
+} logger_clock_datetime_t;
 
 typedef struct {
     bool initialized;
@@ -23,9 +34,15 @@ typedef struct {
 
 void logger_clock_init(void);
 void logger_clock_sample(logger_clock_status_t *status);
+bool logger_clock_set_utc(const char *rfc3339_utc, logger_clock_status_t *status_out);
 
 const char *logger_clock_state_name(const logger_clock_status_t *status);
+bool logger_clock_observed_utc_ns(const logger_clock_status_t *status, int64_t *utc_ns_out);
 bool logger_clock_derive_study_day_local(
+    const logger_clock_status_t *status,
+    const char *timezone,
+    char out_study_day[11]);
+bool logger_clock_derive_study_day_local_observed(
     const logger_clock_status_t *status,
     const char *timezone,
     char out_study_day[11]);
