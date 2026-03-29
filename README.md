@@ -33,6 +33,16 @@ Current status: active implementation (transport, HR, PMD ECG/IMU, and initial P
 Start here:
 
 - `docs/README.md`
+- `docs/sdk_overview.md`
+- `docs/c_sdk/README.md`
+- `docs/c_sdk/cookbook.md`
+- `docs/micropython/README.md`
+- `docs/micropython/research_workflows.md`
+
+The `docs/` directory is an `mdBook`.
+
+- Build locally: `mdbook build docs`
+- Serve locally: `mdbook serve docs --open`
 
 ## Build + tooling
 

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-# H10 HR recording control demo: query status, start, re-check, stop.
+"""H10 onboard HR recording-control demo.
+
+The script checks current recording state, refuses to proceed if old stopped
+recordings are still stored, starts a short HR recording, then stops it.
+"""
 
 import time
 import polar_sdk

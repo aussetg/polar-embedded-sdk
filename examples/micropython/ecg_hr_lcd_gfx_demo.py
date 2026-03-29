@@ -1,9 +1,12 @@
-# Pico GFX Pack (128x64 mono) demo: live HR + ECG sweep
-#
-# Display behavior:
-# - HR value top-left
-# - ECG drawn as a continuous ~2s window
-# - left->right overwrite with a small clear gap ahead of the trace
+"""Display live HR text and an ECG sweep on a supported PicoGraphics display.
+
+Display behavior:
+- HR value in the top-left corner
+- ECG drawn as a continuous roughly 2-second window
+- left-to-right overwrite with a small clear gap ahead of the trace
+
+Use this when you want a visual on-device demo rather than a logging script.
+"""
 
 import time
 import struct

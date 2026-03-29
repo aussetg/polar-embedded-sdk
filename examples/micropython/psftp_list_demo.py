@@ -1,3 +1,9 @@
+"""Simple PSFTP directory-listing demo.
+
+Use this to confirm that PSFTP discovery, security, and directory listing are
+working before you try downloads or recording control.
+"""
+
 import time
 import polar_sdk
 

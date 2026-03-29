@@ -1,4 +1,8 @@
-# Minimal "hello polar" script for polar_sdk.Device.
+"""Minimal `polar_sdk.Device` connect/stats/disconnect example.
+
+This is the smallest useful lifecycle script in the examples directory.
+Start here if you only want to verify that the module imports and can connect.
+"""
 
 import polar_sdk
 

@@ -12,6 +12,7 @@ proto/*.pb
 *.map
 build/
 .cache
+docs/book/
 
 # IDE
 .idea/

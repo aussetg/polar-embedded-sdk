@@ -1,23 +1,32 @@
 # Documentation
 
+This directory is also an **mdBook**.
+
+- Book config: [`book.toml`](./book.toml)
+- Table of contents: [`SUMMARY.md`](./SUMMARY.md)
+- Local build: `mdbook build docs`
+- Local serve: `mdbook serve docs --open`
+
 This repository (**polar-embedded-sdk**) is building a **C-backed MicroPython module** for Polar BLE sensors on **rp2** (current focus: **Polar H10**; current hardware target: **RP2-1**, based on **Pimoroni Pico Plus 2 W / RP2350B + CYW43**), built on top of a **Polar-specific, BTstack-backed C SDK core** (`polar_sdk/core/`).
 
 The documentation is organised so that:
-- the **spec** is the canonical source of required behavior and API,
+- the **SDK guides** are the main source of user-facing behavior and API,
 - **protocol references** are small and vendor-sourced (Polar BLE SDK) or BLE SIG–sourced,
 - **how-to** guides are procedural and repeatable,
 - **known issues** are curated and actionable.
 
 ## Read this first
 
-1. **SDK spec (canonical):** [`specs/micropython_polar_sdk_driver.md`](./specs/micropython_polar_sdk_driver.md)
-2. **Protocol reference index:** [`reference/README.md`](./reference/README.md)
-3. **Build toolchain requirements:** [`howto/toolchain_requirements.md`](./howto/toolchain_requirements.md)
-4. **BTstack alignment policy (single-version target):** [`howto/btstack_version_alignment.md`](./howto/btstack_version_alignment.md)
-5. **Build/flash workflow:** [`howto/build_micropython_with_polar_module.md`](./howto/build_micropython_with_polar_module.md)
-6. **RP2-1 prototype hardware profile:** [`howto/rp2_1_prototype.md`](./howto/rp2_1_prototype.md)
-7. **Validation procedures (HR + ECG):** [`howto/validation.md`](./howto/validation.md)
-8. **Known issues / troubleshooting:** [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md)
+1. **SDK overview:** [`sdk_overview.md`](./sdk_overview.md)
+2. **C SDK guide:** [`c_sdk/README.md`](./c_sdk/README.md)
+3. **C integration cookbook:** [`c_sdk/cookbook.md`](./c_sdk/cookbook.md)
+4. **MicroPython SDK guide:** [`micropython/README.md`](./micropython/README.md)
+5. **Research workflows:** [`micropython/research_workflows.md`](./micropython/research_workflows.md)
+6. **Protocol reference index:** [`reference/README.md`](./reference/README.md)
+7. **Build toolchain requirements:** [`howto/toolchain_requirements.md`](./howto/toolchain_requirements.md)
+8. **Build/flash workflow:** [`howto/build_micropython_with_polar_module.md`](./howto/build_micropython_with_polar_module.md)
+9. **Validation procedures (HR + ECG):** [`howto/validation.md`](./howto/validation.md)
+10. **Known issues / troubleshooting:** [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md)
 
 ## BTstack read order (for this project)
 
@@ -32,7 +41,10 @@ If you’re working on transport/discovery/streaming behavior, read in this orde
 
 ## Docs map
 
-- [`specs/`](./specs/) — canonical requirements and API
+- [`sdk_overview.md`](./sdk_overview.md) — choose between the C SDK and the MicroPython SDK
+- [`c_sdk/`](./c_sdk/) — C core architecture, API status, helper-module guide, and integration cookbook
+- [`micropython/`](./micropython/) — practical user documentation for the `polar_sdk` MicroPython module and research workflows
+- [`specs/`](./specs/) — design notes and in-progress spec material
 - [`reference/`](./reference/) — protocol facts (Polar + BLE standard services)
 - [`howto/`](./howto/) — build + validation workflows
 - [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md) — curated issues and mitigations

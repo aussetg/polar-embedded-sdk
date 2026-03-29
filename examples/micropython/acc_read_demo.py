@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# ACC streaming demo: connect, start ACC, stream for a fixed window, stop.
+"""Live ACC streaming demo for `polar_sdk`.
+
+Use this to confirm that accelerometer streaming works and that data keeps
+arriving over time. The script prints periodic byte/ring-buffer counters rather
+than decoding every sample for display.
+"""
 
 import time
 import polar_sdk

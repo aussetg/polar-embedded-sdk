@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-# Generic capability-driven live stream probe for non-H10 validation.
+"""Generic capability-driven stream probe.
+
+Use this when you want one script shape that can test `hr`, `ecg`, `acc`, or a
+future stream kind chosen from `capabilities()`.
+"""
 
 import time
 import polar_sdk

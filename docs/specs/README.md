@@ -1,8 +1,15 @@
-# Specs
+# Archived design notes
 
-Specs are **canonical** and **normative**: they define required behavior, APIs, and acceptance criteria.
+These documents are older design/spec material kept for implementation history and cross-checking.
 
-Pre-beta policy: API/schema details may change intentionally until first beta/stable freeze (`schema_version = 1` in `capabilities()`).
+They are **not** the primary user-facing documentation anymore.
+
+For current usage, start with:
+
+- `docs/c_sdk/`
+- `docs/micropython/`
+
+Pre-beta policy still applies: API/schema details may change intentionally until first beta/stable freeze (`schema_version = 1` in `capabilities()`).
 
 ## Index
 

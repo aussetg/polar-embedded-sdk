@@ -1,4 +1,8 @@
-# Quick BLE scan helper to find Polar advertisements and addresses.
+"""Quick BLE scan helper using the built-in MicroPython `bluetooth` module.
+
+Use this before `polar_sdk.Device(...)` if you need to discover the address of
+the exact Polar sensor you want to target.
+"""
 
 import bluetooth
 import time

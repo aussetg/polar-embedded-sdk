@@ -1,4 +1,9 @@
-# ECG streaming demo: connect, start ECG, stream for a fixed window, stop.
+"""Live ECG streaming demo for `polar_sdk`.
+
+Use this to confirm that ECG streaming works and to watch chunk/ring-buffer
+counters during a short run. The script counts bytes instead of printing each
+sample value.
+"""
 
 import time
 import polar_sdk

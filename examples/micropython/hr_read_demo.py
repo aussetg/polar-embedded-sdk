@@ -1,4 +1,8 @@
-# HR demo: connect, start HR notifications, read samples.
+"""Basic HR read demo.
+
+Connects to a Polar device, enables HR notifications, reads a small number of
+samples, and then stops cleanly.
+"""
 
 import polar_sdk
 

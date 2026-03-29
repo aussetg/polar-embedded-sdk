@@ -1,190 +1,134 @@
 # MicroPython examples
 
-## smoke_test.py
+These examples are meant to match the user-facing documentation in:
 
-`smoke_test.py` is a minimal on-device check that the **C module is compiled in** and importable.
+- `docs/micropython/README.md`
+- `docs/micropython/quickstart.md`
+- `docs/micropython/research_workflows.md`
+- `docs/micropython/api_reference.md`
+- `docs/micropython/data_formats.md`
 
-Run with `mpremote` after flashing firmware:
-
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/smoke_test.py :smoke_test.py
-mpremote connect /dev/ttyACM0 run :smoke_test.py
-```
-
-Expected output (current baseline):
-- `polar_sdk.version()` prints `0.1.0-dev`
-- `polar_sdk.build_info()` returns preset/SHA/build-type metadata
-- `h10.state()` prints `idle`
-- `h10.stats()` includes transport counters + discovered handle fields
-- `connect(timeout_ms=200)` either succeeds quickly (if target is visible) or raises `polar_sdk.TimeoutError`
-- `disconnect()` returns cleanly
-
-## hello_polar.py
-
-`hello_polar.py` captures the target lifecycle flow (`connect` + `stats` + `disconnect`).
-
-Run with `mpremote`:
+General run pattern:
 
 ```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/hello_polar.py :hello_polar.py
-mpremote connect /dev/ttyACM0 run :hello_polar.py
+mpremote connect /dev/ttyACM0 fs cp examples/micropython/<script>.py :<script>.py
+mpremote connect /dev/ttyACM0 run :<script>.py
 ```
 
-Current behavior depends on radio conditions and whether a matching Polar device is advertising.
-The example also demonstrates capability scoping via `required_capabilities`.
+If multiple Polar devices are nearby, first run `scan_polar.py` and then edit
+`TARGET_ADDR` near the top of the script you care about.
 
-## capabilities_demo.py
+## First steps
 
-`capabilities_demo.py` connects to a Polar device and prints the public
-capability surface (`capabilities()`, stream defaults, and basic security state).
+### `smoke_test.py`
 
-Run with `mpremote`:
+Minimal on-device check that the `polar_sdk` module is present and importable.
+
+### `hello_polar.py`
+
+Smallest useful lifecycle example: create device, connect, inspect `stats()`, disconnect.
+
+### `capabilities_demo.py`
+
+Print the connected device’s public capability surface (`capabilities()`), stream defaults, and recording defaults.
+
+### `scan_polar.py`
+
+Use the built-in MicroPython `bluetooth` module to find nearby Polar advertisements and addresses.
+
+## Research capture workflows
+
+### `hr_csv_capture.py`
+
+Host-captured HR CSV logger.
+
+Typical host command:
 
 ```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/capabilities_demo.py :capabilities_demo.py
-mpremote connect /dev/ttyACM0 run :capabilities_demo.py
+mpremote connect /dev/ttyACM0 run :hr_csv_capture.py > hr_capture.csv
 ```
 
-If multiple Polar devices are nearby, edit `TARGET_ADDR` near the top of the
-script to pin the intended device.
+### `ecg_hex_capture.py`
 
-## stream_probe.py
+Host-captured ECG chunk logger.
 
-`stream_probe.py` is a generic capability-driven live-stream probe for non-H10
-validation. Set `KIND` near the top of the script to one of the supported kinds
-reported by `capabilities_demo.py`.
-
-Run with `mpremote`:
+Typical host command:
 
 ```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/stream_probe.py :stream_probe.py
-mpremote connect /dev/ttyACM0 run :stream_probe.py
+mpremote connect /dev/ttyACM0 run :ecg_hex_capture.py > ecg_capture.txt
 ```
 
-## hr_read_demo.py
+For the complete workflow, decoding steps, and interpretation guidance, see:
 
-`hr_read_demo.py` is an HR API demo (`start_hr`, `read_hr`, `stop_hr`).
+- `docs/micropython/research_workflows.md`
 
-Run with `mpremote`:
+## Stream-specific demos
 
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/hr_read_demo.py :hr_read_demo.py
-mpremote connect /dev/ttyACM0 run :hr_read_demo.py
-```
+### `hr_read_demo.py`
 
-## hr_stability_short.py
+Basic HR API demo: `start_hr()`, `read_hr()`, `stop_hr()`.
 
-`hr_stability_short.py` is a short HR streaming stress check.
+### `hr_stability_short.py`
 
-Run with `mpremote`:
+Short HR stress/sanity check.
 
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/hr_stability_short.py :hr_stability_short.py
-mpremote connect /dev/ttyACM0 run :hr_stability_short.py
-```
+### `hr_passive_stats.py`
 
-## hr_passive_stats.py
-
-`hr_passive_stats.py` enables HR and prints per-second link/HR counters without calling `read_hr()`.
+Enables HR and prints per-second counters without calling `read_hr()`.
 Useful for checking whether notifications arrive at all.
 
-Run with `mpremote`:
+### `ecg_read_demo.py`
 
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/hr_passive_stats.py :hr_passive_stats.py
-mpremote connect /dev/ttyACM0 run :hr_passive_stats.py
-```
+ECG streaming demo: `start_ecg()`, `read_ecg()`, `stop_ecg()`.
 
-## ecg_read_demo.py
+### `acc_read_demo.py`
 
-`ecg_read_demo.py` is an ECG control/read demo (`start_ecg`, `read_ecg`, `stop_ecg`).
+Accelerometer streaming demo: `start_acc()`, `read_acc()`, `stop_acc()`.
 
-Run with `mpremote`:
+### `stream_probe.py`
 
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/ecg_read_demo.py :ecg_read_demo.py
-mpremote connect /dev/ttyACM0 run :ecg_read_demo.py
-```
+Generic capability-driven stream probe for `hr`, `ecg`, `acc`, and future stream kinds exposed by `capabilities()`.
 
-## acc_read_demo.py
+## PSFTP and recording demos
 
-`acc_read_demo.py` is an ACC control/read demo (`start_acc`, `read_acc`, `stop_acc`).
+### `psftp_list_demo.py`
 
-Run with `mpremote`:
+Simple PSFTP directory listing using `list_dir()`.
 
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/acc_read_demo.py :acc_read_demo.py
-mpremote connect /dev/ttyACM0 run :acc_read_demo.py
-```
+### `psftp_download_demo.py`
 
-## ecg_hr_lcd_gfx_demo.py
+Downloads one small file into memory with `download()`.
 
-`ecg_hr_lcd_gfx_demo.py` renders live HR text (top-left) and an ECG waveform on a Pimoroni LCD via `picographics`.
+### `psftp_chunked_download_demo.py`
 
-Requirements:
-- firmware includes `polar_sdk` + `picographics`
-- works with Pico GFX Pack (`DISPLAY_GFX_PACK`) and several Pico Display/LCD modes (auto-detected in script)
+Downloads one small file in pieces with `download_open()`, `download_read()`, and `download_close()`.
 
-Run with `mpremote`:
+### `recording_hr_demo.py`
 
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/ecg_hr_lcd_gfx_demo.py :ecg_hr_lcd_gfx_demo.py
-mpremote connect /dev/ttyACM0 run :ecg_hr_lcd_gfx_demo.py
-```
+Exercises H10 HR recording control:
 
-## psftp_list_demo.py
-
-`psftp_list_demo.py` performs a simple PSFTP directory listing (`list_dir`).
-
-Run with `mpremote`:
-
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/psftp_list_demo.py :psftp_list_demo.py
-mpremote connect /dev/ttyACM0 run :psftp_list_demo.py
-```
-
-## psftp_download_demo.py
-
-`psftp_download_demo.py` lists a directory and downloads one small file (`download`).
-
-Run with `mpremote`:
-
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/psftp_download_demo.py :psftp_download_demo.py
-mpremote connect /dev/ttyACM0 run :psftp_download_demo.py
-```
-
-## psftp_chunked_download_demo.py
-
-`psftp_chunked_download_demo.py` lists a directory, opens one small file with
-`download_open`, reads it in chunks with `download_read`, and validates EOF handling.
-
-Run with `mpremote`:
-
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/psftp_chunked_download_demo.py :psftp_chunked_download_demo.py
-mpremote connect /dev/ttyACM0 run :psftp_chunked_download_demo.py
-```
-
-## recording_hr_demo.py
-
-`recording_hr_demo.py` exercises H10 HR recording control (`recording_default_config`,
-`recording_start`, `recording_status`, `recording_stop`).
+- `recording_default_config()`
+- `recording_start()`
+- `recording_status()`
+- `recording_stop()`
 
 Precondition:
-- `recording_list()` must be empty before running this demo
-- if stopped H10 recordings already exist, delete them explicitly with
-  `recording_delete(recording_id)` first
 
-Run with `mpremote`:
+- `recording_list()` should be empty before starting a new H10 HR recording
+- if stopped H10 recordings already exist, delete them first with `recording_delete(recording_id)`
 
-```bash
-mpremote connect /dev/ttyACM0 fs cp examples/micropython/recording_hr_demo.py :recording_hr_demo.py
-mpremote connect /dev/ttyACM0 run :recording_hr_demo.py
-```
+## Display/UI demo
 
-For current PSFTP/platform caveats, see:
+### `ecg_hr_lcd_gfx_demo.py`
+
+Renders live HR text and an ECG waveform on a supported Pimoroni PicoGraphics display.
+
+Requirements:
+
+- firmware includes `polar_sdk` and `picographics`
+- supported display constant is available in the build
+
+## Related docs
+
 - `docs/KNOWN_ISSUES.md`
-
-For the broader package-level validation sequence, see:
 - `docs/howto/package_acceptance.md`

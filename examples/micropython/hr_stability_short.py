@@ -1,3 +1,9 @@
+"""Short HR stability probe.
+
+Runs a 15-second HR session and counts how many samples were received. Use it
+for quick sanity checks after firmware changes.
+"""
+
 import polar_sdk
 import time
 

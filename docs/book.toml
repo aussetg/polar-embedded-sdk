@@ -1,0 +1,17 @@
+[book]
+title = "polar-embedded-sdk"
+description = "Documentation for the Polar embedded SDK C core and MicroPython module"
+authors = ["polar-embedded-sdk contributors"]
+language = "en"
+src = "."
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+smart-punctuation = true
+git-repository-url = "https://git.sr.ht/~aussetg/polar-embedded-sdk"
+no-section-label = false

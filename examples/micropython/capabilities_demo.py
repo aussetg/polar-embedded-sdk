@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# Connect to a Polar device and print the public capability surface.
+"""Inspect the public capability surface of a connected Polar device.
+
+This is the best first script to run when you want to know what a build/device
+combination currently exposes: stream kinds, recording support, PSFTP support,
+and default configs.
+"""
 
 import polar_sdk
 

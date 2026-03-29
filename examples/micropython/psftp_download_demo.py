@@ -1,3 +1,9 @@
+"""Simple PSFTP file download demo.
+
+Lists the root directory, picks one small file, and downloads it in one call
+with `download()`.
+"""
+
 import time
 import polar_sdk
 

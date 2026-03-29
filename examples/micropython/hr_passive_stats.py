@@ -1,3 +1,10 @@
+"""Passive HR-notification health check.
+
+The script enables HR notifications and prints counters once per second without
+consuming samples via `read_hr()`. Use it when you want to know whether data is
+arriving at all.
+"""
+
 import polar_sdk
 import time
 

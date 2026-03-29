@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Chunked PSFTP download demo.
+
+Lists the root directory, opens one small file with `download_open()`, reads it
+through a fixed-size buffer with `download_read()`, and checks EOF handling.
+"""
+
 import time
 import polar_sdk
 

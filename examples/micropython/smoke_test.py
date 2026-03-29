@@ -1,7 +1,9 @@
-# Minimal smoke test for the C-backed "polar_sdk" MicroPython module.
-#
-# This is expected to run on-device after flashing firmware that includes
-# the user C module from polar_sdk/mpy.
+"""Minimal on-device smoke test for the C-backed `polar_sdk` module.
+
+Run this after flashing firmware that includes the user C module from
+`polar_sdk/mpy`. It checks import, build metadata, error types, and a short
+connect/disconnect path.
+"""
 
 import polar_sdk
 
