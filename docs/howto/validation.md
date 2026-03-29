@@ -1,7 +1,7 @@
 # How-to — validate the module (HR + ECG soak tests)
 
 Status: How-to
-Last updated: 2026-02-24
+Last updated: 2026-03-29
 
 This document describes **repeatable validation procedures** for the embedded Polar MicroPython module (built on the C SDK core).
 
@@ -10,7 +10,8 @@ It is intentionally procedural (not a roadmap). Acceptance criteria are defined 
 ## Prerequisites
 
 - Hardware:
-  - RP2-1 prototype (Pimoroni Pico Plus 2 W, RP2350B + CYW43)
+  - RP2-1 prototype (Pimoroni Pico Plus 2 W, RP2350B + CYW43), or
+  - RP2-2 prototype (Pimoroni Pico LiPo 2 XL W + Adafruit PiCowbell Adalogger, RP2350B + RM2)
   - Polar H10 (powered / worn / good skin contact)
 - Firmware built with required features enabled:
   - `-DPOLAR_ENABLE_HR=ON`

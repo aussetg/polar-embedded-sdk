@@ -20,6 +20,7 @@
   - [BTstack version alignment](howto/btstack_version_alignment.md)
   - [Build MicroPython with the Polar module](howto/build_micropython_with_polar_module.md)
   - [RP2-1 prototype hardware profile](howto/rp2_1_prototype.md)
+  - [RP2-2 prototype hardware profile](howto/rp2_2_prototype.md)
   - [Build the pico-sdk probe](howto/build_pico_sdk_probe.md)
   - [Validation](howto/validation.md)
   - [Package acceptance](howto/package_acceptance.md)

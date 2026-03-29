@@ -79,6 +79,30 @@
         "POLAR_BUILD_PRESET_NAME": "fw-rp2-1-debug",
         "POLAR_ARTIFACTS_PROFILE": "fw-rp2-1-debug"
       }
+    },
+    {
+      "name": "fw-rp2-2",
+      "displayName": "Firmware RP2-2: polar_sdk module",
+      "inherits": ["_fw-rp2-release"],
+      "binaryDir": "${fileDir}/build/mpy-rp2-2",
+      "cacheVariables": {
+        "MICROPY_BOARD": "RP2_2",
+        "MICROPY_BOARD_DIR": "${fileDir}/firmware/boards/RP2_2",
+        "USER_C_MODULES": "${fileDir}/polar_sdk/mpy",
+        "POLAR_BUILD_PRESET_NAME": "fw-rp2-2",
+        "POLAR_ARTIFACTS_PROFILE": "fw-rp2-2"
+      }
+    },
+    {
+      "name": "fw-rp2-2-debug",
+      "displayName": "Firmware RP2-2: polar_sdk module (debug)",
+      "inherits": ["fw-rp2-2"],
+      "binaryDir": "${fileDir}/build/mpy-rp2-2-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "POLAR_BUILD_PRESET_NAME": "fw-rp2-2-debug",
+        "POLAR_ARTIFACTS_PROFILE": "fw-rp2-2-debug"
+      }
     }
   ],
   "buildPresets": [
@@ -100,6 +124,16 @@
     {
       "name": "fw-rp2-1-debug",
       "configurePreset": "fw-rp2-1-debug",
+      "jobs": 0
+    },
+    {
+      "name": "fw-rp2-2",
+      "configurePreset": "fw-rp2-2",
+      "jobs": 0
+    },
+    {
+      "name": "fw-rp2-2-debug",
+      "configurePreset": "fw-rp2-2-debug",
       "jobs": 0
     }
   ],
@@ -157,6 +191,34 @@
         {
           "type": "build",
           "name": "fw-rp2-1-debug"
+        }
+      ]
+    },
+    {
+      "name": "wf-fw-rp2-2",
+      "displayName": "Configure+build RP2-2 polar_sdk firmware",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "fw-rp2-2"
+        },
+        {
+          "type": "build",
+          "name": "fw-rp2-2"
+        }
+      ]
+    },
+    {
+      "name": "wf-fw-rp2-2-debug",
+      "displayName": "Configure+build RP2-2 polar_sdk firmware (debug)",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "fw-rp2-2-debug"
+        },
+        {
+          "type": "build",
+          "name": "fw-rp2-2-debug"
         }
       ]
     }

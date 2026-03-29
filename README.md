@@ -2,7 +2,12 @@
 
 This repository is building towards an **unofficial embedded reimplementation of Polar BLE SDK protocols** for **microcontrollers**, with a **portable C SDK core** (Polar-specific, BTstack-backed) and a **MicroPython `rp2` binding**.
 
-Current primary development target: **Polar H10** on **RP2** (current hardware: **RP2-1**, based on **Pimoroni Pico Plus 2 W / RP2350B + CYW43**) using **BTstack**.
+Current prototype targets for **Polar H10** on **RP2** are:
+
+- **RP2-1** — Pimoroni Pico Plus 2 W / RP2350B + CYW43
+- **RP2-2** — Pimoroni Pico LiPo 2 XL W + Adafruit PiCowbell Adalogger / RP2350B + RM2 + PCF8523 + microSD
+
+Both use **BTstack**.
 
 ## Why ?
 
@@ -46,7 +51,7 @@ The `docs/` directory is an `mdBook`.
 
 ## Build + tooling
 
-- `CMakePresets.json` — canonical firmware build entrypoint (Pico 2 W + RP2-1 release/debug/workflow presets)
+- `CMakePresets.json` — canonical firmware build entrypoint (Pico 2 W + RP2-1/RP2-2 release/debug/workflow presets)
 - `CMakeLists.txt` — repo-level build entrypoint forwarding into vendored MicroPython rp2 build
 - `firmware/cmake/` — firmware build fragments (minimal Pimoroni `picographics` profile + compatibility shim)
 - `examples/pico_sdk/` — standalone C probe (pico-sdk + BTstack) used for isolation testing

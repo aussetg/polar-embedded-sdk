@@ -8,6 +8,7 @@ Procedural guides for building and development workflows.
 - **BTstack version alignment policy (single-version @ 1.8):** [`btstack_version_alignment.md`](./btstack_version_alignment.md)
 - **Build MicroPython (rp2) with the `polar_sdk` user C module:** [`build_micropython_with_polar_module.md`](./build_micropython_with_polar_module.md)
 - **RP2-1 hardware profile (Pico Plus 2 W + RV3028 + SD):** [`rp2_1_prototype.md`](./rp2_1_prototype.md)
+- **RP2-2 hardware profile (Pico LiPo 2 XL W + PiCowbell Adalogger):** [`rp2_2_prototype.md`](./rp2_2_prototype.md)
 - **Build the pure pico-sdk BTstack probe (`examples/pico_sdk`):** [`build_pico_sdk_probe.md`](./build_pico_sdk_probe.md)
 - **Validate the MicroPython module (HR + ECG soak tests):** [`validation.md`](./validation.md)
 - **MicroPython package acceptance pass:** [`package_acceptance.md`](./package_acceptance.md)

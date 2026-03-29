@@ -12,4 +12,6 @@ fi
 uvx ruff check \
   scripts \
   examples/micropython \
-  firmware/boards/RP2_1/manifest.py
+  firmware/boards/RP2_1/manifest.py \
+  firmware/boards/RP2_2/manifest.py \
+  firmware/boards/RP2_2/modules/pcf8523.py
