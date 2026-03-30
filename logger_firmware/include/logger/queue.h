@@ -52,6 +52,12 @@ void logger_upload_queue_summary_init(logger_upload_queue_summary_t *summary);
 void logger_upload_queue_compute_summary(
     const logger_upload_queue_t *queue,
     logger_upload_queue_summary_t *summary);
+
+const logger_upload_queue_entry_t *logger_upload_queue_find_by_session_id(
+    const logger_upload_queue_t *queue,
+    const char *session_id);
+
+bool logger_upload_queue_load(logger_upload_queue_t *queue);
 bool logger_upload_queue_scan(
     logger_upload_queue_t *queue,
     logger_system_log_t *system_log,

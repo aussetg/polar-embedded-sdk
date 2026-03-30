@@ -265,8 +265,9 @@ static void logger_write_status_payload(const logger_app_t *app) {
     char study_day_local[11] = {0};
     logger_upload_queue_t queue;
     logger_upload_queue_summary_t queue_summary;
+    logger_upload_queue_init(&queue);
     logger_upload_queue_summary_init(&queue_summary);
-    if (logger_upload_queue_scan(&queue, NULL, logger_now_utc_or_null(app))) {
+    if (logger_upload_queue_load(&queue) || logger_upload_queue_scan(&queue, NULL, logger_now_utc_or_null(app))) {
         logger_upload_queue_compute_summary(&queue, &queue_summary);
     }
     const bool have_study_day = app->session.active
@@ -399,7 +400,9 @@ static void logger_handle_provisioning_status_json(logger_app_t *app) {
 static void logger_handle_queue_json(logger_app_t *app) {
     logger_upload_queue_t queue;
     logger_upload_queue_init(&queue);
-    (void)logger_upload_queue_scan(&queue, NULL, logger_now_utc_or_null(app));
+    if (!logger_upload_queue_load(&queue)) {
+        (void)logger_upload_queue_scan(&queue, NULL, logger_now_utc_or_null(app));
+    }
 
     logger_json_begin_success("queue", logger_now_utc_or_null(app));
     fputs("{\"schema_source\":\"upload_queue.json\",\"updated_at_utc\":", stdout);

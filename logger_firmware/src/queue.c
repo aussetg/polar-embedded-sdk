@@ -1,6 +1,7 @@
 #include "logger/queue.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ff.h"
@@ -12,6 +13,8 @@
 #define LOGGER_QUEUE_TMP_PATH "0:/logger/state/upload_queue.json.tmp"
 #define LOGGER_SESSIONS_DIR "0:/logger/sessions"
 #define LOGGER_MANIFEST_READ_MAX 8192u
+#define LOGGER_QUEUE_READ_MAX 49152u
+#define LOGGER_QUEUE_ENTRY_JSON_MAX 1536u
 
 typedef struct {
     char session_id[33];
@@ -150,6 +153,68 @@ static bool logger_json_extract_bool(const char *json, const char *key, bool *va
         return true;
     }
     return false;
+}
+
+static bool logger_json_extract_uint64(const char *json, const char *key, uint64_t *value_out) {
+    const char *start = strstr(json, key);
+    if (start == NULL || value_out == NULL) {
+        return false;
+    }
+    start += strlen(key);
+    if (*start < '0' || *start > '9') {
+        return false;
+    }
+    char *end = NULL;
+    const unsigned long long value = strtoull(start, &end, 10);
+    if (end == start) {
+        return false;
+    }
+    *value_out = (uint64_t)value;
+    return true;
+}
+
+static bool logger_json_extract_uint32(const char *json, const char *key, uint32_t *value_out) {
+    uint64_t value = 0u;
+    if (!logger_json_extract_uint64(json, key, &value) || value > 0xffffffffu) {
+        return false;
+    }
+    *value_out = (uint32_t)value;
+    return true;
+}
+
+static const char *logger_json_find_matching(const char *start, char open_ch, char close_ch) {
+    if (start == NULL || *start != open_ch) {
+        return NULL;
+    }
+
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (const char *p = start; *p != '\0'; ++p) {
+        const char ch = *p;
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == open_ch) {
+            depth += 1;
+        } else if (ch == close_ch) {
+            depth -= 1;
+            if (depth == 0) {
+                return p;
+            }
+        }
+    }
+    return NULL;
 }
 
 static bool logger_json_find_session_object_bounds(const char *json, const char **start_out, const char **end_out) {
@@ -361,6 +426,130 @@ static void logger_log_local_corrupt(
         details);
 }
 
+static void logger_log_queue_missing_local(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    const logger_upload_queue_entry_t *entry) {
+    if (system_log == NULL || entry == NULL) {
+        return;
+    }
+    char dir_escaped[160];
+    char session_escaped[96];
+    logger_json_escape_into(dir_escaped, sizeof(dir_escaped), entry->dir_name);
+    logger_json_escape_into(session_escaped, sizeof(session_escaped), entry->session_id);
+    char details[320];
+    snprintf(details,
+             sizeof(details),
+             "{\"dir_name\":\"%s\",\"session_id\":\"%s\"}",
+             dir_escaped,
+             session_escaped);
+    (void)logger_system_log_append(
+        system_log,
+        updated_at_utc_or_null,
+        "queue_missing_local_removed",
+        LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+        details);
+}
+
+static void logger_log_queue_rebuilt(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    const char *reason) {
+    if (system_log == NULL) {
+        return;
+    }
+    char reason_escaped[96];
+    logger_json_escape_into(reason_escaped, sizeof(reason_escaped), reason);
+    char details[160];
+    snprintf(details, sizeof(details), "{\"reason\":\"%s\"}", reason_escaped);
+    (void)logger_system_log_append(
+        system_log,
+        updated_at_utc_or_null,
+        "upload_queue_rebuilt",
+        LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+        details);
+}
+
+static void logger_log_upload_interrupted(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    const logger_upload_queue_entry_t *entry) {
+    if (system_log == NULL || entry == NULL) {
+        return;
+    }
+    char session_escaped[96];
+    logger_json_escape_into(session_escaped, sizeof(session_escaped), entry->session_id);
+    char details[160];
+    snprintf(details, sizeof(details), "{\"session_id\":\"%s\"}", session_escaped);
+    (void)logger_system_log_append(
+        system_log,
+        updated_at_utc_or_null,
+        "upload_interrupted_recovered",
+        LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+        details);
+}
+
+static bool logger_queue_status_valid(const char *status) {
+    return strcmp(status, "pending") == 0 ||
+           strcmp(status, "uploading") == 0 ||
+           strcmp(status, "verified") == 0 ||
+           strcmp(status, "blocked_min_firmware") == 0 ||
+           strcmp(status, "failed") == 0;
+}
+
+static void logger_queue_copy_mutable_fields(
+    logger_upload_queue_entry_t *dst,
+    const logger_upload_queue_entry_t *src) {
+    logger_copy_string(dst->status, sizeof(dst->status), src->status);
+    dst->attempt_count = src->attempt_count;
+    logger_copy_string(dst->last_attempt_utc, sizeof(dst->last_attempt_utc), src->last_attempt_utc);
+    logger_copy_string(dst->last_failure_class, sizeof(dst->last_failure_class), src->last_failure_class);
+    logger_copy_string(dst->verified_upload_utc, sizeof(dst->verified_upload_utc), src->verified_upload_utc);
+    logger_copy_string(dst->receipt_id, sizeof(dst->receipt_id), src->receipt_id);
+}
+
+static bool logger_queue_entry_dir_exists(const logger_upload_queue_entry_t *entry) {
+    if (entry == NULL || !logger_string_present(entry->dir_name)) {
+        return false;
+    }
+    char dir_path[LOGGER_STORAGE_PATH_MAX];
+    if (!logger_path_join2(dir_path, sizeof(dir_path), LOGGER_SESSIONS_DIR "/", entry->dir_name)) {
+        return false;
+    }
+    FILINFO info;
+    memset(&info, 0, sizeof(info));
+    return f_stat(dir_path, &info) == FR_OK && (info.fattrib & AM_DIR) != 0u;
+}
+
+static bool logger_parse_queue_entry_json(const char *json, logger_upload_queue_entry_t *entry) {
+    memset(entry, 0, sizeof(*entry));
+    uint32_t attempt_count = 0u;
+
+    if (!logger_json_extract_string(json, "\"session_id\":\"", entry->session_id, sizeof(entry->session_id)) ||
+        !logger_json_extract_string(json, "\"study_day_local\":\"", entry->study_day_local, sizeof(entry->study_day_local)) ||
+        !logger_json_extract_string(json, "\"dir_name\":\"", entry->dir_name, sizeof(entry->dir_name)) ||
+        !logger_json_extract_string_or_null(json, "session_start_utc", entry->session_start_utc, sizeof(entry->session_start_utc)) ||
+        !logger_json_extract_string_or_null(json, "session_end_utc", entry->session_end_utc, sizeof(entry->session_end_utc)) ||
+        !logger_json_extract_string(json, "\"bundle_sha256\":\"", entry->bundle_sha256, sizeof(entry->bundle_sha256)) ||
+        !logger_json_extract_uint64(json, "\"bundle_size_bytes\":", &entry->bundle_size_bytes) ||
+        !logger_json_extract_bool(json, "\"quarantined\":", &entry->quarantined) ||
+        !logger_json_extract_string(json, "\"status\":\"", entry->status, sizeof(entry->status)) ||
+        !logger_json_extract_uint32(json, "\"attempt_count\":", &attempt_count) ||
+        !logger_json_extract_string_or_null(json, "last_attempt_utc", entry->last_attempt_utc, sizeof(entry->last_attempt_utc)) ||
+        !logger_json_extract_string_or_null(json, "last_failure_class", entry->last_failure_class, sizeof(entry->last_failure_class)) ||
+        !logger_json_extract_string_or_null(json, "verified_upload_utc", entry->verified_upload_utc, sizeof(entry->verified_upload_utc)) ||
+        !logger_json_extract_string_or_null(json, "receipt_id", entry->receipt_id, sizeof(entry->receipt_id))) {
+        return false;
+    }
+
+    if (!logger_queue_status_valid(entry->status)) {
+        return false;
+    }
+
+    entry->attempt_count = attempt_count;
+    return true;
+}
+
 static int logger_upload_queue_entry_compare(
     const logger_upload_queue_entry_t *a,
     const logger_upload_queue_entry_t *b) {
@@ -387,6 +576,40 @@ static void logger_upload_queue_sort(logger_upload_queue_t *queue) {
     }
 }
 
+static bool logger_file_write_all(FIL *file, const void *data, size_t len) {
+    UINT written = 0u;
+    return f_write(file, data, len, &written) == FR_OK && written == len;
+}
+
+static bool logger_file_write_cstr(FIL *file, const char *text) {
+    return logger_file_write_all(file, text, strlen(text));
+}
+
+static bool logger_file_write_json_string_or_null(FIL *file, const char *value) {
+    if (!logger_string_present(value)) {
+        return logger_file_write_cstr(file, "null");
+    }
+    char escaped[512];
+    logger_json_escape_into(escaped, sizeof(escaped), value);
+    char quoted[544];
+    const int n = snprintf(quoted, sizeof(quoted), "\"%s\"", escaped);
+    return n > 0 && (size_t)n < sizeof(quoted) && logger_file_write_all(file, quoted, (size_t)n);
+}
+
+const logger_upload_queue_entry_t *logger_upload_queue_find_by_session_id(
+    const logger_upload_queue_t *queue,
+    const char *session_id) {
+    if (queue == NULL || !logger_string_present(session_id)) {
+        return NULL;
+    }
+    for (size_t i = 0u; i < queue->session_count; ++i) {
+        if (strcmp(queue->sessions[i].session_id, session_id) == 0) {
+            return &queue->sessions[i];
+        }
+    }
+    return NULL;
+}
+
 void logger_upload_queue_init(logger_upload_queue_t *queue) {
     memset(queue, 0, sizeof(*queue));
 }
@@ -407,12 +630,16 @@ void logger_upload_queue_compute_summary(
     logger_copy_string(summary->updated_at_utc, sizeof(summary->updated_at_utc), queue->updated_at_utc);
     summary->session_count = (uint32_t)queue->session_count;
 
+    char latest_failure_at[LOGGER_UPLOAD_QUEUE_UTC_MAX + 1] = {0};
+    bool have_failure = false;
     for (size_t i = 0u; i < queue->session_count; ++i) {
         const logger_upload_queue_entry_t *entry = &queue->sessions[i];
         if (strcmp(entry->status, "blocked_min_firmware") == 0) {
             summary->blocked_count += 1u;
         }
-        if (strcmp(entry->status, "pending") == 0 || strcmp(entry->status, "failed") == 0) {
+        if (strcmp(entry->status, "pending") == 0 ||
+            strcmp(entry->status, "failed") == 0 ||
+            strcmp(entry->status, "uploading") == 0) {
             if (summary->pending_count == 0u) {
                 logger_copy_string(summary->oldest_pending_study_day,
                                    sizeof(summary->oldest_pending_study_day),
@@ -421,11 +648,97 @@ void logger_upload_queue_compute_summary(
             summary->pending_count += 1u;
         }
         if (logger_string_present(entry->last_failure_class)) {
-            logger_copy_string(summary->last_failure_class,
-                               sizeof(summary->last_failure_class),
-                               entry->last_failure_class);
+            if (!have_failure ||
+                (!logger_string_present(latest_failure_at) && logger_string_present(entry->last_attempt_utc)) ||
+                strcmp(entry->last_attempt_utc, latest_failure_at) >= 0) {
+                logger_copy_string(summary->last_failure_class,
+                                   sizeof(summary->last_failure_class),
+                                   entry->last_failure_class);
+                logger_copy_string(latest_failure_at,
+                                   sizeof(latest_failure_at),
+                                   entry->last_attempt_utc);
+                have_failure = true;
+            }
         }
     }
+}
+
+bool logger_upload_queue_load(logger_upload_queue_t *queue) {
+    logger_upload_queue_init(queue);
+
+    logger_storage_status_t storage;
+    (void)logger_storage_refresh(&storage);
+    if (!storage.mounted) {
+        return false;
+    }
+    if (!logger_storage_file_exists(LOGGER_QUEUE_PATH)) {
+        return true;
+    }
+
+    static char queue_json[LOGGER_QUEUE_READ_MAX + 1u];
+    size_t len = 0u;
+    if (!logger_storage_read_file(LOGGER_QUEUE_PATH, queue_json, LOGGER_QUEUE_READ_MAX, &len)) {
+        return false;
+    }
+    queue_json[len] = '\0';
+
+    if (strstr(queue_json, "\"schema_version\":1") == NULL) {
+        return false;
+    }
+    if (!logger_json_extract_string_or_null(queue_json, "updated_at_utc", queue->updated_at_utc, sizeof(queue->updated_at_utc))) {
+        return false;
+    }
+
+    const char *sessions_key = strstr(queue_json, "\"sessions\":[");
+    if (sessions_key == NULL) {
+        return false;
+    }
+    const char *array_start = strchr(sessions_key, '[');
+    if (array_start == NULL) {
+        return false;
+    }
+    const char *array_end = logger_json_find_matching(array_start, '[', ']');
+    if (array_end == NULL) {
+        return false;
+    }
+
+    const char *cursor = array_start + 1;
+    while (cursor < array_end) {
+        while (cursor < array_end && (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n' || *cursor == ',')) {
+            ++cursor;
+        }
+        if (cursor >= array_end) {
+            break;
+        }
+        if (*cursor != '{') {
+            return false;
+        }
+        const char *object_end = logger_json_find_matching(cursor, '{', '}');
+        if (object_end == NULL || object_end > array_end) {
+            return false;
+        }
+
+        const size_t object_len = (size_t)(object_end - cursor + 1);
+        if (object_len >= LOGGER_QUEUE_ENTRY_JSON_MAX || queue->session_count >= LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
+            return false;
+        }
+
+        char object_json[LOGGER_QUEUE_ENTRY_JSON_MAX + 1u];
+        memcpy(object_json, cursor, object_len);
+        object_json[object_len] = '\0';
+
+        logger_upload_queue_entry_t entry;
+        if (!logger_parse_queue_entry_json(object_json, &entry) ||
+            logger_upload_queue_find_by_session_id(queue, entry.session_id) != NULL) {
+            return false;
+        }
+
+        queue->sessions[queue->session_count++] = entry;
+        cursor = object_end + 1;
+    }
+
+    logger_upload_queue_sort(queue);
+    return true;
 }
 
 bool logger_upload_queue_scan(
@@ -436,7 +749,7 @@ bool logger_upload_queue_scan(
 
     logger_storage_status_t storage;
     (void)logger_storage_refresh(&storage);
-    if (!storage.mounted || !storage.writable) {
+    if (!storage.mounted) {
         return false;
     }
 
@@ -537,61 +850,50 @@ bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
     }
 
     bool ok = true;
-    UINT written = 0u;
-    const char *prefix = "{\"schema_version\":1,\"updated_at_utc\":";
-    ok = ok && f_write(&file, prefix, strlen(prefix), &written) == FR_OK && written == strlen(prefix);
-    if (ok) {
-        char escaped[96];
-        if (logger_string_present(queue->updated_at_utc)) {
-            logger_json_escape_into(escaped, sizeof(escaped), queue->updated_at_utc);
-            char buf[128];
-            const int n = snprintf(buf, sizeof(buf), "\"%s\"", escaped);
-            ok = ok && n > 0 && (size_t)n < sizeof(buf) &&
-                f_write(&file, buf, (UINT)n, &written) == FR_OK && written == (UINT)n;
-        } else {
-            ok = ok && f_write(&file, "null", 4u, &written) == FR_OK && written == 4u;
-        }
-    }
-    static const char sessions_prefix[] = ",\"sessions\":[";
-    ok = ok && f_write(&file, sessions_prefix, sizeof(sessions_prefix) - 1u, &written) == FR_OK && written == (sizeof(sessions_prefix) - 1u);
+    ok = ok && logger_file_write_cstr(&file, "{\"schema_version\":1,\"updated_at_utc\":");
+    ok = ok && logger_file_write_json_string_or_null(&file, queue->updated_at_utc);
+    ok = ok && logger_file_write_cstr(&file, ",\"sessions\":[");
 
     for (size_t i = 0u; ok && i < queue->session_count; ++i) {
         const logger_upload_queue_entry_t *entry = &queue->sessions[i];
-        char s_session_id[80], s_study_day[48], s_dir_name[128], s_start[96], s_end[96], s_sha[96], s_status[64];
-        char s_last_attempt[96], s_last_failure[96], s_verified[96], s_receipt[196];
-        logger_json_escape_into(s_session_id, sizeof(s_session_id), entry->session_id);
-        logger_json_escape_into(s_study_day, sizeof(s_study_day), entry->study_day_local);
-        logger_json_escape_into(s_dir_name, sizeof(s_dir_name), entry->dir_name);
-        logger_json_escape_into(s_start, sizeof(s_start), entry->session_start_utc);
-        logger_json_escape_into(s_end, sizeof(s_end), entry->session_end_utc);
-        logger_json_escape_into(s_sha, sizeof(s_sha), entry->bundle_sha256);
-        logger_json_escape_into(s_status, sizeof(s_status), entry->status);
-        logger_json_escape_into(s_last_attempt, sizeof(s_last_attempt), entry->last_attempt_utc);
-        logger_json_escape_into(s_last_failure, sizeof(s_last_failure), entry->last_failure_class);
-        logger_json_escape_into(s_verified, sizeof(s_verified), entry->verified_upload_utc);
-        logger_json_escape_into(s_receipt, sizeof(s_receipt), entry->receipt_id);
+        char number_buf[32];
 
-        char entry_buf[1024];
-        const int n = snprintf(
-            entry_buf,
-            sizeof(entry_buf),
-            "%s{\"session_id\":\"%s\",\"study_day_local\":\"%s\",\"dir_name\":\"%s\",\"session_start_utc\":\"%s\",\"session_end_utc\":\"%s\",\"bundle_sha256\":\"%s\",\"bundle_size_bytes\":%llu,\"quarantined\":%s,\"status\":\"%s\",\"attempt_count\":%lu,\"last_attempt_utc\":null,\"last_failure_class\":null,\"verified_upload_utc\":null,\"receipt_id\":null}",
-            i == 0u ? "" : ",",
-            s_session_id,
-            s_study_day,
-            s_dir_name,
-            s_start,
-            s_end,
-            s_sha,
-            (unsigned long long)entry->bundle_size_bytes,
-            entry->quarantined ? "true" : "false",
-            s_status,
-            (unsigned long)entry->attempt_count);
-        ok = ok && n > 0 && (size_t)n < sizeof(entry_buf) &&
-            f_write(&file, entry_buf, (UINT)n, &written) == FR_OK && written == (UINT)n;
+        ok = ok && logger_file_write_cstr(&file, i == 0u ? "{" : ",{");
+
+        ok = ok && logger_file_write_cstr(&file, "\"session_id\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->session_id);
+        ok = ok && logger_file_write_cstr(&file, ",\"study_day_local\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->study_day_local);
+        ok = ok && logger_file_write_cstr(&file, ",\"dir_name\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->dir_name);
+        ok = ok && logger_file_write_cstr(&file, ",\"session_start_utc\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->session_start_utc);
+        ok = ok && logger_file_write_cstr(&file, ",\"session_end_utc\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->session_end_utc);
+        ok = ok && logger_file_write_cstr(&file, ",\"bundle_sha256\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->bundle_sha256);
+        ok = ok && logger_file_write_cstr(&file, ",\"bundle_size_bytes\":");
+        const int bundle_n = snprintf(number_buf, sizeof(number_buf), "%llu", (unsigned long long)entry->bundle_size_bytes);
+        ok = ok && bundle_n > 0 && (size_t)bundle_n < sizeof(number_buf) && logger_file_write_all(&file, number_buf, (size_t)bundle_n);
+        ok = ok && logger_file_write_cstr(&file, ",\"quarantined\":");
+        ok = ok && logger_file_write_cstr(&file, entry->quarantined ? "true" : "false");
+        ok = ok && logger_file_write_cstr(&file, ",\"status\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->status);
+        ok = ok && logger_file_write_cstr(&file, ",\"attempt_count\":");
+        const int attempt_n = snprintf(number_buf, sizeof(number_buf), "%lu", (unsigned long)entry->attempt_count);
+        ok = ok && attempt_n > 0 && (size_t)attempt_n < sizeof(number_buf) && logger_file_write_all(&file, number_buf, (size_t)attempt_n);
+        ok = ok && logger_file_write_cstr(&file, ",\"last_attempt_utc\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->last_attempt_utc);
+        ok = ok && logger_file_write_cstr(&file, ",\"last_failure_class\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->last_failure_class);
+        ok = ok && logger_file_write_cstr(&file, ",\"verified_upload_utc\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->verified_upload_utc);
+        ok = ok && logger_file_write_cstr(&file, ",\"receipt_id\":");
+        ok = ok && logger_file_write_json_string_or_null(&file, entry->receipt_id);
+        ok = ok && logger_file_write_cstr(&file, "}");
     }
 
-    ok = ok && f_write(&file, "]}", 2u, &written) == FR_OK && written == 2u;
+    ok = ok && logger_file_write_cstr(&file, "]}");
     const FRESULT sync_fr = ok ? f_sync(&file) : FR_INT_ERR;
     const FRESULT close_fr = f_close(&file);
     if (!ok || sync_fr != FR_OK || close_fr != FR_OK) {
@@ -611,17 +913,69 @@ bool logger_upload_queue_refresh_file(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null,
     logger_upload_queue_summary_t *summary_out) {
-    logger_upload_queue_t queue;
-    const bool scanned = logger_upload_queue_scan(&queue, system_log, updated_at_utc_or_null);
-    if (summary_out != NULL) {
-        if (scanned) {
-            logger_upload_queue_compute_summary(&queue, summary_out);
-        } else {
+    logger_upload_queue_t scanned;
+    if (!logger_upload_queue_scan(&scanned, system_log, updated_at_utc_or_null)) {
+        if (summary_out != NULL) {
             logger_upload_queue_summary_init(summary_out);
         }
-    }
-    if (!scanned) {
         return false;
     }
-    return logger_upload_queue_write(&queue);
+
+    logger_upload_queue_t previous;
+    logger_upload_queue_init(&previous);
+    const bool queue_file_present = logger_storage_file_exists(LOGGER_QUEUE_PATH);
+    const bool loaded_previous = logger_upload_queue_load(&previous);
+    if (!loaded_previous && queue_file_present) {
+        logger_log_queue_rebuilt(system_log, updated_at_utc_or_null, "load_failed");
+    }
+
+    logger_upload_queue_t merged;
+    logger_upload_queue_init(&merged);
+    logger_copy_string(merged.updated_at_utc, sizeof(merged.updated_at_utc), updated_at_utc_or_null);
+
+    bool previous_seen[LOGGER_UPLOAD_QUEUE_MAX_SESSIONS];
+    memset(previous_seen, 0, sizeof(previous_seen));
+
+    for (size_t i = 0u; i < scanned.session_count; ++i) {
+        logger_upload_queue_entry_t entry = scanned.sessions[i];
+        if (loaded_previous) {
+            for (size_t j = 0u; j < previous.session_count; ++j) {
+                if (strcmp(previous.sessions[j].session_id, entry.session_id) == 0) {
+                    previous_seen[j] = true;
+                    logger_queue_copy_mutable_fields(&entry, &previous.sessions[j]);
+                    if (strcmp(entry.status, "uploading") == 0) {
+                        logger_copy_string(entry.status, sizeof(entry.status), "failed");
+                        logger_copy_string(entry.last_failure_class, sizeof(entry.last_failure_class), "interrupted");
+                        logger_log_upload_interrupted(system_log, updated_at_utc_or_null, &entry);
+                    }
+                    break;
+                }
+            }
+        }
+        if (merged.session_count < LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
+            merged.sessions[merged.session_count++] = entry;
+        }
+    }
+
+    if (loaded_previous) {
+        for (size_t i = 0u; i < previous.session_count; ++i) {
+            if (previous_seen[i]) {
+                continue;
+            }
+            if (logger_queue_entry_dir_exists(&previous.sessions[i])) {
+                logger_log_local_corrupt(system_log,
+                                         updated_at_utc_or_null,
+                                         previous.sessions[i].dir_name,
+                                         "queue_entry_unreconciled");
+            } else {
+                logger_log_queue_missing_local(system_log, updated_at_utc_or_null, &previous.sessions[i]);
+            }
+        }
+    }
+
+    logger_upload_queue_sort(&merged);
+    if (summary_out != NULL) {
+        logger_upload_queue_compute_summary(&merged, summary_out);
+    }
+    return logger_upload_queue_write(&merged);
 }
