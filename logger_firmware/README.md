@@ -1,14 +1,25 @@
 # logger_firmware
 
 Standalone pico-sdk/C firmware tree for the RP2-2 logger appliance.
+Its goal is to automatically (after configuration) and independently run,
+collect Polar data, and then upload to a server.
 
-This directory is the home for the **appliance firmware** described by:
+It is more or less a state machine going through:
 
-- `docs/specs/logger_firmware_v1.md`
-- `docs/specs/logger_runtime_architecture_v1.md`
-- `docs/specs/logger_data_contract_v1.md`
-- `docs/specs/logger_host_interfaces_v1.md`
-- `docs/specs/logger_update_architecture.md`
+1. `BOOT`
+2. `SERVICE`
+3. `LOG_WAIT_H10`
+4. `LOG_CONNECTING`
+5. `LOG_SECURING`
+6. `LOG_STARTING_STREAM`
+7. `LOG_STREAMING`
+8. `LOG_STOPPING`
+9. `UPLOAD_PREP`
+10. `UPLOAD_RUNNING`
+11. `IDLE_WAITING_FOR_CHARGER`
+12. `IDLE_UPLOAD_COMPLETE`
+
+It is currently very simple and only uses Pico SDK and the Polar Logger SDK—no RTOS or fancy stuff going on.
 
 It is intentionally separate from:
 
@@ -16,18 +27,6 @@ It is intentionally separate from:
 - `polar_sdk/mpy/` — MicroPython binding layer
 - `examples/pico_sdk/` — isolation probes and experiments
 - `firmware/` — current MicroPython board/build support
-
-## Current scaffold
-
-The first slice here is deliberately small but real:
-
-- a standalone pico-sdk build entrypoint,
-- an RP2-2 appliance board-policy header,
-- a tiny top-level runtime state model using the logger spec state names,
-- a boot path that safely falls into `SERVICE` until provisioning/storage/clock policy is implemented,
-- a visible heartbeat using the wireless-chip LED.
-
-In other words: this tree now boots as a logger-appliance stub rather than as another probe.
 
 ## Build
 
@@ -47,32 +46,3 @@ Artifacts appear in:
 ```text
 build/logger_firmware_rp2_2/
 ```
-
-## Initial source layout
-
-```text
-logger_firmware/
-  CMakeLists.txt
-  README.md
-  boards/
-    rp2_2/
-      board_config.h
-  include/
-    logger/
-      app_main.h
-      app_state.h
-  src/
-    main.c
-    app_main.c
-    app_state.c
-```
-
-## Next implementation steps
-
-The next durable slices should follow `docs/specs/logger_runtime_architecture_v1.md` in this rough order:
-
-1. persistent config + provisioning gate,
-2. SD mount and fail-closed storage checks,
-3. session/journal append-only core,
-4. H10 scan/connect/security/start logic via `polar_sdk/core/`,
-5. upload queue and service CLI.

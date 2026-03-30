@@ -1,17 +1,28 @@
-# Archived design notes
+# Specs and design notes
 
-These documents are older design/spec material kept for implementation history and cross-checking.
+This directory now contains two kinds of material:
 
-They are **not** the primary user-facing documentation anymore.
+1. **Current custom logger firmware specs** for the pico-sdk/C study logger.
+2. **Older SDK/MicroPython design notes** kept for implementation history and cross-checking.
 
-For current usage, start with:
+For current SDK usage, still start with:
 
 - `docs/c_sdk/`
 - `docs/micropython/`
 
-Pre-beta policy still applies: API/schema details may change intentionally until first beta/stable freeze (`schema_version = 1` in `capabilities()`).
+For the new custom logger firmware work, start here.
 
-## Index
+## Current custom logger firmware specs
+
+- **Behavior/product spec:** [`logger_firmware_v1.md`](./logger_firmware_v1.md)
+- **Storage/upload/data contract:** [`logger_data_contract_v1.md`](./logger_data_contract_v1.md)
+- **Stable host/CLI JSON interfaces:** [`logger_host_interfaces_v1.md`](./logger_host_interfaces_v1.md)
+- **Runtime architecture and state machine:** [`logger_runtime_architecture_v1.md`](./logger_runtime_architecture_v1.md)
+- **Long-term update path (SD-assisted first, OTA later):** [`logger_update_architecture.md`](./logger_update_architecture.md)
+
+## Older SDK/MicroPython design notes
+
+These documents are retained mainly as historical design material.
 
 - **Polar SDK core + MicroPython module (rp2 + BTstack):** [`micropython_polar_sdk_driver.md`](./micropython_polar_sdk_driver.md)
 - **API design draft (C + MicroPython):** [`polar_sdk_api_design.md`](./polar_sdk_api_design.md)

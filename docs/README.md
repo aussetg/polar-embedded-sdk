@@ -44,7 +44,7 @@ If you’re working on transport/discovery/streaming behavior, read in this orde
 - [`sdk_overview.md`](./sdk_overview.md) — choose between the C SDK and the MicroPython SDK
 - [`c_sdk/`](./c_sdk/) — C core architecture, API status, helper-module guide, and integration cookbook
 - [`micropython/`](./micropython/) — practical user documentation for the `polar_sdk` MicroPython module and research workflows
-- [`specs/`](./specs/) — design notes and in-progress spec material
+- [`specs/`](./specs/) — current custom logger firmware specs, update architecture notes, and older SDK design material
 - [`reference/`](./reference/) — protocol facts (Polar + BLE standard services)
 - [`howto/`](./howto/) — build + validation workflows
 - [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md) — curated issues and mitigations
