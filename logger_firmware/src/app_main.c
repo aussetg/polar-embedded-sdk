@@ -10,6 +10,7 @@
 
 #include "board_config.h"
 #include "logger/queue.h"
+#include "logger/upload.h"
 
 static bool logger_timezone_is_utc_like(const char *timezone) {
     return timezone != NULL &&
@@ -155,6 +156,108 @@ static void logger_app_transition_via_stopping(
     uint32_t now_ms) {
     logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_LOG_STOPPING, reason, now_ms);
     app->runtime.planned_next_state = next_state;
+}
+
+static bool logger_app_deadline_reached(uint32_t now_ms, uint32_t deadline_ms) {
+    return (int32_t)(now_ms - deadline_ms) >= 0;
+}
+
+static void logger_app_reset_upload_pass(logger_app_t *app) {
+    app->upload_pass_count = 0u;
+    app->upload_pass_next_index = 0u;
+    app->upload_pass_had_success = false;
+}
+
+static void logger_app_begin_upload_flow(logger_app_t *app, bool manual_off_charger) {
+    app->upload_manual_off_charger = manual_off_charger;
+    app->upload_next_attempt_mono_ms = 0u;
+    app->upload_retry_backoff_index = 0u;
+    logger_app_reset_upload_pass(app);
+}
+
+static void logger_app_begin_upload_after_stop(
+    logger_app_t *app,
+    bool manual_off_charger,
+    const char *reason,
+    uint32_t now_ms) {
+    logger_app_begin_upload_flow(app, manual_off_charger);
+    logger_app_transition_via_stopping(app, LOGGER_RUNTIME_UPLOAD_PREP, reason, now_ms);
+}
+
+static void logger_app_transition_idle_waiting_for_charger(
+    logger_app_t *app,
+    bool manual_off_charger,
+    const char *reason,
+    uint32_t now_ms) {
+    app->upload_manual_off_charger = manual_off_charger;
+    app->upload_next_attempt_mono_ms = 0u;
+    app->upload_retry_backoff_index = 0u;
+    app->idle_resume_on_unplug = false;
+    logger_app_reset_upload_pass(app);
+    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER, reason, now_ms);
+}
+
+static void logger_app_transition_idle_upload_complete(
+    logger_app_t *app,
+    bool resume_on_unplug,
+    const char *reason,
+    uint32_t now_ms) {
+    app->upload_next_attempt_mono_ms = 0u;
+    app->upload_retry_backoff_index = 0u;
+    app->idle_resume_on_unplug = resume_on_unplug;
+    logger_app_reset_upload_pass(app);
+    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE, reason, now_ms);
+}
+
+static bool logger_app_prepare_upload_pass(
+    logger_app_t *app,
+    logger_upload_queue_summary_t *summary_out) {
+    logger_upload_queue_t queue;
+    logger_upload_queue_init(&queue);
+    logger_upload_queue_summary_init(summary_out);
+    app->upload_pass_count = 0u;
+    app->upload_pass_next_index = 0u;
+
+    if (!logger_upload_queue_load(&queue)) {
+        return false;
+    }
+    logger_upload_queue_compute_summary(&queue, summary_out);
+
+    for (size_t i = 0u; i < queue.session_count; ++i) {
+        const logger_upload_queue_entry_t *entry = &queue.sessions[i];
+        if (strcmp(entry->status, "pending") != 0 && strcmp(entry->status, "failed") != 0) {
+            continue;
+        }
+        if (app->upload_pass_count >= LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
+            break;
+        }
+        memcpy(app->upload_pass_session_ids[app->upload_pass_count],
+               entry->session_id,
+               sizeof(app->upload_pass_session_ids[app->upload_pass_count]));
+        app->upload_pass_count += 1u;
+    }
+    return true;
+}
+
+static void logger_app_schedule_upload_retry(logger_app_t *app, uint32_t now_ms) {
+    static const uint32_t delays_ms[] = {
+        30000u,
+        60000u,
+        300000u,
+        900000u,
+    };
+    const uint8_t max_index = (uint8_t)(sizeof(delays_ms) / sizeof(delays_ms[0]) - 1u);
+    uint8_t delay_index = app->upload_pass_had_success ? 0u : app->upload_retry_backoff_index;
+    if (delay_index > max_index) {
+        delay_index = max_index;
+    }
+    app->upload_next_attempt_mono_ms = now_ms + delays_ms[delay_index];
+    if (app->upload_pass_had_success) {
+        app->upload_retry_backoff_index = 1u;
+    } else if (app->upload_retry_backoff_index < max_index) {
+        app->upload_retry_backoff_index += 1u;
+    }
+    logger_app_reset_upload_pass(app);
 }
 
 static bool logger_app_indicator_led_should_be_on(const logger_app_t *app, uint32_t now_ms) {
@@ -311,7 +414,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
             return;
         }
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_LOW_BATTERY_BLOCKED_START);
-        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER, "low_battery_blocked_start", now_ms);
+        logger_app_transition_idle_waiting_for_charger(app, false, "low_battery_blocked_start", now_ms);
         return;
     }
 
@@ -325,7 +428,8 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
             logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_recovery_failed", now_ms);
             return;
         }
-        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE, "charger_overnight_window", now_ms);
+        logger_app_begin_upload_flow(app, false);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_UPLOAD_PREP, "charger_overnight_window", now_ms);
         return;
     }
 
@@ -365,9 +469,14 @@ static void logger_step_log_wait_h10(logger_app_t *app, uint32_t now_ms) {
         return;
     }
 
+    if (logger_app_should_enter_overnight_idle(app)) {
+        logger_app_begin_upload_after_stop(app, false, "charger_overnight_window", now_ms);
+        return;
+    }
+
     if (logger_battery_low_start_blocked(&app->battery)) {
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_LOW_BATTERY_BLOCKED_START);
-        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER, "battery_dropped_below_start_threshold", now_ms);
+        logger_app_transition_via_stopping(app, LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER, "battery_dropped_below_start_threshold", now_ms);
         return;
     }
 
@@ -405,7 +514,17 @@ static void logger_step_log_wait_h10(logger_app_t *app, uint32_t now_ms) {
             printf("[logger] marker ignored: no active session/span\n");
         }
     } else if (event == LOGGER_BUTTON_EVENT_LONG_PRESS) {
-        logger_app_transition_via_stopping(app, LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE, "manual_long_press", now_ms);
+        if (app->battery.vbus_present || logger_battery_off_charger_upload_allowed(&app->battery)) {
+            logger_app_begin_upload_after_stop(app,
+                                               !app->battery.vbus_present,
+                                               "manual_long_press",
+                                               now_ms);
+        } else {
+            logger_app_transition_via_stopping(app,
+                                               LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER,
+                                               "manual_long_press_wait_for_charger",
+                                               now_ms);
+        }
     }
 }
 
@@ -430,10 +549,164 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
     logger_app_state_transition(&app->runtime, app->runtime.planned_next_state, "log_stopping_complete", now_ms);
 }
 
-static void logger_step_idle_common(logger_app_t *app, uint32_t now_ms) {
+static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
+    logger_app_refresh_observations(app, now_ms);
+    logger_service_cli_poll(&app->cli, app, now_ms);
+
+    const logger_fault_code_t storage_fault = logger_app_storage_fault_code(&app->storage);
+    if (storage_fault != LOGGER_FAULT_NONE) {
+        logger_app_maybe_latch_new_fault(app, storage_fault);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "upload_storage_fault", now_ms);
+        return;
+    }
+
+    if (!app->upload_manual_off_charger && !app->battery.vbus_present) {
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_LOG_WAIT_H10, "upload_usb_removed", now_ms);
+        return;
+    }
+    if (app->upload_manual_off_charger && !logger_battery_off_charger_upload_allowed(&app->battery)) {
+        logger_app_transition_idle_waiting_for_charger(app, true, "manual_upload_battery_too_low", now_ms);
+        return;
+    }
+
+    logger_upload_queue_summary_t summary;
+    app->upload_pass_had_success = false;
+    if (!logger_app_prepare_upload_pass(app, &summary)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "upload_queue_load_failed", now_ms);
+        return;
+    }
+    (void)summary;
+
+    if (app->upload_pass_count == 0u) {
+        logger_app_transition_idle_upload_complete(app,
+                                                   app->battery.vbus_present,
+                                                   "upload_queue_empty",
+                                                   now_ms);
+        return;
+    }
+
+    app->upload_next_attempt_mono_ms = 0u;
+    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_UPLOAD_RUNNING, "upload_ready", now_ms);
+}
+
+static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
+    logger_app_refresh_observations(app, now_ms);
+    logger_service_cli_poll(&app->cli, app, now_ms);
+
+    const logger_fault_code_t storage_fault = logger_app_storage_fault_code(&app->storage);
+    if (storage_fault != LOGGER_FAULT_NONE) {
+        logger_app_maybe_latch_new_fault(app, storage_fault);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "upload_storage_fault", now_ms);
+        return;
+    }
+
+    if (!app->upload_manual_off_charger && !app->battery.vbus_present) {
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_LOG_WAIT_H10, "upload_usb_removed", now_ms);
+        return;
+    }
+    if (app->upload_manual_off_charger && !logger_battery_off_charger_upload_allowed(&app->battery)) {
+        logger_app_transition_idle_waiting_for_charger(app, true, "manual_upload_battery_too_low", now_ms);
+        return;
+    }
+
+    if (app->upload_next_attempt_mono_ms != 0u) {
+        if (!logger_app_deadline_reached(now_ms, app->upload_next_attempt_mono_ms)) {
+            return;
+        }
+        app->upload_next_attempt_mono_ms = 0u;
+    }
+
+    if (app->upload_pass_count == 0u) {
+        logger_upload_queue_summary_t summary;
+        if (!logger_app_prepare_upload_pass(app, &summary)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "upload_queue_load_failed", now_ms);
+            return;
+        }
+        (void)summary;
+        if (app->upload_pass_count == 0u) {
+            logger_app_transition_idle_upload_complete(app,
+                                                       app->battery.vbus_present,
+                                                       "upload_queue_empty",
+                                                       now_ms);
+            return;
+        }
+    }
+
+    if (app->upload_pass_next_index >= app->upload_pass_count) {
+        const bool pass_had_success = app->upload_pass_had_success;
+        logger_upload_queue_summary_t summary;
+        if (!logger_app_prepare_upload_pass(app, &summary)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "upload_queue_reload_failed", now_ms);
+            return;
+        }
+        (void)summary;
+        if (app->upload_pass_count == 0u) {
+            logger_app_transition_idle_upload_complete(app,
+                                                       app->battery.vbus_present,
+                                                       "upload_queue_complete",
+                                                       now_ms);
+            return;
+        }
+        app->upload_pass_had_success = pass_had_success;
+        if (app->upload_manual_off_charger) {
+            logger_app_transition_idle_waiting_for_charger(app, true, "manual_upload_pass_complete", now_ms);
+            return;
+        }
+        logger_app_schedule_upload_retry(app, now_ms);
+        return;
+    }
+
+    const char *session_id = app->upload_pass_session_ids[app->upload_pass_next_index];
+    logger_upload_process_result_t result;
+    (void)logger_upload_process_session(
+        &app->system_log,
+        &app->persisted.config,
+        app->hardware_id,
+        app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+        session_id,
+        &result);
+
+    if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED) {
+        app->upload_pass_had_success = true;
+    } else if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE);
+    } else if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
+        logger_app_transition_idle_upload_complete(app,
+                                                   app->battery.vbus_present,
+                                                   "upload_not_attempted",
+                                                   now_ms);
+        return;
+    }
+
+    app->upload_pass_next_index += 1u;
+}
+
+static void logger_step_idle_waiting_for_charger(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
     logger_service_cli_poll(&app->cli, app, now_ms);
     (void)logger_button_poll(&app->button, now_ms);
+
+    if (app->battery.vbus_present) {
+        logger_app_begin_upload_flow(app, false);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_UPLOAD_PREP, "charger_attached", now_ms);
+    }
+}
+
+static void logger_step_idle_upload_complete(logger_app_t *app, uint32_t now_ms) {
+    logger_app_refresh_observations(app, now_ms);
+    logger_service_cli_poll(&app->cli, app, now_ms);
+    (void)logger_button_poll(&app->button, now_ms);
+
+    if (!app->idle_resume_on_unplug && app->battery.vbus_present) {
+        app->idle_resume_on_unplug = true;
+    }
+    if (app->idle_resume_on_unplug && !app->battery.vbus_present) {
+        app->upload_manual_off_charger = false;
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_LOG_WAIT_H10, "usb_removed_resume_logging", now_ms);
+    }
 }
 
 void logger_app_step(logger_app_t *app, uint32_t now_ms) {
@@ -457,16 +730,19 @@ void logger_app_step(logger_app_t *app, uint32_t now_ms) {
             break;
 
         case LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER:
+            logger_step_idle_waiting_for_charger(app, now_ms);
+            break;
+
         case LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE:
-            logger_step_idle_common(app, now_ms);
+            logger_step_idle_upload_complete(app, now_ms);
             break;
 
         case LOGGER_RUNTIME_UPLOAD_PREP:
-            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE, "upload_not_implemented", now_ms);
+            logger_step_upload_prep(app, now_ms);
             break;
 
         case LOGGER_RUNTIME_UPLOAD_RUNNING:
-            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE, "upload_not_implemented", now_ms);
+            logger_step_upload_running(app, now_ms);
             break;
 
         default:

@@ -59,4 +59,12 @@ bool logger_upload_process_one(
     const char *now_utc_or_null,
     logger_upload_process_result_t *result);
 
+bool logger_upload_process_session(
+    logger_system_log_t *system_log,
+    const logger_config_t *config,
+    const char *hardware_id,
+    const char *now_utc_or_null,
+    const char *session_id,
+    logger_upload_process_result_t *result);
+
 #endif

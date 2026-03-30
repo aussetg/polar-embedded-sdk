@@ -732,6 +732,26 @@ static logger_upload_queue_entry_t *logger_upload_queue_find_next_eligible(logge
     return NULL;
 }
 
+static logger_upload_queue_entry_t *logger_upload_queue_find_eligible_session(
+    logger_upload_queue_t *queue,
+    const char *session_id_or_null) {
+    if (!logger_string_present(session_id_or_null)) {
+        return logger_upload_queue_find_next_eligible(queue);
+    }
+
+    for (size_t i = 0u; i < queue->session_count; ++i) {
+        logger_upload_queue_entry_t *entry = &queue->sessions[i];
+        if (strcmp(entry->session_id, session_id_or_null) != 0) {
+            continue;
+        }
+        if (strcmp(entry->status, "pending") == 0 || strcmp(entry->status, "failed") == 0) {
+            return entry;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
 static void logger_upload_append_event(
     logger_system_log_t *system_log,
     const char *now_utc_or_null,
@@ -884,11 +904,12 @@ bool logger_upload_net_test(
     return reachable;
 }
 
-bool logger_upload_process_one(
+static bool logger_upload_process_selected(
     logger_system_log_t *system_log,
     const logger_config_t *config,
     const char *hardware_id,
     const char *now_utc_or_null,
+    const char *target_session_id_or_null,
     logger_upload_process_result_t *result) {
     logger_upload_process_result_init(result);
 
@@ -923,10 +944,15 @@ bool logger_upload_process_one(
         return false;
     }
 
-    logger_upload_queue_entry_t *entry = logger_upload_queue_find_next_eligible(&queue);
+    logger_upload_queue_entry_t *entry = logger_upload_queue_find_eligible_session(&queue, target_session_id_or_null);
     if (entry == NULL) {
+        logger_copy_string(result->session_id, sizeof(result->session_id), target_session_id_or_null);
         result->code = LOGGER_UPLOAD_PROCESS_RESULT_NO_WORK;
-        logger_copy_string(result->message, sizeof(result->message), "no pending uploads");
+        logger_copy_string(result->message,
+                           sizeof(result->message),
+                           logger_string_present(target_session_id_or_null)
+                               ? "session is no longer eligible for upload"
+                               : "no pending uploads");
         return true;
     }
     logger_copy_string(result->session_id, sizeof(result->session_id), entry->session_id);
@@ -1153,7 +1179,7 @@ bool logger_upload_process_one(
         logger_copy_string(result->receipt_id, sizeof(result->receipt_id), entry->receipt_id);
         logger_copy_string(result->verified_upload_utc, sizeof(result->verified_upload_utc), entry->verified_upload_utc);
         snprintf(result->message, sizeof(result->message), "verified via %s", reply.deduplicated ? "deduplicated ack" : "server ack");
-        char extra[96];
+        char extra[160];
         snprintf(extra,
                  sizeof(extra),
                  "\"receipt_id\":\"%s\",\"deduplicated\":%s",
@@ -1196,4 +1222,33 @@ bool logger_upload_process_one(
                                    ? "\"failure_class\":\"min_firmware_rejected\""
                                    : "\"failure_class\":\"http_rejected\"");
     return result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE;
+}
+
+bool logger_upload_process_one(
+    logger_system_log_t *system_log,
+    const logger_config_t *config,
+    const char *hardware_id,
+    const char *now_utc_or_null,
+    logger_upload_process_result_t *result) {
+    return logger_upload_process_selected(system_log,
+                                          config,
+                                          hardware_id,
+                                          now_utc_or_null,
+                                          NULL,
+                                          result);
+}
+
+bool logger_upload_process_session(
+    logger_system_log_t *system_log,
+    const logger_config_t *config,
+    const char *hardware_id,
+    const char *now_utc_or_null,
+    const char *session_id,
+    logger_upload_process_result_t *result) {
+    return logger_upload_process_selected(system_log,
+                                          config,
+                                          hardware_id,
+                                          now_utc_or_null,
+                                          session_id,
+                                          result);
 }
