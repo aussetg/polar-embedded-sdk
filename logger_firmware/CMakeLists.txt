@@ -39,6 +39,7 @@ add_executable(logger_appliance
     src/clock.c
     src/config_store.c
     src/faults.c
+    src/h10.c
     src/identity.c
     src/json.c
     src/journal.c
@@ -50,6 +51,18 @@ add_executable(logger_appliance
     src/system_log.c
     src/upload.c
     src/upload_bundle.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_helpers.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_adv_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_dispatch.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_link.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_scan.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_sm.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_common.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_connect.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_runtime_context.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_sm_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_transport_adapter.c
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src/microtar.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ff.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ffunicode.c
@@ -59,6 +72,7 @@ target_include_directories(logger_appliance PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/boards/rp2_2
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/include
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/jsmn
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src
@@ -67,6 +81,8 @@ target_include_directories(logger_appliance PRIVATE
 target_link_libraries(logger_appliance PRIVATE
     pico_stdlib
     pico_cyw43_arch_lwip_poll
+    pico_btstack_ble
+    pico_btstack_cyw43
     pico_rand
     pico_sha256
     pico_unique_id

@@ -9,6 +9,7 @@
 #include "logger/button.h"
 #include "logger/clock.h"
 #include "logger/config_store.h"
+#include "logger/h10.h"
 #include "logger/identity.h"
 #include "logger/queue.h"
 #include "logger/session.h"
@@ -23,6 +24,7 @@ typedef struct logger_app {
     logger_battery_status_t battery;
     logger_clock_status_t clock;
     logger_persisted_state_t persisted;
+    logger_h10_state_t h10;
     logger_storage_status_t storage;
     logger_system_log_t system_log;
     logger_session_state_t session;

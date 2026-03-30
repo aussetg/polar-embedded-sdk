@@ -295,7 +295,15 @@ static void logger_write_status_payload(const logger_app_t *app) {
 
     fputs(",\"h10\":{\"bound_address\":", stdout);
     logger_json_write_string_or_null(app->persisted.config.bound_h10_address);
-    fputs(",\"connected\":false,\"encrypted\":false,\"bonded\":false,\"last_seen_address\":null,\"battery_percent\":null}", stdout);
+    fputs(",\"connected\":", stdout);
+    fputs(app->h10.connected ? "true" : "false", stdout);
+    fputs(",\"encrypted\":", stdout);
+    fputs(app->h10.encrypted ? "true" : "false", stdout);
+    fputs(",\"bonded\":", stdout);
+    fputs(app->h10.bonded ? "true" : "false", stdout);
+    fputs(",\"last_seen_address\":", stdout);
+    logger_json_write_string_or_null(app->h10.last_seen_address[0] != '\0' ? app->h10.last_seen_address : NULL);
+    fputs(",\"battery_percent\":null}", stdout);
 
     fputs(",\"session\":{\"active\":", stdout);
     fputs(app->session.active ? "true" : "false", stdout);

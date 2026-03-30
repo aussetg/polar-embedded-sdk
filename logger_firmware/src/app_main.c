@@ -78,6 +78,7 @@ static void logger_app_refresh_observations(logger_app_t *app, uint32_t now_ms) 
     logger_battery_sample(&app->battery);
     logger_clock_sample(&app->clock);
     (void)logger_storage_refresh(&app->storage);
+    (void)logger_h10_set_bound_address(&app->h10, app->persisted.config.bound_h10_address);
 
     app->runtime.charger_present = app->battery.vbus_present;
     app->runtime.wall_clock_valid = app->clock.valid;
@@ -260,6 +261,22 @@ static void logger_app_schedule_upload_retry(logger_app_t *app, uint32_t now_ms)
     logger_app_reset_upload_pass(app);
 }
 
+static logger_runtime_state_t logger_app_h10_target_runtime_state(const logger_app_t *app) {
+    switch (app->h10.phase) {
+        case LOGGER_H10_PHASE_CONNECTING:
+            return LOGGER_RUNTIME_LOG_CONNECTING;
+        case LOGGER_H10_PHASE_SECURING:
+            return LOGGER_RUNTIME_LOG_SECURING;
+        case LOGGER_H10_PHASE_READY:
+            return LOGGER_RUNTIME_LOG_STARTING_STREAM;
+        case LOGGER_H10_PHASE_OFF:
+        case LOGGER_H10_PHASE_WAITING:
+        case LOGGER_H10_PHASE_SCANNING:
+        default:
+            return LOGGER_RUNTIME_LOG_WAIT_H10;
+    }
+}
+
 static bool logger_app_indicator_led_should_be_on(const logger_app_t *app, uint32_t now_ms) {
     const logger_fault_code_t fault = app->persisted.current_fault_code;
     if (fault != LOGGER_FAULT_NONE) {
@@ -322,6 +339,7 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms, logger_boot_gesture_t b
 
     logger_battery_init();
     logger_clock_init();
+    logger_h10_init(&app->h10);
     logger_storage_init();
     logger_button_init(&app->button, now_ms);
     logger_service_cli_init(&app->cli);
@@ -444,12 +462,15 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_service(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
     (void)logger_button_poll(&app->button, now_ms);
 }
 
-static void logger_step_log_wait_h10(logger_app_t *app, uint32_t now_ms) {
+static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    logger_h10_set_enabled(&app->h10, true);
+    logger_h10_poll(&app->h10, now_ms);
     logger_service_cli_poll(&app->cli, app, now_ms);
 
     if (app->session.active &&
@@ -525,10 +546,19 @@ static void logger_step_log_wait_h10(logger_app_t *app, uint32_t now_ms) {
                                                "manual_long_press_wait_for_charger",
                                                now_ms);
         }
+        return;
+    }
+
+    const logger_runtime_state_t target_state = logger_app_h10_target_runtime_state(app);
+    if (target_state != app->runtime.current_state) {
+        logger_app_state_transition(&app->runtime, target_state, "h10_link_phase", now_ms);
     }
 }
 
 static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
+    if (!logger_runtime_state_is_logging(app->runtime.planned_next_state)) {
+        logger_h10_set_enabled(&app->h10, false);
+    }
     if (app->session.active) {
         if (!logger_session_stop_debug(
                 &app->session,
@@ -551,6 +581,7 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
 
     const logger_fault_code_t storage_fault = logger_app_storage_fault_code(&app->storage);
@@ -592,6 +623,7 @@ static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
 
     const logger_fault_code_t storage_fault = logger_app_storage_fault_code(&app->storage);
@@ -686,6 +718,7 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_idle_waiting_for_charger(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
     (void)logger_button_poll(&app->button, now_ms);
 
@@ -697,6 +730,7 @@ static void logger_step_idle_waiting_for_charger(logger_app_t *app, uint32_t now
 
 static void logger_step_idle_upload_complete(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
     (void)logger_button_poll(&app->button, now_ms);
 
@@ -722,7 +756,10 @@ void logger_app_step(logger_app_t *app, uint32_t now_ms) {
             break;
 
         case LOGGER_RUNTIME_LOG_WAIT_H10:
-            logger_step_log_wait_h10(app, now_ms);
+        case LOGGER_RUNTIME_LOG_CONNECTING:
+        case LOGGER_RUNTIME_LOG_SECURING:
+        case LOGGER_RUNTIME_LOG_STARTING_STREAM:
+            logger_step_logging_link_state(app, now_ms);
             break;
 
         case LOGGER_RUNTIME_LOG_STOPPING:
