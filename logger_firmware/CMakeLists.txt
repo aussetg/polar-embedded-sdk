@@ -40,6 +40,7 @@ add_executable(logger_appliance
     src/config_store.c
     src/faults.c
     src/identity.c
+    src/json.c
     src/journal.c
     src/queue.c
     src/session.c
@@ -47,20 +48,27 @@ add_executable(logger_appliance
     src/sha256.c
     src/storage.c
     src/system_log.c
+    src/upload.c
+    src/upload_bundle.c
+    ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src/microtar.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ff.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ffunicode.c
 )
 
 target_include_directories(logger_appliance PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
+    ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/boards/rp2_2
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source
+    ${CMAKE_CURRENT_LIST_DIR}/../vendors/jsmn
+    ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src
 )
 
 target_link_libraries(logger_appliance PRIVATE
     pico_stdlib
-    pico_cyw43_arch_none
+    pico_cyw43_arch_lwip_poll
     pico_rand
+    pico_sha256
     pico_unique_id
     hardware_adc
     hardware_flash

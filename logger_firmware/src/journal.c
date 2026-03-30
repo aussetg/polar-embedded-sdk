@@ -1,13 +1,12 @@
 #include "logger/journal.h"
 
 #include <ctype.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "ff.h"
 
 #include "logger/clock.h"
+#include "logger/json.h"
 #include "logger/storage.h"
 
 #define LOGGER_JOURNAL_FILE_HEADER_BYTES 64u
@@ -15,6 +14,7 @@
 #define LOGGER_JOURNAL_FLAG_JSON 0x00000001u
 #define LOGGER_JOURNAL_FLAG_BINARY 0x00000002u
 #define LOGGER_JOURNAL_SCAN_PAYLOAD_CAPTURE_MAX 1023u
+#define LOGGER_JOURNAL_JSON_TOKEN_MAX 64u
 
 static uint32_t logger_crc32_ieee(const uint8_t *data, size_t len) {
     uint32_t crc = 0xffffffffu;
@@ -118,107 +118,6 @@ static void logger_copy_string(char *dst, size_t dst_len, const char *src) {
     dst[i] = '\0';
 }
 
-static const char *logger_json_find_key(const char *json, const char *key) {
-    if (json == NULL || key == NULL) {
-        return NULL;
-    }
-    return strstr(json, key);
-}
-
-static bool logger_json_extract_string(const char *json, const char *key, char *out, size_t out_len) {
-    const char *start = logger_json_find_key(json, key);
-    if (start == NULL) {
-        return false;
-    }
-    start += strlen(key);
-    const char *end = strchr(start, '"');
-    if (end == NULL) {
-        return false;
-    }
-
-    size_t out_i = 0u;
-    for (const char *p = start; p < end && (out_i + 1u) < out_len; ++p) {
-        if (*p == '\\' && (p + 1) < end) {
-            ++p;
-            switch (*p) {
-                case '\\':
-                case '"':
-                case '/':
-                    out[out_i++] = *p;
-                    break;
-                case 'b':
-                    out[out_i++] = '\b';
-                    break;
-                case 'f':
-                    out[out_i++] = '\f';
-                    break;
-                case 'n':
-                    out[out_i++] = '\n';
-                    break;
-                case 'r':
-                    out[out_i++] = '\r';
-                    break;
-                case 't':
-                    out[out_i++] = '\t';
-                    break;
-                default:
-                    return false;
-            }
-        } else {
-            out[out_i++] = *p;
-        }
-    }
-    out[out_i] = '\0';
-    return true;
-}
-
-static bool logger_json_extract_u32(const char *json, const char *key, uint32_t *value_out) {
-    const char *start = logger_json_find_key(json, key);
-    if (start == NULL || value_out == NULL) {
-        return false;
-    }
-    start += strlen(key);
-    char *end = NULL;
-    const unsigned long value = strtoul(start, &end, 10);
-    if (end == start) {
-        return false;
-    }
-    *value_out = (uint32_t)value;
-    return true;
-}
-
-static bool logger_json_extract_i64(const char *json, const char *key, int64_t *value_out) {
-    const char *start = logger_json_find_key(json, key);
-    if (start == NULL || value_out == NULL) {
-        return false;
-    }
-    start += strlen(key);
-    char *end = NULL;
-    const long long value = strtoll(start, &end, 10);
-    if (end == start) {
-        return false;
-    }
-    *value_out = (int64_t)value;
-    return true;
-}
-
-static bool logger_json_extract_bool(const char *json, const char *key, bool *value_out) {
-    const char *start = logger_json_find_key(json, key);
-    if (start == NULL || value_out == NULL) {
-        return false;
-    }
-    start += strlen(key);
-    if (strncmp(start, "true", 4u) == 0) {
-        *value_out = true;
-        return true;
-    }
-    if (strncmp(start, "false", 5u) == 0) {
-        *value_out = false;
-        return true;
-    }
-    return false;
-}
-
 static logger_journal_span_summary_t *logger_journal_find_span(
     logger_journal_scan_result_t *result,
     const char *span_id,
@@ -239,9 +138,12 @@ static logger_journal_span_summary_t *logger_journal_find_span(
     return NULL;
 }
 
-static void logger_journal_capture_utc(const char *json, char out[LOGGER_JOURNAL_UTC_MAX + 1]) {
+static void logger_journal_capture_utc(
+    const logger_json_doc_t *doc,
+    const jsmntok_t *object_tok,
+    char out[LOGGER_JOURNAL_UTC_MAX + 1]) {
     int64_t utc_ns = 0ll;
-    if (!logger_json_extract_i64(json, "\"utc_ns\":", &utc_ns) ||
+    if (!logger_json_object_get_int64(doc, object_tok, "utc_ns", &utc_ns) ||
         !logger_clock_format_utc_ns_rfc3339(utc_ns, out)) {
         out[0] = '\0';
     }
@@ -250,15 +152,24 @@ static void logger_journal_capture_utc(const char *json, char out[LOGGER_JOURNAL
 static void logger_journal_apply_json_record(
     logger_journal_scan_result_t *result,
     logger_journal_record_type_t record_type,
-    const char *json) {
+    const logger_json_doc_t *doc,
+    const jsmntok_t *root) {
     switch (record_type) {
         case LOGGER_JOURNAL_RECORD_SESSION_START: {
-            (void)logger_json_extract_string(json, "\"session_id\":\"", result->session_id, sizeof(result->session_id));
-            (void)logger_json_extract_string(json, "\"study_day_local\":\"", result->study_day_local, sizeof(result->study_day_local));
-            (void)logger_json_extract_string(json, "\"start_reason\":\"", result->session_start_reason, sizeof(result->session_start_reason));
-            logger_journal_capture_utc(json, result->session_start_utc);
+            (void)logger_json_object_copy_string(doc, root, "session_id", result->session_id, sizeof(result->session_id));
+            (void)logger_json_object_copy_string(doc,
+                                                 root,
+                                                 "study_day_local",
+                                                 result->study_day_local,
+                                                 sizeof(result->study_day_local));
+            (void)logger_json_object_copy_string(doc,
+                                                 root,
+                                                 "start_reason",
+                                                 result->session_start_reason,
+                                                 sizeof(result->session_start_reason));
+            logger_journal_capture_utc(doc, root, result->session_start_utc);
             char clock_state[16];
-            if (logger_json_extract_string(json, "\"clock_state\":\"", clock_state, sizeof(clock_state)) &&
+            if (logger_json_object_copy_string(doc, root, "clock_state", clock_state, sizeof(clock_state)) &&
                 strcmp(clock_state, "valid") != 0) {
                 result->quarantined = true;
                 result->quarantine_clock_invalid_at_start = true;
@@ -268,10 +179,10 @@ static void logger_journal_apply_json_record(
         case LOGGER_JOURNAL_RECORD_SPAN_START: {
             char span_id[LOGGER_JOURNAL_ID_HEX_LEN + 1];
             uint32_t span_index = result->span_count;
-            if (!logger_json_extract_string(json, "\"span_id\":\"", span_id, sizeof(span_id))) {
+            if (!logger_json_object_copy_string(doc, root, "span_id", span_id, sizeof(span_id))) {
                 break;
             }
-            (void)logger_json_extract_u32(json, "\"span_index_in_session\":", &span_index);
+            (void)logger_json_object_get_uint32(doc, root, "span_index_in_session", &span_index);
             logger_journal_span_summary_t *span = logger_journal_find_span(result, span_id, span_index);
             if (span == NULL) {
                 break;
@@ -279,8 +190,8 @@ static void logger_journal_apply_json_record(
             memset(span, 0, sizeof(*span));
             span->present = true;
             logger_copy_string(span->span_id, sizeof(span->span_id), span_id);
-            (void)logger_json_extract_string(json, "\"start_reason\":\"", span->start_reason, sizeof(span->start_reason));
-            logger_journal_capture_utc(json, span->start_utc);
+            (void)logger_json_object_copy_string(doc, root, "start_reason", span->start_reason, sizeof(span->start_reason));
+            logger_journal_capture_utc(doc, root, span->start_utc);
             result->active_span_open = true;
             result->active_span_index = span_index;
             logger_copy_string(result->active_span_id, sizeof(result->active_span_id), span_id);
@@ -291,7 +202,7 @@ static void logger_journal_apply_json_record(
         }
         case LOGGER_JOURNAL_RECORD_SPAN_END: {
             char span_id[LOGGER_JOURNAL_ID_HEX_LEN + 1];
-            if (!logger_json_extract_string(json, "\"span_id\":\"", span_id, sizeof(span_id))) {
+            if (!logger_json_object_copy_string(doc, root, "span_id", span_id, sizeof(span_id))) {
                 logger_copy_string(span_id, sizeof(span_id), result->active_span_id);
             }
             logger_journal_span_summary_t *span = logger_journal_find_span(result, span_id, result->active_span_index);
@@ -300,11 +211,11 @@ static void logger_journal_apply_json_record(
             }
             span->present = true;
             logger_copy_string(span->span_id, sizeof(span->span_id), span_id);
-            (void)logger_json_extract_string(json, "\"end_reason\":\"", span->end_reason, sizeof(span->end_reason));
-            (void)logger_json_extract_u32(json, "\"packet_count\":", &span->packet_count);
-            (void)logger_json_extract_u32(json, "\"first_seq_in_span\":", &span->first_seq_in_span);
-            (void)logger_json_extract_u32(json, "\"last_seq_in_span\":", &span->last_seq_in_span);
-            logger_journal_capture_utc(json, span->end_utc);
+            (void)logger_json_object_copy_string(doc, root, "end_reason", span->end_reason, sizeof(span->end_reason));
+            (void)logger_json_object_get_uint32(doc, root, "packet_count", &span->packet_count);
+            (void)logger_json_object_get_uint32(doc, root, "first_seq_in_span", &span->first_seq_in_span);
+            (void)logger_json_object_get_uint32(doc, root, "last_seq_in_span", &span->last_seq_in_span);
+            logger_journal_capture_utc(doc, root, span->end_utc);
             if (strcmp(result->active_span_id, span_id) == 0) {
                 result->active_span_open = false;
                 result->active_span_id[0] = '\0';
@@ -312,9 +223,13 @@ static void logger_journal_apply_json_record(
             break;
         }
         case LOGGER_JOURNAL_RECORD_SESSION_END:
-            logger_journal_capture_utc(json, result->session_end_utc);
-            (void)logger_json_extract_string(json, "\"end_reason\":\"", result->session_end_reason, sizeof(result->session_end_reason));
-            (void)logger_json_extract_bool(json, "\"quarantined\":", &result->quarantined);
+            logger_journal_capture_utc(doc, root, result->session_end_utc);
+            (void)logger_json_object_copy_string(doc,
+                                                 root,
+                                                 "end_reason",
+                                                 result->session_end_reason,
+                                                 sizeof(result->session_end_reason));
+            (void)logger_json_object_get_bool(doc, root, "quarantined", &result->quarantined);
             result->session_closed = true;
             break;
         case LOGGER_JOURNAL_RECORD_RECOVERY:
@@ -487,7 +402,18 @@ bool logger_journal_scan(const char *path, logger_journal_scan_result_t *result)
         result->valid_size_bytes += total_bytes;
         result->next_record_seq = record_seq + 1u;
         if ((flags & LOGGER_JOURNAL_FLAG_JSON) != 0u) {
-            logger_journal_apply_json_record(result, record_type, (const char *)payload_capture);
+            jsmntok_t tokens[LOGGER_JOURNAL_JSON_TOKEN_MAX];
+            logger_json_doc_t doc;
+            if (logger_json_parse(&doc,
+                                  (const char *)payload_capture,
+                                  capture_offset,
+                                  tokens,
+                                  LOGGER_JOURNAL_JSON_TOKEN_MAX)) {
+                const jsmntok_t *root = logger_json_root(&doc);
+                if (root != NULL && root->type == JSMN_OBJECT) {
+                    logger_journal_apply_json_record(result, record_type, &doc, root);
+                }
+            }
         }
     }
 

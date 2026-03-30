@@ -8,6 +8,7 @@
 #include "pico/rand.h"
 
 #include "board_config.h"
+#include "logger/json.h"
 #include "logger/queue.h"
 #include "logger/sha256.h"
 
@@ -21,6 +22,7 @@
 
 #define LOGGER_SESSION_JSON_MAX 1024
 #define LOGGER_SESSION_MANIFEST_MAX 8192
+#define LOGGER_SESSION_LIVE_JSON_TOKEN_MAX 64u
 
 typedef struct {
     char *buf;
@@ -57,10 +59,6 @@ static void logger_copy_string(char *dst, size_t dst_len, const char *src) {
     dst[i] = '\0';
 }
 
-static bool logger_string_present(const char *value) {
-    return value != NULL && value[0] != '\0';
-}
-
 static bool logger_path_join2(char *dst, size_t dst_len, const char *a, const char *b) {
     const size_t a_len = strlen(a);
     const size_t b_len = strlen(b);
@@ -83,70 +81,6 @@ static bool logger_path_join3(char *dst, size_t dst_len, const char *a, const ch
     memcpy(dst + a_len, b, b_len);
     memcpy(dst + a_len + b_len, c, c_len + 1u);
     return true;
-}
-
-static void logger_json_escape_into(char *dst, size_t dst_len, const char *src) {
-    if (dst_len == 0u) {
-        return;
-    }
-    size_t out = 0u;
-    if (src == NULL) {
-        dst[0] = '\0';
-        return;
-    }
-    for (const unsigned char *p = (const unsigned char *)src; *p != '\0' && (out + 1u) < dst_len; ++p) {
-        const char *replacement = NULL;
-        char unicode_buf[7];
-        switch (*p) {
-            case '\\': replacement = "\\\\"; break;
-            case '"': replacement = "\\\""; break;
-            case '\n': replacement = "\\n"; break;
-            case '\r': replacement = "\\r"; break;
-            case '\t': replacement = "\\t"; break;
-            default: break;
-        }
-        if (replacement != NULL) {
-            const size_t repl_len = strlen(replacement);
-            if ((out + repl_len) >= dst_len) {
-                break;
-            }
-            memcpy(dst + out, replacement, repl_len);
-            out += repl_len;
-            continue;
-        }
-        if (*p < 0x20u) {
-            snprintf(unicode_buf, sizeof(unicode_buf), "\\u%04x", *p);
-            if ((out + 6u) >= dst_len) {
-                break;
-            }
-            memcpy(dst + out, unicode_buf, 6u);
-            out += 6u;
-            continue;
-        }
-        dst[out++] = (char)*p;
-    }
-    dst[out] = '\0';
-}
-
-static void logger_json_string_literal(char *dst, size_t dst_len, const char *src) {
-    if (!logger_string_present(src)) {
-        logger_copy_string(dst, dst_len, "null");
-        return;
-    }
-    char escaped[256];
-    logger_json_escape_into(escaped, sizeof(escaped), src);
-    if (dst_len < 3u) {
-        if (dst_len > 0u) {
-            dst[0] = '\0';
-        }
-        return;
-    }
-    const size_t escaped_len = strlen(escaped);
-    const size_t copy_len = escaped_len < (dst_len - 3u) ? escaped_len : (dst_len - 3u);
-    dst[0] = '"';
-    memcpy(dst + 1u, escaped, copy_len);
-    dst[1u + copy_len] = '"';
-    dst[2u + copy_len] = '\0';
 }
 
 static int64_t logger_session_observed_utc_ns_or_zero(const logger_clock_status_t *clock) {
@@ -820,19 +754,20 @@ static bool logger_session_load_live_session_id(
         return false;
     }
     buf[len] = '\0';
-    const char *needle = "\"session_id\":\"";
-    const char *start = strstr(buf, needle);
-    if (start == NULL) {
+
+    jsmntok_t tokens[LOGGER_SESSION_LIVE_JSON_TOKEN_MAX];
+    logger_json_doc_t doc;
+    if (!logger_json_parse(&doc, buf, len, tokens, LOGGER_SESSION_LIVE_JSON_TOKEN_MAX)) {
         return false;
     }
-    start += strlen(needle);
-    const char *end = strchr(start, '"');
-    if (end == NULL || (size_t)(end - start) != LOGGER_SESSION_ID_HEX_LEN) {
+
+    const jsmntok_t *root = logger_json_root(&doc);
+    if (root == NULL || root->type != JSMN_OBJECT) {
         return false;
     }
-    memcpy(session_id_out, start, LOGGER_SESSION_ID_HEX_LEN);
-    session_id_out[LOGGER_SESSION_ID_HEX_LEN] = '\0';
-    return true;
+
+    return logger_json_object_copy_string(&doc, root, "session_id", session_id_out, LOGGER_SESSION_ID_HEX_LEN + 1) &&
+           strlen(session_id_out) == LOGGER_SESSION_ID_HEX_LEN;
 }
 
 void logger_session_init(logger_session_state_t *session) {

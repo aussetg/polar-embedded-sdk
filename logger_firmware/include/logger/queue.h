@@ -63,6 +63,10 @@ bool logger_upload_queue_scan(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null);
 bool logger_upload_queue_write(const logger_upload_queue_t *queue);
+bool logger_upload_queue_rebuild_file(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    logger_upload_queue_summary_t *summary_out);
 bool logger_upload_queue_refresh_file(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null,

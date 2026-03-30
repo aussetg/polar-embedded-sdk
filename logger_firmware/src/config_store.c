@@ -270,6 +270,20 @@ bool logger_config_set_timezone(logger_persisted_state_t *state, const char *val
     return logger_config_store_save(state);
 }
 
+bool logger_config_set_wifi_ssid(logger_persisted_state_t *state, const char *value) {
+    if (!logger_write_if_changed(state->config.wifi_ssid, sizeof(state->config.wifi_ssid), value)) {
+        return false;
+    }
+    return logger_config_store_save(state);
+}
+
+bool logger_config_set_wifi_psk(logger_persisted_state_t *state, const char *value) {
+    if (!logger_write_if_changed(state->config.wifi_psk, sizeof(state->config.wifi_psk), value)) {
+        return false;
+    }
+    return logger_config_store_save(state);
+}
+
 bool logger_config_set_upload_url(logger_persisted_state_t *state, const char *value) {
     if (!logger_write_if_changed(state->config.upload_url, sizeof(state->config.upload_url), value)) {
         return false;

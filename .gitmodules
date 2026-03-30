@@ -16,3 +16,9 @@
 [submodule "vendors/polar-ble-sdk"]
 	path = vendors/polar-ble-sdk
 	url = https://github.com/polarofficial/polar-ble-sdk.git
+[submodule "vendors/jsmn"]
+	path = vendors/jsmn
+	url = https://github.com/zserge/jsmn.git
+[submodule "vendors/microtar"]
+	path = vendors/microtar
+	url = https://github.com/rxi/microtar.git

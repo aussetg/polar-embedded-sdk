@@ -7,7 +7,9 @@
 
 #include "board_config.h"
 #include "logger/app_main.h"
+#include "logger/json.h"
 #include "logger/queue.h"
+#include "logger/upload.h"
 
 #ifndef LOGGER_FIRMWARE_VERSION
 #define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
@@ -25,50 +27,7 @@ static const char *logger_now_utc_or_null(const logger_app_t *app) {
     return app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL;
 }
 
-static void logger_json_write_escaped(const char *value) {
-    for (const unsigned char *p = (const unsigned char *)value; *p != '\0'; ++p) {
-        switch (*p) {
-            case '\\':
-                fputs("\\\\", stdout);
-                break;
-            case '"':
-                fputs("\\\"", stdout);
-                break;
-            case '\b':
-                fputs("\\b", stdout);
-                break;
-            case '\f':
-                fputs("\\f", stdout);
-                break;
-            case '\n':
-                fputs("\\n", stdout);
-                break;
-            case '\r':
-                fputs("\\r", stdout);
-                break;
-            case '\t':
-                fputs("\\t", stdout);
-                break;
-            default:
-                if (*p < 0x20u) {
-                    printf("\\u%04x", *p);
-                } else {
-                    putchar((int)*p);
-                }
-                break;
-        }
-    }
-}
-
-static void logger_json_write_string_or_null(const char *value) {
-    if (!logger_string_present(value)) {
-        fputs("null", stdout);
-        return;
-    }
-    putchar('"');
-    logger_json_write_escaped(value);
-    putchar('"');
-}
+#define logger_json_write_string_or_null(value) logger_json_fwrite_string_or_null(stdout, (value))
 
 static void logger_json_begin_success(const char *command, const char *generated_at_utc) {
     fputs("{\"schema_version\":1,\"command\":", stdout);
@@ -617,6 +576,42 @@ static void logger_handle_preflight_json(logger_app_t *app) {
     logger_json_end_success();
 }
 
+static void logger_handle_net_test_json(logger_app_t *app) {
+    if (logger_cli_is_logging_mode(app)) {
+        logger_json_begin_error("net-test", logger_now_utc_or_null(app), "busy_logging", "net-test is not permitted while logging");
+        return;
+    }
+    if (!logger_cli_is_service_mode(app)) {
+        logger_json_begin_error("net-test", logger_now_utc_or_null(app), "not_permitted_in_mode", "net-test is only allowed in service mode");
+        return;
+    }
+
+    logger_upload_net_test_result_t result;
+    const bool ok = logger_upload_net_test(&app->persisted.config, &result);
+
+    logger_json_begin_success("net-test", logger_now_utc_or_null(app));
+    fputs("{\"wifi_join\":{\"result\":", stdout);
+    logger_json_write_string_or_null(result.wifi_join_result);
+    fputs(",\"details\":{\"message\":", stdout);
+    logger_json_write_string_or_null(result.wifi_join_details);
+    fputs("}},\"dns\":{\"result\":", stdout);
+    logger_json_write_string_or_null(result.dns_result);
+    fputs(",\"details\":{\"message\":", stdout);
+    logger_json_write_string_or_null(result.dns_details);
+    fputs("}},\"tls\":{\"result\":", stdout);
+    logger_json_write_string_or_null(result.tls_result);
+    fputs(",\"details\":{\"message\":", stdout);
+    logger_json_write_string_or_null(result.tls_details);
+    fputs("}},\"upload_endpoint_reachable\":{\"result\":", stdout);
+    logger_json_write_string_or_null(result.upload_endpoint_reachable_result);
+    fputs(",\"details\":{\"message\":", stdout);
+    logger_json_write_string_or_null(result.upload_endpoint_reachable_details);
+    fputs(",\"ok\":", stdout);
+    fputs(ok ? "true" : "false", stdout);
+    fputs("}}}", stdout);
+    logger_json_end_success();
+}
+
 static void logger_handle_service_unlock(logger_service_cli_t *cli, logger_app_t *app, uint32_t now_ms) {
     if (logger_cli_is_logging_mode(app)) {
         logger_json_begin_error("service unlock", logger_now_utc_or_null(app), "busy_logging", "service unlock is not permitted while logging");
@@ -746,19 +741,6 @@ static void logger_handle_clock_set(logger_service_cli_t *cli, logger_app_t *app
 }
 
 static void logger_handle_debug_config_set(logger_service_cli_t *cli, logger_app_t *app, const char *args) {
-    if (logger_cli_is_logging_mode(app)) {
-        logger_json_begin_error("debug config set", logger_now_utc_or_null(app), "busy_logging", "config mutation is not permitted while logging");
-        return;
-    }
-    if (!logger_cli_is_service_mode(app)) {
-        logger_json_begin_error("debug config set", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug config set is only allowed in service mode");
-        return;
-    }
-    if (!logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
-        logger_json_begin_error("debug config set", logger_now_utc_or_null(app), "service_locked", "service unlock is required before debug config set");
-        return;
-    }
-
     char field[48];
     char value[256];
     field[0] = '\0';
@@ -766,6 +748,25 @@ static void logger_handle_debug_config_set(logger_service_cli_t *cli, logger_app
     const int matched = sscanf(args, "%47s %255[^\n]", field, value);
     if (matched < 2) {
         logger_json_begin_error("debug config set", logger_now_utc_or_null(app), "invalid_config", "expected: debug config set <field> <value>");
+        return;
+    }
+
+    const bool upload_debug_field = strcmp(field, "wifi_ssid") == 0 ||
+                                    strcmp(field, "wifi_psk") == 0 ||
+                                    strcmp(field, "upload_url") == 0 ||
+                                    strcmp(field, "upload_token") == 0;
+    const bool allow_in_log_wait_h10 = upload_debug_field && app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
+
+    if (logger_cli_is_logging_mode(app) && !allow_in_log_wait_h10) {
+        logger_json_begin_error("debug config set", logger_now_utc_or_null(app), "busy_logging", "config mutation is not permitted while logging");
+        return;
+    }
+    if (!logger_cli_is_service_mode(app) && !allow_in_log_wait_h10) {
+        logger_json_begin_error("debug config set", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug config set is only allowed in service mode");
+        return;
+    }
+    if (logger_cli_is_service_mode(app) && !logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error("debug config set", logger_now_utc_or_null(app), "service_locked", "service unlock is required before debug config set");
         return;
     }
 
@@ -779,6 +780,10 @@ static void logger_handle_debug_config_set(logger_service_cli_t *cli, logger_app
         ok = logger_config_set_bound_h10_address(&app->persisted, value, &bond_cleared);
     } else if (strcmp(field, "timezone") == 0) {
         ok = logger_config_set_timezone(&app->persisted, value);
+    } else if (strcmp(field, "wifi_ssid") == 0) {
+        ok = logger_config_set_wifi_ssid(&app->persisted, value);
+    } else if (strcmp(field, "wifi_psk") == 0) {
+        ok = logger_config_set_wifi_psk(&app->persisted, value);
     } else if (strcmp(field, "upload_url") == 0) {
         ok = logger_config_set_upload_url(&app->persisted, value);
     } else if (strcmp(field, "upload_token") == 0) {
@@ -927,6 +932,104 @@ static void logger_handle_debug_session_stop(logger_app_t *app, uint32_t now_ms)
     logger_json_end_success();
 }
 
+static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli, logger_app_t *app) {
+    const bool allowed_in_wait_h10 = app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
+    if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
+        logger_json_begin_error("debug queue rebuild", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug queue rebuild is only allowed in service mode or log_wait_h10");
+        return;
+    }
+    if (app->session.active) {
+        logger_json_begin_error("debug queue rebuild", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug queue rebuild is not permitted while a session is active");
+        return;
+    }
+    if (logger_cli_is_service_mode(app) && !logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error("debug queue rebuild", logger_now_utc_or_null(app), "service_locked", "service unlock is required before debug queue rebuild");
+        return;
+    }
+
+    logger_upload_queue_summary_t summary;
+    if (!logger_upload_queue_rebuild_file(&app->system_log, logger_now_utc_or_null(app), &summary)) {
+        logger_json_begin_error("debug queue rebuild", logger_now_utc_or_null(app), "storage_unavailable", "failed to rebuild upload_queue.json from local sessions");
+        return;
+    }
+
+    logger_json_begin_success("debug queue rebuild", logger_now_utc_or_null(app));
+    fputs("{\"rebuilt\":true,\"updated_at_utc\":", stdout);
+    logger_json_write_string_or_null(summary.updated_at_utc[0] != '\0' ? summary.updated_at_utc : NULL);
+    fputs(",\"session_count\":", stdout);
+    printf("%lu", (unsigned long)summary.session_count);
+    fputs(",\"pending_count\":", stdout);
+    printf("%lu", (unsigned long)summary.pending_count);
+    fputs(",\"blocked_count\":", stdout);
+    printf("%lu", (unsigned long)summary.blocked_count);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_debug_upload_once(logger_service_cli_t *cli, logger_app_t *app) {
+    const bool allowed_in_wait_h10 = app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
+    if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
+        logger_json_begin_error("debug upload once", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug upload once is only allowed in service mode or log_wait_h10");
+        return;
+    }
+    if (logger_cli_is_service_mode(app) && !logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error("debug upload once", logger_now_utc_or_null(app), "service_locked", "service unlock is required before debug upload once");
+        return;
+    }
+
+    logger_upload_process_result_t result;
+    const bool ok = logger_upload_process_one(
+        &app->system_log,
+        &app->persisted.config,
+        app->hardware_id,
+        logger_now_utc_or_null(app),
+        &result);
+
+    if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
+        logger_json_begin_error("debug upload once", logger_now_utc_or_null(app), "invalid_config", result.message);
+        return;
+    }
+    if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_FAILED) {
+        logger_json_begin_error(
+            "debug upload once",
+            logger_now_utc_or_null(app),
+            logger_string_present(result.failure_class) ? result.failure_class : "upload_failed",
+            result.message);
+        return;
+    }
+    if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
+        logger_json_begin_error("debug upload once", logger_now_utc_or_null(app), "min_firmware_rejected", result.message);
+        return;
+    }
+
+    logger_json_begin_success("debug upload once", logger_now_utc_or_null(app));
+    fputs("{\"attempted\":", stdout);
+    fputs(result.attempted ? "true" : "false", stdout);
+    fputs(",\"result\":", stdout);
+    logger_json_write_string_or_null(
+        result.code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED ? "verified" :
+        result.code == LOGGER_UPLOAD_PROCESS_RESULT_NO_WORK ? "no_work" :
+        (ok ? "ok" : "unknown"));
+    fputs(",\"session_id\":", stdout);
+    logger_json_write_string_or_null(logger_string_present(result.session_id) ? result.session_id : NULL);
+    fputs(",\"final_status\":", stdout);
+    logger_json_write_string_or_null(logger_string_present(result.final_status) ? result.final_status : NULL);
+    fputs(",\"receipt_id\":", stdout);
+    logger_json_write_string_or_null(logger_string_present(result.receipt_id) ? result.receipt_id : NULL);
+    fputs(",\"verified_upload_utc\":", stdout);
+    logger_json_write_string_or_null(logger_string_present(result.verified_upload_utc) ? result.verified_upload_utc : NULL);
+    fputs(",\"http_status\":", stdout);
+    if (result.http_status >= 0) {
+        printf("%d", result.http_status);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs(",\"message\":", stdout);
+    logger_json_write_string_or_null(logger_string_present(result.message) ? result.message : NULL);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
 void logger_service_cli_init(logger_service_cli_t *cli) {
     memset(cli, 0, sizeof(*cli));
 }
@@ -954,6 +1057,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
     }
     if (strcmp(line, "preflight --json") == 0) {
         logger_handle_preflight_json(app);
+        return;
+    }
+    if (strcmp(line, "net-test --json") == 0) {
+        logger_handle_net_test_json(app);
         return;
     }
     if (strcmp(line, "config export --json") == 0) {
@@ -1004,6 +1111,14 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
         logger_handle_debug_session_stop(app, now_ms);
         return;
     }
+    if (strcmp(line, "debug queue rebuild") == 0) {
+        logger_handle_debug_queue_rebuild(cli, app);
+        return;
+    }
+    if (strcmp(line, "debug upload once") == 0) {
+        logger_handle_debug_upload_once(cli, app);
+        return;
+    }
     if (strcmp(line, "debug reboot") == 0) {
         app->reboot_pending = true;
         logger_json_begin_success("debug reboot", logger_now_utc_or_null(app));
@@ -1011,8 +1126,7 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
         logger_json_end_success();
         return;
     }
-    if (strcmp(line, "net-test --json") == 0 ||
-        strcmp(line, "sd format") == 0 ||
+    if (strcmp(line, "sd format") == 0 ||
         strncmp(line, "config import ", 14) == 0) {
         logger_json_begin_error(line, logger_now_utc_or_null(app), "internal_error", "command not implemented yet");
         return;

@@ -52,6 +52,8 @@ bool logger_config_set_logger_id(logger_persisted_state_t *state, const char *va
 bool logger_config_set_subject_id(logger_persisted_state_t *state, const char *value);
 bool logger_config_set_bound_h10_address(logger_persisted_state_t *state, const char *value, bool *bond_cleared);
 bool logger_config_set_timezone(logger_persisted_state_t *state, const char *value);
+bool logger_config_set_wifi_ssid(logger_persisted_state_t *state, const char *value);
+bool logger_config_set_wifi_psk(logger_persisted_state_t *state, const char *value);
 bool logger_config_set_upload_url(logger_persisted_state_t *state, const char *value);
 bool logger_config_set_upload_token(logger_persisted_state_t *state, const char *value);
 bool logger_config_clear_upload(logger_persisted_state_t *state);

@@ -1,17 +1,18 @@
 #ifndef LOGGER_FIRMWARE_SHA256_H
 #define LOGGER_FIRMWARE_SHA256_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define LOGGER_SHA256_BYTES 32u
+#include "pico/sha256.h"
+
+#define LOGGER_SHA256_BYTES SHA256_RESULT_BYTES
 #define LOGGER_SHA256_HEX_LEN 64u
 
 typedef struct {
-    uint32_t state[8];
-    uint64_t bit_count;
-    uint8_t block[64];
-    size_t block_len;
+    pico_sha256_state_t state;
+    bool active;
 } logger_sha256_t;
 
 void logger_sha256_init(logger_sha256_t *ctx);
