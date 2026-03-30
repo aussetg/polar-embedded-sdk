@@ -7,6 +7,7 @@
 
 #include "board_config.h"
 #include "logger/app_main.h"
+#include "logger/queue.h"
 
 #ifndef LOGGER_FIRMWARE_VERSION
 #define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
@@ -262,6 +263,12 @@ static void logger_write_storage_card_identity(const logger_app_t *app) {
 
 static void logger_write_status_payload(const logger_app_t *app) {
     char study_day_local[11] = {0};
+    logger_upload_queue_t queue;
+    logger_upload_queue_summary_t queue_summary;
+    logger_upload_queue_summary_init(&queue_summary);
+    if (logger_upload_queue_scan(&queue, NULL, logger_now_utc_or_null(app))) {
+        logger_upload_queue_compute_summary(&queue, &queue_summary);
+    }
     const bool have_study_day = app->session.active
         ? true
         : (logger_runtime_state_is_logging(app->runtime.current_state) &&
@@ -350,7 +357,15 @@ static void logger_write_status_payload(const logger_app_t *app) {
     }
     fputs("}", stdout);
 
-    fputs(",\"upload_queue\":{\"pending_count\":0,\"blocked_count\":0,\"oldest_pending_study_day\":null,\"last_failure_class\":null}", stdout);
+    fputs(",\"upload_queue\":{\"pending_count\":", stdout);
+    printf("%lu", (unsigned long)queue_summary.pending_count);
+    fputs(",\"blocked_count\":", stdout);
+    printf("%lu", (unsigned long)queue_summary.blocked_count);
+    fputs(",\"oldest_pending_study_day\":", stdout);
+    logger_json_write_string_or_null(logger_string_present(queue_summary.oldest_pending_study_day) ? queue_summary.oldest_pending_study_day : NULL);
+    fputs(",\"last_failure_class\":", stdout);
+    logger_json_write_string_or_null(logger_string_present(queue_summary.last_failure_class) ? queue_summary.last_failure_class : NULL);
+    fputs("}", stdout);
     fputs(",\"last_day_outcome\":{\"study_day_local\":null,\"kind\":null,\"reason\":null}", stdout);
     fputs(",\"firmware\":{\"version\":", stdout);
     logger_json_write_string_or_null(LOGGER_FIRMWARE_VERSION);
@@ -382,10 +397,50 @@ static void logger_handle_provisioning_status_json(logger_app_t *app) {
 }
 
 static void logger_handle_queue_json(logger_app_t *app) {
+    logger_upload_queue_t queue;
+    logger_upload_queue_init(&queue);
+    (void)logger_upload_queue_scan(&queue, NULL, logger_now_utc_or_null(app));
+
     logger_json_begin_success("queue", logger_now_utc_or_null(app));
     fputs("{\"schema_source\":\"upload_queue.json\",\"updated_at_utc\":", stdout);
-    logger_json_write_string_or_null(logger_now_utc_or_null(app));
-    fputs(",\"sessions\":[]}", stdout);
+    logger_json_write_string_or_null(logger_string_present(queue.updated_at_utc) ? queue.updated_at_utc : NULL);
+    fputs(",\"sessions\":[", stdout);
+    for (size_t i = 0u; i < queue.session_count; ++i) {
+        const logger_upload_queue_entry_t *entry = &queue.sessions[i];
+        if (i != 0u) {
+            fputs(",", stdout);
+        }
+        fputs("{\"session_id\":", stdout);
+        logger_json_write_string_or_null(entry->session_id);
+        fputs(",\"study_day_local\":", stdout);
+        logger_json_write_string_or_null(entry->study_day_local);
+        fputs(",\"dir_name\":", stdout);
+        logger_json_write_string_or_null(entry->dir_name);
+        fputs(",\"session_start_utc\":", stdout);
+        logger_json_write_string_or_null(entry->session_start_utc);
+        fputs(",\"session_end_utc\":", stdout);
+        logger_json_write_string_or_null(entry->session_end_utc);
+        fputs(",\"bundle_sha256\":", stdout);
+        logger_json_write_string_or_null(entry->bundle_sha256);
+        fputs(",\"bundle_size_bytes\":", stdout);
+        printf("%llu", (unsigned long long)entry->bundle_size_bytes);
+        fputs(",\"status\":", stdout);
+        logger_json_write_string_or_null(entry->status);
+        fputs(",\"quarantined\":", stdout);
+        fputs(entry->quarantined ? "true" : "false", stdout);
+        fputs(",\"attempt_count\":", stdout);
+        printf("%lu", (unsigned long)entry->attempt_count);
+        fputs(",\"last_attempt_utc\":", stdout);
+        logger_json_write_string_or_null(logger_string_present(entry->last_attempt_utc) ? entry->last_attempt_utc : NULL);
+        fputs(",\"last_failure_class\":", stdout);
+        logger_json_write_string_or_null(logger_string_present(entry->last_failure_class) ? entry->last_failure_class : NULL);
+        fputs(",\"verified_upload_utc\":", stdout);
+        logger_json_write_string_or_null(logger_string_present(entry->verified_upload_utc) ? entry->verified_upload_utc : NULL);
+        fputs(",\"receipt_id\":", stdout);
+        logger_json_write_string_or_null(logger_string_present(entry->receipt_id) ? entry->receipt_id : NULL);
+        fputs("}", stdout);
+    }
+    fputs("]}", stdout);
     logger_json_end_success();
 }
 
@@ -855,7 +910,10 @@ static void logger_handle_debug_session_stop(logger_app_t *app, uint32_t now_ms)
     if (!logger_session_stop_debug(
             &app->session,
             &app->system_log,
+            app->hardware_id,
+            &app->persisted,
             &app->clock,
+            &app->storage,
             app->persisted.boot_counter,
             now_ms)) {
         logger_json_begin_error("debug session stop", logger_now_utc_or_null(app), "storage_unavailable", "failed to close debug session");

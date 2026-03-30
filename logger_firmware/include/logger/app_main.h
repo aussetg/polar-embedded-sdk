@@ -28,6 +28,7 @@ typedef struct logger_app {
     logger_service_cli_t cli;
     char hardware_id[LOGGER_HARDWARE_ID_HEX_LEN + 1];
     uint32_t last_observation_mono_ms;
+    uint32_t last_session_live_flush_mono_ms;
     uint32_t last_session_snapshot_mono_ms;
     bool indicator_led_on;
     bool boot_banner_printed;

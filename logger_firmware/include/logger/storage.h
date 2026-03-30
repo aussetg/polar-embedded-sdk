@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LOGGER_STORAGE_PATH_MAX 224
+#define LOGGER_STORAGE_PATH_MAX 320
 
 typedef struct {
     bool initialized;
@@ -38,5 +38,8 @@ bool logger_storage_write_file_atomic(const char *path, const void *data, size_t
 bool logger_storage_append_file(const char *path, const void *data, size_t len, uint64_t *new_size_bytes);
 bool logger_storage_remove_file(const char *path);
 bool logger_storage_file_size(const char *path, uint64_t *size_bytes);
+bool logger_storage_file_exists(const char *path);
+bool logger_storage_read_file(const char *path, void *data, size_t cap, size_t *len_out);
+bool logger_storage_truncate_file(const char *path, uint64_t size_bytes);
 
 #endif

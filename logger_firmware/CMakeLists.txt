@@ -41,8 +41,10 @@ add_executable(logger_appliance
     src/faults.c
     src/identity.c
     src/journal.c
+    src/queue.c
     src/session.c
     src/service_cli.c
+    src/sha256.c
     src/storage.c
     src/system_log.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ff.c

@@ -9,6 +9,7 @@
 #include "pico/stdlib.h"
 
 #include "board_config.h"
+#include "logger/queue.h"
 
 static bool logger_timezone_is_utc_like(const char *timezone) {
     return timezone != NULL &&
@@ -81,6 +82,34 @@ static void logger_app_refresh_observations(logger_app_t *app, uint32_t now_ms) 
     app->runtime.wall_clock_valid = app->clock.valid;
     app->runtime.provisioning_complete = logger_config_normal_logging_ready(&app->persisted.config);
     app->last_observation_mono_ms = now_ms;
+}
+
+static bool logger_app_recover_session_if_needed(logger_app_t *app, uint32_t now_ms, bool resume_allowed) {
+    bool recovered_active = false;
+    bool closed_session = false;
+    if (!logger_session_recover_on_boot(
+            &app->session,
+            &app->system_log,
+            app->hardware_id,
+            &app->persisted,
+            &app->clock,
+            &app->storage,
+            app->persisted.boot_counter,
+            now_ms,
+            resume_allowed,
+            &recovered_active,
+            &closed_session)) {
+        return false;
+    }
+    if (recovered_active) {
+        app->last_session_live_flush_mono_ms = now_ms;
+        app->last_session_snapshot_mono_ms = now_ms;
+    }
+    if (closed_session) {
+        app->last_session_live_flush_mono_ms = 0u;
+        app->last_session_snapshot_mono_ms = 0u;
+    }
+    return true;
 }
 
 static void logger_app_maybe_latch_new_fault(logger_app_t *app, logger_fault_code_t code) {
@@ -240,11 +269,23 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
 
     if (app->boot_gesture == LOGGER_BOOT_GESTURE_SERVICE) {
         printf("[logger] boot gesture: forced service mode\n");
+        if (logger_storage_ready_for_logging(&app->storage) &&
+            !logger_app_recover_session_if_needed(app, now_ms, false)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_recovery_failed", now_ms);
+            return;
+        }
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "boot_service_hold", now_ms);
         return;
     }
 
     if (!app->runtime.provisioning_complete) {
+        if (logger_storage_ready_for_logging(&app->storage) &&
+            !logger_app_recover_session_if_needed(app, now_ms, false)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_recovery_failed", now_ms);
+            return;
+        }
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_CONFIG_INCOMPLETE);
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "config_incomplete", now_ms);
         return;
@@ -257,7 +298,18 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
         return;
     }
 
+    if (!logger_upload_queue_refresh_file(&app->system_log, app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL, NULL)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_refresh_failed", now_ms);
+        return;
+    }
+
     if (logger_battery_low_start_blocked(&app->battery)) {
+        if (!logger_app_recover_session_if_needed(app, now_ms, false)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_recovery_failed", now_ms);
+            return;
+        }
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_LOW_BATTERY_BLOCKED_START);
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER, "low_battery_blocked_start", now_ms);
         return;
@@ -268,7 +320,18 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
     }
 
     if (logger_app_should_enter_overnight_idle(app)) {
+        if (!logger_app_recover_session_if_needed(app, now_ms, false)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_recovery_failed", now_ms);
+            return;
+        }
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE, "charger_overnight_window", now_ms);
+        return;
+    }
+
+    if (!logger_app_recover_session_if_needed(app, now_ms, true)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_recovery_failed", now_ms);
         return;
     }
 
@@ -284,6 +347,16 @@ static void logger_step_service(logger_app_t *app, uint32_t now_ms) {
 static void logger_step_log_wait_h10(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
     logger_service_cli_poll(&app->cli, app, now_ms);
+
+    if (app->session.active &&
+        (app->last_session_live_flush_mono_ms == 0u || (now_ms - app->last_session_live_flush_mono_ms) >= 5000u)) {
+        if (!logger_session_refresh_live(&app->session, &app->clock, app->persisted.boot_counter, now_ms)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_live_write_failed", now_ms);
+            return;
+        }
+        app->last_session_live_flush_mono_ms = now_ms;
+    }
 
     const logger_fault_code_t storage_fault = logger_app_storage_fault_code(&app->storage);
     if (storage_fault != LOGGER_FAULT_NONE) {
@@ -341,13 +414,18 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
         if (!logger_session_stop_debug(
                 &app->session,
                 &app->system_log,
+                app->hardware_id,
+                &app->persisted,
                 &app->clock,
+                &app->storage,
                 app->persisted.boot_counter,
                 now_ms)) {
             logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
             logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_stop_write_failed", now_ms);
             return;
         }
+        app->last_session_live_flush_mono_ms = 0u;
+        app->last_session_snapshot_mono_ms = 0u;
     }
     logger_app_state_transition(&app->runtime, app->runtime.planned_next_state, "log_stopping_complete", now_ms);
 }

@@ -116,6 +116,22 @@ static int64_t logger_days_from_civil(int year, int month, int day) {
     return (int64_t)(era * 146097 + (int)doe - 719468);
 }
 
+static void logger_civil_from_days(int64_t z, int *year, unsigned *month, unsigned *day) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - (era * 146097));
+    const unsigned yoe = (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365;
+    int y = (int)yoe + (int)(era * 400);
+    const unsigned doy = doe - (365u * yoe + (yoe / 4) - (yoe / 100));
+    const unsigned mp = (5u * doy + 2u) / 153u;
+    const unsigned d = doy - (153u * mp + 2u) / 5u + 1u;
+    const unsigned m = (mp < 10u) ? (mp + 3u) : (mp - 9u);
+    y += m <= 2u;
+    *year = y;
+    *month = m;
+    *day = d;
+}
+
 static bool logger_clock_status_to_observed_utc_ns(const logger_clock_status_t *status, int64_t *utc_ns_out) {
     if (!logger_clock_datetime_reasonable(status)) {
         return false;
@@ -272,6 +288,68 @@ bool logger_clock_observed_utc_ns(const logger_clock_status_t *status, int64_t *
         return false;
     }
     return logger_clock_status_to_observed_utc_ns(status, utc_ns_out);
+}
+
+bool logger_clock_format_utc_ns_rfc3339(int64_t utc_ns, char out_rfc3339[LOGGER_CLOCK_RFC3339_UTC_LEN + 1]) {
+    if (out_rfc3339 == NULL) {
+        return false;
+    }
+
+    int64_t seconds = utc_ns / 1000000000ll;
+    int32_t nanos = (int32_t)(utc_ns % 1000000000ll);
+    if (nanos < 0) {
+        nanos += 1000000000;
+        seconds -= 1;
+    }
+
+    const int64_t days = seconds / 86400ll;
+    int64_t day_seconds = seconds % 86400ll;
+    if (day_seconds < 0) {
+        day_seconds += 86400ll;
+    }
+
+    int year = 0;
+    unsigned month = 0u;
+    unsigned day = 0u;
+    logger_civil_from_days(days, &year, &month, &day);
+
+    const int hour = (int)(day_seconds / 3600ll);
+    const int minute = (int)((day_seconds % 3600ll) / 60ll);
+    const int second = (int)(day_seconds % 60ll);
+
+    const int base_n = snprintf(out_rfc3339,
+                                LOGGER_CLOCK_RFC3339_UTC_LEN + 1,
+                                "%04d-%02u-%02uT%02d:%02d:%02d",
+                                year,
+                                month,
+                                day,
+                                hour,
+                                minute,
+                                second);
+    if (base_n <= 0 || (size_t)base_n >= (LOGGER_CLOCK_RFC3339_UTC_LEN + 1u)) {
+        return false;
+    }
+    size_t out_len = (size_t)base_n;
+
+    if (nanos == 0) {
+        out_rfc3339[out_len++] = 'Z';
+        out_rfc3339[out_len] = '\0';
+        return true;
+    }
+
+    char frac[10];
+    snprintf(frac, sizeof(frac), "%09d", (int)nanos);
+    size_t frac_len = 9u;
+    while (frac_len > 0u && frac[frac_len - 1u] == '0') {
+        frac[--frac_len] = '\0';
+    }
+
+    out_rfc3339[out_len++] = '.';
+    memcpy(out_rfc3339 + out_len, frac, frac_len);
+    out_len += frac_len;
+    out_rfc3339[out_len++] = 'Z';
+    out_rfc3339[out_len] = '\0';
+    return true;
 }
 
 static bool logger_clock_derive_study_day_from_fields(
