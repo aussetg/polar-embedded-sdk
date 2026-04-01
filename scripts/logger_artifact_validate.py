@@ -557,7 +557,11 @@ def validate_session_dir(session_dir: Path) -> dict[str, Any]:
             "study_day_local": study_day_local,
             "session_start_utc": session.get("start_utc") if isinstance(session, dict) else None,
             "session_end_utc": session.get("end_utc") if isinstance(session, dict) else None,
+            "session_start_reason": session.get("start_reason") if isinstance(session, dict) else None,
+            "session_end_reason": session.get("end_reason") if isinstance(session, dict) else None,
+            "span_count": session.get("span_count") if isinstance(session, dict) else None,
             "quarantined": session.get("quarantined") if isinstance(session, dict) else None,
+            "quarantine_reasons": session.get("quarantine_reasons") if isinstance(session, dict) else None,
             "bundle_sha256": bundle_sha256,
             "bundle_size_bytes": bundle_size_bytes,
         }
