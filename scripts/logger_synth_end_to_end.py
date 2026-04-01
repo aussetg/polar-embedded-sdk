@@ -45,6 +45,21 @@ except ModuleNotFoundError:  # pragma: no cover - import path depends on invocat
     from scripts.logger_system_log_validate import find_events_by_kind, validate_system_log_document
 
 
+INTERRUPTED_UPLOAD_DELAY_MS = 30_000
+INTERRUPTED_UPLOAD_REQUEST_WAIT_S = 20.0
+INTERRUPTED_UPLOAD_REBOOT_SETTLE_S = 1.0
+POST_REBOOT_READY_TIMEOUT_S = 45.0
+DEFAULT_RESET_COMMAND = [
+    "openocd",
+    "-f",
+    "interface/cmsis-dap.cfg",
+    "-f",
+    "target/rp2350.cfg",
+    "-c",
+    "adapter speed 5000; init; reset run; shutdown",
+]
+
+
 @dataclass(frozen=True)
 class Step:
     label: str
@@ -115,8 +130,12 @@ class SerialJsonClient:
 
     def send_command(self, step: Step) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         assert self.fd is not None
-        os.write(self.fd, (step.line + "\n").encode("utf-8"))
+        self.write_line(step.line)
         return self.read_json(step.expected_command, timeout_s=step.timeout_s)
+
+    def write_line(self, line: str) -> None:
+        assert self.fd is not None
+        os.write(self.fd, (line + "\n").encode("utf-8"))
 
     def read_json(self, expected_command: str, *, timeout_s: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         assert self.fd is not None
@@ -320,6 +339,13 @@ def prepare_upload_url(base_url: str, scenario: str, ref_server_min_firmware: st
         return append_or_replace_query(base_url, "force", "validation_failed")
     if scenario == "upload-blocked-min-firmware" and "force" not in query and ref_server_min_firmware is None:
         return append_or_replace_query(base_url, "force", "minimum_firmware")
+    if scenario == "upload-interrupted-reboot":
+        url = base_url
+        if "force" not in query:
+            url = append_or_replace_query(url, "force", "temporary_unavailable")
+        if "delay_ms" not in query:
+            url = append_or_replace_query(url, "delay_ms", str(INTERRUPTED_UPLOAD_DELAY_MS))
+        return url
     return base_url
 
 
@@ -329,6 +355,82 @@ def http_get_json(url: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError(f"expected JSON object from {url}")
     return payload
+
+
+def derive_local_ref_server_healthz_url(upload_url: str | None) -> str | None:
+    if upload_url is None:
+        return None
+    parsed = urlparse(upload_url)
+    if parsed.scheme != "http" or parsed.port is None:
+        return None
+    return f"http://127.0.0.1:{parsed.port}/healthz"
+
+
+def derive_local_ref_server_uploads_url(upload_url: str | None) -> str | None:
+    if upload_url is None:
+        return None
+    parsed = urlparse(upload_url)
+    if parsed.scheme != "http" or parsed.port is None:
+        return None
+    return f"http://127.0.0.1:{parsed.port}/uploads"
+
+
+def wait_for_ref_server_upload_start(healthz_url: str, *, timeout_s: float) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_doc: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            doc = http_get_json(healthz_url)
+            last_doc = doc
+            if doc.get("active_upload_requests", 0) >= 1 or doc.get("upload_request_count", 0) >= 1:
+                return doc
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+        time.sleep(0.1)
+    raise RuntimeError(
+        "timed out waiting for reference upload server to observe an upload request; "
+        f"last_doc={last_doc!r} last_error={last_error!r}"
+    )
+
+
+def reset_target_via_openocd() -> dict[str, Any]:
+    completed = subprocess.run(
+        DEFAULT_RESET_COMMAND,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "target reset via openocd failed: "
+            f"rc={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r}"
+        )
+    return {
+        "command": DEFAULT_RESET_COMMAND,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def run_steps_after_reboot(
+    port: Path,
+    steps: list[Step],
+    *,
+    timeout_s: float,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with SerialJsonClient(port) as client:
+                return run_steps(client, steps, require_service_mode=False)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            time.sleep(0.5)
+    raise RuntimeError(f"timed out waiting for post-reboot serial recovery: {last_error}")
 
 
 def response_by_label(responses: list[dict[str, Any]], label: str) -> dict[str, Any]:
@@ -355,13 +457,18 @@ def assert_no_unexpected_error(response: dict[str, Any], step: Step) -> None:
         require_ok(response, step)
 
 
-def run_steps(client: SerialJsonClient, steps: list[Step]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+def run_steps(
+    client: SerialJsonClient,
+    steps: list[Step],
+    *,
+    require_service_mode: bool = True,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     drained = client.drain_input()
     responses: list[dict[str, Any]] = []
     stray_responses: list[dict[str, Any]] = []
     for index, step in enumerate(steps):
         response, stray = client.send_command(step)
-        if index == 0:
+        if index == 0 and require_service_mode:
             validate_status_service_mode(response)
         assert_no_unexpected_error(response, step)
         responses.append(
@@ -385,7 +492,7 @@ def expected_upload_error_code(scenario: str) -> str | None:
 
 
 def default_wifi_args_required(scenario: str) -> bool:
-    return scenario in {"upload-verified", "upload-failed", "upload-blocked-min-firmware"}
+    return scenario in {"upload-verified", "upload-failed", "upload-blocked-min-firmware", "upload-interrupted-reboot"}
 
 
 def build_scenario(
@@ -399,8 +506,8 @@ def build_scenario(
 ) -> list[Step]:
     if name == "smoke":
         return [
-            Step("status_before", "status --json", "status --json"),
-            Step("queue_before", "queue --json", "queue --json"),
+            Step("status_before", "status --json", "status"),
+            Step("queue_before", "queue --json", "queue"),
             Step("unlock", "service unlock", "service unlock"),
             Step("clock_set", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
             Step("session_start", "debug session start", "debug session start"),
@@ -414,14 +521,14 @@ def build_scenario(
                 "debug synth clock-jump",
             ),
             Step("session_stop", "debug session stop", "debug session stop"),
-            Step("queue_after", "queue --json", "queue --json"),
+            Step("queue_after", "queue --json", "queue"),
             Step("system_log", "system-log export --json", "system-log export"),
-            Step("status_after", "status --json", "status --json"),
+            Step("status_after", "status --json", "status"),
         ]
     if name == "clock-fix":
         return [
-            Step("status_before", "status --json", "status --json"),
-            Step("queue_before", "queue --json", "queue --json"),
+            Step("status_before", "status --json", "status"),
+            Step("queue_before", "queue --json", "queue"),
             Step("unlock", "service unlock", "service unlock"),
             Step("clock_set", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
             Step("session_start", "debug session start", "debug session start"),
@@ -433,14 +540,14 @@ def build_scenario(
             ),
             Step("ecg_2", "debug synth ecg 2", "debug synth ecg"),
             Step("session_stop", "debug session stop", "debug session stop"),
-            Step("queue_after", "queue --json", "queue --json"),
+            Step("queue_after", "queue --json", "queue"),
             Step("system_log", "system-log export --json", "system-log export"),
-            Step("status_after", "status --json", "status --json"),
+            Step("status_after", "status --json", "status"),
         ]
     if name == "rollover":
         return [
-            Step("status_before", "status --json", "status --json"),
-            Step("queue_before", "queue --json", "queue --json"),
+            Step("status_before", "status --json", "status"),
+            Step("queue_before", "queue --json", "queue"),
             Step("unlock", "service unlock", "service unlock"),
             Step("clock_set", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
             Step("session_start", "debug session start", "debug session start"),
@@ -452,19 +559,19 @@ def build_scenario(
             ),
             Step("ecg_2", "debug synth ecg 2", "debug synth ecg"),
             Step("session_stop", "debug session stop", "debug session stop"),
-            Step("queue_after", "queue --json", "queue --json"),
+            Step("queue_after", "queue --json", "queue"),
             Step("system_log", "system-log export --json", "system-log export"),
-            Step("status_after", "status --json", "status --json"),
+            Step("status_after", "status --json", "status"),
         ]
     if name == "no-session-day":
         return [
-            Step("status_before", "status --json", "status --json"),
-            Step("queue_before", "queue --json", "queue --json"),
+            Step("status_before", "status --json", "status"),
+            Step("queue_before", "queue --json", "queue"),
             Step("unlock", "service unlock", "service unlock"),
             Step("clock_set", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
             Step("no_session_day", "debug synth no-session-day auto 1 1 0", "debug synth no-session-day"),
-            Step("status_after", "status --json", "status --json"),
-            Step("queue_after", "queue --json", "queue --json"),
+            Step("status_after", "status --json", "status"),
+            Step("queue_after", "queue --json", "queue"),
             Step("system_log", "system-log export --json", "system-log export"),
         ]
     if name in {"upload-verified", "upload-failed", "upload-blocked-min-firmware"}:
@@ -472,14 +579,14 @@ def build_scenario(
             raise ValueError(f"scenario {name!r} requires upload_url, wifi_ssid, and wifi_psk")
 
         steps = [
-            Step("status_before", "status --json", "status --json"),
-            Step("queue_before", "queue --json", "queue --json"),
+            Step("status_before", "status --json", "status"),
+            Step("queue_before", "queue --json", "queue"),
             Step("unlock_1", "service unlock", "service unlock"),
             Step("clock_set", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
             Step("session_start", "debug session start", "debug session start"),
             Step("ecg_1", "debug synth ecg 4", "debug synth ecg"),
             Step("session_stop", "debug session stop", "debug session stop"),
-            Step("queue_mid", "queue --json", "queue --json"),
+            Step("queue_mid", "queue --json", "queue"),
             Step("unlock_2", "service unlock", "service unlock"),
             Step("set_wifi_ssid", f"debug config set wifi_ssid {wifi_ssid}", "debug config set"),
             Step("set_wifi_psk", f"debug config set wifi_psk {wifi_psk}", "debug config set"),
@@ -497,11 +604,32 @@ def build_scenario(
                     timeout_s=90.0,
                     allow_error=name != "upload-verified",
                 ),
-                Step("queue_after", "queue --json", "queue --json"),
+                Step("queue_after", "queue --json", "queue"),
                 Step("system_log", "system-log export --json", "system-log export"),
-                Step("status_after", "status --json", "status --json"),
+                Step("status_after", "status --json", "status"),
             ]
         )
+        return steps
+    if name == "upload-interrupted-reboot":
+        if upload_url is None or wifi_ssid is None or wifi_psk is None:
+            raise ValueError(f"scenario {name!r} requires upload_url, wifi_ssid, and wifi_psk")
+
+        steps = [
+            Step("status_before", "status --json", "status"),
+            Step("queue_before", "queue --json", "queue"),
+            Step("unlock_1", "service unlock", "service unlock"),
+            Step("clock_set", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
+            Step("session_start", "debug session start", "debug session start"),
+            Step("ecg_1", "debug synth ecg 4", "debug synth ecg"),
+            Step("session_stop", "debug session stop", "debug session stop"),
+            Step("queue_mid", "queue --json", "queue"),
+            Step("unlock_2", "service unlock", "service unlock"),
+            Step("set_wifi_ssid", f"debug config set wifi_ssid {wifi_ssid}", "debug config set"),
+            Step("set_wifi_psk", f"debug config set wifi_psk {wifi_psk}", "debug config set"),
+            Step("set_upload_url", f"debug config set upload_url {upload_url}", "debug config set"),
+        ]
+        if upload_token is not None:
+            steps.append(Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set"))
         return steps
     raise ValueError(f"unsupported scenario {name!r}")
 
@@ -511,7 +639,7 @@ def default_start_time(scenario: str) -> datetime:
         return parse_rfc3339_utc("2026-04-02T03:59:50Z")
     if scenario == "no-session-day":
         return parse_rfc3339_utc("2026-04-02T21:00:00Z")
-    if scenario in {"upload-verified", "upload-failed", "upload-blocked-min-firmware"}:
+    if scenario in {"upload-verified", "upload-failed", "upload-blocked-min-firmware", "upload-interrupted-reboot"}:
         return parse_rfc3339_utc("2026-04-02T14:00:00Z")
     return parse_rfc3339_utc("2026-04-02T12:00:00Z")
 
@@ -735,6 +863,74 @@ def validate_upload_outcome(
     }
 
 
+def validate_interrupted_upload_recovery(
+    responses: list[dict[str, Any]],
+    *,
+    ref_server_uploads_url: str | None,
+) -> dict[str, Any]:
+    queue_before = response_by_label(responses, "queue_before")
+    queue_mid = response_by_label(responses, "queue_mid")
+    queue_after = response_by_label(responses, "queue_after_reboot")
+    eligible_before = eligible_queue_session_ids(queue_before)
+    if eligible_before:
+        raise RuntimeError(
+            "upload-interrupted-reboot requires a clean eligible queue before starting; "
+            f"found pending/failed sessions: {eligible_before}"
+        )
+
+    new_session_ids = extract_new_session_ids(queue_before, queue_mid)
+    if len(new_session_ids) != 1:
+        raise RuntimeError("upload-interrupted-reboot expected exactly one new closed session before upload")
+    session_id = new_session_ids[0]
+
+    upload_entry = queue_entry_map_from_response(queue_after).get(session_id)
+    if upload_entry is None:
+        raise RuntimeError("interrupted upload session is missing from final queue --json output")
+    if upload_entry.get("status") != "failed":
+        raise RuntimeError(
+            "upload-interrupted-reboot expected final queue status 'failed', "
+            f"got {upload_entry.get('status')!r}"
+        )
+    if upload_entry.get("attempt_count") != 1:
+        raise RuntimeError("upload-interrupted-reboot expected attempt_count=1")
+    if upload_entry.get("last_failure_class") != "interrupted":
+        raise RuntimeError(
+            "upload-interrupted-reboot expected last_failure_class='interrupted', "
+            f"got {upload_entry.get('last_failure_class')!r}"
+        )
+
+    system_log_summary = validate_system_log_response(response_by_label(responses, "system_log_after_reboot"))
+    events = find_events_by_kind(response_by_label(responses, "system_log_after_reboot"), "upload_interrupted_recovered")
+    if not any(
+        isinstance(event, dict)
+        and isinstance(event.get("details"), dict)
+        and event["details"].get("session_id") == session_id
+        for event in events
+    ):
+        raise RuntimeError(
+            "system-log export did not contain upload_interrupted_recovered for "
+            f"session_id={session_id}"
+        )
+
+    ref_server_uploads = None
+    if ref_server_uploads_url is not None:
+        ref_server_doc = http_get_json(ref_server_uploads_url)
+        uploads = ref_server_doc.get("uploads") if isinstance(ref_server_doc.get("uploads"), list) else []
+        ref_server_uploads = uploads
+        if any(isinstance(upload, dict) and upload.get("session_id") == session_id for upload in uploads):
+            raise RuntimeError("reference server unexpectedly accepted the interrupted upload session")
+
+    return {
+        "started_session_id": session_id,
+        "queue_before_session_ids": sorted(session_ids_from_queue_response(queue_before)),
+        "queue_after_session_ids": sorted(session_ids_from_queue_response(queue_after)),
+        "new_session_ids": new_session_ids,
+        "system_log_validation": system_log_summary,
+        "final_queue_entry": upload_entry,
+        "ref_server_uploads": ref_server_uploads,
+    }
+
+
 def run_scenario(
     port: Path,
     scenario: str,
@@ -748,6 +944,20 @@ def run_scenario(
     ref_server_data_dir: Path | None = None,
     ref_server_min_firmware: str | None = None,
 ) -> dict[str, Any]:
+    if scenario == "upload-interrupted-reboot":
+        return run_interrupted_upload_reboot_scenario(
+            port,
+            scenario,
+            start_utc,
+            upload_url=upload_url,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_token=upload_token,
+            spawn_ref_server=spawn_ref_server,
+            ref_server_data_dir=ref_server_data_dir,
+            ref_server_min_firmware=ref_server_min_firmware,
+        )
+
     effective_upload_url = upload_url
     ref_server_uploads_url = None
 
@@ -803,6 +1013,108 @@ def run_scenario(
     }
 
 
+def run_interrupted_upload_reboot_scenario(
+    port: Path,
+    scenario: str,
+    start_utc: datetime,
+    *,
+    upload_url: str | None,
+    wifi_ssid: str | None,
+    wifi_psk: str | None,
+    upload_token: str | None,
+    spawn_ref_server: bool,
+    ref_server_data_dir: Path | None,
+    ref_server_min_firmware: str | None,
+) -> dict[str, Any]:
+    if upload_url is None or wifi_ssid is None or wifi_psk is None:
+        raise ValueError("upload-interrupted-reboot requires upload_url, wifi_ssid, and wifi_psk")
+
+    effective_upload_url = prepare_upload_url(upload_url, scenario, ref_server_min_firmware)
+    ref_server_uploads_url = derive_local_ref_server_uploads_url(effective_upload_url)
+    ref_server_healthz_url = derive_local_ref_server_healthz_url(effective_upload_url)
+
+    with ExitStack() as stack:
+        if spawn_ref_server:
+            if ref_server_data_dir is None:
+                stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+                ref_server_data_dir = Path("build") / f"logger_upload_ref_server_runner_{scenario}_{stamp}"
+            ref_server = stack.enter_context(
+                RefServerProcess(
+                    RefServerConfig(
+                        upload_url=effective_upload_url,
+                        data_dir=ref_server_data_dir,
+                        bearer_token=upload_token,
+                        min_firmware=ref_server_min_firmware,
+                    )
+                )
+            )
+            ref_server_uploads_url = ref_server.uploads_url
+            ref_server_healthz_url = ref_server.healthz_url
+
+        steps = build_scenario(
+            scenario,
+            start_utc,
+            upload_url=effective_upload_url,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_token=upload_token,
+        )
+
+        with SerialJsonClient(port) as client:
+            drained, responses, stray_responses = run_steps(client, steps)
+            client.drain_input()
+            client.write_line("debug upload once")
+
+            request_observed = None
+            if ref_server_healthz_url is not None:
+                try:
+                    request_observed = wait_for_ref_server_upload_start(
+                        ref_server_healthz_url,
+                        timeout_s=INTERRUPTED_UPLOAD_REQUEST_WAIT_S,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    request_observed = {"method": "sleep_fallback", "error": str(exc)}
+                    time.sleep(5.0)
+            else:
+                request_observed = {"method": "sleep_fallback", "error": None}
+                time.sleep(5.0)
+
+        reset_result = reset_target_via_openocd()
+        time.sleep(INTERRUPTED_UPLOAD_REBOOT_SETTLE_S)
+
+        post_steps = [
+            Step("status_after_reboot", "status --json", "status", timeout_s=5.0),
+            Step("queue_after_reboot", "queue --json", "queue", timeout_s=5.0),
+            Step("system_log_after_reboot", "system-log export --json", "system-log export", timeout_s=5.0),
+        ]
+        post_drained, post_responses, post_stray_responses = run_steps_after_reboot(
+            port,
+            post_steps,
+            timeout_s=POST_REBOOT_READY_TIMEOUT_S,
+        )
+
+        all_responses = responses + post_responses
+        all_stray_responses = stray_responses + post_stray_responses
+        scenario_analysis = validate_interrupted_upload_recovery(
+            all_responses,
+            ref_server_uploads_url=ref_server_uploads_url,
+        )
+
+        return {
+            "scenario": scenario,
+            "port": str(port),
+            "start_utc": format_rfc3339_utc(start_utc),
+            "effective_upload_url": effective_upload_url,
+            "drained_preamble": drained,
+            "post_reboot_drained_preamble": post_drained,
+            "responses": all_responses,
+            "stray_responses": all_stray_responses,
+            "request_observed": request_observed,
+            "reset_result": reset_result,
+            **scenario_analysis,
+        }
+
+
 def print_text(summary: dict[str, Any]) -> None:
     print(f"scenario: {summary['scenario']}")
     print(f"port: {summary['port']}")
@@ -844,6 +1156,7 @@ def main() -> int:
             "upload-verified",
             "upload-failed",
             "upload-blocked-min-firmware",
+            "upload-interrupted-reboot",
         ],
         default="smoke",
         help="synthetic scenario to run",

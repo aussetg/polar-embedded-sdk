@@ -35,6 +35,7 @@ import io
 import json
 import tarfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -258,6 +259,33 @@ class UploadStore:
             )
 
 
+class RequestTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active_upload_requests = 0
+        self._upload_request_count = 0
+        self._last_force: str | None = None
+
+    def start_upload(self, force: str | None) -> None:
+        with self._lock:
+            self._active_upload_requests += 1
+            self._upload_request_count += 1
+            self._last_force = force
+
+    def finish_upload(self) -> None:
+        with self._lock:
+            if self._active_upload_requests > 0:
+                self._active_upload_requests -= 1
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "active_upload_requests": self._active_upload_requests,
+                "upload_request_count": self._upload_request_count,
+                "last_force": self._last_force,
+            }
+
+
 def utc_now_rfc3339() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -394,6 +422,28 @@ def require_header(headers: Any, name: str) -> str:
             retryable=False,
         )
     return value.strip()
+
+
+def parse_delay_ms(value: str | None) -> int:
+    if value is None:
+        return 0
+    try:
+        delay_ms = int(value)
+    except ValueError as exc:
+        raise UploadError(
+            HTTPStatus.BAD_REQUEST,
+            "malformed_request",
+            "delay_ms must be a non-negative integer",
+            retryable=False,
+        ) from exc
+    if delay_ms < 0 or delay_ms > 300_000:
+        raise UploadError(
+            HTTPStatus.BAD_REQUEST,
+            "malformed_request",
+            "delay_ms must be between 0 and 300000",
+            retryable=False,
+        )
+    return delay_ms
 
 
 def sha256_hex(data: bytes) -> str:
@@ -777,7 +827,7 @@ def validate_bundle(body: bytes, headers: Any, config: ServerConfig) -> Validate
     )
 
 
-def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPRequestHandler]:
+def make_handler(config: ServerConfig, store: UploadStore, request_tracker: RequestTracker) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "LoggerRefServer/1"
         sys_version = ""
@@ -792,14 +842,20 @@ def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPReque
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def _send_plain(self, status: HTTPStatus, body: bytes, content_type: str = "text/plain; charset=utf-8") -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def _send_error_response(self, error: UploadError) -> None:
             if error.plain_body is not None:
@@ -865,6 +921,7 @@ def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPReque
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path == "/healthz":
+                tracker = request_tracker.snapshot()
                 self._send_json(
                     HTTPStatus.OK,
                     {
@@ -875,6 +932,7 @@ def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPReque
                         "stored_upload_count": store.count(),
                         "require_bearer": config.bearer_token is not None,
                         "min_firmware": config.min_firmware,
+                        **tracker,
                     },
                 )
                 return
@@ -920,6 +978,11 @@ def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPReque
                 )
                 return
 
+            query = parse_qs(parsed.query)
+            force = query.get("force", [None])[0]
+            delay_ms = parse_delay_ms(query.get("delay_ms", [None])[0])
+            request_tracker.start_upload(force)
+
             try:
                 if self.headers.get("Content-Type") != "application/x-tar":
                     raise UploadError(
@@ -940,7 +1003,6 @@ def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPReque
                         )
 
                 body = self._read_exact_body()
-                force = parse_qs(parsed.query).get("force", [None])[0]
                 if force == "plain_503":
                     raise UploadError(
                         HTTPStatus.SERVICE_UNAVAILABLE,
@@ -961,6 +1023,9 @@ def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPReque
                     )
 
                 validated = validate_bundle(body, self.headers, config)
+
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
 
                 injected_failures: dict[str, tuple[HTTPStatus, str, str, bool]] = {
                     "temporary_unavailable": (
@@ -1017,6 +1082,8 @@ def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPReque
                         retryable=True,
                     )
                 )
+            finally:
+                request_tracker.finish_upload()
 
     return Handler
 
@@ -1024,7 +1091,8 @@ def make_handler(config: ServerConfig, store: UploadStore) -> type[BaseHTTPReque
 def main() -> int:
     config = parse_args()
     store = UploadStore(config.data_dir)
-    handler_cls = make_handler(config, store)
+    request_tracker = RequestTracker()
+    handler_cls = make_handler(config, store, request_tracker)
     server = ThreadingHTTPServer((config.host, config.port), handler_cls)
 
     print("[logger-ref-server] listening")
