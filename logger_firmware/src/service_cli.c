@@ -1539,6 +1539,46 @@ static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli, logger_
     logger_json_end_success();
 }
 
+static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli, logger_app_t *app) {
+    const bool allowed_in_wait_h10 = app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
+    if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
+        logger_json_begin_error("debug queue requeue-blocked", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug queue requeue-blocked is only allowed in service mode or log_wait_h10");
+        return;
+    }
+    if (app->session.active) {
+        logger_json_begin_error("debug queue requeue-blocked", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug queue requeue-blocked is not permitted while a session is active");
+        return;
+    }
+    if (logger_cli_is_service_mode(app) && !logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error("debug queue requeue-blocked", logger_now_utc_or_null(app), "service_locked", "service unlock is required before debug queue requeue-blocked");
+        return;
+    }
+
+    size_t requeued_count = 0u;
+    logger_upload_queue_summary_t summary;
+    if (!logger_upload_queue_requeue_blocked_file(&app->system_log,
+                                                  logger_now_utc_or_null(app),
+                                                  &requeued_count,
+                                                  &summary)) {
+        logger_json_begin_error("debug queue requeue-blocked", logger_now_utc_or_null(app), "storage_unavailable", "failed to rewrite blocked upload_queue.json entries as pending");
+        return;
+    }
+
+    logger_json_begin_success("debug queue requeue-blocked", logger_now_utc_or_null(app));
+    fputs("{\"requeued_count\":", stdout);
+    printf("%lu", (unsigned long)requeued_count);
+    fputs(",\"updated_at_utc\":", stdout);
+    logger_json_write_string_or_null(summary.updated_at_utc[0] != '\0' ? summary.updated_at_utc : NULL);
+    fputs(",\"session_count\":", stdout);
+    printf("%lu", (unsigned long)summary.session_count);
+    fputs(",\"pending_count\":", stdout);
+    printf("%lu", (unsigned long)summary.pending_count);
+    fputs(",\"blocked_count\":", stdout);
+    printf("%lu", (unsigned long)summary.blocked_count);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
 static void logger_handle_debug_upload_once(logger_service_cli_t *cli, logger_app_t *app) {
     const bool allowed_in_wait_h10 = app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
     if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
@@ -1686,6 +1726,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
     }
     if (strcmp(line, "debug queue rebuild") == 0) {
         logger_handle_debug_queue_rebuild(cli, app);
+        return;
+    }
+    if (strcmp(line, "debug queue requeue-blocked") == 0) {
+        logger_handle_debug_queue_requeue_blocked(cli, app);
         return;
     }
     if (strcmp(line, "debug upload once") == 0) {

@@ -67,6 +67,11 @@ bool logger_upload_queue_rebuild_file(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null,
     logger_upload_queue_summary_t *summary_out);
+bool logger_upload_queue_requeue_blocked_file(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    size_t *requeued_count_out,
+    logger_upload_queue_summary_t *summary_out);
 bool logger_upload_queue_refresh_file(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null,

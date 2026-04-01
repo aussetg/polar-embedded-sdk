@@ -176,6 +176,30 @@ static void logger_log_queue_rebuilt(
         details);
 }
 
+static void logger_log_queue_requeued(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    const char *reason,
+    size_t count) {
+    if (system_log == NULL) {
+        return;
+    }
+    char reason_escaped[96];
+    logger_json_escape_into(reason_escaped, sizeof(reason_escaped), reason);
+    char details[192];
+    snprintf(details,
+             sizeof(details),
+             "{\"reason\":\"%s\",\"count\":%lu}",
+             reason_escaped,
+             (unsigned long)count);
+    (void)logger_system_log_append(
+        system_log,
+        updated_at_utc_or_null,
+        "upload_queue_requeued",
+        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        details);
+}
+
 static void logger_log_upload_interrupted(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null,
@@ -663,6 +687,57 @@ bool logger_upload_queue_rebuild_file(
     logger_log_queue_rebuilt(system_log, updated_at_utc_or_null, "manual_rebuild");
     if (summary_out != NULL) {
         logger_upload_queue_compute_summary(&rebuilt, summary_out);
+    }
+    return true;
+}
+
+bool logger_upload_queue_requeue_blocked_file(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    size_t *requeued_count_out,
+    logger_upload_queue_summary_t *summary_out) {
+    if (requeued_count_out != NULL) {
+        *requeued_count_out = 0u;
+    }
+
+    logger_upload_queue_t queue;
+    if (!logger_upload_queue_load(&queue)) {
+        if (summary_out != NULL) {
+            logger_upload_queue_summary_init(summary_out);
+        }
+        return false;
+    }
+
+    size_t requeued_count = 0u;
+    for (size_t i = 0u; i < queue.session_count; ++i) {
+        logger_upload_queue_entry_t *entry = &queue.sessions[i];
+        if (strcmp(entry->status, "blocked_min_firmware") != 0) {
+            continue;
+        }
+        logger_copy_string(entry->status, sizeof(entry->status), "pending");
+        entry->last_failure_class[0] = '\0';
+        entry->verified_upload_utc[0] = '\0';
+        entry->receipt_id[0] = '\0';
+        requeued_count += 1u;
+    }
+
+    if (requeued_count > 0u) {
+        logger_copy_string(queue.updated_at_utc, sizeof(queue.updated_at_utc), updated_at_utc_or_null);
+        logger_upload_queue_sort(&queue);
+        if (!logger_upload_queue_write(&queue)) {
+            if (summary_out != NULL) {
+                logger_upload_queue_summary_init(summary_out);
+            }
+            return false;
+        }
+        logger_log_queue_requeued(system_log, updated_at_utc_or_null, "manual_requeue_blocked", requeued_count);
+    }
+
+    if (requeued_count_out != NULL) {
+        *requeued_count_out = requeued_count;
+    }
+    if (summary_out != NULL) {
+        logger_upload_queue_compute_summary(&queue, summary_out);
     }
     return true;
 }
