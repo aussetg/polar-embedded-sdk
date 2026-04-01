@@ -19,6 +19,8 @@
 #define LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT 29u
 #define LOGGER_QUEUE_JSON_TOKEN_MAX \
     (LOGGER_QUEUE_TOP_LEVEL_JSON_TOKEN_COUNT + (LOGGER_UPLOAD_QUEUE_MAX_SESSIONS * LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT))
+#define LOGGER_UPLOAD_RETENTION_DAYS 14u
+#define LOGGER_UPLOAD_RETENTION_SECONDS (LOGGER_UPLOAD_RETENTION_DAYS * 24u * 60u * 60u)
 
 typedef struct {
     char session_id[33];
@@ -200,6 +202,35 @@ static void logger_log_queue_requeued(
         details);
 }
 
+static void logger_log_session_pruned(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    const logger_upload_queue_entry_t *entry,
+    const char *reason) {
+    if (system_log == NULL || entry == NULL) {
+        return;
+    }
+    char session_escaped[96];
+    char dir_escaped[160];
+    char reason_escaped[64];
+    logger_json_escape_into(session_escaped, sizeof(session_escaped), entry->session_id);
+    logger_json_escape_into(dir_escaped, sizeof(dir_escaped), entry->dir_name);
+    logger_json_escape_into(reason_escaped, sizeof(reason_escaped), reason);
+    char details[384];
+    snprintf(details,
+             sizeof(details),
+             "{\"session_id\":\"%s\",\"dir_name\":\"%s\",\"reason\":\"%s\"}",
+             session_escaped,
+             dir_escaped,
+             reason_escaped);
+    (void)logger_system_log_append(
+        system_log,
+        updated_at_utc_or_null,
+        "session_pruned",
+        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        details);
+}
+
 static void logger_log_upload_interrupted(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null,
@@ -350,6 +381,136 @@ static void logger_upload_queue_sort(logger_upload_queue_t *queue) {
         }
         queue->sessions[j] = value;
     }
+}
+
+static void logger_upload_queue_remove_at(logger_upload_queue_t *queue, size_t index) {
+    if (queue == NULL || index >= queue->session_count) {
+        return;
+    }
+    for (size_t i = index + 1u; i < queue->session_count; ++i) {
+        queue->sessions[i - 1u] = queue->sessions[i];
+    }
+    if (queue->session_count > 0u) {
+        queue->session_count -= 1u;
+        memset(&queue->sessions[queue->session_count], 0, sizeof(queue->sessions[queue->session_count]));
+    }
+}
+
+static int64_t logger_days_from_civil(int year, unsigned month, unsigned day) {
+    year -= month <= 2u;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = (unsigned)(year - era * 400);
+    const unsigned doy = (153u * (month + (month > 2u ? (unsigned)-3 : 9u)) + 2u) / 5u + day - 1u;
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static bool logger_parse_rfc3339_utc_seconds(const char *text, int64_t *seconds_out) {
+    if (text == NULL || seconds_out == NULL || strlen(text) != 20u) {
+        return false;
+    }
+
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    if (sscanf(text,
+               "%4d-%2d-%2dT%2d:%2d:%2dZ",
+               &year,
+               &month,
+               &day,
+               &hour,
+               &minute,
+               &second) != 6) {
+        return false;
+    }
+    if (month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) {
+        return false;
+    }
+
+    const int64_t days = logger_days_from_civil(year, (unsigned)month, (unsigned)day);
+    *seconds_out = (days * 86400) + ((int64_t)hour * 3600) + ((int64_t)minute * 60) + (int64_t)second;
+    return true;
+}
+
+static bool logger_queue_entry_retention_expired(
+    const logger_upload_queue_entry_t *entry,
+    const char *now_utc_or_null) {
+    if (entry == NULL || strcmp(entry->status, "verified") != 0) {
+        return false;
+    }
+    int64_t now_seconds = 0;
+    int64_t verified_seconds = 0;
+    if (!logger_parse_rfc3339_utc_seconds(now_utc_or_null, &now_seconds) ||
+        !logger_parse_rfc3339_utc_seconds(entry->verified_upload_utc, &verified_seconds)) {
+        return false;
+    }
+    return now_seconds >= verified_seconds &&
+           (uint64_t)(now_seconds - verified_seconds) >= (uint64_t)LOGGER_UPLOAD_RETENTION_SECONDS;
+}
+
+static ssize_t logger_upload_queue_find_oldest_verified(const logger_upload_queue_t *queue) {
+    if (queue == NULL) {
+        return -1;
+    }
+    for (size_t i = 0u; i < queue->session_count; ++i) {
+        if (strcmp(queue->sessions[i].status, "verified") == 0) {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+static bool logger_remove_closed_session_dir(const char *dir_name) {
+    if (!logger_string_present(dir_name)) {
+        return false;
+    }
+
+    char dir_path[LOGGER_STORAGE_PATH_MAX];
+    if (!logger_path_join2(dir_path, sizeof(dir_path), LOGGER_SESSIONS_DIR "/", dir_name)) {
+        return false;
+    }
+
+    DIR dir;
+    if (f_opendir(&dir, dir_path) != FR_OK) {
+        return false;
+    }
+
+    bool ok = true;
+    for (;;) {
+        FILINFO info;
+        memset(&info, 0, sizeof(info));
+        const FRESULT fr = f_readdir(&dir, &info);
+        if (fr != FR_OK) {
+            ok = false;
+            break;
+        }
+        if (info.fname[0] == '\0') {
+            break;
+        }
+        if (strcmp(info.fname, ".") == 0 || strcmp(info.fname, "..") == 0) {
+            continue;
+        }
+        if ((info.fattrib & AM_DIR) != 0u) {
+            ok = false;
+            break;
+        }
+
+        char child_path[LOGGER_STORAGE_PATH_MAX];
+        if (!logger_path_join3(child_path, sizeof(child_path), dir_path, "/", info.fname) ||
+            f_unlink(child_path) != FR_OK) {
+            ok = false;
+            break;
+        }
+    }
+    (void)f_closedir(&dir);
+    if (!ok) {
+        return false;
+    }
+    return f_unlink(dir_path) == FR_OK;
 }
 
 static bool logger_file_write_all(FIL *file, const void *data, size_t len) {
@@ -694,6 +855,7 @@ bool logger_upload_queue_rebuild_file(
 bool logger_upload_queue_requeue_blocked_file(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null,
+    const char *reason,
     size_t *requeued_count_out,
     logger_upload_queue_summary_t *summary_out) {
     if (requeued_count_out != NULL) {
@@ -730,11 +892,131 @@ bool logger_upload_queue_requeue_blocked_file(
             }
             return false;
         }
-        logger_log_queue_requeued(system_log, updated_at_utc_or_null, "manual_requeue_blocked", requeued_count);
+        logger_log_queue_requeued(system_log,
+                                  updated_at_utc_or_null,
+                                  logger_string_present(reason) ? reason : "manual_requeue_blocked",
+                                  requeued_count);
     }
 
     if (requeued_count_out != NULL) {
         *requeued_count_out = requeued_count;
+    }
+    if (summary_out != NULL) {
+        logger_upload_queue_compute_summary(&queue, summary_out);
+    }
+    return true;
+}
+
+bool logger_upload_queue_prune_file(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    uint64_t reserve_bytes,
+    size_t *retention_pruned_count_out,
+    size_t *reserve_pruned_count_out,
+    bool *reserve_met_out,
+    logger_upload_queue_summary_t *summary_out) {
+    if (retention_pruned_count_out != NULL) {
+        *retention_pruned_count_out = 0u;
+    }
+    if (reserve_pruned_count_out != NULL) {
+        *reserve_pruned_count_out = 0u;
+    }
+    if (reserve_met_out != NULL) {
+        *reserve_met_out = false;
+    }
+
+    logger_storage_status_t storage;
+    if (!logger_storage_refresh(&storage) || !storage.mounted || !storage.writable || !storage.logger_root_ready) {
+        if (summary_out != NULL) {
+            logger_upload_queue_summary_init(summary_out);
+        }
+        return false;
+    }
+
+    logger_upload_queue_t queue;
+    if (!logger_upload_queue_load(&queue)) {
+        if (summary_out != NULL) {
+            logger_upload_queue_summary_init(summary_out);
+        }
+        return false;
+    }
+
+    size_t retention_pruned_count = 0u;
+    size_t reserve_pruned_count = 0u;
+    bool changed = false;
+
+    for (size_t i = 0u; i < queue.session_count;) {
+        if (!logger_queue_entry_retention_expired(&queue.sessions[i], updated_at_utc_or_null)) {
+            ++i;
+            continue;
+        }
+
+        logger_upload_queue_entry_t pruned = queue.sessions[i];
+        if (!logger_remove_closed_session_dir(pruned.dir_name)) {
+            if (summary_out != NULL) {
+                logger_upload_queue_summary_init(summary_out);
+            }
+            return false;
+        }
+        logger_log_session_pruned(system_log, updated_at_utc_or_null, &pruned, "retention_expired");
+        logger_upload_queue_remove_at(&queue, i);
+        retention_pruned_count += 1u;
+        changed = true;
+    }
+
+    if (!logger_storage_refresh(&storage)) {
+        if (summary_out != NULL) {
+            logger_upload_queue_summary_init(summary_out);
+        }
+        return false;
+    }
+
+    while (storage.free_bytes < reserve_bytes) {
+        const ssize_t oldest_verified_index = logger_upload_queue_find_oldest_verified(&queue);
+        if (oldest_verified_index < 0) {
+            break;
+        }
+
+        const size_t index = (size_t)oldest_verified_index;
+        logger_upload_queue_entry_t pruned = queue.sessions[index];
+        if (!logger_remove_closed_session_dir(pruned.dir_name)) {
+            if (summary_out != NULL) {
+                logger_upload_queue_summary_init(summary_out);
+            }
+            return false;
+        }
+        logger_log_session_pruned(system_log, updated_at_utc_or_null, &pruned, "reserve_protection");
+        logger_upload_queue_remove_at(&queue, index);
+        reserve_pruned_count += 1u;
+        changed = true;
+
+        if (!logger_storage_refresh(&storage)) {
+            if (summary_out != NULL) {
+                logger_upload_queue_summary_init(summary_out);
+            }
+            return false;
+        }
+    }
+
+    if (changed) {
+        logger_copy_string(queue.updated_at_utc, sizeof(queue.updated_at_utc), updated_at_utc_or_null);
+        logger_upload_queue_sort(&queue);
+        if (!logger_upload_queue_write(&queue)) {
+            if (summary_out != NULL) {
+                logger_upload_queue_summary_init(summary_out);
+            }
+            return false;
+        }
+    }
+
+    if (retention_pruned_count_out != NULL) {
+        *retention_pruned_count_out = retention_pruned_count;
+    }
+    if (reserve_pruned_count_out != NULL) {
+        *reserve_pruned_count_out = reserve_pruned_count;
+    }
+    if (reserve_met_out != NULL) {
+        *reserve_met_out = storage.free_bytes >= reserve_bytes;
     }
     if (summary_out != NULL) {
         logger_upload_queue_compute_summary(&queue, summary_out);

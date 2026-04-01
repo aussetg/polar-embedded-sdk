@@ -15,6 +15,8 @@
 #define LOGGER_CONFIG_UPLOAD_TOKEN_MAX 160
 #define LOGGER_CONFIG_WIFI_SSID_MAX 33
 #define LOGGER_CONFIG_WIFI_PSK_MAX 65
+#define LOGGER_PERSISTED_FIRMWARE_VERSION_MAX 32
+#define LOGGER_PERSISTED_BUILD_ID_MAX 64
 
 typedef struct {
     char logger_id[LOGGER_CONFIG_LOGGER_ID_MAX];
@@ -32,6 +34,8 @@ typedef struct {
     logger_fault_code_t current_fault_code;
     logger_fault_code_t last_cleared_fault_code;
     logger_config_t config;
+    char last_boot_firmware_version[LOGGER_PERSISTED_FIRMWARE_VERSION_MAX];
+    char last_boot_build_id[LOGGER_PERSISTED_BUILD_ID_MAX];
     uint32_t storage_sequence;
     int storage_slot;
     bool storage_valid;

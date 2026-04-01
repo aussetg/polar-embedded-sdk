@@ -227,6 +227,18 @@ static bool logger_cli_is_upload_mode(const logger_app_t *app) {
     return logger_runtime_state_is_upload(app->runtime.current_state);
 }
 
+static bool logger_cli_upload_blocked_fault_present(void) {
+    logger_upload_queue_t queue;
+    logger_upload_queue_summary_t summary;
+    logger_upload_queue_init(&queue);
+    logger_upload_queue_summary_init(&summary);
+    if (!logger_upload_queue_load(&queue)) {
+        return true;
+    }
+    logger_upload_queue_compute_summary(&queue, &summary);
+    return summary.blocked_count > 0u;
+}
+
 static logger_fault_code_t logger_cli_storage_fault_code(const logger_app_t *app) {
     if (!app->storage.card_present || !app->storage.mounted || !app->storage.writable ||
         !app->storage.logger_root_ready || strcmp(app->storage.filesystem, "fat32") != 0) {
@@ -252,8 +264,9 @@ static bool logger_cli_fault_condition_still_present(const logger_app_t *app) {
         case LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET:
             return logger_cli_storage_fault_code(app) == app->persisted.current_fault_code;
         case LOGGER_FAULT_SD_WRITE_FAILED:
-        case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
             return true;
+        case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
+            return logger_cli_upload_blocked_fault_present();
         case LOGGER_FAULT_NONE:
         default:
             return false;
@@ -1558,6 +1571,7 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
     logger_upload_queue_summary_t summary;
     if (!logger_upload_queue_requeue_blocked_file(&app->system_log,
                                                   logger_now_utc_or_null(app),
+                                                  "manual_requeue_blocked",
                                                   &requeued_count,
                                                   &summary)) {
         logger_json_begin_error("debug queue requeue-blocked", logger_now_utc_or_null(app), "storage_unavailable", "failed to rewrite blocked upload_queue.json entries as pending");
@@ -1567,6 +1581,55 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
     logger_json_begin_success("debug queue requeue-blocked", logger_now_utc_or_null(app));
     fputs("{\"requeued_count\":", stdout);
     printf("%lu", (unsigned long)requeued_count);
+    fputs(",\"updated_at_utc\":", stdout);
+    logger_json_write_string_or_null(summary.updated_at_utc[0] != '\0' ? summary.updated_at_utc : NULL);
+    fputs(",\"session_count\":", stdout);
+    printf("%lu", (unsigned long)summary.session_count);
+    fputs(",\"pending_count\":", stdout);
+    printf("%lu", (unsigned long)summary.pending_count);
+    fputs(",\"blocked_count\":", stdout);
+    printf("%lu", (unsigned long)summary.blocked_count);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_debug_prune_once(logger_service_cli_t *cli, logger_app_t *app) {
+    const bool allowed_in_wait_h10 = app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
+    if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
+        logger_json_begin_error("debug prune once", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug prune once is only allowed in service mode or log_wait_h10");
+        return;
+    }
+    if (app->session.active) {
+        logger_json_begin_error("debug prune once", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug prune once is not permitted while a session is active");
+        return;
+    }
+    if (logger_cli_is_service_mode(app) && !logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error("debug prune once", logger_now_utc_or_null(app), "service_locked", "service unlock is required before debug prune once");
+        return;
+    }
+
+    size_t retention_pruned_count = 0u;
+    size_t reserve_pruned_count = 0u;
+    bool reserve_met = false;
+    logger_upload_queue_summary_t summary;
+    if (!logger_upload_queue_prune_file(&app->system_log,
+                                        logger_now_utc_or_null(app),
+                                        LOGGER_SD_MIN_FREE_RESERVE_BYTES,
+                                        &retention_pruned_count,
+                                        &reserve_pruned_count,
+                                        &reserve_met,
+                                        &summary)) {
+        logger_json_begin_error("debug prune once", logger_now_utc_or_null(app), "storage_unavailable", "failed to apply upload retention/prune policy");
+        return;
+    }
+
+    logger_json_begin_success("debug prune once", logger_now_utc_or_null(app));
+    fputs("{\"retention_pruned_count\":", stdout);
+    printf("%lu", (unsigned long)retention_pruned_count);
+    fputs(",\"reserve_pruned_count\":", stdout);
+    printf("%lu", (unsigned long)reserve_pruned_count);
+    fputs(",\"reserve_met\":", stdout);
+    fputs(reserve_met ? "true" : "false", stdout);
     fputs(",\"updated_at_utc\":", stdout);
     logger_json_write_string_or_null(summary.updated_at_utc[0] != '\0' ? summary.updated_at_utc : NULL);
     fputs(",\"session_count\":", stdout);
@@ -1730,6 +1793,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
     }
     if (strcmp(line, "debug queue requeue-blocked") == 0) {
         logger_handle_debug_queue_requeue_blocked(cli, app);
+        return;
+    }
+    if (strcmp(line, "debug prune once") == 0) {
+        logger_handle_debug_prune_once(cli, app);
         return;
     }
     if (strcmp(line, "debug upload once") == 0) {

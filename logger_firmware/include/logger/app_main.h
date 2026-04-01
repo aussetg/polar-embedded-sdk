@@ -44,6 +44,7 @@ typedef struct logger_app {
     uint32_t day_connect_baseline;
     uint32_t day_ecg_start_baseline;
     uint32_t last_clock_observation_mono_ms;
+    uint32_t last_queue_maintenance_mono_ms;
     uint32_t upload_next_attempt_mono_ms;
     int64_t last_clock_observation_utc_ns;
     uint8_t upload_retry_backoff_index;
@@ -61,6 +62,7 @@ typedef struct logger_app {
     bool last_clock_observation_valid;
     bool indicator_led_on;
     bool boot_banner_printed;
+    bool boot_firmware_identity_changed;
     bool reboot_pending;
 } logger_app_t;
 

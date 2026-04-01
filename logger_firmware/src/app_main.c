@@ -12,6 +12,16 @@
 #include "logger/queue.h"
 #include "logger/upload.h"
 
+#ifndef LOGGER_FIRMWARE_VERSION
+#define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
+#endif
+
+#ifndef LOGGER_BUILD_ID
+#define LOGGER_BUILD_ID "logger-fw-dev"
+#endif
+
+#define LOGGER_QUEUE_MAINTENANCE_INTERVAL_MS 300000u
+
 static bool logger_timezone_is_utc_like(const char *timezone) {
     return timezone != NULL &&
            (strcmp(timezone, "UTC") == 0 || strcmp(timezone, "Etc/UTC") == 0);
@@ -35,6 +45,20 @@ static void logger_app_copy_string(char *dst, size_t dst_len, const char *src) {
 
 static int64_t logger_app_i64_abs(int64_t value) {
     return value < 0 ? -value : value;
+}
+
+static bool logger_app_boot_identity_matches_persisted(const logger_persisted_state_t *state) {
+    return strcmp(state->last_boot_firmware_version, LOGGER_FIRMWARE_VERSION) == 0 &&
+           strcmp(state->last_boot_build_id, LOGGER_BUILD_ID) == 0;
+}
+
+static void logger_app_set_persisted_boot_identity(logger_persisted_state_t *state) {
+    logger_app_copy_string(state->last_boot_firmware_version,
+                           sizeof(state->last_boot_firmware_version),
+                           LOGGER_FIRMWARE_VERSION);
+    logger_app_copy_string(state->last_boot_build_id,
+                           sizeof(state->last_boot_build_id),
+                           LOGGER_BUILD_ID);
 }
 
 static void logger_print_boot_banner(const logger_app_t *app) {
@@ -279,6 +303,38 @@ static void logger_app_schedule_upload_retry(logger_app_t *app, uint32_t now_ms)
         app->upload_retry_backoff_index += 1u;
     }
     logger_app_reset_upload_pass(app);
+}
+
+static bool logger_app_run_queue_maintenance(logger_app_t *app, uint32_t now_ms, bool force) {
+    if (!app->storage.mounted || !app->storage.writable || !app->storage.logger_root_ready) {
+        return true;
+    }
+
+    if (!force &&
+        app->last_queue_maintenance_mono_ms != 0u &&
+        (now_ms - app->last_queue_maintenance_mono_ms) < LOGGER_QUEUE_MAINTENANCE_INTERVAL_MS) {
+        return true;
+    }
+
+    size_t retention_pruned_count = 0u;
+    size_t reserve_pruned_count = 0u;
+    bool reserve_met = false;
+    if (!logger_upload_queue_prune_file(&app->system_log,
+                                        app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+                                        LOGGER_SD_MIN_FREE_RESERVE_BYTES,
+                                        &retention_pruned_count,
+                                        &reserve_pruned_count,
+                                        &reserve_met,
+                                        NULL)) {
+        return false;
+    }
+
+    app->last_queue_maintenance_mono_ms = now_ms;
+    if (retention_pruned_count > 0u || reserve_pruned_count > 0u || reserve_met != app->storage.reserve_ok) {
+        app->last_observation_mono_ms = 0u;
+        logger_app_refresh_observations(app, now_ms);
+    }
+    return true;
 }
 
 static bool logger_app_observed_study_day(const logger_app_t *app, char out_study_day[11]) {
@@ -703,6 +759,8 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms, logger_boot_gesture_t b
     logger_identity_read_hardware_id_hex(app->hardware_id);
     logger_persisted_state_init(&app->persisted);
     (void)logger_config_store_load(&app->persisted);
+    app->boot_firmware_identity_changed = !logger_app_boot_identity_matches_persisted(&app->persisted);
+    logger_app_set_persisted_boot_identity(&app->persisted);
     app->persisted.boot_counter += 1u;
     (void)logger_config_store_save(&app->persisted);
 
@@ -722,8 +780,11 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms, logger_boot_gesture_t b
     char boot_details[128];
     snprintf(boot_details,
              sizeof(boot_details),
-             "{\"gesture\":\"%s\"}",
-             logger_app_boot_gesture_name(boot_gesture));
+             "{\"gesture\":\"%s\",\"firmware_version\":\"%s\",\"build_id\":\"%s\",\"firmware_changed\":%s}",
+             logger_app_boot_gesture_name(boot_gesture),
+             LOGGER_FIRMWARE_VERSION,
+             LOGGER_BUILD_ID,
+             app->boot_firmware_identity_changed ? "true" : "false");
     (void)logger_system_log_append(
         &app->system_log,
         app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
@@ -757,6 +818,32 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
         return;
     }
 
+    if (app->storage.mounted && app->storage.writable && app->storage.logger_root_ready) {
+        if (!logger_upload_queue_refresh_file(&app->system_log,
+                                              app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+                                              NULL)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_refresh_failed", now_ms);
+            return;
+        }
+        if (app->boot_firmware_identity_changed) {
+            if (!logger_upload_queue_requeue_blocked_file(&app->system_log,
+                                                          app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+                                                          "firmware_changed",
+                                                          NULL,
+                                                          NULL)) {
+                logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+                logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_requeue_failed", now_ms);
+                return;
+            }
+        }
+        if (!logger_app_run_queue_maintenance(app, now_ms, true)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_prune_failed", now_ms);
+            return;
+        }
+    }
+
     if (app->boot_gesture == LOGGER_BOOT_GESTURE_SERVICE) {
         printf("[logger] boot gesture: forced service mode\n");
         if (logger_storage_ready_for_logging(&app->storage) &&
@@ -785,12 +872,6 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
     if (storage_fault != LOGGER_FAULT_NONE) {
         logger_app_maybe_latch_new_fault(app, storage_fault);
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "storage_not_ready", now_ms);
-        return;
-    }
-
-    if (!logger_upload_queue_refresh_file(&app->system_log, app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL, NULL)) {
-        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_refresh_failed", now_ms);
         return;
     }
 
@@ -831,6 +912,11 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_service(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    if (!logger_app_run_queue_maintenance(app, now_ms, !app->storage.reserve_ok)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_prune_failed", now_ms);
+        return;
+    }
     logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
     (void)logger_button_poll(&app->button, now_ms);
@@ -838,6 +924,11 @@ static void logger_step_service(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    if (!logger_app_run_queue_maintenance(app, now_ms, !app->storage.reserve_ok)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "queue_prune_failed", now_ms);
+        return;
+    }
     logger_h10_set_enabled(&app->h10, true);
     logger_h10_poll(&app->h10, now_ms);
     logger_service_cli_poll(&app->cli, app, now_ms);
@@ -997,6 +1088,11 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    if (!logger_app_run_queue_maintenance(app, now_ms, !app->storage.reserve_ok)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_prune_failed", now_ms);
+        return;
+    }
     logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
 
@@ -1039,6 +1135,11 @@ static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    if (!logger_app_run_queue_maintenance(app, now_ms, !app->storage.reserve_ok)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_prune_failed", now_ms);
+        return;
+    }
     logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
 
@@ -1134,6 +1235,11 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_idle_waiting_for_charger(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    if (!logger_app_run_queue_maintenance(app, now_ms, !app->storage.reserve_ok)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_prune_failed", now_ms);
+        return;
+    }
     logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
     (void)logger_button_poll(&app->button, now_ms);
@@ -1146,6 +1252,11 @@ static void logger_step_idle_waiting_for_charger(logger_app_t *app, uint32_t now
 
 static void logger_step_idle_upload_complete(logger_app_t *app, uint32_t now_ms) {
     logger_app_refresh_observations(app, now_ms);
+    if (!logger_app_run_queue_maintenance(app, now_ms, !app->storage.reserve_ok)) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "queue_prune_failed", now_ms);
+        return;
+    }
     logger_h10_set_enabled(&app->h10, false);
     logger_service_cli_poll(&app->cli, app, now_ms);
     (void)logger_button_poll(&app->button, now_ms);

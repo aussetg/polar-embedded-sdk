@@ -13,7 +13,7 @@
 #include "logger/flash_layout.h"
 
 #define LOGGER_FLASH_MAGIC 0x31474643u
-#define LOGGER_FLASH_SCHEMA_VERSION 1u
+#define LOGGER_FLASH_SCHEMA_VERSION 2u
 
 #define LOGGER_FLASH_CONFIG_SLOT0_OFFSET LOGGER_FLASH_CONFIG_REGION_OFFSET
 #define LOGGER_FLASH_CONFIG_SLOT1_OFFSET (LOGGER_FLASH_CONFIG_SLOT0_OFFSET + LOGGER_FLASH_CONFIG_SLOT_SIZE)
@@ -30,7 +30,28 @@ typedef struct {
     uint16_t current_fault_code;
     uint16_t last_cleared_fault_code;
     logger_config_t config;
+} logger_flash_record_v1_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t schema_version;
+    uint16_t payload_bytes;
+    uint32_t sequence;
+    uint32_t crc32;
+    uint32_t boot_counter;
+    uint16_t current_fault_code;
+    uint16_t last_cleared_fault_code;
+    logger_config_t config;
+    char last_boot_firmware_version[LOGGER_PERSISTED_FIRMWARE_VERSION_MAX];
+    char last_boot_build_id[LOGGER_PERSISTED_BUILD_ID_MAX];
 } logger_flash_record_t;
+
+typedef struct {
+    bool valid;
+    uint32_t sequence;
+    logger_persisted_state_t state;
+    int slot;
+} logger_flash_slot_state_t;
 
 static uint32_t logger_crc32_ieee(const uint8_t *data, size_t len) {
     uint32_t crc = 0xffffffffu;
@@ -48,8 +69,21 @@ static uint32_t logger_flash_slot_offset(unsigned slot) {
     return slot == 0u ? LOGGER_FLASH_CONFIG_SLOT0_OFFSET : LOGGER_FLASH_CONFIG_SLOT1_OFFSET;
 }
 
-static const logger_flash_record_t *logger_flash_slot_ptr(unsigned slot) {
-    return (const logger_flash_record_t *)(XIP_BASE + logger_flash_slot_offset(slot));
+static bool logger_flash_record_v1_valid(const logger_flash_record_v1_t *record) {
+    if (record->magic != LOGGER_FLASH_MAGIC) {
+        return false;
+    }
+    if (record->schema_version != 1u) {
+        return false;
+    }
+    if (record->payload_bytes != sizeof(logger_flash_record_v1_t)) {
+        return false;
+    }
+
+    logger_flash_record_v1_t copy = *record;
+    copy.crc32 = 0u;
+    const uint32_t crc = logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy));
+    return crc == record->crc32;
 }
 
 static bool logger_flash_record_valid(const logger_flash_record_t *record) {
@@ -102,6 +136,27 @@ static void logger_state_from_record(logger_persisted_state_t *state, const logg
     state->current_fault_code = (logger_fault_code_t)record->current_fault_code;
     state->last_cleared_fault_code = (logger_fault_code_t)record->last_cleared_fault_code;
     state->config = record->config;
+    logger_copy_string(state->last_boot_firmware_version,
+                       sizeof(state->last_boot_firmware_version),
+                       record->last_boot_firmware_version);
+    logger_copy_string(state->last_boot_build_id,
+                       sizeof(state->last_boot_build_id),
+                       record->last_boot_build_id);
+    state->storage_sequence = record->sequence;
+    state->storage_slot = slot;
+    state->storage_valid = true;
+}
+
+static void logger_state_from_record_v1(
+    logger_persisted_state_t *state,
+    const logger_flash_record_v1_t *record,
+    int slot) {
+    state->boot_counter = record->boot_counter;
+    state->current_fault_code = (logger_fault_code_t)record->current_fault_code;
+    state->last_cleared_fault_code = (logger_fault_code_t)record->last_cleared_fault_code;
+    state->config = record->config;
+    state->last_boot_firmware_version[0] = '\0';
+    state->last_boot_build_id[0] = '\0';
     state->storage_sequence = record->sequence;
     state->storage_slot = slot;
     state->storage_valid = true;
@@ -118,7 +173,51 @@ static void logger_record_from_state(const logger_persisted_state_t *state, logg
     record->current_fault_code = (uint16_t)state->current_fault_code;
     record->last_cleared_fault_code = (uint16_t)state->last_cleared_fault_code;
     record->config = state->config;
+    logger_copy_string(record->last_boot_firmware_version,
+                       sizeof(record->last_boot_firmware_version),
+                       state->last_boot_firmware_version);
+    logger_copy_string(record->last_boot_build_id,
+                       sizeof(record->last_boot_build_id),
+                       state->last_boot_build_id);
     record->crc32 = logger_crc32_ieee((const uint8_t *)record, sizeof(*record));
+}
+
+static bool logger_flash_slot_load(unsigned slot, logger_flash_slot_state_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->slot = (int)slot;
+
+    const uint8_t *raw = (const uint8_t *)(XIP_BASE + logger_flash_slot_offset(slot));
+    const uint32_t magic = *(const uint32_t *)raw;
+    const uint16_t schema_version = *(const uint16_t *)(raw + 4u);
+
+    if (magic != LOGGER_FLASH_MAGIC) {
+        return false;
+    }
+
+    logger_persisted_state_init(&out->state);
+    if (schema_version == 1u) {
+        const logger_flash_record_v1_t *record = (const logger_flash_record_v1_t *)raw;
+        if (!logger_flash_record_v1_valid(record)) {
+            return false;
+        }
+        logger_state_from_record_v1(&out->state, record, (int)slot);
+        out->sequence = record->sequence;
+        out->valid = true;
+        return true;
+    }
+
+    if (schema_version == LOGGER_FLASH_SCHEMA_VERSION) {
+        const logger_flash_record_t *record = (const logger_flash_record_t *)raw;
+        if (!logger_flash_record_valid(record)) {
+            return false;
+        }
+        logger_state_from_record(&out->state, record, (int)slot);
+        out->sequence = record->sequence;
+        out->valid = true;
+        return true;
+    }
+
+    return false;
 }
 
 static bool logger_flash_layout_is_safe(void) {
@@ -132,17 +231,17 @@ bool logger_config_store_load(logger_persisted_state_t *state) {
         return false;
     }
 
-    const logger_flash_record_t *slot0 = logger_flash_slot_ptr(0);
-    const logger_flash_record_t *slot1 = logger_flash_slot_ptr(1);
-    const bool valid0 = logger_flash_record_valid(slot0);
-    const bool valid1 = logger_flash_record_valid(slot1);
+    logger_flash_slot_state_t slot0;
+    logger_flash_slot_state_t slot1;
+    const bool valid0 = logger_flash_slot_load(0u, &slot0);
+    const bool valid1 = logger_flash_slot_load(1u, &slot1);
 
-    if (valid0 && (!valid1 || slot0->sequence >= slot1->sequence)) {
-        logger_state_from_record(state, slot0, 0);
+    if (valid0 && (!valid1 || slot0.sequence >= slot1.sequence)) {
+        *state = slot0.state;
         return true;
     }
     if (valid1) {
-        logger_state_from_record(state, slot1, 1);
+        *state = slot1.state;
         return true;
     }
 

@@ -70,7 +70,16 @@ bool logger_upload_queue_rebuild_file(
 bool logger_upload_queue_requeue_blocked_file(
     logger_system_log_t *system_log,
     const char *updated_at_utc_or_null,
+    const char *reason,
     size_t *requeued_count_out,
+    logger_upload_queue_summary_t *summary_out);
+bool logger_upload_queue_prune_file(
+    logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null,
+    uint64_t reserve_bytes,
+    size_t *retention_pruned_count_out,
+    size_t *reserve_pruned_count_out,
+    bool *reserve_met_out,
     logger_upload_queue_summary_t *summary_out);
 bool logger_upload_queue_refresh_file(
     logger_system_log_t *system_log,
