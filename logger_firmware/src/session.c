@@ -194,12 +194,20 @@ static void logger_sb_append_json_string_or_null(logger_sb_t *sb, const char *va
 static void logger_session_recompute_quarantine(
     logger_session_state_t *session,
     const logger_clock_status_t *clock) {
-    if (clock != NULL && clock->valid) {
+    if (session->quarantine_clock_jump) {
+        logger_copy_string(session->clock_state, sizeof(session->clock_state), "jumped");
+    } else if (session->quarantine_clock_invalid_at_start ||
+               session->quarantine_clock_fixed_mid_session ||
+               (clock != NULL && !clock->valid)) {
+        logger_copy_string(session->clock_state, sizeof(session->clock_state), "invalid");
+    } else if (clock != NULL && clock->valid) {
         logger_copy_string(session->clock_state, sizeof(session->clock_state), "valid");
     } else {
         logger_copy_string(session->clock_state, sizeof(session->clock_state), "invalid");
     }
     session->quarantined = session->quarantine_clock_invalid_at_start ||
+                           session->quarantine_clock_fixed_mid_session ||
+                           session->quarantine_clock_jump ||
                            session->quarantine_recovery_after_reset ||
                            (clock != NULL && !clock->valid);
 }
@@ -240,6 +248,20 @@ static void logger_session_quarantine_reasons_json(
     bool first = true;
     if (session->quarantine_clock_invalid_at_start) {
         logger_sb_append(&sb, "\"clock_invalid_at_start\"");
+        first = false;
+    }
+    if (session->quarantine_clock_fixed_mid_session) {
+        if (!first) {
+            logger_sb_append(&sb, ",");
+        }
+        logger_sb_append(&sb, "\"clock_fixed_mid_session\"");
+        first = false;
+    }
+    if (session->quarantine_clock_jump) {
+        if (!first) {
+            logger_sb_append(&sb, ",");
+        }
+        logger_sb_append(&sb, "\"clock_jump\"");
         first = false;
     }
     if (session->quarantine_recovery_after_reset) {
@@ -769,6 +791,7 @@ static bool logger_session_start_new_active_internal(
     const char *h10_address,
     bool encrypted,
     bool bonded,
+    bool clock_jump_at_session_start,
     bool debug_session,
     uint32_t boot_counter,
     uint32_t now_ms,
@@ -784,8 +807,8 @@ static bool logger_session_start_new_active_internal(
     }
 
     logger_session_init(session);
-    logger_session_recompute_quarantine(session, clock);
     session->quarantine_clock_invalid_at_start = clock != NULL && !clock->valid;
+    session->quarantine_clock_jump = clock_jump_at_session_start;
     logger_session_recompute_quarantine(session, clock);
 
     if (!logger_clock_derive_study_day_local_observed(clock, persisted->config.timezone, session->study_day_local)) {
@@ -1005,6 +1028,7 @@ bool logger_session_start_debug(
         persisted->config.bound_h10_address,
         false,
         false,
+        false,
         true,
         boot_counter,
         now_ms,
@@ -1113,6 +1137,7 @@ bool logger_session_ensure_active_span(
     const char *h10_address,
     bool encrypted,
     bool bonded,
+    bool clock_jump_at_session_start,
     uint32_t boot_counter,
     uint32_t now_ms,
     const char **error_code_out,
@@ -1133,6 +1158,7 @@ bool logger_session_ensure_active_span(
             h10_address,
             encrypted,
             bonded,
+            clock_jump_at_session_start,
             false,
             boot_counter,
             now_ms,
@@ -1279,6 +1305,101 @@ bool logger_session_handle_disconnect(
     return logger_session_write_live_internal(session, clock, boot_counter, now_ms);
 }
 
+bool logger_session_handle_clock_event(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    const char *event_kind,
+    const char *span_end_reason,
+    int64_t delta_ns,
+    int64_t old_utc_ns,
+    int64_t new_utc_ns,
+    bool split_span) {
+    if (!session->active || event_kind == NULL) {
+        return true;
+    }
+
+    if (strcmp(event_kind, "clock_fixed") == 0) {
+        session->quarantine_clock_fixed_mid_session = true;
+    } else if (strcmp(event_kind, "clock_jump") == 0) {
+        session->quarantine_clock_jump = true;
+    }
+    logger_session_recompute_quarantine(session, clock);
+
+    if (split_span && session->span_active) {
+        if (!logger_session_close_active_span(
+                session,
+                clock,
+                span_end_reason != NULL ? span_end_reason : "clock_jump",
+                boot_counter,
+                now_ms,
+                NULL)) {
+            return false;
+        }
+    }
+
+    char payload[LOGGER_SESSION_JSON_MAX];
+    const int n = snprintf(payload,
+                           sizeof(payload),
+                           "{\"schema_version\":1,\"record_type\":\"clock_event\",\"utc_ns\":%lld,\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"event_kind\":\"%s\",\"delta_ns\":%lld,\"old_utc_ns\":%lld,\"new_utc_ns\":%lld}",
+                           (long long)logger_session_observed_utc_ns_or_zero(clock),
+                           (unsigned long long)now_ms * 1000ull,
+                           (unsigned long)boot_counter,
+                           session->session_id,
+                           event_kind,
+                           (long long)delta_ns,
+                           (long long)old_utc_ns,
+                           (long long)new_utc_ns);
+    if (!(n > 0 && (size_t)n < sizeof(payload)) ||
+        !logger_journal_append_json_record(
+            session->journal_path,
+            LOGGER_JOURNAL_RECORD_CLOCK_EVENT,
+            session->next_record_seq++,
+            payload,
+            &session->journal_size_bytes)) {
+        return false;
+    }
+
+    return logger_session_write_live_internal(session, clock, boot_counter, now_ms);
+}
+
+bool logger_session_append_h10_battery(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    uint8_t battery_percent,
+    const char *read_reason) {
+    if (!session->active) {
+        return true;
+    }
+
+    char span_id_json[64];
+    logger_json_string_literal(span_id_json,
+                               sizeof(span_id_json),
+                               session->span_active ? session->current_span_id : NULL);
+
+    char payload[LOGGER_SESSION_JSON_MAX];
+    const int n = snprintf(payload,
+                           sizeof(payload),
+                           "{\"schema_version\":1,\"record_type\":\"h10_battery\",\"utc_ns\":%lld,\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":%s,\"battery_percent\":%u,\"read_reason\":\"%s\"}",
+                           (long long)logger_session_observed_utc_ns_or_zero(clock),
+                           (unsigned long long)now_ms * 1000ull,
+                           (unsigned long)boot_counter,
+                           session->session_id,
+                           span_id_json,
+                           (unsigned)battery_percent,
+                           read_reason != NULL ? read_reason : "periodic");
+    return n > 0 && (size_t)n < sizeof(payload) &&
+           logger_journal_append_json_record(
+               session->journal_path,
+               LOGGER_JOURNAL_RECORD_H10_BATTERY,
+               session->next_record_seq++,
+               payload,
+               &session->journal_size_bytes);
+}
+
 bool logger_session_finalize(
     logger_session_state_t *session,
     logger_system_log_t *system_log,
@@ -1408,6 +1529,8 @@ bool logger_session_recover_on_boot(
                        sizeof(session->current_span_id),
                        scan.active_span_open ? scan.active_span_id : NULL);
     session->quarantine_clock_invalid_at_start = scan.quarantine_clock_invalid_at_start;
+    session->quarantine_clock_fixed_mid_session = scan.quarantine_clock_fixed_mid_session;
+    session->quarantine_clock_jump = scan.quarantine_clock_jump;
     session->quarantine_recovery_after_reset = scan.quarantine_recovery_after_reset;
     logger_session_recompute_quarantine(session, clock);
 

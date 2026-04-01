@@ -25,6 +25,11 @@ typedef struct {
 } logger_h10_packet_t;
 
 typedef struct {
+    uint8_t battery_percent;
+    const char *read_reason;
+} logger_h10_battery_event_t;
+
+typedef struct {
     bool initialized;
     bool enabled;
     bool controller_ready;
@@ -52,13 +57,16 @@ typedef struct {
     uint8_t last_disconnect_reason;
     uint8_t last_start_response_status;
     uint8_t last_gatt_att_status;
+    int16_t battery_percent;
     uint16_t att_mtu;
     uint32_t last_seen_mono_ms;
     uint32_t next_retry_mono_ms;
     uint32_t start_deadline_mono_ms;
+    uint32_t last_battery_read_mono_ms;
     uint32_t seen_count;
     uint32_t connect_count;
     uint32_t disconnect_count;
+    uint32_t battery_read_count;
     uint32_t ecg_start_attempt_count;
     uint32_t ecg_start_success_count;
     uint32_t ecg_packet_count;
@@ -66,6 +74,9 @@ typedef struct {
     uint8_t packet_read_index;
     uint8_t packet_write_index;
     uint8_t packet_count;
+    uint8_t battery_event_reason;
+    bool battery_event_pending;
+    bool battery_read_due_connect;
     logger_h10_packet_t packets[LOGGER_H10_PACKET_QUEUE_DEPTH];
 } logger_h10_state_t;
 
@@ -74,6 +85,7 @@ bool logger_h10_set_bound_address(logger_h10_state_t *state, const char *bound_a
 void logger_h10_set_enabled(logger_h10_state_t *state, bool enabled);
 void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms);
 bool logger_h10_pop_ecg_packet(logger_h10_state_t *state, logger_h10_packet_t *out);
+bool logger_h10_take_battery_event(logger_h10_state_t *state, logger_h10_battery_event_t *out);
 
 const char *logger_h10_phase_name(logger_h10_phase_t phase);
 

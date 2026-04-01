@@ -1,5 +1,6 @@
 #include "logger/service_cli.h"
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,6 +26,63 @@ static bool logger_string_present(const char *value) {
 
 static const char *logger_now_utc_or_null(const logger_app_t *app) {
     return app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL;
+}
+
+static void logger_copy_string(char *dst, size_t dst_len, const char *src) {
+    if (dst_len == 0u) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t i = 0u;
+    while (src[i] != '\0' && (i + 1u) < dst_len) {
+        dst[i] = src[i];
+        ++i;
+    }
+    dst[i] = '\0';
+}
+
+static void logger_set_last_day_outcome(
+    logger_app_t *app,
+    const char *study_day_local,
+    const char *kind,
+    const char *reason) {
+    logger_copy_string(app->last_day_outcome_study_day_local, sizeof(app->last_day_outcome_study_day_local), study_day_local);
+    logger_copy_string(app->last_day_outcome_kind, sizeof(app->last_day_outcome_kind), kind);
+    logger_copy_string(app->last_day_outcome_reason, sizeof(app->last_day_outcome_reason), reason);
+    app->last_day_outcome_valid = study_day_local != NULL && study_day_local[0] != '\0' &&
+                                  kind != NULL && kind[0] != '\0' &&
+                                  reason != NULL && reason[0] != '\0';
+}
+
+static bool logger_parse_u8(const char *text, uint8_t *value_out) {
+    if (text == NULL || value_out == NULL || text[0] == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (end == NULL || *end != '\0' || value > 255u) {
+        return false;
+    }
+    *value_out = (uint8_t)value;
+    return true;
+}
+
+static bool logger_parse_bool01(const char *text, bool *value_out) {
+    if (text == NULL || value_out == NULL) {
+        return false;
+    }
+    if (strcmp(text, "0") == 0) {
+        *value_out = false;
+        return true;
+    }
+    if (strcmp(text, "1") == 0) {
+        *value_out = true;
+        return true;
+    }
+    return false;
 }
 
 #define logger_json_write_string_or_null(value) logger_json_fwrite_string_or_null(stdout, (value))
@@ -303,7 +361,13 @@ static void logger_write_status_payload(const logger_app_t *app) {
     fputs(app->h10.bonded ? "true" : "false", stdout);
     fputs(",\"last_seen_address\":", stdout);
     logger_json_write_string_or_null(app->h10.last_seen_address[0] != '\0' ? app->h10.last_seen_address : NULL);
-    fputs(",\"battery_percent\":null}", stdout);
+    fputs(",\"battery_percent\":", stdout);
+    if (app->h10.battery_percent >= 0) {
+        printf("%d", app->h10.battery_percent);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs("}", stdout);
 
     fputs(",\"session\":{\"active\":", stdout);
     fputs(app->session.active ? "true" : "false", stdout);
@@ -334,7 +398,13 @@ static void logger_write_status_payload(const logger_app_t *app) {
     fputs(",\"last_failure_class\":", stdout);
     logger_json_write_string_or_null(logger_string_present(queue_summary.last_failure_class) ? queue_summary.last_failure_class : NULL);
     fputs("}", stdout);
-    fputs(",\"last_day_outcome\":{\"study_day_local\":null,\"kind\":null,\"reason\":null}", stdout);
+    fputs(",\"last_day_outcome\":{\"study_day_local\":", stdout);
+    logger_json_write_string_or_null(app->last_day_outcome_valid ? app->last_day_outcome_study_day_local : NULL);
+    fputs(",\"kind\":", stdout);
+    logger_json_write_string_or_null(app->last_day_outcome_valid ? app->last_day_outcome_kind : NULL);
+    fputs(",\"reason\":", stdout);
+    logger_json_write_string_or_null(app->last_day_outcome_valid ? app->last_day_outcome_reason : NULL);
+    fputs("}", stdout);
     fputs(",\"firmware\":{\"version\":", stdout);
     logger_json_write_string_or_null(LOGGER_FIRMWARE_VERSION);
     fputs(",\"build_id\":", stdout);
@@ -940,6 +1010,501 @@ static void logger_handle_debug_session_stop(logger_app_t *app, uint32_t now_ms)
     logger_json_end_success();
 }
 
+static bool logger_debug_require_service_unlocked(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    const char *command,
+    const char *mode_message) {
+    if (!logger_cli_is_service_mode(app)) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "not_permitted_in_mode", mode_message);
+        return false;
+    }
+    if (!logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "service_locked", "service unlock is required");
+        return false;
+    }
+    return true;
+}
+
+static void logger_handle_debug_synth_ecg(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    const char *args,
+    uint32_t now_ms) {
+    if (!logger_debug_require_service_unlocked(cli, app, "debug synth ecg", "debug synth ecg is only allowed in service mode")) {
+        return;
+    }
+    if (!app->session.active) {
+        logger_json_begin_error("debug synth ecg", logger_now_utc_or_null(app), "not_permitted_in_mode", "no debug session is active");
+        return;
+    }
+
+    uint8_t count = 1u;
+    if (args != NULL && args[0] != '\0' && !logger_parse_u8(args, &count)) {
+        logger_json_begin_error("debug synth ecg", logger_now_utc_or_null(app), "invalid_config", "expected: debug synth ecg [count]");
+        return;
+    }
+    if (count == 0u) {
+        count = 1u;
+    }
+
+    if (!app->session.span_active) {
+        const char *error_code = NULL;
+        const char *error_message = NULL;
+        if (!logger_session_ensure_active_span(
+                &app->session,
+                &app->system_log,
+                app->hardware_id,
+                &app->persisted,
+                &app->clock,
+                &app->storage,
+                "reconnect",
+                app->persisted.config.bound_h10_address,
+                false,
+                false,
+                false,
+                app->persisted.boot_counter,
+                now_ms,
+                &error_code,
+                &error_message)) {
+            logger_json_begin_error("debug synth ecg", logger_now_utc_or_null(app),
+                                    error_code != NULL ? error_code : "storage_unavailable",
+                                    error_message != NULL ? error_message : "failed to reopen span");
+            return;
+        }
+    }
+
+    uint8_t packet[12] = {0};
+    packet[0] = 0x00u;
+    uint32_t appended = 0u;
+    for (uint8_t i = 0u; i < count; ++i) {
+        packet[1] = i;
+        packet[2] = (uint8_t)(i + 1u);
+        packet[3] = 0x34u;
+        packet[4] = 0x12u;
+        packet[5] = 0x78u;
+        packet[6] = 0x56u;
+        packet[7] = 0xbcu;
+        packet[8] = 0x9au;
+        packet[9] = 0xf0u;
+        packet[10] = 0xdeu;
+        packet[11] = 0x01u;
+        if (!logger_session_append_ecg_packet(
+                &app->session,
+                &app->clock,
+                ((uint64_t)now_ms * 1000ull) + ((uint64_t)i * 1000ull),
+                packet,
+                sizeof(packet))) {
+            logger_json_begin_error("debug synth ecg", logger_now_utc_or_null(app), "storage_unavailable", "failed to append synthetic ECG packet");
+            return;
+        }
+        appended += 1u;
+    }
+
+    logger_json_begin_success("debug synth ecg", logger_now_utc_or_null(app));
+    fputs("{\"appended_packets\":", stdout);
+    printf("%lu", (unsigned long)appended);
+    fputs(",\"session_id\":", stdout);
+    logger_json_write_string_or_null(app->session.session_id);
+    fputs(",\"span_id\":", stdout);
+    logger_json_write_string_or_null(app->session.span_active ? app->session.current_span_id : NULL);
+    fputs(",\"journal_size_bytes\":", stdout);
+    printf("%llu", (unsigned long long)app->session.journal_size_bytes);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_debug_synth_disconnect(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    uint32_t now_ms) {
+    if (!logger_debug_require_service_unlocked(cli, app, "debug synth disconnect", "debug synth disconnect is only allowed in service mode")) {
+        return;
+    }
+    if (!app->session.active || !app->session.span_active) {
+        logger_json_begin_error("debug synth disconnect", logger_now_utc_or_null(app), "not_permitted_in_mode", "no active span is open");
+        return;
+    }
+    if (!logger_session_handle_disconnect(&app->session, &app->clock, app->persisted.boot_counter, now_ms, "disconnect")) {
+        logger_json_begin_error("debug synth disconnect", logger_now_utc_or_null(app), "storage_unavailable", "failed to append synthetic disconnect gap");
+        return;
+    }
+    logger_json_begin_success("debug synth disconnect", logger_now_utc_or_null(app));
+    fputs("{\"span_active\":false,\"session_id\":", stdout);
+    logger_json_write_string_or_null(app->session.session_id);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_debug_synth_h10_battery(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    const char *args,
+    uint32_t now_ms) {
+    if (!logger_debug_require_service_unlocked(cli, app, "debug synth h10-battery", "debug synth h10-battery is only allowed in service mode")) {
+        return;
+    }
+    if (!app->session.active) {
+        logger_json_begin_error("debug synth h10-battery", logger_now_utc_or_null(app), "not_permitted_in_mode", "no debug session is active");
+        return;
+    }
+
+    char percent_text[16] = {0};
+    char reason[16] = {0};
+    if (args == NULL || sscanf(args, "%15s %15s", percent_text, reason) != 2) {
+        logger_json_begin_error("debug synth h10-battery", logger_now_utc_or_null(app), "invalid_config", "expected: debug synth h10-battery <percent> <connect|periodic>");
+        return;
+    }
+    uint8_t percent = 0u;
+    if (!logger_parse_u8(percent_text, &percent) || percent > 100u ||
+        (strcmp(reason, "connect") != 0 && strcmp(reason, "periodic") != 0)) {
+        logger_json_begin_error("debug synth h10-battery", logger_now_utc_or_null(app), "invalid_config", "invalid battery percent or read reason");
+        return;
+    }
+
+    if (!logger_session_append_h10_battery(
+            &app->session,
+            &app->clock,
+            app->persisted.boot_counter,
+            now_ms,
+            percent,
+            reason)) {
+        logger_json_begin_error("debug synth h10-battery", logger_now_utc_or_null(app), "storage_unavailable", "failed to append synthetic h10_battery record");
+        return;
+    }
+    app->h10.battery_percent = percent;
+
+    logger_json_begin_success("debug synth h10-battery", logger_now_utc_or_null(app));
+    fputs("{\"written\":true,\"battery_percent\":", stdout);
+    printf("%u", (unsigned)percent);
+    fputs(",\"read_reason\":", stdout);
+    logger_json_write_string_or_null(reason);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static const char *logger_classify_no_session_day_reason(bool seen_bound_device, bool ble_connected, bool ecg_start_attempted) {
+    if (!seen_bound_device) {
+        return "no_h10_seen";
+    }
+    if (!ble_connected) {
+        return "no_h10_connect";
+    }
+    if (!ecg_start_attempted) {
+        return "no_ecg_stream";
+    }
+    return "no_ecg_stream";
+}
+
+static bool logger_no_session_reason_valid(const char *reason) {
+    return strcmp(reason, "no_h10_seen") == 0 ||
+           strcmp(reason, "no_h10_connect") == 0 ||
+           strcmp(reason, "no_ecg_stream") == 0 ||
+           strcmp(reason, "stopped_before_first_span") == 0;
+}
+
+static void logger_handle_debug_synth_no_session_day(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    const char *args) {
+    if (!logger_debug_require_service_unlocked(cli, app, "debug synth no-session-day", "debug synth no-session-day is only allowed in service mode")) {
+        return;
+    }
+    if (app->session.active) {
+        logger_json_begin_error("debug synth no-session-day", logger_now_utc_or_null(app), "not_permitted_in_mode", "debug synth no-session-day requires no active session");
+        return;
+    }
+
+    char mode_or_reason[32] = {0};
+    char seen_text[8] = {0};
+    char connected_text[8] = {0};
+    char start_text[8] = {0};
+    const int matched = args == NULL ? 0 : sscanf(args, "%31s %7s %7s %7s", mode_or_reason, seen_text, connected_text, start_text);
+    if (matched < 1) {
+        logger_json_begin_error("debug synth no-session-day", logger_now_utc_or_null(app), "invalid_config", "expected: debug synth no-session-day <reason>|auto [seen connected ecg_started]");
+        return;
+    }
+
+    bool seen_bound_device = app->h10.seen_count > 0u;
+    bool ble_connected = app->h10.connect_count > 0u;
+    bool ecg_start_attempted = app->h10.ecg_start_attempt_count > 0u;
+    const char *reason = mode_or_reason;
+
+    if (strcmp(mode_or_reason, "auto") == 0) {
+        if (matched == 4) {
+            if (!logger_parse_bool01(seen_text, &seen_bound_device) ||
+                !logger_parse_bool01(connected_text, &ble_connected) ||
+                !logger_parse_bool01(start_text, &ecg_start_attempted)) {
+                logger_json_begin_error("debug synth no-session-day", logger_now_utc_or_null(app), "invalid_config", "auto mode flags must be 0 or 1");
+                return;
+            }
+        }
+        reason = logger_classify_no_session_day_reason(seen_bound_device, ble_connected, ecg_start_attempted);
+    } else if (!logger_no_session_reason_valid(reason)) {
+        logger_json_begin_error("debug synth no-session-day", logger_now_utc_or_null(app), "invalid_config", "invalid no-session-day reason");
+        return;
+    }
+
+    char study_day_local[11] = {0};
+    if (!logger_clock_derive_study_day_local_observed(&app->clock, app->persisted.config.timezone, study_day_local)) {
+        logger_json_begin_error("debug synth no-session-day", logger_now_utc_or_null(app), "invalid_config", "cannot derive study_day_local from current clock/timezone");
+        return;
+    }
+
+    char details[160];
+    snprintf(details,
+             sizeof(details),
+             "{\"study_day_local\":\"%s\",\"reason\":\"%s\",\"seen_bound_device\":%s,\"ble_connected\":%s,\"ecg_start_attempted\":%s}",
+             study_day_local,
+             reason,
+             seen_bound_device ? "true" : "false",
+             ble_connected ? "true" : "false",
+             ecg_start_attempted ? "true" : "false");
+    if (!logger_system_log_append(&app->system_log,
+                                  logger_now_utc_or_null(app),
+                                  "no_session_day_summary",
+                                  LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+                                  details)) {
+        logger_json_begin_error("debug synth no-session-day", logger_now_utc_or_null(app), "storage_unavailable", "failed to append synthetic no_session_day_summary");
+        return;
+    }
+    logger_set_last_day_outcome(app, study_day_local, "no_session", reason);
+
+    logger_json_begin_success("debug synth no-session-day", logger_now_utc_or_null(app));
+    fputs("{\"study_day_local\":", stdout);
+    logger_json_write_string_or_null(study_day_local);
+    fputs(",\"reason\":", stdout);
+    logger_json_write_string_or_null(reason);
+    fputs(",\"seen_bound_device\":", stdout);
+    fputs(seen_bound_device ? "true" : "false", stdout);
+    fputs(",\"ble_connected\":", stdout);
+    fputs(ble_connected ? "true" : "false", stdout);
+    fputs(",\"ecg_start_attempted\":", stdout);
+    fputs(ecg_start_attempted ? "true" : "false", stdout);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static bool logger_update_clock_from_rfc3339(logger_app_t *app, const char *rfc3339, uint32_t now_ms, int64_t *old_utc_ns_out, int64_t *new_utc_ns_out) {
+    int64_t old_utc_ns = 0ll;
+    (void)logger_clock_observed_utc_ns(&app->clock, &old_utc_ns);
+    if (!logger_clock_set_utc(rfc3339, &app->clock)) {
+        return false;
+    }
+    int64_t new_utc_ns = 0ll;
+    (void)logger_clock_observed_utc_ns(&app->clock, &new_utc_ns);
+    app->last_clock_observation_available = true;
+    app->last_clock_observation_valid = app->clock.valid;
+    app->last_clock_observation_mono_ms = now_ms;
+    app->last_clock_observation_utc_ns = new_utc_ns;
+    if (old_utc_ns_out != NULL) {
+        *old_utc_ns_out = old_utc_ns;
+    }
+    if (new_utc_ns_out != NULL) {
+        *new_utc_ns_out = new_utc_ns;
+    }
+    return true;
+}
+
+static void logger_handle_debug_synth_rollover(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    const char *rfc3339,
+    uint32_t now_ms) {
+    if (!logger_debug_require_service_unlocked(cli, app, "debug synth rollover", "debug synth rollover is only allowed in service mode")) {
+        return;
+    }
+    if (!app->session.active) {
+        logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app), "not_permitted_in_mode", "no debug session is active");
+        return;
+    }
+
+    char old_session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+    char old_study_day_local[11];
+    logger_copy_string(old_session_id, sizeof(old_session_id), app->session.session_id);
+    logger_copy_string(old_study_day_local, sizeof(old_study_day_local), app->session.study_day_local);
+
+    if (!logger_update_clock_from_rfc3339(app, rfc3339, now_ms, NULL, NULL)) {
+        logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app), "invalid_config", "invalid RFC3339 UTC timestamp");
+        return;
+    }
+
+    char new_study_day_local[11] = {0};
+    if (!logger_clock_derive_study_day_local_observed(&app->clock, app->persisted.config.timezone, new_study_day_local)) {
+        logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app), "invalid_config", "cannot derive study_day_local from current clock/timezone");
+        return;
+    }
+    if (strcmp(old_study_day_local, new_study_day_local) == 0) {
+        logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app), "invalid_config", "new timestamp does not cross the study-day boundary");
+        return;
+    }
+
+    if (!logger_session_finalize(
+            &app->session,
+            &app->system_log,
+            app->hardware_id,
+            &app->persisted,
+            &app->clock,
+            &app->storage,
+            "rollover",
+            app->persisted.boot_counter,
+            now_ms)) {
+        logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app), "storage_unavailable", "failed to finalize pre-rollover session");
+        return;
+    }
+    const char *error_code = NULL;
+    const char *error_message = NULL;
+    if (!logger_session_ensure_active_span(
+            &app->session,
+            &app->system_log,
+            app->hardware_id,
+            &app->persisted,
+            &app->clock,
+            &app->storage,
+            "rollover_continue",
+            app->persisted.config.bound_h10_address,
+            false,
+            false,
+            false,
+            app->persisted.boot_counter,
+            now_ms,
+            &error_code,
+            &error_message)) {
+        logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app),
+                                error_code != NULL ? error_code : "storage_unavailable",
+                                error_message != NULL ? error_message : "failed to open post-rollover session");
+        return;
+    }
+    logger_set_last_day_outcome(app, old_study_day_local, "session", "session_closed");
+    app->last_session_live_flush_mono_ms = now_ms;
+    app->last_session_snapshot_mono_ms = now_ms;
+
+    logger_json_begin_success("debug synth rollover", logger_now_utc_or_null(app));
+    fputs("{\"old_study_day_local\":", stdout);
+    logger_json_write_string_or_null(old_study_day_local);
+    fputs(",\"new_study_day_local\":", stdout);
+    logger_json_write_string_or_null(new_study_day_local);
+    fputs(",\"old_session_id\":", stdout);
+    logger_json_write_string_or_null(old_session_id);
+    fputs(",\"new_session_id\":", stdout);
+    logger_json_write_string_or_null(app->session.session_id);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_debug_synth_clock_boundary(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    const char *command,
+    const char *event_kind,
+    const char *span_end_reason,
+    const char *continue_reason,
+    bool jump_at_session_start,
+    const char *rfc3339,
+    uint32_t now_ms) {
+    if (!logger_debug_require_service_unlocked(cli, app, command, "synthetic clock commands are only allowed in service mode")) {
+        return;
+    }
+    if (!app->session.active) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "not_permitted_in_mode", "no debug session is active");
+        return;
+    }
+
+    char old_session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+    char old_study_day_local[11];
+    logger_copy_string(old_session_id, sizeof(old_session_id), app->session.session_id);
+    logger_copy_string(old_study_day_local, sizeof(old_study_day_local), app->session.study_day_local);
+
+    int64_t old_utc_ns = 0ll;
+    int64_t new_utc_ns = 0ll;
+    if (!logger_update_clock_from_rfc3339(app, rfc3339, now_ms, &old_utc_ns, &new_utc_ns)) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "invalid_config", "invalid RFC3339 UTC timestamp");
+        return;
+    }
+
+    char new_study_day_local[11] = {0};
+    if (!logger_clock_derive_study_day_local_observed(&app->clock, app->persisted.config.timezone, new_study_day_local)) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "invalid_config", "cannot derive study_day_local from current clock/timezone");
+        return;
+    }
+    const bool crossed_study_day = strcmp(old_study_day_local, new_study_day_local) != 0;
+
+    if (!logger_session_handle_clock_event(
+            &app->session,
+            &app->clock,
+            app->persisted.boot_counter,
+            now_ms,
+            event_kind,
+            span_end_reason,
+            new_utc_ns - old_utc_ns,
+            old_utc_ns,
+            new_utc_ns,
+            true)) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "storage_unavailable", "failed to append synthetic clock boundary records");
+        return;
+    }
+
+    if (crossed_study_day) {
+        if (!logger_session_finalize(
+                &app->session,
+                &app->system_log,
+                app->hardware_id,
+                &app->persisted,
+                &app->clock,
+                &app->storage,
+                span_end_reason,
+                app->persisted.boot_counter,
+                now_ms)) {
+            logger_json_begin_error(command, logger_now_utc_or_null(app), "storage_unavailable", "failed to finalize pre-boundary session");
+            return;
+        }
+        logger_set_last_day_outcome(app, old_study_day_local, "session", "session_closed");
+    }
+
+    const char *error_code = NULL;
+    const char *error_message = NULL;
+    if (!logger_session_ensure_active_span(
+            &app->session,
+            &app->system_log,
+            app->hardware_id,
+            &app->persisted,
+            &app->clock,
+            &app->storage,
+            continue_reason,
+            app->persisted.config.bound_h10_address,
+            false,
+            false,
+            jump_at_session_start && crossed_study_day,
+            app->persisted.boot_counter,
+            now_ms,
+            &error_code,
+            &error_message)) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app),
+                                error_code != NULL ? error_code : "storage_unavailable",
+                                error_message != NULL ? error_message : "failed to open post-boundary span/session");
+        return;
+    }
+
+    app->last_session_live_flush_mono_ms = now_ms;
+    app->last_session_snapshot_mono_ms = now_ms;
+
+    logger_json_begin_success(command, logger_now_utc_or_null(app));
+    fputs("{\"crossed_study_day\":", stdout);
+    fputs(crossed_study_day ? "true" : "false", stdout);
+    fputs(",\"old_study_day_local\":", stdout);
+    logger_json_write_string_or_null(old_study_day_local);
+    fputs(",\"new_study_day_local\":", stdout);
+    logger_json_write_string_or_null(new_study_day_local);
+    fputs(",\"old_session_id\":", stdout);
+    logger_json_write_string_or_null(old_session_id);
+    fputs(",\"new_session_id\":", stdout);
+    logger_json_write_string_or_null(app->session.session_id);
+    fputs(",\"current_span_id\":", stdout);
+    logger_json_write_string_or_null(app->session.span_active ? app->session.current_span_id : NULL);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
 static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli, logger_app_t *app) {
     const bool allowed_in_wait_h10 = app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
     if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
@@ -1125,6 +1690,56 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
     }
     if (strcmp(line, "debug upload once") == 0) {
         logger_handle_debug_upload_once(cli, app);
+        return;
+    }
+    if (strcmp(line, "debug synth ecg") == 0) {
+        logger_handle_debug_synth_ecg(cli, app, "", now_ms);
+        return;
+    }
+    if (strncmp(line, "debug synth ecg ", 16) == 0) {
+        logger_handle_debug_synth_ecg(cli, app, line + 16, now_ms);
+        return;
+    }
+    if (strcmp(line, "debug synth disconnect") == 0) {
+        logger_handle_debug_synth_disconnect(cli, app, now_ms);
+        return;
+    }
+    if (strncmp(line, "debug synth h10-battery ", 25) == 0) {
+        logger_handle_debug_synth_h10_battery(cli, app, line + 25, now_ms);
+        return;
+    }
+    if (strncmp(line, "debug synth no-session-day ", 27) == 0) {
+        logger_handle_debug_synth_no_session_day(cli, app, line + 27);
+        return;
+    }
+    if (strncmp(line, "debug synth rollover ", 22) == 0) {
+        logger_handle_debug_synth_rollover(cli, app, line + 22, now_ms);
+        return;
+    }
+    if (strncmp(line, "debug synth clock-fix ", 23) == 0) {
+        logger_handle_debug_synth_clock_boundary(
+            cli,
+            app,
+            "debug synth clock-fix",
+            "clock_fixed",
+            "clock_fix",
+            "clock_fix_continue",
+            false,
+            line + 23,
+            now_ms);
+        return;
+    }
+    if (strncmp(line, "debug synth clock-jump ", 24) == 0) {
+        logger_handle_debug_synth_clock_boundary(
+            cli,
+            app,
+            "debug synth clock-jump",
+            "clock_jump",
+            "clock_jump",
+            "clock_jump_continue",
+            true,
+            line + 24,
+            now_ms);
         return;
     }
     if (strcmp(line, "debug reboot") == 0) {

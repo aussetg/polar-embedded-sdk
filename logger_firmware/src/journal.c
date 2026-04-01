@@ -169,10 +169,14 @@ static void logger_journal_apply_json_record(
                                                  sizeof(result->session_start_reason));
             logger_journal_capture_utc(doc, root, result->session_start_utc);
             char clock_state[16];
-            if (logger_json_object_copy_string(doc, root, "clock_state", clock_state, sizeof(clock_state)) &&
-                strcmp(clock_state, "valid") != 0) {
-                result->quarantined = true;
-                result->quarantine_clock_invalid_at_start = true;
+            if (logger_json_object_copy_string(doc, root, "clock_state", clock_state, sizeof(clock_state))) {
+                if (strcmp(clock_state, "invalid") == 0) {
+                    result->quarantined = true;
+                    result->quarantine_clock_invalid_at_start = true;
+                } else if (strcmp(clock_state, "jumped") == 0) {
+                    result->quarantined = true;
+                    result->quarantine_clock_jump = true;
+                }
             }
             break;
         }
@@ -238,6 +242,19 @@ static void logger_journal_apply_json_record(
             result->quarantined = true;
             result->quarantine_recovery_after_reset = true;
             break;
+        case LOGGER_JOURNAL_RECORD_CLOCK_EVENT: {
+            char event_kind[24];
+            if (logger_json_object_copy_string(doc, root, "event_kind", event_kind, sizeof(event_kind))) {
+                if (strcmp(event_kind, "clock_fixed") == 0) {
+                    result->quarantined = true;
+                    result->quarantine_clock_fixed_mid_session = true;
+                } else if (strcmp(event_kind, "clock_jump") == 0) {
+                    result->quarantined = true;
+                    result->quarantine_clock_jump = true;
+                }
+            }
+            break;
+        }
         default:
             break;
     }

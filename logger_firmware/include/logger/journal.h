@@ -28,6 +28,8 @@ typedef struct {
     bool active_span_open;
     bool quarantined;
     bool quarantine_clock_invalid_at_start;
+    bool quarantine_clock_fixed_mid_session;
+    bool quarantine_clock_jump;
     bool quarantine_recovery_after_reset;
     uint64_t valid_size_bytes;
     uint64_t next_record_seq;

@@ -36,6 +36,11 @@
 #define LOGGER_H10_ECG_SAMPLE_RATE 130u
 #define LOGGER_H10_ECG_RESOLUTION 14u
 #define LOGGER_H10_STREAM_START_TIMEOUT_MS 5000u
+#define LOGGER_H10_BATTERY_PERIOD_MS 3600000u
+
+#define LOGGER_H10_BATTERY_REASON_NONE 0u
+#define LOGGER_H10_BATTERY_REASON_CONNECT 1u
+#define LOGGER_H10_BATTERY_REASON_PERIODIC 2u
 
 static const uint8_t LOGGER_H10_UUID_PMD_SERVICE_BE[16] = {
     0xFB, 0x00, 0x5C, 0x80, 0x02, 0xE7, 0xF3, 0x87,
@@ -98,6 +103,9 @@ static uint8_t g_pmd_cp_response_status = 0xffu;
 static uint8_t g_pmd_cp_response_type = 0xffu;
 
 static bool g_mtu_exchange_done = false;
+static bool g_battery_read_active = false;
+static bool g_battery_value_received = false;
+static uint8_t g_battery_pending_reason = LOGGER_H10_BATTERY_REASON_NONE;
 
 static void logger_h10_gatt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
@@ -177,6 +185,9 @@ static void logger_h10_reset_pmd_state(logger_h10_state_t *state) {
     g_pmd_cp_response_status = 0xffu;
     g_pmd_cp_response_type = 0xffu;
     g_mtu_exchange_done = false;
+    g_battery_read_active = false;
+    g_battery_value_received = false;
+    g_battery_pending_reason = LOGGER_H10_BATTERY_REASON_NONE;
 
     state->start_in_progress = false;
     state->start_succeeded = false;
@@ -186,6 +197,9 @@ static void logger_h10_reset_pmd_state(logger_h10_state_t *state) {
     state->last_gatt_att_status = ATT_ERROR_SUCCESS;
     state->att_mtu = ATT_DEFAULT_MTU;
     state->start_deadline_mono_ms = 0u;
+    state->battery_event_pending = false;
+    state->battery_event_reason = LOGGER_H10_BATTERY_REASON_NONE;
+    state->battery_read_due_connect = false;
     logger_h10_reset_packet_queue(state);
 }
 
@@ -273,6 +287,18 @@ bool logger_h10_pop_ecg_packet(logger_h10_state_t *state, logger_h10_packet_t *o
     memset(&state->packets[state->packet_read_index], 0, sizeof(state->packets[state->packet_read_index]));
     state->packet_read_index = (uint8_t)((state->packet_read_index + 1u) % LOGGER_H10_PACKET_QUEUE_DEPTH);
     state->packet_count -= 1u;
+    return true;
+}
+
+bool logger_h10_take_battery_event(logger_h10_state_t *state, logger_h10_battery_event_t *out) {
+    if (state == NULL || out == NULL || !state->battery_event_pending || state->battery_percent < 0) {
+        return false;
+    }
+
+    out->battery_percent = (uint8_t)state->battery_percent;
+    out->read_reason = state->battery_event_reason == LOGGER_H10_BATTERY_REASON_CONNECT ? "connect" : "periodic";
+    state->battery_event_pending = false;
+    state->battery_event_reason = LOGGER_H10_BATTERY_REASON_NONE;
     return true;
 }
 
@@ -657,6 +683,48 @@ static bool logger_h10_start_characteristic_discovery(logger_h10_state_t *state)
     return true;
 }
 
+static bool logger_h10_request_battery_read(logger_h10_state_t *state, uint8_t reason) {
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID || g_battery_read_active ||
+        g_service_query_active || g_char_query_active || state->start_in_progress ||
+        g_pmd_cfg_pending || g_pmd_write_pending) {
+        return false;
+    }
+
+    g_battery_read_active = true;
+    g_battery_value_received = false;
+    g_battery_pending_reason = reason;
+    state->last_gatt_att_status = ATT_ERROR_SUCCESS;
+    const int err = gatt_client_read_value_of_characteristics_by_uuid16(
+        logger_h10_gatt_packet_handler,
+        g_conn_handle,
+        0x0001u,
+        0xffffu,
+        ORG_BLUETOOTH_CHARACTERISTIC_BATTERY_LEVEL);
+    if (err != 0) {
+        g_battery_read_active = false;
+        g_battery_pending_reason = LOGGER_H10_BATTERY_REASON_NONE;
+        state->last_gatt_att_status = (uint8_t)err;
+        return false;
+    }
+    return true;
+}
+
+static void logger_h10_maybe_schedule_battery_read(logger_h10_state_t *state, uint32_t now_ms) {
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID || !state->secure) {
+        return;
+    }
+    if (state->battery_read_due_connect) {
+        if (logger_h10_request_battery_read(state, LOGGER_H10_BATTERY_REASON_CONNECT)) {
+            state->battery_read_due_connect = false;
+        }
+        return;
+    }
+    if (state->last_battery_read_mono_ms != 0u && (now_ms - state->last_battery_read_mono_ms) < LOGGER_H10_BATTERY_PERIOD_MS) {
+        return;
+    }
+    (void)logger_h10_request_battery_read(state, LOGGER_H10_BATTERY_REASON_PERIODIC);
+}
+
 static bool logger_h10_start_ecg(logger_h10_state_t *state, uint32_t now_ms) {
     if (state == NULL || !state->connected || !state->secure || !g_pmd_cp_found || !g_pmd_data_found) {
         return false;
@@ -731,6 +799,7 @@ static void logger_h10_on_connected_ready(void *ctx, const polar_sdk_link_event_
         logger_copy_string(state->connected_address, sizeof(state->connected_address), bd_addr_to_str(g_peer_addr));
     }
     logger_h10_reset_pmd_state(state);
+    state->battery_read_due_connect = true;
     logger_h10_set_phase(state, LOGGER_H10_PHASE_SECURING);
 }
 
@@ -974,6 +1043,28 @@ static void logger_h10_gatt_packet_handler(uint8_t packet_type, uint16_t channel
         return;
     }
 
+    if (packet_type == HCI_EVENT_PACKET && hci_event_packet_get_type(packet) == GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT && g_battery_read_active) {
+        const uint16_t value_len = gatt_event_characteristic_value_query_result_get_value_length(packet);
+        const uint8_t *value = gatt_event_characteristic_value_query_result_get_value(packet);
+        if (value_len >= 1u && value != NULL) {
+            g_h10->battery_percent = value[0];
+            g_h10->last_battery_read_mono_ms = btstack_run_loop_get_time_ms();
+            g_h10->battery_read_count += 1u;
+            g_h10->battery_event_pending = true;
+            g_h10->battery_event_reason = g_battery_pending_reason;
+            g_battery_value_received = true;
+        }
+        return;
+    }
+
+    if (have_query_complete && g_battery_read_active) {
+        g_h10->last_gatt_att_status = query_complete_att_status;
+        g_battery_read_active = false;
+        g_battery_value_received = false;
+        g_battery_pending_reason = LOGGER_H10_BATTERY_REASON_NONE;
+        return;
+    }
+
     if (g_service_query_active) {
         gatt_client_service_t service;
         if (polar_sdk_btstack_decode_service_query_result(packet_type, packet, &service)) {
@@ -1109,6 +1200,7 @@ static void logger_h10_init_btstack_core(void) {
 void logger_h10_init(logger_h10_state_t *state) {
     memset(state, 0, sizeof(*state));
     state->last_seen_rssi = -127;
+    state->battery_percent = -1;
     state->phase = LOGGER_H10_PHASE_OFF;
     state->last_start_response_status = 0xffu;
     state->att_mtu = ATT_DEFAULT_MTU;
@@ -1164,6 +1256,7 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
 
     if (state->connected) {
         if (state->streaming) {
+            logger_h10_maybe_schedule_battery_read(state, now_ms);
             logger_h10_set_phase(state, LOGGER_H10_PHASE_STREAMING);
             return;
         }
@@ -1184,6 +1277,7 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
         }
 
         if (state->start_succeeded) {
+            logger_h10_maybe_schedule_battery_read(state, now_ms);
             if (state->start_deadline_mono_ms != 0u && (int32_t)(now_ms - state->start_deadline_mono_ms) >= 0) {
                 printf("[logger] h10 ecg start timed out waiting for packets\n");
                 logger_h10_disconnect_for_restart(state);

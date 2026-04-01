@@ -17,6 +17,26 @@ static bool logger_timezone_is_utc_like(const char *timezone) {
            (strcmp(timezone, "UTC") == 0 || strcmp(timezone, "Etc/UTC") == 0);
 }
 
+static void logger_app_copy_string(char *dst, size_t dst_len, const char *src) {
+    if (dst_len == 0u) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t i = 0u;
+    while (src[i] != '\0' && (i + 1u) < dst_len) {
+        dst[i] = src[i];
+        ++i;
+    }
+    dst[i] = '\0';
+}
+
+static int64_t logger_app_i64_abs(int64_t value) {
+    return value < 0 ? -value : value;
+}
+
 static void logger_print_boot_banner(const logger_app_t *app) {
     printf("[logger] appliance firmware\n");
     printf("[logger] board_profile=%s\n", LOGGER_BOARD_PROFILE);
@@ -261,6 +281,108 @@ static void logger_app_schedule_upload_retry(logger_app_t *app, uint32_t now_ms)
     logger_app_reset_upload_pass(app);
 }
 
+static bool logger_app_observed_study_day(const logger_app_t *app, char out_study_day[11]) {
+    return logger_clock_derive_study_day_local_observed(&app->clock, app->persisted.config.timezone, out_study_day);
+}
+
+static void logger_app_reset_day_tracking(logger_app_t *app, const char *study_day_local) {
+    logger_app_copy_string(app->current_day_study_day_local, sizeof(app->current_day_study_day_local), study_day_local);
+    app->day_seen_baseline = app->h10.seen_count;
+    app->day_connect_baseline = app->h10.connect_count;
+    app->day_ecg_start_baseline = app->h10.ecg_start_attempt_count;
+    app->day_tracking_initialized = study_day_local != NULL && study_day_local[0] != '\0';
+    app->current_day_has_session = app->session.active;
+}
+
+static bool logger_app_current_day_seen_bound_device(const logger_app_t *app) {
+    return app->h10.seen_count > app->day_seen_baseline;
+}
+
+static bool logger_app_current_day_ble_connected(const logger_app_t *app) {
+    return app->h10.connect_count > app->day_connect_baseline;
+}
+
+static bool logger_app_current_day_ecg_start_attempted(const logger_app_t *app) {
+    return app->h10.ecg_start_attempt_count > app->day_ecg_start_baseline;
+}
+
+static void logger_app_set_last_day_outcome(
+    logger_app_t *app,
+    const char *study_day_local,
+    const char *kind,
+    const char *reason) {
+    logger_app_copy_string(app->last_day_outcome_study_day_local, sizeof(app->last_day_outcome_study_day_local), study_day_local);
+    logger_app_copy_string(app->last_day_outcome_kind, sizeof(app->last_day_outcome_kind), kind);
+    logger_app_copy_string(app->last_day_outcome_reason, sizeof(app->last_day_outcome_reason), reason);
+    app->last_day_outcome_valid = study_day_local != NULL && study_day_local[0] != '\0' &&
+                                  kind != NULL && kind[0] != '\0' &&
+                                  reason != NULL && reason[0] != '\0';
+}
+
+static void logger_app_set_next_span_start_reason(logger_app_t *app, const char *reason) {
+    logger_app_copy_string(app->next_span_start_reason, sizeof(app->next_span_start_reason), reason);
+}
+
+static const char *logger_app_take_next_span_start_reason(logger_app_t *app, const char *fallback) {
+    static char reason[sizeof(app->next_span_start_reason)];
+    if (app->next_span_start_reason[0] == '\0') {
+        return fallback;
+    }
+    logger_app_copy_string(reason, sizeof(reason), app->next_span_start_reason);
+    app->next_span_start_reason[0] = '\0';
+    return reason;
+}
+
+static void logger_app_set_stopping_end_reason(logger_app_t *app, const char *reason) {
+    logger_app_copy_string(app->stopping_end_reason, sizeof(app->stopping_end_reason), reason);
+}
+
+static bool logger_app_finalize_no_session_day(logger_app_t *app, const char *forced_reason) {
+    if (!app->day_tracking_initialized || app->current_day_has_session || app->current_day_study_day_local[0] == '\0') {
+        return true;
+    }
+
+    const bool seen_bound_device = logger_app_current_day_seen_bound_device(app);
+    const bool ble_connected = logger_app_current_day_ble_connected(app);
+    const bool ecg_start_attempted = logger_app_current_day_ecg_start_attempted(app);
+
+    const char *reason = forced_reason;
+    if (reason == NULL || reason[0] == '\0') {
+        if (!seen_bound_device) {
+            reason = "no_h10_seen";
+        } else if (!ble_connected) {
+            reason = "no_h10_connect";
+        } else {
+            reason = "no_ecg_stream";
+        }
+    }
+
+    char details[160];
+    snprintf(details,
+             sizeof(details),
+             "{\"study_day_local\":\"%s\",\"reason\":\"%s\",\"seen_bound_device\":%s,\"ble_connected\":%s,\"ecg_start_attempted\":%s}",
+             app->current_day_study_day_local,
+             reason,
+             seen_bound_device ? "true" : "false",
+             ble_connected ? "true" : "false",
+             ecg_start_attempted ? "true" : "false");
+    if (!logger_system_log_append(
+            &app->system_log,
+            app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+            "no_session_day_summary",
+            LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+            details)) {
+        return false;
+    }
+
+    logger_app_set_last_day_outcome(app, app->current_day_study_day_local, "no_session", reason);
+    return true;
+}
+
+static bool logger_app_finalize_no_session_before_stop(logger_app_t *app) {
+    return logger_app_finalize_no_session_day(app, "stopped_before_first_span");
+}
+
 static logger_runtime_state_t logger_app_h10_target_runtime_state(const logger_app_t *app) {
     switch (app->h10.phase) {
         case LOGGER_H10_PHASE_CONNECTING:
@@ -280,6 +402,9 @@ static logger_runtime_state_t logger_app_h10_target_runtime_state(const logger_a
 }
 
 static const char *logger_app_session_stop_reason(const logger_app_t *app) {
+    if (app->stopping_end_reason[0] != '\0') {
+        return app->stopping_end_reason;
+    }
     if (app->persisted.current_fault_code == LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE ||
         app->persisted.current_fault_code == LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET ||
         app->persisted.current_fault_code == LOGGER_FAULT_SD_WRITE_FAILED) {
@@ -302,7 +427,9 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
     logger_h10_packet_t packet;
     bool appended_any = false;
     while (logger_h10_pop_ecg_packet(&app->h10, &packet)) {
-        const char *span_start_reason = app->session.active ? "reconnect" : "session_start";
+        const char *span_start_reason = logger_app_take_next_span_start_reason(
+            app,
+            app->session.active ? "reconnect" : "session_start");
         if (!app->session.span_active) {
             const char *error_code = NULL;
             const char *error_message = NULL;
@@ -317,6 +444,7 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
                     app->persisted.config.bound_h10_address,
                     app->h10.encrypted,
                     app->h10.bonded,
+                    app->pending_next_session_clock_jump,
                     app->persisted.boot_counter,
                     now_ms,
                     &error_code,
@@ -327,6 +455,8 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
                 logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_span_open_failed", now_ms);
                 return false;
             }
+            app->pending_next_session_clock_jump = false;
+            app->current_day_has_session = true;
             app->last_session_live_flush_mono_ms = now_ms;
             app->last_session_snapshot_mono_ms = now_ms;
         }
@@ -367,6 +497,152 @@ static bool logger_app_handle_h10_disconnect(logger_app_t *app, uint32_t now_ms)
         return false;
     }
     app->last_session_live_flush_mono_ms = now_ms;
+    return true;
+}
+
+static bool logger_app_handle_h10_battery_events(logger_app_t *app, uint32_t now_ms) {
+    logger_h10_battery_event_t event;
+    while (logger_h10_take_battery_event(&app->h10, &event)) {
+        if (!app->session.active) {
+            continue;
+        }
+        if (!logger_session_append_h10_battery(
+                &app->session,
+                &app->clock,
+                app->persisted.boot_counter,
+                now_ms,
+                event.battery_percent,
+                event.read_reason)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_h10_battery_write_failed", now_ms);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app, uint32_t now_ms) {
+    char observed_study_day_local[11] = {0};
+    const bool have_study_day = logger_app_observed_study_day(app, observed_study_day_local);
+
+    if (!app->day_tracking_initialized && have_study_day) {
+        logger_app_reset_day_tracking(app, observed_study_day_local);
+    }
+    if (app->session.active) {
+        app->current_day_has_session = true;
+    }
+
+    int64_t observed_utc_ns = 0ll;
+    const bool have_observed_utc = logger_clock_observed_utc_ns(&app->clock, &observed_utc_ns);
+    if (app->last_clock_observation_available && have_observed_utc) {
+        const int64_t delta_ns = observed_utc_ns - app->last_clock_observation_utc_ns;
+        const int64_t expected_delta_ns = (int64_t)(now_ms - app->last_clock_observation_mono_ms) * 1000000ll;
+        const int64_t jump_error_ns = delta_ns - expected_delta_ns;
+
+        if (!app->last_clock_observation_valid && app->clock.valid && app->session.active) {
+            const bool crosses_day = have_study_day && strcmp(observed_study_day_local, app->session.study_day_local) != 0;
+            if (!logger_session_handle_clock_event(
+                    &app->session,
+                    &app->clock,
+                    app->persisted.boot_counter,
+                    now_ms,
+                    "clock_fixed",
+                    "clock_fix",
+                    delta_ns,
+                    app->last_clock_observation_utc_ns,
+                    observed_utc_ns,
+                    true)) {
+                logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+                logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_clock_fix_failed", now_ms);
+                return false;
+            }
+            logger_app_set_next_span_start_reason(app, "clock_fix_continue");
+            if (crosses_day) {
+                logger_app_set_stopping_end_reason(app, "clock_fix");
+                logger_app_copy_string(app->pending_day_study_day_local,
+                                       sizeof(app->pending_day_study_day_local),
+                                       observed_study_day_local);
+                app->pending_next_session_clock_jump = false;
+                logger_app_transition_via_stopping(app, LOGGER_RUNTIME_LOG_WAIT_H10, "clock_fix_new_day", now_ms);
+                return false;
+            }
+        } else if (app->last_clock_observation_valid && !app->clock.valid && app->session.active) {
+            if (!logger_session_handle_clock_event(
+                    &app->session,
+                    &app->clock,
+                    app->persisted.boot_counter,
+                    now_ms,
+                    "clock_invalid",
+                    NULL,
+                    0ll,
+                    app->last_clock_observation_utc_ns,
+                    observed_utc_ns,
+                    false)) {
+                logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+                logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_clock_invalid_failed", now_ms);
+                return false;
+            }
+        } else if (app->last_clock_observation_valid && app->clock.valid &&
+                   logger_app_i64_abs(jump_error_ns) > (5ll * 60ll * 1000000000ll) && app->session.active) {
+            const bool crosses_day = have_study_day && strcmp(observed_study_day_local, app->session.study_day_local) != 0;
+            if (!logger_session_handle_clock_event(
+                    &app->session,
+                    &app->clock,
+                    app->persisted.boot_counter,
+                    now_ms,
+                    "clock_jump",
+                    "clock_jump",
+                    jump_error_ns,
+                    app->last_clock_observation_utc_ns,
+                    observed_utc_ns,
+                    true)) {
+                logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+                logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_clock_jump_failed", now_ms);
+                return false;
+            }
+            logger_app_set_next_span_start_reason(app, "clock_jump_continue");
+            if (crosses_day) {
+                logger_app_set_stopping_end_reason(app, "clock_jump");
+                logger_app_copy_string(app->pending_day_study_day_local,
+                                       sizeof(app->pending_day_study_day_local),
+                                       observed_study_day_local);
+                app->pending_next_session_clock_jump = true;
+                logger_app_transition_via_stopping(app, LOGGER_RUNTIME_LOG_WAIT_H10, "clock_jump_new_day", now_ms);
+                return false;
+            }
+        }
+    }
+
+    if (app->day_tracking_initialized && have_study_day &&
+        strcmp(observed_study_day_local, app->current_day_study_day_local) != 0) {
+        if (app->session.active) {
+            logger_app_set_stopping_end_reason(app, "rollover");
+            logger_app_set_next_span_start_reason(app, "rollover_continue");
+            logger_app_copy_string(app->pending_day_study_day_local,
+                                   sizeof(app->pending_day_study_day_local),
+                                   observed_study_day_local);
+            app->pending_next_session_clock_jump = false;
+            logger_app_transition_via_stopping(app, LOGGER_RUNTIME_LOG_WAIT_H10, "study_day_rollover", now_ms);
+            return false;
+        }
+
+        if (!app->current_day_has_session) {
+            if (!logger_app_finalize_no_session_day(app, NULL)) {
+                logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+                logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "no_session_day_summary_failed", now_ms);
+                return false;
+            }
+        }
+        logger_app_reset_day_tracking(app, observed_study_day_local);
+    }
+
+    if (have_observed_utc) {
+        app->last_clock_observation_available = true;
+        app->last_clock_observation_utc_ns = observed_utc_ns;
+        app->last_clock_observation_mono_ms = now_ms;
+        app->last_clock_observation_valid = app->clock.valid;
+    }
+
     return true;
 }
 
@@ -566,6 +842,13 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
     logger_h10_poll(&app->h10, now_ms);
     logger_service_cli_poll(&app->cli, app, now_ms);
 
+    if (!logger_app_handle_day_and_clock_boundaries(app, now_ms)) {
+        return;
+    }
+    if (!logger_app_handle_h10_battery_events(app, now_ms)) {
+        return;
+    }
+
     if (!logger_app_handle_h10_packets(app, now_ms)) {
         return;
     }
@@ -585,17 +868,35 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
 
     const logger_fault_code_t storage_fault = logger_app_storage_fault_code(&app->storage);
     if (storage_fault != LOGGER_FAULT_NONE) {
+        if (!app->session.active && !app->current_day_has_session &&
+            !logger_app_finalize_no_session_before_stop(app)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "no_session_day_summary_failed", now_ms);
+            return;
+        }
         logger_app_maybe_latch_new_fault(app, storage_fault);
         logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "storage_fault", now_ms);
         return;
     }
 
     if (logger_app_should_enter_overnight_idle(app)) {
+        if (!app->session.active && !app->current_day_has_session &&
+            !logger_app_finalize_no_session_before_stop(app)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "no_session_day_summary_failed", now_ms);
+            return;
+        }
         logger_app_begin_upload_after_stop(app, false, "charger_overnight_window", now_ms);
         return;
     }
 
     if (logger_battery_low_start_blocked(&app->battery)) {
+        if (!app->session.active && !app->current_day_has_session &&
+            !logger_app_finalize_no_session_before_stop(app)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "no_session_day_summary_failed", now_ms);
+            return;
+        }
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_LOW_BATTERY_BLOCKED_START);
         logger_app_transition_via_stopping(app, LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER, "battery_dropped_below_start_threshold", now_ms);
         return;
@@ -635,6 +936,12 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
             printf("[logger] marker ignored: no active session/span\n");
         }
     } else if (event == LOGGER_BUTTON_EVENT_LONG_PRESS) {
+        if (!app->session.active && !app->current_day_has_session &&
+            !logger_app_finalize_no_session_before_stop(app)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "no_session_day_summary_failed", now_ms);
+            return;
+        }
         if (app->battery.vbus_present || logger_battery_off_charger_upload_allowed(&app->battery)) {
             logger_app_begin_upload_after_stop(app,
                                                !app->battery.vbus_present,
@@ -660,6 +967,8 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
         logger_h10_set_enabled(&app->h10, false);
     }
     if (app->session.active) {
+        char closed_study_day_local[11];
+        logger_app_copy_string(closed_study_day_local, sizeof(closed_study_day_local), app->session.study_day_local);
         if (!logger_session_finalize(
                 &app->session,
                 &app->system_log,
@@ -674,9 +983,15 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
             logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "session_stop_write_failed", now_ms);
             return;
         }
+        logger_app_set_last_day_outcome(app, closed_study_day_local, "session", "session_closed");
         app->last_session_live_flush_mono_ms = 0u;
         app->last_session_snapshot_mono_ms = 0u;
     }
+    if (app->pending_day_study_day_local[0] != '\0') {
+        logger_app_reset_day_tracking(app, app->pending_day_study_day_local);
+        app->pending_day_study_day_local[0] = '\0';
+    }
+    app->stopping_end_reason[0] = '\0';
     logger_app_state_transition(&app->runtime, app->runtime.planned_next_state, "log_stopping_complete", now_ms);
 }
 

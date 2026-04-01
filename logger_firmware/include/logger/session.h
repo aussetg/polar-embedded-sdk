@@ -20,6 +20,8 @@ typedef struct {
     bool span_active;
     bool quarantined;
     bool quarantine_clock_invalid_at_start;
+    bool quarantine_clock_fixed_mid_session;
+    bool quarantine_clock_jump;
     bool quarantine_recovery_after_reset;
     char clock_state[8];
     char session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
@@ -91,6 +93,7 @@ bool logger_session_ensure_active_span(
     const char *h10_address,
     bool encrypted,
     bool bonded,
+    bool clock_jump_at_session_start,
     uint32_t boot_counter,
     uint32_t now_ms,
     const char **error_code_out,
@@ -109,6 +112,26 @@ bool logger_session_handle_disconnect(
     uint32_t boot_counter,
     uint32_t now_ms,
     const char *gap_reason);
+
+bool logger_session_handle_clock_event(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    const char *event_kind,
+    const char *span_end_reason,
+    int64_t delta_ns,
+    int64_t old_utc_ns,
+    int64_t new_utc_ns,
+    bool split_span);
+
+bool logger_session_append_h10_battery(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    uint8_t battery_percent,
+    const char *read_reason);
 
 bool logger_session_finalize(
     logger_session_state_t *session,
