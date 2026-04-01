@@ -1704,19 +1704,19 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
         logger_handle_debug_synth_disconnect(cli, app, now_ms);
         return;
     }
-    if (strncmp(line, "debug synth h10-battery ", 25) == 0) {
-        logger_handle_debug_synth_h10_battery(cli, app, line + 25, now_ms);
+    if (strncmp(line, "debug synth h10-battery ", 24) == 0) {
+        logger_handle_debug_synth_h10_battery(cli, app, line + 24, now_ms);
         return;
     }
     if (strncmp(line, "debug synth no-session-day ", 27) == 0) {
         logger_handle_debug_synth_no_session_day(cli, app, line + 27);
         return;
     }
-    if (strncmp(line, "debug synth rollover ", 22) == 0) {
-        logger_handle_debug_synth_rollover(cli, app, line + 22, now_ms);
+    if (strncmp(line, "debug synth rollover ", 21) == 0) {
+        logger_handle_debug_synth_rollover(cli, app, line + 21, now_ms);
         return;
     }
-    if (strncmp(line, "debug synth clock-fix ", 23) == 0) {
+    if (strncmp(line, "debug synth clock-fix ", 22) == 0) {
         logger_handle_debug_synth_clock_boundary(
             cli,
             app,
@@ -1725,11 +1725,11 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
             "clock_fix",
             "clock_fix_continue",
             false,
-            line + 23,
+            line + 22,
             now_ms);
         return;
     }
-    if (strncmp(line, "debug synth clock-jump ", 24) == 0) {
+    if (strncmp(line, "debug synth clock-jump ", 23) == 0) {
         logger_handle_debug_synth_clock_boundary(
             cli,
             app,
@@ -1738,7 +1738,7 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
             "clock_jump",
             "clock_jump_continue",
             true,
-            line + 24,
+            line + 23,
             now_ms);
         return;
     }
