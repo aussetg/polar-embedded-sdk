@@ -31,6 +31,8 @@ typedef struct {
     bool quarantine_recovery_after_reset;
     uint64_t valid_size_bytes;
     uint64_t next_record_seq;
+    uint32_t next_chunk_seq_in_session;
+    uint32_t next_packet_seq_in_span;
     uint32_t span_count;
     uint32_t active_span_index;
     char session_id[LOGGER_JOURNAL_ID_HEX_LEN + 1];
@@ -69,6 +71,14 @@ bool logger_journal_append_json_record(
     logger_journal_record_type_t record_type,
     uint64_t record_seq,
     const char *json_payload,
+    uint64_t *size_bytes_out);
+
+bool logger_journal_append_binary_record(
+    const char *path,
+    logger_journal_record_type_t record_type,
+    uint64_t record_seq,
+    const void *payload,
+    size_t payload_len,
     uint64_t *size_bytes_out);
 
 bool logger_journal_scan(const char *path, logger_journal_scan_result_t *result);

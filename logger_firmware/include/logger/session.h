@@ -2,6 +2,7 @@
 #define LOGGER_FIRMWARE_SESSION_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "logger/battery.h"
@@ -36,6 +37,8 @@ typedef struct {
     char manifest_path[LOGGER_STORAGE_PATH_MAX];
     uint64_t next_record_seq;
     uint64_t journal_size_bytes;
+    uint32_t next_chunk_seq_in_session;
+    uint32_t next_packet_seq_in_span;
     uint32_t span_count;
     logger_journal_span_summary_t spans[LOGGER_JOURNAL_MAX_SPANS];
 } logger_session_state_t;
@@ -74,6 +77,47 @@ bool logger_session_write_status_snapshot(
 bool logger_session_write_marker(
     logger_session_state_t *session,
     const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms);
+
+bool logger_session_ensure_active_span(
+    logger_session_state_t *session,
+    logger_system_log_t *system_log,
+    const char *hardware_id,
+    const logger_persisted_state_t *persisted,
+    const logger_clock_status_t *clock,
+    const logger_storage_status_t *storage,
+    const char *start_reason,
+    const char *h10_address,
+    bool encrypted,
+    bool bonded,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    const char **error_code_out,
+    const char **error_message_out);
+
+bool logger_session_append_ecg_packet(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint64_t mono_us,
+    const uint8_t *value,
+    size_t value_len);
+
+bool logger_session_handle_disconnect(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    const char *gap_reason);
+
+bool logger_session_finalize(
+    logger_session_state_t *session,
+    logger_system_log_t *system_log,
+    const char *hardware_id,
+    const logger_persisted_state_t *persisted,
+    const logger_clock_status_t *clock,
+    const logger_storage_status_t *storage,
+    const char *end_reason,
     uint32_t boot_counter,
     uint32_t now_ms);
 

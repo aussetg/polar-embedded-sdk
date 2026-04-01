@@ -52,6 +52,7 @@ add_executable(logger_appliance
     src/upload.c
     src/upload_bundle.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_helpers.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_gatt.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_adv_runtime.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_dispatch.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_link.c
@@ -59,8 +60,16 @@ add_executable(logger_appliance
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_sm.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_common.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_connect.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_discovery_apply.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_gatt_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_gatt_mtu.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_gatt_notify_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_pmd.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_pmd_control.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_pmd_start.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_runtime.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_runtime_context.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_sm_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_transport_adapter.c
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src/microtar.c

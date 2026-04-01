@@ -8,6 +8,7 @@
 #include "pico/rand.h"
 
 #include "board_config.h"
+#include "logger/h10.h"
 #include "logger/json.h"
 #include "logger/queue.h"
 #include "logger/sha256.h"
@@ -23,6 +24,10 @@
 #define LOGGER_SESSION_JSON_MAX 1024
 #define LOGGER_SESSION_MANIFEST_MAX 8192
 #define LOGGER_SESSION_LIVE_JSON_TOKEN_MAX 64u
+#define LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES 80u
+#define LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES 28u
+#define LOGGER_SESSION_STREAM_KIND_ECG 1u
+#define LOGGER_SESSION_DATA_ENCODING_RAW_PMD_NOTIFICATION_LIST_V1 1u
 
 typedef struct {
     char *buf;
@@ -57,6 +62,59 @@ static void logger_copy_string(char *dst, size_t dst_len, const char *src) {
         ++i;
     }
     dst[i] = '\0';
+}
+
+static bool logger_hex_nibble(char ch, uint8_t *value) {
+    if (ch >= '0' && ch <= '9') {
+        *value = (uint8_t)(ch - '0');
+        return true;
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        *value = (uint8_t)(10 + (ch - 'a'));
+        return true;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        *value = (uint8_t)(10 + (ch - 'A'));
+        return true;
+    }
+    return false;
+}
+
+static bool logger_hex_to_bytes_16(const char *hex, uint8_t out[16]) {
+    if (hex == NULL || strlen(hex) != LOGGER_SESSION_ID_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0u; i < 16u; ++i) {
+        uint8_t hi = 0u;
+        uint8_t lo = 0u;
+        if (!logger_hex_nibble(hex[i * 2u], &hi) || !logger_hex_nibble(hex[(i * 2u) + 1u], &lo)) {
+            return false;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+static void logger_put_u16le(uint8_t *dst, uint16_t value) {
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+}
+
+static void logger_put_u32le(uint8_t *dst, uint32_t value) {
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    dst[2] = (uint8_t)(value >> 16);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+static void logger_put_u64le(uint8_t *dst, uint64_t value) {
+    for (size_t i = 0u; i < 8u; ++i) {
+        dst[i] = (uint8_t)(value >> (8u * i));
+    }
+}
+
+static size_t logger_align4(size_t n) {
+    return (n + 3u) & ~((size_t)3u);
 }
 
 static bool logger_path_join2(char *dst, size_t dst_len, const char *a, const char *b) {
@@ -284,6 +342,8 @@ static bool logger_session_begin_span(
     const logger_clock_status_t *clock,
     const char *start_reason,
     const char *h10_address,
+    bool encrypted,
+    bool bonded,
     uint32_t boot_counter,
     uint32_t now_ms) {
     if (session->span_count >= LOGGER_JOURNAL_MAX_SPANS) {
@@ -301,6 +361,7 @@ static bool logger_session_begin_span(
     logger_copy_string(span->start_reason, sizeof(span->start_reason), start_reason);
     logger_copy_string(span->start_utc, sizeof(span->start_utc), clock != NULL ? clock->now_utc : NULL);
     session->span_count += 1u;
+    session->next_packet_seq_in_span = 0u;
 
     char h10_escaped[LOGGER_CONFIG_BOUND_H10_ADDR_MAX * 2u];
     logger_json_escape_into(h10_escaped, sizeof(h10_escaped), h10_address);
@@ -308,7 +369,7 @@ static bool logger_session_begin_span(
     char payload[LOGGER_SESSION_JSON_MAX];
     const int n = snprintf(payload,
                            sizeof(payload),
-                           "{\"schema_version\":1,\"record_type\":\"span_start\",\"utc_ns\":%lld,\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":\"%s\",\"span_index_in_session\":%lu,\"start_reason\":\"%s\",\"h10_address\":\"%s\",\"encrypted\":false,\"bonded\":false}",
+                           "{\"schema_version\":1,\"record_type\":\"span_start\",\"utc_ns\":%lld,\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":\"%s\",\"span_index_in_session\":%lu,\"start_reason\":\"%s\",\"h10_address\":\"%s\",\"encrypted\":%s,\"bonded\":%s}",
                            (long long)logger_session_observed_utc_ns_or_zero(clock),
                            (unsigned long long)now_ms * 1000ull,
                            (unsigned long)boot_counter,
@@ -316,7 +377,9 @@ static bool logger_session_begin_span(
                            span->span_id,
                            (unsigned long)session->current_span_index,
                            start_reason,
-                           h10_escaped);
+                           h10_escaped,
+                           encrypted ? "true" : "false",
+                           bonded ? "true" : "false");
     if (!(n > 0 && (size_t)n < sizeof(payload)) ||
         !logger_journal_append_json_record(
             session->journal_path,
@@ -683,6 +746,138 @@ static bool logger_session_finalize_internal(
     return true;
 }
 
+static void logger_session_set_error(
+    const char **error_code_out,
+    const char **error_message_out,
+    const char *code,
+    const char *message) {
+    if (error_code_out != NULL) {
+        *error_code_out = code;
+    }
+    if (error_message_out != NULL) {
+        *error_message_out = message;
+    }
+}
+
+static bool logger_session_start_new_active_internal(
+    logger_session_state_t *session,
+    logger_system_log_t *system_log,
+    const logger_persisted_state_t *persisted,
+    const logger_clock_status_t *clock,
+    const logger_storage_status_t *storage,
+    const char *span_start_reason,
+    const char *h10_address,
+    bool encrypted,
+    bool bonded,
+    bool debug_session,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    const char **error_code_out,
+    const char **error_message_out) {
+    if (!logger_storage_ready_for_logging(storage)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "storage_unavailable",
+            "storage is not ready for session artifacts");
+        return false;
+    }
+
+    logger_session_init(session);
+    logger_session_recompute_quarantine(session, clock);
+    session->quarantine_clock_invalid_at_start = clock != NULL && !clock->valid;
+    logger_session_recompute_quarantine(session, clock);
+
+    if (!logger_clock_derive_study_day_local_observed(clock, persisted->config.timezone, session->study_day_local)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "invalid_config",
+            "cannot derive study_day_local from current clock/timezone");
+        return false;
+    }
+
+    logger_random_hex128(session->session_id);
+    logger_copy_string(session->session_start_utc, sizeof(session->session_start_utc), clock != NULL ? clock->now_utc : NULL);
+    logger_copy_string(session->session_start_reason, sizeof(session->session_start_reason), "first_span_of_session");
+    session->next_chunk_seq_in_session = 0u;
+    session->next_packet_seq_in_span = 0u;
+    if (!logger_session_set_paths(session)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "storage_unavailable",
+            "session path exceeds buffer");
+        logger_session_init(session);
+        return false;
+    }
+    if (!logger_storage_ensure_dir(session->session_dir_path)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "storage_unavailable",
+            "failed to create session directory");
+        logger_session_init(session);
+        return false;
+    }
+    if (!logger_journal_create(
+            session->journal_path,
+            session->session_id,
+            boot_counter,
+            logger_session_observed_utc_ns_or_zero(clock),
+            &session->journal_size_bytes)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "storage_unavailable",
+            "failed to create journal.bin");
+        logger_session_init(session);
+        return false;
+    }
+    if (!logger_session_append_session_start(session, persisted, clock, boot_counter, now_ms) ||
+        !logger_session_begin_span(
+            session,
+            clock,
+            span_start_reason,
+            h10_address,
+            encrypted,
+            bonded,
+            boot_counter,
+            now_ms)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "storage_unavailable",
+            "failed to write initial journal records");
+        logger_session_init(session);
+        return false;
+    }
+
+    session->active = true;
+    if (!logger_session_write_live_internal(session, clock, boot_counter, now_ms)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "storage_unavailable",
+            "failed to write live.json");
+        logger_session_init(session);
+        return false;
+    }
+
+    char details[96];
+    snprintf(details,
+             sizeof(details),
+             "{\"debug\":%s}",
+             debug_session ? "true" : "false");
+    (void)logger_system_log_append(
+        system_log,
+        clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
+        "session_started",
+        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        details);
+    return true;
+}
+
 static void logger_session_log_recovery_issue(
     logger_system_log_t *system_log,
     const char *utc_or_null,
@@ -793,114 +988,28 @@ bool logger_session_start_debug(
     (void)current_fault;
 
     if (session->active) {
-        if (error_code_out != NULL) {
-            *error_code_out = "not_permitted_in_mode";
-        }
-        if (error_message_out != NULL) {
-            *error_message_out = "debug session is already active";
-        }
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "not_permitted_in_mode",
+            "debug session is already active");
         return false;
     }
-    if (!logger_storage_ready_for_logging(storage)) {
-        if (error_code_out != NULL) {
-            *error_code_out = "storage_unavailable";
-        }
-        if (error_message_out != NULL) {
-            *error_message_out = "storage is not ready for session artifacts";
-        }
-        return false;
-    }
-
-    logger_session_init(session);
-    logger_session_recompute_quarantine(session, clock);
-    session->quarantine_clock_invalid_at_start = clock != NULL && !clock->valid;
-    logger_session_recompute_quarantine(session, clock);
-
-    if (!logger_clock_derive_study_day_local_observed(clock, persisted->config.timezone, session->study_day_local)) {
-        if (error_code_out != NULL) {
-            *error_code_out = "invalid_config";
-        }
-        if (error_message_out != NULL) {
-            *error_message_out = "cannot derive study_day_local from current clock/timezone";
-        }
-        return false;
-    }
-
-    logger_random_hex128(session->session_id);
-    logger_copy_string(session->session_start_utc, sizeof(session->session_start_utc), clock != NULL ? clock->now_utc : NULL);
-    logger_copy_string(session->session_start_reason, sizeof(session->session_start_reason), "first_span_of_session");
-    if (!logger_session_set_paths(session)) {
-        if (error_code_out != NULL) {
-            *error_code_out = "storage_unavailable";
-        }
-        if (error_message_out != NULL) {
-            *error_message_out = "session path exceeds buffer";
-        }
-        logger_session_init(session);
-        return false;
-    }
-    if (!logger_storage_ensure_dir(session->session_dir_path)) {
-        if (error_code_out != NULL) {
-            *error_code_out = "storage_unavailable";
-        }
-        if (error_message_out != NULL) {
-            *error_message_out = "failed to create session directory";
-        }
-        logger_session_init(session);
-        return false;
-    }
-    if (!logger_journal_create(
-            session->journal_path,
-            session->session_id,
-            boot_counter,
-            logger_session_observed_utc_ns_or_zero(clock),
-            &session->journal_size_bytes)) {
-        if (error_code_out != NULL) {
-            *error_code_out = "storage_unavailable";
-        }
-        if (error_message_out != NULL) {
-            *error_message_out = "failed to create journal.bin";
-        }
-        logger_session_init(session);
-        return false;
-    }
-    if (!logger_session_append_session_start(session, persisted, clock, boot_counter, now_ms) ||
-        !logger_session_begin_span(
-            session,
-            clock,
-            "session_start",
-            persisted->config.bound_h10_address,
-            boot_counter,
-            now_ms)) {
-        if (error_code_out != NULL) {
-            *error_code_out = "storage_unavailable";
-        }
-        if (error_message_out != NULL) {
-            *error_message_out = "failed to write initial journal records";
-        }
-        logger_session_init(session);
-        return false;
-    }
-
-    session->active = true;
-    if (!logger_session_write_live_internal(session, clock, boot_counter, now_ms)) {
-        if (error_code_out != NULL) {
-            *error_code_out = "storage_unavailable";
-        }
-        if (error_message_out != NULL) {
-            *error_message_out = "failed to write live.json";
-        }
-        logger_session_init(session);
-        return false;
-    }
-
-    (void)logger_system_log_append(
+    return logger_session_start_new_active_internal(
+        session,
         system_log,
-        clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
-        "session_started",
-        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        "{\"debug\":true}");
-    return true;
+        persisted,
+        clock,
+        storage,
+        "session_start",
+        persisted->config.bound_h10_address,
+        false,
+        false,
+        true,
+        boot_counter,
+        now_ms,
+        error_code_out,
+        error_message_out);
 }
 
 bool logger_session_refresh_live(
@@ -991,6 +1100,206 @@ bool logger_session_write_marker(
                session->next_record_seq++,
                payload,
                &session->journal_size_bytes);
+}
+
+bool logger_session_ensure_active_span(
+    logger_session_state_t *session,
+    logger_system_log_t *system_log,
+    const char *hardware_id,
+    const logger_persisted_state_t *persisted,
+    const logger_clock_status_t *clock,
+    const logger_storage_status_t *storage,
+    const char *start_reason,
+    const char *h10_address,
+    bool encrypted,
+    bool bonded,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    const char **error_code_out,
+    const char **error_message_out) {
+    (void)hardware_id;
+
+    if (session->active && session->span_active) {
+        return true;
+    }
+    if (!session->active) {
+        return logger_session_start_new_active_internal(
+            session,
+            system_log,
+            persisted,
+            clock,
+            storage,
+            start_reason,
+            h10_address,
+            encrypted,
+            bonded,
+            false,
+            boot_counter,
+            now_ms,
+            error_code_out,
+            error_message_out);
+    }
+    if (!logger_storage_ready_for_logging(storage)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "storage_unavailable",
+            "storage is not ready for session artifacts");
+        return false;
+    }
+
+    logger_session_recompute_quarantine(session, clock);
+    if (!logger_session_begin_span(
+            session,
+            clock,
+            start_reason,
+            h10_address,
+            encrypted,
+            bonded,
+            boot_counter,
+            now_ms) ||
+        !logger_session_write_live_internal(session, clock, boot_counter, now_ms)) {
+        logger_session_set_error(
+            error_code_out,
+            error_message_out,
+            "storage_unavailable",
+            "failed to write reconnect span records");
+        return false;
+    }
+
+    return true;
+}
+
+bool logger_session_append_ecg_packet(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint64_t mono_us,
+    const uint8_t *value,
+    size_t value_len) {
+    if (!session->active || !session->span_active || value == NULL || value_len == 0u ||
+        value_len > LOGGER_H10_PACKET_MAX_BYTES || session->current_span_index >= session->span_count) {
+        return false;
+    }
+
+    const size_t entry_len_unpadded = LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES + value_len;
+    const size_t entry_len = logger_align4(entry_len_unpadded);
+    uint8_t payload[LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES +
+                    LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES +
+                    LOGGER_H10_PACKET_MAX_BYTES + 4u];
+    memset(payload, 0, sizeof(payload));
+
+    logger_journal_span_summary_t *span = &session->spans[session->current_span_index];
+    const uint32_t seq_in_span = session->next_packet_seq_in_span;
+    const uint32_t old_packet_count = span->packet_count;
+    const uint32_t old_first_seq = span->first_seq_in_span;
+    const uint32_t old_last_seq = span->last_seq_in_span;
+    const uint32_t old_next_packet_seq = session->next_packet_seq_in_span;
+    const uint32_t old_next_chunk_seq = session->next_chunk_seq_in_session;
+
+    if (span->packet_count == 0u) {
+        span->first_seq_in_span = seq_in_span;
+    }
+    span->packet_count += 1u;
+    span->last_seq_in_span = seq_in_span;
+    session->next_packet_seq_in_span += 1u;
+
+    int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+    if (!logger_hex_to_bytes_16(session->current_span_id, payload + 8u)) {
+        span->packet_count = old_packet_count;
+        span->first_seq_in_span = old_first_seq;
+        span->last_seq_in_span = old_last_seq;
+        session->next_packet_seq_in_span = old_next_packet_seq;
+        return false;
+    }
+
+    logger_put_u16le(payload + 0u, LOGGER_SESSION_STREAM_KIND_ECG);
+    logger_put_u16le(payload + 2u, LOGGER_SESSION_DATA_ENCODING_RAW_PMD_NOTIFICATION_LIST_V1);
+    logger_put_u32le(payload + 4u, session->next_chunk_seq_in_session);
+    logger_put_u32le(payload + 24u, 1u);
+    logger_put_u32le(payload + 28u, seq_in_span);
+    logger_put_u32le(payload + 32u, seq_in_span);
+    logger_put_u64le(payload + 40u, mono_us);
+    logger_put_u64le(payload + 48u, mono_us);
+    logger_put_u64le(payload + 56u, (uint64_t)utc_ns);
+    logger_put_u64le(payload + 64u, (uint64_t)utc_ns);
+    logger_put_u32le(payload + 72u, (uint32_t)entry_len);
+
+    uint8_t *entry = payload + LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES;
+    logger_put_u32le(entry + 0u, seq_in_span);
+    logger_put_u64le(entry + 8u, mono_us);
+    logger_put_u64le(entry + 16u, (uint64_t)utc_ns);
+    logger_put_u16le(entry + 24u, (uint16_t)value_len);
+    memcpy(entry + LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES, value, value_len);
+
+    const size_t payload_len = LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES + entry_len;
+    if (!logger_journal_append_binary_record(
+            session->journal_path,
+            LOGGER_JOURNAL_RECORD_DATA_CHUNK,
+            session->next_record_seq++,
+            payload,
+            payload_len,
+            &session->journal_size_bytes)) {
+        span->packet_count = old_packet_count;
+        span->first_seq_in_span = old_first_seq;
+        span->last_seq_in_span = old_last_seq;
+        session->next_packet_seq_in_span = old_next_packet_seq;
+        session->next_chunk_seq_in_session = old_next_chunk_seq;
+        session->next_record_seq -= 1u;
+        return false;
+    }
+
+    session->next_chunk_seq_in_session += 1u;
+    return true;
+}
+
+bool logger_session_handle_disconnect(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint32_t boot_counter,
+    uint32_t now_ms,
+    const char *gap_reason) {
+    if (!session->active || !session->span_active) {
+        return true;
+    }
+
+    char ended_span_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+    ended_span_id[0] = '\0';
+    if (!logger_session_close_active_span(session, clock, "disconnect", boot_counter, now_ms, ended_span_id)) {
+        return false;
+    }
+    if (!logger_session_append_gap(
+            session,
+            clock,
+            ended_span_id,
+            gap_reason != NULL ? gap_reason : "disconnect",
+            boot_counter,
+            now_ms)) {
+        return false;
+    }
+    return logger_session_write_live_internal(session, clock, boot_counter, now_ms);
+}
+
+bool logger_session_finalize(
+    logger_session_state_t *session,
+    logger_system_log_t *system_log,
+    const char *hardware_id,
+    const logger_persisted_state_t *persisted,
+    const logger_clock_status_t *clock,
+    const logger_storage_status_t *storage,
+    const char *end_reason,
+    uint32_t boot_counter,
+    uint32_t now_ms) {
+    return logger_session_finalize_internal(
+        session,
+        system_log,
+        hardware_id,
+        persisted,
+        clock,
+        storage,
+        end_reason != NULL ? end_reason : "manual_stop",
+        false,
+        boot_counter,
+        now_ms);
 }
 
 bool logger_session_stop_debug(
@@ -1089,6 +1398,8 @@ bool logger_session_recover_on_boot(
     logger_copy_string(session->manifest_path, sizeof(session->manifest_path), manifest_path);
     session->next_record_seq = scan.next_record_seq;
     session->journal_size_bytes = scan.valid_size_bytes;
+    session->next_chunk_seq_in_session = scan.next_chunk_seq_in_session;
+    session->next_packet_seq_in_span = scan.next_packet_seq_in_span;
     session->span_count = scan.span_count;
     memcpy(session->spans, scan.spans, sizeof(session->spans));
     session->span_active = scan.active_span_open;
@@ -1140,6 +1451,8 @@ bool logger_session_recover_on_boot(
             clock,
             "recovery_resume",
             persisted->config.bound_h10_address,
+            false,
+            false,
             boot_counter,
             now_ms)) {
         return false;

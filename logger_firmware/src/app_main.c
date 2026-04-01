@@ -267,14 +267,107 @@ static logger_runtime_state_t logger_app_h10_target_runtime_state(const logger_a
             return LOGGER_RUNTIME_LOG_CONNECTING;
         case LOGGER_H10_PHASE_SECURING:
             return LOGGER_RUNTIME_LOG_SECURING;
-        case LOGGER_H10_PHASE_READY:
+        case LOGGER_H10_PHASE_STARTING:
             return LOGGER_RUNTIME_LOG_STARTING_STREAM;
+        case LOGGER_H10_PHASE_STREAMING:
+            return LOGGER_RUNTIME_LOG_STREAMING;
         case LOGGER_H10_PHASE_OFF:
         case LOGGER_H10_PHASE_WAITING:
         case LOGGER_H10_PHASE_SCANNING:
         default:
             return LOGGER_RUNTIME_LOG_WAIT_H10;
     }
+}
+
+static const char *logger_app_session_stop_reason(const logger_app_t *app) {
+    if (app->persisted.current_fault_code == LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE ||
+        app->persisted.current_fault_code == LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET ||
+        app->persisted.current_fault_code == LOGGER_FAULT_SD_WRITE_FAILED) {
+        return "storage_fault";
+    }
+    if (logger_battery_low_start_blocked(&app->battery) || logger_battery_is_critical(&app->battery)) {
+        return "low_battery";
+    }
+    return "manual_stop";
+}
+
+static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
+    if (app->h10.packet_count == 0u) {
+        return true;
+    }
+
+    logger_clock_sample(&app->clock);
+    app->runtime.wall_clock_valid = app->clock.valid;
+
+    logger_h10_packet_t packet;
+    bool appended_any = false;
+    while (logger_h10_pop_ecg_packet(&app->h10, &packet)) {
+        const char *span_start_reason = app->session.active ? "reconnect" : "session_start";
+        if (!app->session.span_active) {
+            const char *error_code = NULL;
+            const char *error_message = NULL;
+            if (!logger_session_ensure_active_span(
+                    &app->session,
+                    &app->system_log,
+                    app->hardware_id,
+                    &app->persisted,
+                    &app->clock,
+                    &app->storage,
+                    span_start_reason,
+                    app->persisted.config.bound_h10_address,
+                    app->h10.encrypted,
+                    app->h10.bonded,
+                    app->persisted.boot_counter,
+                    now_ms,
+                    &error_code,
+                    &error_message)) {
+                (void)error_code;
+                (void)error_message;
+                logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+                logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_span_open_failed", now_ms);
+                return false;
+            }
+            app->last_session_live_flush_mono_ms = now_ms;
+            app->last_session_snapshot_mono_ms = now_ms;
+        }
+
+        if (!logger_session_append_ecg_packet(
+                &app->session,
+                &app->clock,
+                packet.mono_us,
+                packet.value,
+                packet.value_len)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_packet_write_failed", now_ms);
+            return false;
+        }
+        appended_any = true;
+    }
+
+    if (appended_any && app->runtime.current_state != LOGGER_RUNTIME_LOG_STREAMING) {
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_LOG_STREAMING, "h10_ecg_packets", now_ms);
+    }
+
+    return true;
+}
+
+static bool logger_app_handle_h10_disconnect(logger_app_t *app, uint32_t now_ms) {
+    if (!app->session.active || !app->session.span_active || app->h10.connected) {
+        return true;
+    }
+
+    if (!logger_session_handle_disconnect(
+            &app->session,
+            &app->clock,
+            app->persisted.boot_counter,
+            now_ms,
+            "disconnect")) {
+        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+        logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "session_disconnect_gap_failed", now_ms);
+        return false;
+    }
+    app->last_session_live_flush_mono_ms = now_ms;
+    return true;
 }
 
 static bool logger_app_indicator_led_should_be_on(const logger_app_t *app, uint32_t now_ms) {
@@ -473,6 +566,13 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
     logger_h10_poll(&app->h10, now_ms);
     logger_service_cli_poll(&app->cli, app, now_ms);
 
+    if (!logger_app_handle_h10_packets(app, now_ms)) {
+        return;
+    }
+    if (!logger_app_handle_h10_disconnect(app, now_ms)) {
+        return;
+    }
+
     if (app->session.active &&
         (app->last_session_live_flush_mono_ms == 0u || (now_ms - app->last_session_live_flush_mono_ms) >= 5000u)) {
         if (!logger_session_refresh_live(&app->session, &app->clock, app->persisted.boot_counter, now_ms)) {
@@ -560,13 +660,14 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
         logger_h10_set_enabled(&app->h10, false);
     }
     if (app->session.active) {
-        if (!logger_session_stop_debug(
+        if (!logger_session_finalize(
                 &app->session,
                 &app->system_log,
                 app->hardware_id,
                 &app->persisted,
                 &app->clock,
                 &app->storage,
+                logger_app_session_stop_reason(app),
                 app->persisted.boot_counter,
                 now_ms)) {
             logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
@@ -759,6 +860,7 @@ void logger_app_step(logger_app_t *app, uint32_t now_ms) {
         case LOGGER_RUNTIME_LOG_CONNECTING:
         case LOGGER_RUNTIME_LOG_SECURING:
         case LOGGER_RUNTIME_LOG_STARTING_STREAM:
+        case LOGGER_RUNTIME_LOG_STREAMING:
             logger_step_logging_link_state(app, now_ms);
             break;
 

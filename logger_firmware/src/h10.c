@@ -5,11 +5,21 @@
 
 #include "btstack.h"
 
+#include "pico/cyw43_arch.h"
+#include "pico/stdlib.h"
+
 #include "polar_sdk_btstack_adv_runtime.h"
 #include "polar_sdk_btstack_dispatch.h"
+#include "polar_sdk_btstack_gatt.h"
+#include "polar_sdk_btstack_helpers.h"
 #include "polar_sdk_btstack_scan.h"
 #include "polar_sdk_btstack_sm.h"
 #include "polar_sdk_connect.h"
+#include "polar_sdk_discovery_apply.h"
+#include "polar_sdk_gatt_mtu.h"
+#include "polar_sdk_gatt_notify_runtime.h"
+#include "polar_sdk_pmd.h"
+#include "polar_sdk_pmd_control.h"
 #include "polar_sdk_runtime.h"
 #include "polar_sdk_runtime_context.h"
 #include "polar_sdk_sm_control.h"
@@ -18,6 +28,29 @@
 #define LOGGER_H10_SCAN_WINDOW_UNITS 0x0030
 #define LOGGER_H10_CONNECT_TIMEOUT_WINDOW_MS 60000u
 #define LOGGER_H10_CONNECT_ATTEMPT_SLICE_MS 3500u
+
+#define LOGGER_H10_PMD_MIN_MTU 70u
+#define LOGGER_H10_PMD_SECURITY_ROUNDS 3u
+#define LOGGER_H10_PMD_SECURITY_WAIT_MS 3500u
+#define LOGGER_H10_PMD_CCC_ATTEMPTS 4u
+#define LOGGER_H10_ECG_SAMPLE_RATE 130u
+#define LOGGER_H10_ECG_RESOLUTION 14u
+#define LOGGER_H10_STREAM_START_TIMEOUT_MS 5000u
+
+static const uint8_t LOGGER_H10_UUID_PMD_SERVICE_BE[16] = {
+    0xFB, 0x00, 0x5C, 0x80, 0x02, 0xE7, 0xF3, 0x87,
+    0x1C, 0xAD, 0x8A, 0xCD, 0x2D, 0x8D, 0xF0, 0xC8,
+};
+
+static const uint8_t LOGGER_H10_UUID_PMD_CP_BE[16] = {
+    0xFB, 0x00, 0x5C, 0x81, 0x02, 0xE7, 0xF3, 0x87,
+    0x1C, 0xAD, 0x8A, 0xCD, 0x2D, 0x8D, 0xF0, 0xC8,
+};
+
+static const uint8_t LOGGER_H10_UUID_PMD_DATA_BE[16] = {
+    0xFB, 0x00, 0x5C, 0x82, 0x02, 0xE7, 0xF3, 0x87,
+    0x1C, 0xAD, 0x8A, 0xCD, 0x2D, 0x8D, 0xF0, 0xC8,
+};
 
 static logger_h10_state_t *g_h10 = NULL;
 static bool g_btstack_core_initialized = false;
@@ -34,6 +67,39 @@ static bd_addr_t g_target_addr;
 static bd_addr_t g_peer_addr;
 static bd_addr_type_t g_peer_addr_type = BD_ADDR_TYPE_UNKNOWN;
 static bool g_user_disconnect_requested = false;
+
+static gatt_client_service_t g_pmd_service;
+static gatt_client_characteristic_t g_pmd_cp_char;
+static gatt_client_characteristic_t g_pmd_data_char;
+static bool g_pmd_service_found = false;
+static bool g_pmd_cp_found = false;
+static bool g_pmd_data_found = false;
+static bool g_service_query_active = false;
+static bool g_char_query_active = false;
+
+static gatt_client_notification_t g_pmd_cp_listener;
+static gatt_client_notification_t g_pmd_data_listener;
+static bool g_pmd_cp_listener_registered = false;
+static bool g_pmd_data_listener_registered = false;
+
+static bool g_pmd_cfg_pending = false;
+static bool g_pmd_cfg_done = false;
+static uint8_t g_pmd_cfg_att_status = ATT_ERROR_SUCCESS;
+
+static bool g_pmd_write_pending = false;
+static bool g_pmd_write_done = false;
+static uint8_t g_pmd_write_att_status = ATT_ERROR_SUCCESS;
+
+static bool g_pmd_cp_response_waiting = false;
+static bool g_pmd_cp_response_done = false;
+static uint8_t g_pmd_cp_response_expected_opcode = 0u;
+static uint8_t g_pmd_cp_response_expected_type = 0xffu;
+static uint8_t g_pmd_cp_response_status = 0xffu;
+static uint8_t g_pmd_cp_response_type = 0xffu;
+
+static bool g_mtu_exchange_done = false;
+
+static void logger_h10_gatt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
 static void logger_copy_string(char *dst, size_t dst_len, const char *src) {
     if (dst_len == 0u) {
@@ -63,11 +129,64 @@ const char *logger_h10_phase_name(logger_h10_phase_t phase) {
             return "connecting";
         case LOGGER_H10_PHASE_SECURING:
             return "securing";
-        case LOGGER_H10_PHASE_READY:
-            return "ready";
+        case LOGGER_H10_PHASE_STARTING:
+            return "starting";
+        case LOGGER_H10_PHASE_STREAMING:
+            return "streaming";
         default:
             return "unknown";
     }
+}
+
+static void logger_h10_reset_packet_queue(logger_h10_state_t *state) {
+    state->packet_read_index = 0u;
+    state->packet_write_index = 0u;
+    state->packet_count = 0u;
+    memset(state->packets, 0, sizeof(state->packets));
+}
+
+static void logger_h10_reset_pmd_state(logger_h10_state_t *state) {
+    if (g_pmd_cp_listener_registered) {
+        gatt_client_stop_listening_for_characteristic_value_updates(&g_pmd_cp_listener);
+        g_pmd_cp_listener_registered = false;
+    }
+    if (g_pmd_data_listener_registered) {
+        gatt_client_stop_listening_for_characteristic_value_updates(&g_pmd_data_listener);
+        g_pmd_data_listener_registered = false;
+    }
+
+    memset(&g_pmd_service, 0, sizeof(g_pmd_service));
+    memset(&g_pmd_cp_char, 0, sizeof(g_pmd_cp_char));
+    memset(&g_pmd_data_char, 0, sizeof(g_pmd_data_char));
+    g_pmd_service_found = false;
+    g_pmd_cp_found = false;
+    g_pmd_data_found = false;
+    g_service_query_active = false;
+    g_char_query_active = false;
+
+    g_pmd_cfg_pending = false;
+    g_pmd_cfg_done = false;
+    g_pmd_cfg_att_status = ATT_ERROR_SUCCESS;
+    g_pmd_write_pending = false;
+    g_pmd_write_done = false;
+    g_pmd_write_att_status = ATT_ERROR_SUCCESS;
+    g_pmd_cp_response_waiting = false;
+    g_pmd_cp_response_done = false;
+    g_pmd_cp_response_expected_opcode = 0u;
+    g_pmd_cp_response_expected_type = 0xffu;
+    g_pmd_cp_response_status = 0xffu;
+    g_pmd_cp_response_type = 0xffu;
+    g_mtu_exchange_done = false;
+
+    state->start_in_progress = false;
+    state->start_succeeded = false;
+    state->streaming = false;
+    state->packet_overflow = false;
+    state->last_start_response_status = 0xffu;
+    state->last_gatt_att_status = ATT_ERROR_SUCCESS;
+    state->att_mtu = ATT_DEFAULT_MTU;
+    state->start_deadline_mono_ms = 0u;
+    logger_h10_reset_packet_queue(state);
 }
 
 static void logger_h10_clear_link_state(logger_h10_state_t *state) {
@@ -82,6 +201,7 @@ static void logger_h10_clear_link_state(logger_h10_state_t *state) {
     g_conn_handle = HCI_CON_HANDLE_INVALID;
     g_peer_addr_type = BD_ADDR_TYPE_UNKNOWN;
     memset(g_peer_addr, 0, sizeof(g_peer_addr));
+    logger_h10_reset_pmd_state(state);
 }
 
 static void logger_h10_set_phase(logger_h10_state_t *state, logger_h10_phase_t phase) {
@@ -111,6 +231,51 @@ static void logger_h10_stop_scan(logger_h10_state_t *state) {
     }
 }
 
+static void logger_h10_disconnect_for_restart(logger_h10_state_t *state) {
+    state->start_in_progress = false;
+    state->start_deadline_mono_ms = 0u;
+    if (state->connected && g_conn_handle != HCI_CON_HANDLE_INVALID) {
+        (void)gap_disconnect(g_conn_handle);
+        return;
+    }
+    logger_h10_schedule_retry(state, btstack_run_loop_get_time_ms());
+}
+
+static bool logger_h10_queue_push_ecg_packet(
+    logger_h10_state_t *state,
+    uint64_t mono_us,
+    const uint8_t *value,
+    uint16_t value_len) {
+    if (value == NULL || value_len == 0u || value_len > LOGGER_H10_PACKET_MAX_BYTES) {
+        state->ecg_packet_drop_count += 1u;
+        return false;
+    }
+    if (state->packet_count >= LOGGER_H10_PACKET_QUEUE_DEPTH) {
+        state->packet_overflow = true;
+        state->ecg_packet_drop_count += 1u;
+        return false;
+    }
+
+    logger_h10_packet_t *slot = &state->packets[state->packet_write_index];
+    slot->mono_us = mono_us;
+    slot->value_len = value_len;
+    memcpy(slot->value, value, value_len);
+    state->packet_write_index = (uint8_t)((state->packet_write_index + 1u) % LOGGER_H10_PACKET_QUEUE_DEPTH);
+    state->packet_count += 1u;
+    return true;
+}
+
+bool logger_h10_pop_ecg_packet(logger_h10_state_t *state, logger_h10_packet_t *out) {
+    if (state == NULL || out == NULL || state->packet_count == 0u) {
+        return false;
+    }
+    *out = state->packets[state->packet_read_index];
+    memset(&state->packets[state->packet_read_index], 0, sizeof(state->packets[state->packet_read_index]));
+    state->packet_read_index = (uint8_t)((state->packet_read_index + 1u) % LOGGER_H10_PACKET_QUEUE_DEPTH);
+    state->packet_count -= 1u;
+    return true;
+}
+
 static void logger_h10_start_scan(logger_h10_state_t *state) {
     if (!state->enabled || !state->controller_ready || !state->target_address_valid || state->scanning || state->connect_intent || state->connected) {
         return;
@@ -133,6 +298,427 @@ static void logger_h10_power_off(logger_h10_state_t *state) {
     logger_h10_set_phase(state, LOGGER_H10_PHASE_OFF);
 }
 
+static void logger_h10_sleep_ms(uint32_t ms) {
+    while (ms-- > 0u) {
+        cyw43_arch_poll();
+        sleep_ms(1u);
+    }
+}
+
+static bool logger_h10_wait_flag_until_true(const volatile bool *flag, uint32_t timeout_ms) {
+    uint32_t elapsed = 0u;
+    while (elapsed < timeout_ms) {
+        if (*flag) {
+            return true;
+        }
+        if (g_h10 == NULL || !g_h10->connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
+            return false;
+        }
+        logger_h10_sleep_ms(1u);
+        elapsed += 1u;
+    }
+    return *flag;
+}
+
+typedef struct {
+    gatt_client_characteristic_t *chr;
+    gatt_client_notification_t *notification;
+    bool *listening;
+} logger_h10_notify_ctx_t;
+
+static bool logger_h10_notify_is_connected_ready(void *ctx) {
+    (void)ctx;
+    return g_h10 != NULL && g_h10->connected && g_conn_handle != HCI_CON_HANDLE_INVALID;
+}
+
+static bool logger_h10_notify_listener_active(void *ctx) {
+    logger_h10_notify_ctx_t *notify_ctx = (logger_h10_notify_ctx_t *)ctx;
+    return notify_ctx != NULL && notify_ctx->listening != NULL && *notify_ctx->listening;
+}
+
+static void logger_h10_notify_start_listener(void *ctx) {
+    logger_h10_notify_ctx_t *notify_ctx = (logger_h10_notify_ctx_t *)ctx;
+    if (notify_ctx == NULL || notify_ctx->chr == NULL || notify_ctx->notification == NULL || notify_ctx->listening == NULL) {
+        return;
+    }
+    gatt_client_listen_for_characteristic_value_updates(
+        notify_ctx->notification,
+        logger_h10_gatt_packet_handler,
+        g_conn_handle,
+        notify_ctx->chr);
+    *notify_ctx->listening = true;
+}
+
+static void logger_h10_notify_stop_listener(void *ctx) {
+    logger_h10_notify_ctx_t *notify_ctx = (logger_h10_notify_ctx_t *)ctx;
+    if (notify_ctx == NULL || notify_ctx->notification == NULL || notify_ctx->listening == NULL) {
+        return;
+    }
+    gatt_client_stop_listening_for_characteristic_value_updates(notify_ctx->notification);
+    *notify_ctx->listening = false;
+}
+
+static int logger_h10_notify_write_ccc(void *ctx, uint16_t ccc_cfg) {
+    logger_h10_notify_ctx_t *notify_ctx = (logger_h10_notify_ctx_t *)ctx;
+    if (notify_ctx == NULL || notify_ctx->chr == NULL) {
+        return -1;
+    }
+    g_pmd_cfg_pending = true;
+    g_pmd_cfg_done = false;
+    g_pmd_cfg_att_status = ATT_ERROR_SUCCESS;
+    int err = gatt_client_write_client_characteristic_configuration(
+        logger_h10_gatt_packet_handler,
+        g_conn_handle,
+        notify_ctx->chr,
+        ccc_cfg);
+    if (err != 0) {
+        g_pmd_cfg_pending = false;
+    }
+    return err;
+}
+
+static bool logger_h10_notify_wait_complete(void *ctx, uint32_t timeout_ms, uint8_t *out_att_status) {
+    (void)ctx;
+    const bool done = logger_h10_wait_flag_until_true(&g_pmd_cfg_done, timeout_ms);
+    if (out_att_status != NULL) {
+        *out_att_status = g_pmd_cfg_att_status;
+    }
+    return done;
+}
+
+static int logger_h10_set_notify_for_char_result(
+    gatt_client_characteristic_t *chr,
+    gatt_client_notification_t *notification,
+    bool *listening,
+    bool enable) {
+    logger_h10_notify_ctx_t notify_ctx = {
+        .chr = chr,
+        .notification = notification,
+        .listening = listening,
+    };
+    polar_sdk_gatt_notify_ops_t ops = {
+        .ctx = &notify_ctx,
+        .is_connected_ready = logger_h10_notify_is_connected_ready,
+        .listener_active = logger_h10_notify_listener_active,
+        .start_listener = logger_h10_notify_start_listener,
+        .stop_listener = logger_h10_notify_stop_listener,
+        .write_ccc = logger_h10_notify_write_ccc,
+        .wait_complete = logger_h10_notify_wait_complete,
+    };
+    polar_sdk_gatt_notify_runtime_args_t args = {
+        .ops = &ops,
+        .has_value_handle = chr != NULL && chr->value_handle != 0u,
+        .enable = enable,
+        .properties = chr != NULL ? chr->properties : 0u,
+        .prop_notify = ATT_PROPERTY_NOTIFY,
+        .prop_indicate = ATT_PROPERTY_INDICATE,
+        .ccc_none = GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NONE,
+        .ccc_notify = GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION,
+        .ccc_indicate = GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_INDICATION,
+        .att_success = ATT_ERROR_SUCCESS,
+        .timeout_ms = 2000u,
+        .cfg_pending = &g_pmd_cfg_pending,
+        .cfg_done = &g_pmd_cfg_done,
+    };
+
+    polar_sdk_gatt_notify_runtime_result_t r = polar_sdk_gatt_notify_runtime_set(&args);
+    return polar_sdk_pmd_map_notify_result(
+        r,
+        g_pmd_cfg_att_status,
+        POLAR_SDK_PMD_OP_OK,
+        POLAR_SDK_PMD_OP_NOT_CONNECTED,
+        POLAR_SDK_PMD_OP_TIMEOUT,
+        POLAR_SDK_PMD_OP_TRANSPORT);
+}
+
+static int logger_h10_enable_notifications_once(logger_h10_state_t *state) {
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID || !g_pmd_cp_found || !g_pmd_data_found) {
+        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
+    }
+
+    int status = logger_h10_set_notify_for_char_result(
+        &g_pmd_cp_char,
+        &g_pmd_cp_listener,
+        &g_pmd_cp_listener_registered,
+        true);
+    if (status != POLAR_SDK_PMD_OP_OK) {
+        return status;
+    }
+
+    status = logger_h10_set_notify_for_char_result(
+        &g_pmd_data_char,
+        &g_pmd_data_listener,
+        &g_pmd_data_listener_registered,
+        true);
+    if (status != POLAR_SDK_PMD_OP_OK) {
+        return status;
+    }
+
+    return POLAR_SDK_PMD_OP_OK;
+}
+
+static bool logger_h10_pmd_is_connected(void *ctx) {
+    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
+    return state != NULL && state->connected && g_conn_handle != HCI_CON_HANDLE_INVALID;
+}
+
+static uint8_t logger_h10_pmd_encryption_key_size(void *ctx) {
+    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
+    return state != NULL ? state->encryption_key_size : 0u;
+}
+
+static void logger_h10_pmd_request_pairing(void *ctx) {
+    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
+        return;
+    }
+    polar_sdk_btstack_sm_apply_default_auth_policy();
+    (void)sm_request_pairing(g_conn_handle);
+    state->pairing_requested = true;
+}
+
+static void logger_h10_pmd_sleep_ms(void *ctx, uint32_t ms) {
+    (void)ctx;
+    logger_h10_sleep_ms(ms);
+}
+
+static int logger_h10_pmd_enable_notifications_cb(void *ctx) {
+    return logger_h10_enable_notifications_once((logger_h10_state_t *)ctx);
+}
+
+static int logger_h10_mtu_read_cb(void *ctx, uint16_t *out_mtu) {
+    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
+        return -1;
+    }
+
+    uint16_t current_mtu = ATT_DEFAULT_MTU;
+    if (gatt_client_get_mtu(g_conn_handle, &current_mtu) != ERROR_CODE_SUCCESS) {
+        return -1;
+    }
+    state->att_mtu = current_mtu;
+    if (out_mtu != NULL) {
+        *out_mtu = current_mtu;
+    }
+    return 0;
+}
+
+static int logger_h10_mtu_request_exchange_cb(void *ctx) {
+    (void)ctx;
+    g_mtu_exchange_done = false;
+    gatt_client_send_mtu_negotiation(logger_h10_gatt_packet_handler, g_conn_handle);
+    return 0;
+}
+
+static bool logger_h10_mtu_wait_exchange_complete_cb(void *ctx, uint32_t timeout_ms) {
+    (void)ctx;
+    return logger_h10_wait_flag_until_true(&g_mtu_exchange_done, timeout_ms);
+}
+
+static uint16_t logger_h10_mtu_current_cb(void *ctx) {
+    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
+    return state != NULL ? state->att_mtu : ATT_DEFAULT_MTU;
+}
+
+static int logger_h10_ensure_minimum_mtu_cb(void *ctx, uint16_t minimum_mtu) {
+    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
+        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
+    }
+
+    polar_sdk_gatt_mtu_ops_t mtu_ops = {
+        .ctx = state,
+        .is_connected = logger_h10_pmd_is_connected,
+        .read_mtu = logger_h10_mtu_read_cb,
+        .request_exchange = logger_h10_mtu_request_exchange_cb,
+        .wait_exchange_complete = logger_h10_mtu_wait_exchange_complete_cb,
+        .current_mtu = logger_h10_mtu_current_cb,
+    };
+
+    polar_sdk_gatt_mtu_result_t r = polar_sdk_gatt_mtu_ensure_minimum(
+        &mtu_ops,
+        minimum_mtu,
+        2000u,
+        &state->att_mtu);
+    if (r == POLAR_SDK_GATT_MTU_RESULT_OK) {
+        return POLAR_SDK_PMD_OP_OK;
+    }
+    if (r == POLAR_SDK_GATT_MTU_RESULT_NOT_CONNECTED) {
+        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
+    }
+    if (r == POLAR_SDK_GATT_MTU_RESULT_TIMEOUT) {
+        return POLAR_SDK_PMD_OP_TIMEOUT;
+    }
+    return POLAR_SDK_PMD_OP_TRANSPORT;
+}
+
+static int logger_h10_write_cp_command_and_wait_response(
+    logger_h10_state_t *state,
+    const uint8_t *cmd,
+    size_t cmd_len,
+    uint8_t expected_opcode,
+    uint8_t expected_type,
+    uint8_t *out_status) {
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
+        return POLAR_SDK_PMD_OP_NOT_CONNECTED;
+    }
+    if (cmd == NULL || cmd_len < 2u || cmd_len > UINT16_MAX) {
+        return POLAR_SDK_PMD_OP_TRANSPORT;
+    }
+
+    g_pmd_cp_response_waiting = true;
+    g_pmd_cp_response_done = false;
+    g_pmd_cp_response_expected_opcode = expected_opcode;
+    g_pmd_cp_response_expected_type = expected_type;
+    g_pmd_cp_response_status = 0xffu;
+    g_pmd_cp_response_type = 0xffu;
+
+    g_pmd_write_pending = true;
+    g_pmd_write_done = false;
+    g_pmd_write_att_status = ATT_ERROR_SUCCESS;
+
+    int err = gatt_client_write_value_of_characteristic(
+        logger_h10_gatt_packet_handler,
+        g_conn_handle,
+        g_pmd_cp_char.value_handle,
+        (uint16_t)cmd_len,
+        (uint8_t *)cmd);
+    if (err != 0) {
+        g_pmd_write_pending = false;
+        return POLAR_SDK_PMD_OP_TRANSPORT;
+    }
+
+    if (!logger_h10_wait_flag_until_true(&g_pmd_write_done, 2000u)) {
+        g_pmd_write_pending = false;
+        return POLAR_SDK_PMD_OP_TIMEOUT;
+    }
+    if (g_pmd_write_att_status != ATT_ERROR_SUCCESS) {
+        return (int)g_pmd_write_att_status;
+    }
+
+    if (!logger_h10_wait_flag_until_true(&g_pmd_cp_response_done, 2000u)) {
+        g_pmd_cp_response_waiting = false;
+        return POLAR_SDK_PMD_OP_TIMEOUT;
+    }
+    if (out_status != NULL) {
+        *out_status = g_pmd_cp_response_status;
+    }
+    return POLAR_SDK_PMD_OP_OK;
+}
+
+static int logger_h10_start_ecg_and_wait_response_cb(
+    void *ctx,
+    const uint8_t *start_cmd,
+    size_t start_cmd_len,
+    uint8_t *out_status) {
+    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
+    if (start_cmd == NULL || start_cmd_len < 2u) {
+        return POLAR_SDK_PMD_OP_TRANSPORT;
+    }
+    return logger_h10_write_cp_command_and_wait_response(
+        state,
+        start_cmd,
+        start_cmd_len,
+        POLAR_SDK_PMD_OPCODE_START_MEASUREMENT,
+        start_cmd[1],
+        out_status);
+}
+
+static bool logger_h10_start_service_discovery(logger_h10_state_t *state) {
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID || g_service_query_active) {
+        return false;
+    }
+    g_service_query_active = true;
+    state->last_gatt_att_status = ATT_ERROR_SUCCESS;
+    const int err = gatt_client_discover_primary_services(logger_h10_gatt_packet_handler, g_conn_handle);
+    if (err != 0) {
+        g_service_query_active = false;
+        state->last_gatt_att_status = (uint8_t)err;
+        return false;
+    }
+    return true;
+}
+
+static bool logger_h10_start_characteristic_discovery(logger_h10_state_t *state) {
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID || g_char_query_active || !g_pmd_service_found) {
+        return false;
+    }
+    g_char_query_active = true;
+    state->last_gatt_att_status = ATT_ERROR_SUCCESS;
+    const int err = gatt_client_discover_characteristics_for_service(
+        logger_h10_gatt_packet_handler,
+        g_conn_handle,
+        &g_pmd_service);
+    if (err != 0) {
+        g_char_query_active = false;
+        state->last_gatt_att_status = (uint8_t)err;
+        return false;
+    }
+    return true;
+}
+
+static bool logger_h10_start_ecg(logger_h10_state_t *state, uint32_t now_ms) {
+    if (state == NULL || !state->connected || !state->secure || !g_pmd_cp_found || !g_pmd_data_found) {
+        return false;
+    }
+
+    state->start_in_progress = true;
+    state->start_succeeded = false;
+    state->last_start_response_status = 0xffu;
+    state->ecg_start_attempt_count += 1u;
+
+    polar_sdk_pmd_start_policy_t policy = {
+        .ccc_attempts = LOGGER_H10_PMD_CCC_ATTEMPTS,
+        .security_rounds_per_attempt = LOGGER_H10_PMD_SECURITY_ROUNDS,
+        .security_wait_ms = LOGGER_H10_PMD_SECURITY_WAIT_MS,
+        .minimum_mtu = LOGGER_H10_PMD_MIN_MTU,
+        .sample_rate = LOGGER_H10_ECG_SAMPLE_RATE,
+        .include_resolution = true,
+        .resolution = LOGGER_H10_ECG_RESOLUTION,
+        .include_range = false,
+        .range = 0u,
+    };
+    polar_sdk_pmd_start_ops_t ops = {
+        .ctx = state,
+        .is_connected = logger_h10_pmd_is_connected,
+        .encryption_key_size = logger_h10_pmd_encryption_key_size,
+        .request_pairing = logger_h10_pmd_request_pairing,
+        .sleep_ms = logger_h10_pmd_sleep_ms,
+        .enable_notifications = logger_h10_pmd_enable_notifications_cb,
+        .ensure_minimum_mtu = logger_h10_ensure_minimum_mtu_cb,
+        .start_ecg_and_wait_response = logger_h10_start_ecg_and_wait_response_cb,
+    };
+
+    uint8_t response_status = 0xffu;
+    int last_ccc_att_status = 0;
+    const polar_sdk_pmd_start_result_t result = polar_sdk_pmd_start_ecg_with_policy(
+        &policy,
+        &ops,
+        &response_status,
+        &last_ccc_att_status);
+
+    state->last_start_response_status = response_status;
+    if (last_ccc_att_status > 0 && last_ccc_att_status <= UINT8_MAX) {
+        state->last_gatt_att_status = (uint8_t)last_ccc_att_status;
+    }
+    state->start_in_progress = false;
+
+    if (result != POLAR_SDK_PMD_START_RESULT_OK) {
+        printf("[logger] h10 ecg start failed result=%d att=0x%02x resp=0x%02x\n",
+               (int)result,
+               (unsigned)state->last_gatt_att_status,
+               (unsigned)state->last_start_response_status);
+        return false;
+    }
+
+    state->ecg_start_success_count += 1u;
+    state->start_succeeded = true;
+    state->start_deadline_mono_ms = now_ms + LOGGER_H10_STREAM_START_TIMEOUT_MS;
+    logger_h10_set_phase(state, LOGGER_H10_PHASE_STARTING);
+    printf("[logger] h10 ecg start ok mtu=%u\n", (unsigned)state->att_mtu);
+    return true;
+}
+
 static void logger_h10_on_connected_ready(void *ctx, const polar_sdk_link_event_t *event) {
     logger_h10_state_t *state = (logger_h10_state_t *)ctx;
     state->connected = true;
@@ -144,6 +730,7 @@ static void logger_h10_on_connected_ready(void *ctx, const polar_sdk_link_event_
     if (g_peer_addr_type != BD_ADDR_TYPE_UNKNOWN) {
         logger_copy_string(state->connected_address, sizeof(state->connected_address), bd_addr_to_str(g_peer_addr));
     }
+    logger_h10_reset_pmd_state(state);
     logger_h10_set_phase(state, LOGGER_H10_PHASE_SECURING);
 }
 
@@ -166,7 +753,7 @@ static void logger_h10_on_conn_update_complete(void *ctx, const polar_sdk_link_e
 
 static bool logger_h10_adv_runtime_is_scanning(void *ctx) {
     const logger_h10_state_t *state = (const logger_h10_state_t *)ctx;
-    return state->scanning;
+    return state != NULL && state->scanning;
 }
 
 static void logger_h10_adv_runtime_on_match(void *ctx, const polar_sdk_btstack_adv_report_t *report) {
@@ -312,11 +899,11 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
             if (hci_event_encryption_change_get_connection_handle(packet) != g_conn_handle) {
                 break;
             }
-            const bool encrypted = hci_event_encryption_change_get_encryption_enabled(packet) != 0;
+            const bool encrypted = hci_event_encryption_change_get_encryption_enabled(packet) != 0u;
             g_h10->encrypted = encrypted;
             g_h10->secure = encrypted;
             g_h10->bonded = g_h10->bonded || encrypted;
-            logger_h10_set_phase(g_h10, encrypted ? LOGGER_H10_PHASE_READY : LOGGER_H10_PHASE_SECURING);
+            logger_h10_set_phase(g_h10, encrypted ? LOGGER_H10_PHASE_STARTING : LOGGER_H10_PHASE_SECURING);
             break;
         }
 
@@ -324,12 +911,12 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
             if (hci_event_encryption_change_v2_get_connection_handle(packet) != g_conn_handle) {
                 break;
             }
-            const bool encrypted = hci_event_encryption_change_v2_get_encryption_enabled(packet) != 0;
+            const bool encrypted = hci_event_encryption_change_v2_get_encryption_enabled(packet) != 0u;
             g_h10->encryption_key_size = hci_event_encryption_change_v2_get_encryption_key_size(packet);
             g_h10->encrypted = encrypted;
             g_h10->secure = encrypted && g_h10->encryption_key_size > 0u;
             g_h10->bonded = g_h10->bonded || g_h10->secure;
-            logger_h10_set_phase(g_h10, g_h10->secure ? LOGGER_H10_PHASE_READY : LOGGER_H10_PHASE_SECURING);
+            logger_h10_set_phase(g_h10, g_h10->secure ? LOGGER_H10_PHASE_STARTING : LOGGER_H10_PHASE_SECURING);
             break;
         }
 
@@ -349,6 +936,152 @@ static void logger_h10_sm_packet_handler(uint8_t packet_type, uint16_t channel, 
     polar_sdk_sm_event_t sm_event;
     if (polar_sdk_btstack_decode_sm_event(packet_type, packet, &sm_event)) {
         logger_h10_dispatch_on_sm_event(g_h10, &sm_event);
+    }
+}
+
+static void logger_h10_gatt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
+    (void)channel;
+    (void)size;
+
+    if (g_h10 == NULL) {
+        return;
+    }
+
+    polar_sdk_btstack_mtu_event_t mtu_event;
+    if (polar_sdk_btstack_decode_mtu_event(packet_type, packet, &mtu_event)) {
+        g_h10->att_mtu = mtu_event.mtu;
+        g_mtu_exchange_done = true;
+        return;
+    }
+
+    uint8_t query_complete_att_status = ATT_ERROR_SUCCESS;
+    const bool have_query_complete = polar_sdk_btstack_decode_query_complete_att_status(
+        packet_type,
+        packet,
+        &query_complete_att_status);
+
+    if (have_query_complete && g_pmd_cfg_pending) {
+        g_pmd_cfg_att_status = query_complete_att_status;
+        g_pmd_cfg_pending = false;
+        g_pmd_cfg_done = true;
+        return;
+    }
+
+    if (have_query_complete && g_pmd_write_pending) {
+        g_pmd_write_att_status = query_complete_att_status;
+        g_pmd_write_pending = false;
+        g_pmd_write_done = true;
+        return;
+    }
+
+    if (g_service_query_active) {
+        gatt_client_service_t service;
+        if (polar_sdk_btstack_decode_service_query_result(packet_type, packet, &service)) {
+            const polar_sdk_disc_service_kind_t service_kind = polar_sdk_btstack_classify_service(
+                service.uuid16,
+                service.uuid128,
+                ORG_BLUETOOTH_SERVICE_HEART_RATE,
+                0u,
+                LOGGER_H10_UUID_PMD_SERVICE_BE);
+            if (service_kind == POLAR_SDK_DISC_SERVICE_PMD) {
+                g_pmd_service = service;
+                polar_sdk_discovery_apply_service_kind(
+                    POLAR_SDK_DISC_SERVICE_PMD,
+                    NULL,
+                    &g_pmd_service_found,
+                    NULL);
+            }
+            return;
+        }
+
+        if (have_query_complete) {
+            g_service_query_active = false;
+            g_h10->last_gatt_att_status = query_complete_att_status;
+            if (query_complete_att_status != ATT_ERROR_SUCCESS || !g_pmd_service_found) {
+                logger_h10_disconnect_for_restart(g_h10);
+            }
+            return;
+        }
+    }
+
+    if (g_char_query_active) {
+        gatt_client_characteristic_t chr;
+        if (polar_sdk_btstack_decode_characteristic_query_result(packet_type, packet, &chr)) {
+            const polar_sdk_disc_char_kind_t char_kind = polar_sdk_btstack_classify_char(
+                POLAR_SDK_DISC_STAGE_PMD_CHARS,
+                chr.uuid16,
+                chr.uuid128,
+                ORG_BLUETOOTH_CHARACTERISTIC_HEART_RATE_MEASUREMENT,
+                LOGGER_H10_UUID_PMD_CP_BE,
+                LOGGER_H10_UUID_PMD_DATA_BE,
+                NULL,
+                NULL,
+                NULL);
+            if (char_kind == POLAR_SDK_DISC_CHAR_PMD_CP) {
+                g_pmd_cp_char = chr;
+            } else if (char_kind == POLAR_SDK_DISC_CHAR_PMD_DATA) {
+                g_pmd_data_char = chr;
+            }
+            polar_sdk_discovery_apply_char_kind(
+                char_kind,
+                chr.value_handle,
+                NULL,
+                NULL,
+                &g_pmd_cp_found,
+                NULL,
+                &g_pmd_data_found,
+                NULL,
+                NULL,
+                NULL,
+                NULL);
+            return;
+        }
+
+        if (have_query_complete) {
+            g_char_query_active = false;
+            g_h10->last_gatt_att_status = query_complete_att_status;
+            if (query_complete_att_status != ATT_ERROR_SUCCESS || !g_pmd_cp_found || !g_pmd_data_found) {
+                logger_h10_disconnect_for_restart(g_h10);
+            }
+            return;
+        }
+    }
+
+    polar_sdk_btstack_value_event_t value_event;
+    if (!polar_sdk_btstack_decode_value_event(packet_type, packet, &value_event) ||
+        g_conn_handle == HCI_CON_HANDLE_INVALID) {
+        return;
+    }
+
+    if (value_event.value_handle == g_pmd_cp_char.value_handle) {
+        polar_sdk_pmd_cp_response_t response;
+        if (!polar_sdk_pmd_parse_cp_response(value_event.value, value_event.value_len, &response)) {
+            return;
+        }
+        if (g_pmd_cp_response_waiting &&
+            response.opcode == g_pmd_cp_response_expected_opcode &&
+            (g_pmd_cp_response_expected_type == 0xffu || response.measurement_type == g_pmd_cp_response_expected_type)) {
+            g_pmd_cp_response_type = response.measurement_type;
+            g_pmd_cp_response_status = response.status;
+            g_pmd_cp_response_waiting = false;
+            g_pmd_cp_response_done = true;
+        }
+        return;
+    }
+
+    if (value_event.value_handle != g_pmd_data_char.value_handle || value_event.value_len == 0u) {
+        return;
+    }
+
+    if (value_event.value[0] == POLAR_SDK_PMD_MEASUREMENT_ECG) {
+        if (logger_h10_queue_push_ecg_packet(g_h10, time_us_64(), value_event.value, value_event.value_len)) {
+            g_h10->ecg_packet_count += 1u;
+        }
+        g_h10->streaming = true;
+        g_h10->start_in_progress = false;
+        g_h10->start_succeeded = true;
+        g_h10->start_deadline_mono_ms = 0u;
+        logger_h10_set_phase(g_h10, LOGGER_H10_PHASE_STREAMING);
     }
 }
 
@@ -377,6 +1110,8 @@ void logger_h10_init(logger_h10_state_t *state) {
     memset(state, 0, sizeof(*state));
     state->last_seen_rssi = -127;
     state->phase = LOGGER_H10_PHASE_OFF;
+    state->last_start_response_status = 0xffu;
+    state->att_mtu = ATT_DEFAULT_MTU;
     state->initialized = true;
     g_h10 = state;
     logger_h10_init_btstack_core();
@@ -428,14 +1163,48 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
     }
 
     if (state->connected) {
-        if (state->secure) {
-            logger_h10_set_phase(state, LOGGER_H10_PHASE_READY);
+        if (state->streaming) {
+            logger_h10_set_phase(state, LOGGER_H10_PHASE_STREAMING);
             return;
         }
-        logger_h10_set_phase(state, LOGGER_H10_PHASE_SECURING);
-        if (!state->pairing_requested && g_conn_handle != HCI_CON_HANDLE_INVALID) {
-            sm_request_pairing(g_conn_handle);
-            state->pairing_requested = true;
+
+        if (!state->secure) {
+            logger_h10_set_phase(state, LOGGER_H10_PHASE_SECURING);
+            if (!state->pairing_requested && g_conn_handle != HCI_CON_HANDLE_INVALID) {
+                polar_sdk_btstack_sm_apply_default_auth_policy();
+                (void)sm_request_pairing(g_conn_handle);
+                state->pairing_requested = true;
+            }
+            return;
+        }
+
+        logger_h10_set_phase(state, LOGGER_H10_PHASE_STARTING);
+        if (g_service_query_active || g_char_query_active || state->start_in_progress) {
+            return;
+        }
+
+        if (state->start_succeeded) {
+            if (state->start_deadline_mono_ms != 0u && (int32_t)(now_ms - state->start_deadline_mono_ms) >= 0) {
+                printf("[logger] h10 ecg start timed out waiting for packets\n");
+                logger_h10_disconnect_for_restart(state);
+            }
+            return;
+        }
+
+        if (!g_pmd_service_found) {
+            if (!logger_h10_start_service_discovery(state)) {
+                logger_h10_disconnect_for_restart(state);
+            }
+            return;
+        }
+        if (!g_pmd_cp_found || !g_pmd_data_found) {
+            if (!logger_h10_start_characteristic_discovery(state)) {
+                logger_h10_disconnect_for_restart(state);
+            }
+            return;
+        }
+        if (!logger_h10_start_ecg(state, now_ms)) {
+            logger_h10_disconnect_for_restart(state);
         }
         return;
     }

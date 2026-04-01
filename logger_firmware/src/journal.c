@@ -195,6 +195,7 @@ static void logger_journal_apply_json_record(
             result->active_span_open = true;
             result->active_span_index = span_index;
             logger_copy_string(result->active_span_id, sizeof(result->active_span_id), span_id);
+            result->next_packet_seq_in_span = 0u;
             if (result->span_count <= span_index) {
                 result->span_count = span_index + 1u;
             }
@@ -219,6 +220,7 @@ static void logger_journal_apply_json_record(
             if (strcmp(result->active_span_id, span_id) == 0) {
                 result->active_span_open = false;
                 result->active_span_id[0] = '\0';
+                result->next_packet_seq_in_span = 0u;
             }
             break;
         }
@@ -238,6 +240,47 @@ static void logger_journal_apply_json_record(
             break;
         default:
             break;
+    }
+}
+
+static void logger_journal_apply_binary_record(
+    logger_journal_scan_result_t *result,
+    logger_journal_record_type_t record_type,
+    const uint8_t *payload,
+    size_t payload_len) {
+    if (record_type != LOGGER_JOURNAL_RECORD_DATA_CHUNK || payload == NULL || payload_len < 80u) {
+        return;
+    }
+
+    char span_id[LOGGER_JOURNAL_ID_HEX_LEN + 1];
+    logger_bytes_to_hex_16(payload + 8u, span_id);
+
+    const uint32_t chunk_seq_in_session = logger_u32le(payload + 4u);
+    const uint32_t packet_count = logger_u32le(payload + 24u);
+    const uint32_t first_seq_in_span = logger_u32le(payload + 28u);
+    const uint32_t last_seq_in_span = logger_u32le(payload + 32u);
+
+    logger_journal_span_summary_t *span = logger_journal_find_span(result, span_id, result->active_span_index);
+    if (span == NULL) {
+        return;
+    }
+
+    if (!span->present) {
+        span->present = true;
+        logger_copy_string(span->span_id, sizeof(span->span_id), span_id);
+    }
+    if (span->packet_count == 0u) {
+        span->first_seq_in_span = first_seq_in_span;
+    }
+    span->packet_count += packet_count;
+    span->last_seq_in_span = last_seq_in_span;
+
+    if ((chunk_seq_in_session + 1u) > result->next_chunk_seq_in_session) {
+        result->next_chunk_seq_in_session = chunk_seq_in_session + 1u;
+    }
+    if (result->active_span_open && strcmp(result->active_span_id, span_id) == 0 &&
+        (last_seq_in_span + 1u) > result->next_packet_seq_in_span) {
+        result->next_packet_seq_in_span = last_seq_in_span + 1u;
     }
 }
 
@@ -294,6 +337,35 @@ bool logger_journal_append_json_record(
         return false;
     }
     return logger_storage_append_file(path, json_payload, payload_len, size_bytes_out);
+}
+
+bool logger_journal_append_binary_record(
+    const char *path,
+    logger_journal_record_type_t record_type,
+    uint64_t record_seq,
+    const void *payload,
+    size_t payload_len,
+    uint64_t *size_bytes_out) {
+    if (payload == NULL || payload_len > UINT32_MAX) {
+        return false;
+    }
+
+    uint8_t header[LOGGER_JOURNAL_RECORD_HEADER_BYTES];
+    memset(header, 0, sizeof(header));
+
+    memcpy(header + 0, "RCD1", 4u);
+    logger_put_u16le(header + 4, LOGGER_JOURNAL_RECORD_HEADER_BYTES);
+    logger_put_u16le(header + 6, (uint16_t)record_type);
+    logger_put_u32le(header + 8, (uint32_t)(LOGGER_JOURNAL_RECORD_HEADER_BYTES + payload_len));
+    logger_put_u32le(header + 12, (uint32_t)payload_len);
+    logger_put_u32le(header + 16, LOGGER_JOURNAL_FLAG_BINARY);
+    logger_put_u32le(header + 20, logger_crc32_ieee((const uint8_t *)payload, payload_len));
+    logger_put_u64le(header + 24, record_seq);
+
+    if (!logger_storage_append_file(path, header, sizeof(header), size_bytes_out)) {
+        return false;
+    }
+    return logger_storage_append_file(path, payload, payload_len, size_bytes_out);
 }
 
 bool logger_journal_scan(const char *path, logger_journal_scan_result_t *result) {
@@ -414,6 +486,8 @@ bool logger_journal_scan(const char *path, logger_journal_scan_result_t *result)
                     logger_journal_apply_json_record(result, record_type, &doc, root);
                 }
             }
+        } else if ((flags & LOGGER_JOURNAL_FLAG_BINARY) != 0u) {
+            logger_journal_apply_binary_record(result, record_type, payload_capture, capture_offset);
         }
     }
 
