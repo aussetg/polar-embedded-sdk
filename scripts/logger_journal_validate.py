@@ -101,10 +101,24 @@ class SpanAccumulator:
 
 
 @dataclass
+class SpanRecord:
+    span_id: str
+    index_in_session: int | None = None
+    start_reason: str | None = None
+    end_reason: str | None = None
+    packet_count_reported: int | None = None
+    first_seq_in_span_reported: int | None = None
+    last_seq_in_span_reported: int | None = None
+
+
+@dataclass
 class ValidationState:
     session_id_from_header: str
+    boot_counter_at_open: int = 0
+    journal_open_utc_ns: int = 0
     next_record_seq_expected: int | None = None
     spans: dict[str, SpanAccumulator] = field(default_factory=dict)
+    span_records: dict[str, SpanRecord] = field(default_factory=dict)
     record_counts: dict[str, int] = field(default_factory=dict)
     chunks: list[ChunkSummary] = field(default_factory=list)
     session_start: dict[str, Any] | None = None
@@ -153,6 +167,11 @@ def validate_json_record(state: ValidationState, record_name: str, payload: dict
             state.error(f"record_seq={record_seq}: span_start missing span_id")
             return
         acc = state.spans.setdefault(span_id, SpanAccumulator())
+        span_record = state.span_records.setdefault(span_id, SpanRecord(span_id=span_id))
+        if span_record.start_reason is not None:
+            state.warn(f"record_seq={record_seq}: duplicate span_start for span {span_id}")
+        span_record.index_in_session = payload.get("span_index_in_session")
+        span_record.start_reason = payload.get("start_reason")
         if payload.get("encrypted") not in (True, False):
             state.error(f"record_seq={record_seq}: span_start encrypted must be boolean")
         if payload.get("bonded") not in (True, False):
@@ -166,6 +185,11 @@ def validate_json_record(state: ValidationState, record_name: str, payload: dict
             state.error(f"record_seq={record_seq}: span_end missing span_id")
             return
         acc = state.spans.setdefault(span_id, SpanAccumulator())
+        span_record = state.span_records.setdefault(span_id, SpanRecord(span_id=span_id))
+        span_record.end_reason = payload.get("end_reason")
+        span_record.packet_count_reported = payload.get("packet_count")
+        span_record.first_seq_in_span_reported = payload.get("first_seq_in_span")
+        span_record.last_seq_in_span_reported = payload.get("last_seq_in_span")
         expected_packet_count = payload.get("packet_count")
         expected_first_seq = payload.get("first_seq_in_span")
         expected_last_seq = payload.get("last_seq_in_span")
@@ -325,22 +349,26 @@ def parse_data_chunk(payload: bytes, record_seq: int, state: ValidationState) ->
 def parse_journal(path: Path) -> dict[str, Any]:
     data = path.read_bytes()
     if len(data) < FILE_HEADER_BYTES:
-        raise SystemExit(f"journal too short: {path}")
+        raise ValueError(f"journal too short: {path}")
 
     header = data[:FILE_HEADER_BYTES]
     if header[:8] != b"NOF1JNL1":
-        raise SystemExit(f"invalid journal magic: {path}")
+        raise ValueError(f"invalid journal magic: {path}")
     if u16le(header, 8) != FILE_HEADER_BYTES:
-        raise SystemExit(f"unexpected header size in {path}")
+        raise ValueError(f"unexpected header size in {path}")
     if u16le(header, 10) != 1:
-        raise SystemExit(f"unexpected journal version in {path}")
+        raise ValueError(f"unexpected journal version in {path}")
 
     header_crc_expect = u32le(header, 56)
     header_crc_actual = zlib.crc32(header[:56]) & 0xFFFFFFFF
     if header_crc_expect != header_crc_actual:
-        raise SystemExit(f"journal header CRC mismatch in {path}")
+        raise ValueError(f"journal header CRC mismatch in {path}")
 
-    state = ValidationState(session_id_from_header=hex16(header[16:32]))
+    state = ValidationState(
+        session_id_from_header=hex16(header[16:32]),
+        boot_counter_at_open=u64le(header, 32),
+        journal_open_utc_ns=i64le(header, 40),
+    )
 
     offset = FILE_HEADER_BYTES
     while offset < len(data):
@@ -411,6 +439,11 @@ def parse_journal(path: Path) -> dict[str, Any]:
 
     summary = {
         "path": str(path),
+        "header": {
+            "format_version": 1,
+            "boot_counter_at_open": state.boot_counter_at_open,
+            "journal_open_utc_ns": state.journal_open_utc_ns,
+        },
         "session_id": state.session_id_from_header,
         "record_counts": dict(sorted(state.record_counts.items())),
         "chunk_count": len(state.chunks),
@@ -422,6 +455,17 @@ def parse_journal(path: Path) -> dict[str, Any]:
                 "chunk_count": acc.chunk_count,
             }
             for span_id, acc in sorted(state.spans.items())
+        },
+        "span_records": {
+            span_id: {
+                "index_in_session": span_record.index_in_session,
+                "start_reason": span_record.start_reason,
+                "end_reason": span_record.end_reason,
+                "packet_count_reported": span_record.packet_count_reported,
+                "first_seq_in_span_reported": span_record.first_seq_in_span_reported,
+                "last_seq_in_span_reported": span_record.last_seq_in_span_reported,
+            }
+            for span_id, span_record in sorted(state.span_records.items())
         },
         "session_start": state.session_start,
         "session_end": state.session_end,
@@ -469,7 +513,11 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary")
     args = parser.parse_args()
 
-    summary = parse_journal(args.journal)
+    try:
+        summary = parse_journal(args.journal)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if args.json:
         json.dump(summary, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
