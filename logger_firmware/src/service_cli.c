@@ -5,12 +5,16 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "mbedtls/base64.h"
+#include "mbedtls/x509_crt.h"
+
 #include "pico/stdlib.h"
 
 #include "board_config.h"
 #include "logger/app_main.h"
 #include "logger/json.h"
 #include "logger/queue.h"
+#include "logger/sha256.h"
 #include "logger/upload.h"
 
 #ifndef LOGGER_FIRMWARE_VERSION
@@ -198,14 +202,150 @@ static bool logger_upload_url_uses_https(const char *url) {
     return url != NULL && strncmp(url, "https://", 8u) == 0;
 }
 
-static bool logger_validate_config_import_upload_tls(
+static bool logger_compute_sha256_hex(
+    const uint8_t *data,
+    size_t data_len,
+    char out_hex[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u]) {
+    if (data == NULL || data_len == 0u || out_hex == NULL) {
+        return false;
+    }
+    logger_sha256_t sha;
+    logger_sha256_init(&sha);
+    logger_sha256_update(&sha, data, data_len);
+    logger_sha256_final_hex(&sha, out_hex);
+    return true;
+}
+
+static bool logger_extract_ca_subject(
+    const uint8_t *der,
+    size_t der_len,
+    char *subject_out,
+    size_t subject_out_len) {
+    if (der == NULL || der_len == 0u || subject_out == NULL || subject_out_len == 0u) {
+        return false;
+    }
+
+    mbedtls_x509_crt cert;
+    mbedtls_x509_crt_init(&cert);
+    const int parse_rc = mbedtls_x509_crt_parse(&cert, der, der_len);
+    if (parse_rc != 0) {
+        mbedtls_x509_crt_free(&cert);
+        return false;
+    }
+    if (cert.MBEDTLS_PRIVATE(ca_istrue) == 0) {
+        mbedtls_x509_crt_free(&cert);
+        return false;
+    }
+
+    const int subject_len = mbedtls_x509_dn_gets(subject_out, subject_out_len, &cert.subject);
+    mbedtls_x509_crt_free(&cert);
+    return subject_len > 0 && (size_t)subject_len < subject_out_len;
+}
+
+static bool logger_parse_config_import_provisioned_anchor(
+    const logger_json_doc_t *doc,
+    const jsmntok_t *anchor_tok,
+    logger_config_t *config_out,
+    const char **error_message_out) {
+    if (anchor_tok == NULL || anchor_tok->type != JSMN_OBJECT) {
+        *error_message_out = "config import upload.tls.anchor is invalid";
+        return false;
+    }
+
+    char anchor_format[32] = {0};
+    if (!logger_json_object_copy_string(doc, anchor_tok, "format", anchor_format, sizeof(anchor_format))) {
+        *error_message_out = "config import upload.tls.anchor.format is invalid";
+        return false;
+    }
+    if (strcmp(anchor_format, LOGGER_UPLOAD_TLS_ANCHOR_FORMAT_X509_DER_BASE64) != 0) {
+        *error_message_out = "config import upload.tls.anchor.format is unsupported";
+        return false;
+    }
+
+    static char der_base64[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX + 1u];
+    if (!logger_json_object_copy_string(doc, anchor_tok, "der_base64", der_base64, sizeof(der_base64))) {
+        *error_message_out = "config import upload.tls.anchor.der_base64 is invalid";
+        return false;
+    }
+
+    size_t der_len = 0u;
+    int rc = mbedtls_base64_decode(NULL,
+                                   0u,
+                                   &der_len,
+                                   (const unsigned char *)der_base64,
+                                   strlen(der_base64));
+    if (!(rc == 0 || rc == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) ||
+        der_len == 0u || der_len > LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX) {
+        *error_message_out = "config import upload.tls.anchor.der_base64 does not decode to a supported certificate size";
+        return false;
+    }
+
+    uint8_t der_buf[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX];
+    rc = mbedtls_base64_decode(der_buf,
+                               sizeof(der_buf),
+                               &der_len,
+                               (const unsigned char *)der_base64,
+                               strlen(der_base64));
+    if (rc != 0 || der_len == 0u) {
+        *error_message_out = "config import upload.tls.anchor.der_base64 is invalid";
+        return false;
+    }
+
+    char subject[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SUBJECT_MAX] = {0};
+    if (!logger_extract_ca_subject(der_buf, der_len, subject, sizeof(subject))) {
+        *error_message_out = "config import upload.tls.anchor must be a valid CA certificate";
+        return false;
+    }
+
+    char sha256_hex[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u] = {0};
+    if (!logger_compute_sha256_hex(der_buf, der_len, sha256_hex)) {
+        *error_message_out = "config import upload.tls.anchor SHA-256 computation failed";
+        return false;
+    }
+
+    char expected_sha256[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u] = {0};
+    if (logger_json_object_has_key(doc, anchor_tok, "sha256") &&
+        !logger_json_object_copy_string_or_null(doc, anchor_tok, "sha256", expected_sha256, sizeof(expected_sha256))) {
+        *error_message_out = "config import upload.tls.anchor.sha256 is invalid";
+        return false;
+    }
+    if (logger_string_present(expected_sha256) && strcmp(expected_sha256, sha256_hex) != 0) {
+        *error_message_out = "config import upload.tls.anchor.sha256 does not match der_base64";
+        return false;
+    }
+
+    char expected_subject[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SUBJECT_MAX] = {0};
+    if (logger_json_object_has_key(doc, anchor_tok, "subject") &&
+        !logger_json_object_copy_string_or_null(doc, anchor_tok, "subject", expected_subject, sizeof(expected_subject))) {
+        *error_message_out = "config import upload.tls.anchor.subject is invalid";
+        return false;
+    }
+    if (logger_string_present(expected_subject) && strcmp(expected_subject, subject) != 0) {
+        *error_message_out = "config import upload.tls.anchor.subject does not match der_base64";
+        return false;
+    }
+
+    if (!logger_config_set_provisioned_anchor_in_memory(config_out, der_buf, der_len, sha256_hex, subject)) {
+        *error_message_out = "config import upload.tls.anchor could not be stored";
+        return false;
+    }
+    return true;
+}
+
+static bool logger_parse_config_import_upload_tls(
     const logger_json_doc_t *doc,
     const jsmntok_t *upload_tok,
     bool upload_enabled,
     const char *upload_url,
+    logger_config_t *config_out,
     const char **error_message_out) {
     const jsmntok_t *tls_tok = logger_json_object_get(doc, upload_tok, "tls");
     if (tls_tok == NULL) {
+        if (upload_enabled && logger_upload_url_uses_https(upload_url)) {
+            logger_config_set_upload_tls_public_roots_in_memory(config_out);
+        } else {
+            logger_config_clear_upload_tls_in_memory(config_out);
+        }
         return true;
     }
     if (tls_tok->type != JSMN_OBJECT) {
@@ -235,26 +375,36 @@ static bool logger_validate_config_import_upload_tls(
             *error_message_out = "config import upload.tls must be null for disabled or http:// upload";
             return false;
         }
+        logger_config_clear_upload_tls_in_memory(config_out);
         return true;
     }
 
     if (!logger_string_present(tls_mode)) {
-        *error_message_out = "config import upload.tls.mode must be public_roots for https:// upload";
+        *error_message_out = "config import upload.tls.mode must be public_roots or provisioned_anchor for https:// upload";
         return false;
     }
-    if (strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS) != 0) {
-        *error_message_out = "config import upload.tls.mode is unsupported by current firmware";
-        return false;
+    if (strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS) == 0) {
+        if (logger_string_present(root_profile) && strcmp(root_profile, LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE) != 0) {
+            *error_message_out = "config import upload.tls.root_profile is unsupported by current firmware";
+            return false;
+        }
+        if (!anchor_is_null) {
+            *error_message_out = "config import upload.tls.anchor must be null for public_roots mode";
+            return false;
+        }
+        logger_config_set_upload_tls_public_roots_in_memory(config_out);
+        return true;
     }
-    if (logger_string_present(root_profile) && strcmp(root_profile, LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE) != 0) {
-        *error_message_out = "config import upload.tls.root_profile is unsupported by current firmware";
-        return false;
+    if (strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PROVISIONED_ANCHOR) == 0) {
+        if (logger_string_present(root_profile)) {
+            *error_message_out = "config import upload.tls.root_profile must be null for provisioned_anchor mode";
+            return false;
+        }
+        return logger_parse_config_import_provisioned_anchor(doc, anchor_tok, config_out, error_message_out);
     }
-    if (!anchor_is_null) {
-        *error_message_out = "config import upload.tls.anchor must be null for public_roots mode";
-        return false;
-    }
-    return true;
+
+    *error_message_out = "config import upload.tls.mode is unsupported by current firmware";
+    return false;
 }
 
 static bool logger_normalize_h10_address_local(const char *src, char out[LOGGER_CONFIG_BOUND_H10_ADDR_MAX]) {
@@ -540,10 +690,15 @@ static bool logger_parse_config_import_document(
             *error_message_out = "config import requires upload.url to be an absolute http:// or https:// URL";
             return false;
         }
-        if (!logger_validate_config_import_upload_tls(&doc, upload_tok, upload_enabled, upload_url, error_message_out)) {
+        logger_copy_string(imported.config.upload_url, sizeof(imported.config.upload_url), upload_url);
+        if (!logger_parse_config_import_upload_tls(&doc,
+                                                   upload_tok,
+                                                   upload_enabled,
+                                                   upload_url,
+                                                   &imported.config,
+                                                   error_message_out)) {
             return false;
         }
-        logger_copy_string(imported.config.upload_url, sizeof(imported.config.upload_url), upload_url);
         if (strcmp(auth_type, "bearer") == 0) {
             if (secrets_included) {
                 if (!logger_string_present(auth_token)) {
@@ -562,11 +717,16 @@ static bool logger_parse_config_import_document(
             imported.config.upload_token[0] = '\0';
         }
     } else {
-        if (!logger_validate_config_import_upload_tls(&doc, upload_tok, upload_enabled, upload_url, error_message_out)) {
-            return false;
-        }
         imported.config.upload_url[0] = '\0';
         imported.config.upload_token[0] = '\0';
+        if (!logger_parse_config_import_upload_tls(&doc,
+                                                   upload_tok,
+                                                   upload_enabled,
+                                                   upload_url,
+                                                   &imported.config,
+                                                   error_message_out)) {
+            return false;
+        }
     }
 
     if (bond_cleared_out != NULL) {
@@ -1052,9 +1212,52 @@ static void logger_handle_system_log_export_json(logger_app_t *app) {
     logger_json_end_success();
 }
 
-static void logger_handle_config_export_json(logger_app_t *app) {
-    const bool upload_https = logger_upload_url_uses_https(app->persisted.config.upload_url);
+static void logger_write_upload_tls_json(const logger_config_t *config) {
+    const char *tls_mode = logger_config_upload_tls_mode(config);
 
+    fputs("{\"mode\":", stdout);
+    logger_json_write_string_or_null(tls_mode);
+    fputs(",\"root_profile\":", stdout);
+    logger_json_write_string_or_null(
+        tls_mode != NULL && strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS) == 0
+            ? LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE
+            : NULL);
+    fputs(",\"anchor\":", stdout);
+
+    if (tls_mode == NULL || strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PROVISIONED_ANCHOR) != 0 ||
+        !logger_config_upload_has_provisioned_anchor(config)) {
+        fputs("null", stdout);
+        fputs("}", stdout);
+        return;
+    }
+
+    char der_base64[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX + 1u];
+    size_t der_base64_len = 0u;
+    if (mbedtls_base64_encode((unsigned char *)der_base64,
+                              sizeof(der_base64),
+                              &der_base64_len,
+                              config->upload_tls_anchor_der,
+                              config->upload_tls_anchor_der_len) != 0 ||
+        der_base64_len >= sizeof(der_base64)) {
+        fputs("null}", stdout);
+        return;
+    }
+    der_base64[der_base64_len] = '\0';
+
+    fputs("{\"format\":", stdout);
+    logger_json_write_string_or_null(LOGGER_UPLOAD_TLS_ANCHOR_FORMAT_X509_DER_BASE64);
+    fputs(",\"der_base64\":", stdout);
+    logger_json_write_string_or_null(der_base64);
+    fputs(",\"sha256\":", stdout);
+    logger_json_write_string_or_null(
+        logger_string_present(config->upload_tls_anchor_sha256) ? config->upload_tls_anchor_sha256 : NULL);
+    fputs(",\"subject\":", stdout);
+    logger_json_write_string_or_null(
+        logger_string_present(config->upload_tls_anchor_subject) ? config->upload_tls_anchor_subject : NULL);
+    fputs("}}", stdout);
+}
+
+static void logger_handle_config_export_json(logger_app_t *app) {
     logger_json_begin_success("config export", logger_now_utc_or_null(app));
     fputs("{\"schema_version\":1,\"exported_at_utc\":", stdout);
     logger_json_write_string_or_null(logger_now_utc_or_null(app));
@@ -1090,11 +1293,9 @@ static void logger_handle_config_export_json(logger_app_t *app) {
     logger_json_write_string_or_null(logger_string_present(app->persisted.config.upload_token) ? "bearer" : "none");
     fputs(",\"token_present\":", stdout);
     fputs(logger_string_present(app->persisted.config.upload_token) ? "true" : "false", stdout);
-    fputs("},\"tls\":{\"mode\":", stdout);
-    logger_json_write_string_or_null(upload_https ? LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS : NULL);
-    fputs(",\"root_profile\":", stdout);
-    logger_json_write_string_or_null(upload_https ? LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE : NULL);
-    fputs(",\"anchor\":null}}}", stdout);
+    fputs("},\"tls\":", stdout);
+    logger_write_upload_tls_json(&app->persisted.config);
+    fputs("}}", stdout);
     logger_json_end_success();
 }
 
@@ -1654,6 +1855,67 @@ static void logger_handle_config_import_commit(logger_service_cli_t *cli, logger
 
     cli->config_import_buf[cli->config_import_received_len] = '\0';
     logger_apply_config_import_json(cli, app, "config import commit", cli->config_import_buf, true);
+}
+
+static void logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli, logger_app_t *app) {
+    if (logger_cli_is_logging_mode(app)) {
+        logger_json_begin_error(
+            "upload tls clear-provisioned-anchor",
+            logger_now_utc_or_null(app),
+            "busy_logging",
+            "upload tls clear-provisioned-anchor is not permitted while logging");
+        return;
+    }
+    if (!logger_cli_is_service_mode(app)) {
+        logger_json_begin_error(
+            "upload tls clear-provisioned-anchor",
+            logger_now_utc_or_null(app),
+            "not_permitted_in_mode",
+            "upload tls clear-provisioned-anchor is only allowed in service mode");
+        return;
+    }
+    if (!logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error(
+            "upload tls clear-provisioned-anchor",
+            logger_now_utc_or_null(app),
+            "service_locked",
+            "service unlock is required before upload tls clear-provisioned-anchor");
+        return;
+    }
+
+    bool had_anchor = false;
+    if (!logger_config_clear_provisioned_anchor(&app->persisted, &had_anchor)) {
+        logger_json_begin_error(
+            "upload tls clear-provisioned-anchor",
+            logger_now_utc_or_null(app),
+            "storage_unavailable",
+            "failed to clear provisioned upload TLS anchor");
+        return;
+    }
+
+    char details[160];
+    snprintf(details,
+             sizeof(details),
+             "{\"source\":\"upload_tls_clear_provisioned_anchor\",\"had_anchor\":%s}",
+             had_anchor ? "true" : "false");
+    (void)logger_system_log_append(
+        &app->system_log,
+        logger_now_utc_or_null(app),
+        "config_changed",
+        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        details);
+
+    cli->unlocked = false;
+
+    logger_json_begin_success("upload tls clear-provisioned-anchor", logger_now_utc_or_null(app));
+    fputs("{\"cleared\":true,\"had_anchor\":", stdout);
+    fputs(had_anchor ? "true" : "false", stdout);
+    fputs(",\"current_tls_mode\":", stdout);
+    logger_json_write_string_or_null(logger_config_upload_tls_mode(&app->persisted.config));
+    fputs(",\"upload_ready\":", stdout);
+    fputs(logger_config_upload_ready(&app->persisted.config) ? "true" : "false", stdout);
+    fputs("}", stdout);
+    logger_json_end_success();
 }
 
 static void logger_handle_debug_config_set(logger_service_cli_t *cli, logger_app_t *app, const char *args) {
@@ -2586,6 +2848,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
     }
     if (strcmp(line, "factory-reset") == 0) {
         logger_handle_factory_reset(cli, app);
+        return;
+    }
+    if (strcmp(line, "upload tls clear-provisioned-anchor") == 0) {
+        logger_handle_upload_tls_clear_provisioned_anchor(cli, app);
         return;
     }
     if (strcmp(line, "config import status") == 0) {

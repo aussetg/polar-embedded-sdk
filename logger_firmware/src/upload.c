@@ -100,6 +100,14 @@ typedef struct {
     char error_message[LOGGER_UPLOAD_MESSAGE_MAX + 1];
 } logger_upload_server_reply_t;
 
+typedef struct {
+    const char *mode;
+    const char *root_profile;
+    const uint8_t *ca_data;
+    size_t ca_len;
+    const char *anchor_sha256_or_null;
+} logger_upload_tls_trust_t;
+
 static bool logger_string_present(const char *value) {
     return value != NULL && value[0] != '\0';
 }
@@ -260,9 +268,66 @@ static bool logger_upload_format_host_header(const logger_upload_url_t *url, cha
     return n > 0 && (size_t)n < out_len;
 }
 
-static struct altcp_tls_config *logger_upload_tls_create_client_config(void) {
-    return altcp_tls_create_config_client((const u8_t *)logger_upload_tls_ca_bundle_pem,
-                                          sizeof(logger_upload_tls_ca_bundle_pem));
+static bool logger_upload_select_tls_trust(
+    const logger_config_t *config,
+    logger_upload_tls_trust_t *trust,
+    char *message,
+    size_t message_len) {
+    memset(trust, 0, sizeof(*trust));
+    const char *tls_mode = logger_config_upload_tls_mode(config);
+    if (tls_mode == NULL || strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS) == 0) {
+        trust->mode = LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS;
+        trust->root_profile = LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE;
+        trust->ca_data = (const uint8_t *)logger_upload_tls_ca_bundle_pem;
+        trust->ca_len = sizeof(logger_upload_tls_ca_bundle_pem);
+        return true;
+    }
+    if (strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PROVISIONED_ANCHOR) == 0) {
+        if (!logger_config_upload_has_provisioned_anchor(config)) {
+            logger_copy_string(message, message_len, "provisioned upload TLS anchor is not configured");
+            return false;
+        }
+        trust->mode = LOGGER_UPLOAD_TLS_MODE_PROVISIONED_ANCHOR;
+        trust->root_profile = NULL;
+        trust->ca_data = config->upload_tls_anchor_der;
+        trust->ca_len = config->upload_tls_anchor_der_len;
+        trust->anchor_sha256_or_null = logger_string_present(config->upload_tls_anchor_sha256)
+            ? config->upload_tls_anchor_sha256
+            : NULL;
+        return true;
+    }
+
+    logger_copy_string(message, message_len, "upload TLS mode is unsupported");
+    return false;
+}
+
+static void logger_upload_format_tls_details(
+    const logger_upload_tls_trust_t *trust,
+    const char *suffix,
+    char *out,
+    size_t out_len) {
+    if (strcmp(trust->mode, LOGGER_UPLOAD_TLS_MODE_PROVISIONED_ANCHOR) == 0) {
+        snprintf(out,
+                 out_len,
+                 logger_string_present(trust->anchor_sha256_or_null)
+                     ? "mode=%s sha256=%s %s"
+                     : "mode=%s %s",
+                 trust->mode,
+                 logger_string_present(trust->anchor_sha256_or_null) ? trust->anchor_sha256_or_null : suffix,
+                 logger_string_present(trust->anchor_sha256_or_null) ? suffix : "");
+        return;
+    }
+    snprintf(out,
+             out_len,
+             "mode=%s profile=%s %s",
+             trust->mode,
+             trust->root_profile,
+             suffix);
+}
+
+static struct altcp_tls_config *logger_upload_tls_create_client_config(const logger_upload_tls_trust_t *trust) {
+    return altcp_tls_create_config_client((const u8_t *)trust->ca_data,
+                                          trust->ca_len);
 }
 
 static bool logger_wifi_join(const logger_config_t *config, int *rc_out, char ip_buf[48]) {
@@ -591,10 +656,20 @@ static bool logger_upload_http_resolve(logger_upload_http_request_t *request, co
     return false;
 }
 
-static bool logger_upload_http_connect(logger_upload_http_request_t *request, const logger_upload_url_t *url) {
+static bool logger_upload_http_connect(
+    logger_upload_http_request_t *request,
+    const logger_upload_url_t *url,
+    const logger_config_t *config) {
     request->https = url->https;
     if (url->https) {
-        request->tls_config = logger_upload_tls_create_client_config();
+        logger_upload_tls_trust_t trust;
+        char tls_error[LOGGER_UPLOAD_MESSAGE_MAX + 1u] = {0};
+        if (!logger_upload_select_tls_trust(config, &trust, tls_error, sizeof(tls_error))) {
+            request->transport_failed = true;
+            request->transport_err = ERR_ARG;
+            return false;
+        }
+        request->tls_config = logger_upload_tls_create_client_config(&trust);
         if (request->tls_config == NULL) {
             request->transport_failed = true;
             request->transport_err = ERR_MEM;
@@ -637,6 +712,7 @@ static bool logger_upload_http_connect(logger_upload_http_request_t *request, co
 }
 
 static bool logger_upload_http_execute(
+    const logger_config_t *config,
     const logger_upload_url_t *url,
     const char *request_text,
     logger_upload_bundle_stream_t *bundle_stream,
@@ -672,7 +748,7 @@ static bool logger_upload_http_execute(
             break;
         }
         if (request.dns_done && !request.connect_started) {
-            (void)logger_upload_http_connect(&request, url);
+            (void)logger_upload_http_connect(&request, url, config);
         }
         if (request.connect_started && !request.connected && now_ms >= connect_deadline) {
             request.transport_failed = true;
@@ -881,10 +957,21 @@ bool logger_upload_net_test(
         logger_upload_net_test_result_fail_all(result, "upload URL is not configured");
         return false;
     }
+    if (!logger_config_upload_ready(config)) {
+        logger_upload_net_test_result_fail_all(result, "upload TLS trust is not ready");
+        return false;
+    }
 
     logger_upload_url_t url;
     if (!logger_upload_parse_url(config->upload_url, &url)) {
         logger_upload_net_test_result_fail_all(result, "upload URL is not a valid absolute http(s) URL");
+        return false;
+    }
+
+    logger_upload_tls_trust_t tls_trust;
+    char tls_select_message[LOGGER_UPLOAD_MESSAGE_MAX + 1u] = {0};
+    if (url.https && !logger_upload_select_tls_trust(config, &tls_trust, tls_select_message, sizeof(tls_select_message))) {
+        logger_upload_net_test_result_fail_all(result, tls_select_message);
         return false;
     }
 
@@ -937,7 +1024,12 @@ bool logger_upload_net_test(
     }
 
     logger_upload_http_response_t probe_response;
-    const bool reachable = logger_upload_http_execute(&url, probe_request, NULL, LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS, &probe_response);
+    const bool reachable = logger_upload_http_execute(config,
+                                                      &url,
+                                                      probe_request,
+                                                      NULL,
+                                                      LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS,
+                                                      &probe_response);
     if (url.host_is_literal) {
         result->dns_result = "pass";
         snprintf(result->dns_details, sizeof(result->dns_details), "literal=%s", url.host);
@@ -952,21 +1044,21 @@ bool logger_upload_net_test(
     if (url.https) {
         if (reachable) {
             result->tls_result = "pass";
-            snprintf(result->tls_details,
-                     sizeof(result->tls_details),
-                     "mode=%s profile=%s verified peer via TLS remote=%s",
-                     LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS,
-                     LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE,
+            char suffix[96];
+            snprintf(suffix,
+                     sizeof(suffix),
+                     "verified peer via TLS remote=%s",
                      logger_string_present(probe_response.remote_address) ? probe_response.remote_address : "unknown");
+            logger_upload_format_tls_details(&tls_trust, suffix, result->tls_details, sizeof(result->tls_details));
         } else {
             result->tls_result = "fail";
-            snprintf(result->tls_details,
-                     sizeof(result->tls_details),
-                     strcmp(probe_response.transport_failure_class, "dns_failed") == 0
-                         ? "mode=%s profile=%s TLS handshake was not attempted because DNS resolution failed"
-                         : "mode=%s profile=%s TLS handshake or certificate verification failed",
-                     LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS,
-                     LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE);
+            logger_upload_format_tls_details(
+                &tls_trust,
+                strcmp(probe_response.transport_failure_class, "dns_failed") == 0
+                    ? "TLS handshake was not attempted because DNS resolution failed"
+                    : "TLS handshake or certificate verification failed",
+                result->tls_details,
+                sizeof(result->tls_details));
         }
     }
 
@@ -1008,6 +1100,11 @@ static bool logger_upload_process_selected(
     if (!logger_config_upload_configured(config)) {
         result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
         logger_copy_string(result->message, sizeof(result->message), "upload URL is not configured");
+        return false;
+    }
+    if (!logger_config_upload_ready(config)) {
+        result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
+        logger_copy_string(result->message, sizeof(result->message), "upload TLS trust is not ready");
         return false;
     }
 
@@ -1168,6 +1265,7 @@ static bool logger_upload_process_selected(
 
     logger_upload_http_response_t http_response;
     const bool http_ok = logger_upload_http_execute(
+        config,
         &url,
         request_text,
         &bundle_stream,
