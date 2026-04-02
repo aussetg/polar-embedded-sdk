@@ -1,0 +1,30 @@
+Profile: logger-public-roots-v1
+
+This bundle is the built-in public HTTPS trust profile for logger_firmware.
+
+Included CA roots:
+- Amazon Root CA 1
+  - SHA256: 8ECD E688 4F3D 87B1 125B A31A C3FC B13D 7016 DE7F 57CC 904F E1CB 97C6 AE98 196E
+- DigiCert Global Root CA
+  - SHA256: 4348 A0E9 444C 78CB 265E 058D 5E89 44B4 D84F 9662 BD26 DB25 7F89 34A4 43C7 0161
+- DigiCert Global Root G2
+  - SHA256: CB3C CBB7 6031 E5E0 138F 8DD3 9A23 F9DE 47FF C35E 43C1 144C EA27 D46A 5AB1 CB5F
+- GTS Root R1
+  - SHA256: D947 432A BDE7 B7FA 90FC 2E6B 5910 1B12 80E0 E1C7 E4E4 0FA3 C688 7FFF 57A7 F4CF
+- GTS Root R2
+  - SHA256: 8D25 CD97 229D BF70 356B DA4E B3CC 7340 31E2 4CF0 0FAF CFD3 2DC7 6EB5 841C 7EA8
+- GTS Root R3
+  - SHA256: 34D8 A73E E208 D9BC DB0D 9565 2093 4B4E 40E6 9482 596E 8B6F 73C8 426B 010A 6F48
+- GTS Root R4
+  - SHA256: 349D FA40 58C5 E263 123B 398A E795 573C 4E13 13C8 3FE6 8F93 556C D5E8 031B 3C7D
+- ISRG Root X1
+  - SHA256: 96BC EC06 2649 76F3 7460 779A CF28 C5A7 CFE8 A3C0 AAE1 1A8F FCEE 05C0 BDDF 08C6
+- ISRG Root X2
+  - SHA256: 6972 9B8E 15A8 6EFC 177A 57AF B717 1DFC 64AD D28C 2FCA 8CF1 507E 3445 3CCB 1470
+
+Regenerate the build header with:
+
+  python scripts/logger_tls_codegen.py \
+      --input-pem logger_firmware/tls/public_roots_v1.pem \
+      --output-header build/logger_firmware_rp2_2/generated/upload_tls_roots.h \
+      --profile-name logger-public-roots-v1

@@ -181,6 +181,69 @@ static bool logger_upload_url_supported(const char *url) {
            (strncmp(url, "http://", 7u) == 0 || strncmp(url, "https://", 8u) == 0);
 }
 
+static bool logger_upload_url_uses_https(const char *url) {
+    return url != NULL && strncmp(url, "https://", 8u) == 0;
+}
+
+static bool logger_validate_config_import_upload_tls(
+    const logger_json_doc_t *doc,
+    const jsmntok_t *upload_tok,
+    bool upload_enabled,
+    const char *upload_url,
+    const char **error_message_out) {
+    const jsmntok_t *tls_tok = logger_json_object_get(doc, upload_tok, "tls");
+    if (tls_tok == NULL) {
+        return true;
+    }
+    if (tls_tok->type != JSMN_OBJECT) {
+        *error_message_out = "config import upload.tls is invalid";
+        return false;
+    }
+
+    char tls_mode[32] = {0};
+    char root_profile[64] = {0};
+    if (logger_json_object_has_key(doc, tls_tok, "mode") &&
+        !logger_json_object_copy_string_or_null(doc, tls_tok, "mode", tls_mode, sizeof(tls_mode))) {
+        *error_message_out = "config import upload.tls.mode is invalid";
+        return false;
+    }
+    if (logger_json_object_has_key(doc, tls_tok, "root_profile") &&
+        !logger_json_object_copy_string_or_null(doc, tls_tok, "root_profile", root_profile, sizeof(root_profile))) {
+        *error_message_out = "config import upload.tls.root_profile is invalid";
+        return false;
+    }
+
+    const jsmntok_t *anchor_tok = logger_json_object_get(doc, tls_tok, "anchor");
+    const bool anchor_is_null = anchor_tok == NULL || logger_json_token_is_null(doc, anchor_tok);
+    const bool upload_https = upload_enabled && logger_upload_url_uses_https(upload_url);
+
+    if (!upload_https) {
+        if (logger_string_present(tls_mode) || logger_string_present(root_profile) || !anchor_is_null) {
+            *error_message_out = "config import upload.tls must be null for disabled or http:// upload";
+            return false;
+        }
+        return true;
+    }
+
+    if (!logger_string_present(tls_mode)) {
+        *error_message_out = "config import upload.tls.mode must be public_roots for https:// upload";
+        return false;
+    }
+    if (strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS) != 0) {
+        *error_message_out = "config import upload.tls.mode is unsupported by current firmware";
+        return false;
+    }
+    if (logger_string_present(root_profile) && strcmp(root_profile, LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE) != 0) {
+        *error_message_out = "config import upload.tls.root_profile is unsupported by current firmware";
+        return false;
+    }
+    if (!anchor_is_null) {
+        *error_message_out = "config import upload.tls.anchor must be null for public_roots mode";
+        return false;
+    }
+    return true;
+}
+
 static bool logger_normalize_h10_address_local(const char *src, char out[LOGGER_CONFIG_BOUND_H10_ADDR_MAX]) {
     if (src == NULL || strlen(src) != 17u) {
         return false;
@@ -464,6 +527,9 @@ static bool logger_parse_config_import_document(
             *error_message_out = "config import requires upload.url to be an absolute http:// or https:// URL";
             return false;
         }
+        if (!logger_validate_config_import_upload_tls(&doc, upload_tok, upload_enabled, upload_url, error_message_out)) {
+            return false;
+        }
         logger_copy_string(imported.config.upload_url, sizeof(imported.config.upload_url), upload_url);
         if (strcmp(auth_type, "bearer") == 0) {
             if (secrets_included) {
@@ -483,6 +549,9 @@ static bool logger_parse_config_import_document(
             imported.config.upload_token[0] = '\0';
         }
     } else {
+        if (!logger_validate_config_import_upload_tls(&doc, upload_tok, upload_enabled, upload_url, error_message_out)) {
+            return false;
+        }
         imported.config.upload_url[0] = '\0';
         imported.config.upload_token[0] = '\0';
     }
@@ -940,6 +1009,8 @@ static void logger_handle_system_log_export_json(logger_app_t *app) {
 }
 
 static void logger_handle_config_export_json(logger_app_t *app) {
+    const bool upload_https = logger_upload_url_uses_https(app->persisted.config.upload_url);
+
     logger_json_begin_success("config export", logger_now_utc_or_null(app));
     fputs("{\"schema_version\":1,\"exported_at_utc\":", stdout);
     logger_json_write_string_or_null(logger_now_utc_or_null(app));
@@ -975,7 +1046,11 @@ static void logger_handle_config_export_json(logger_app_t *app) {
     logger_json_write_string_or_null(logger_string_present(app->persisted.config.upload_token) ? "bearer" : "none");
     fputs(",\"token_present\":", stdout);
     fputs(logger_string_present(app->persisted.config.upload_token) ? "true" : "false", stdout);
-    fputs("}}}", stdout);
+    fputs("},\"tls\":{\"mode\":", stdout);
+    logger_json_write_string_or_null(upload_https ? LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS : NULL);
+    fputs(",\"root_profile\":", stdout);
+    logger_json_write_string_or_null(upload_https ? LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE : NULL);
+    fputs(",\"anchor\":null}}}", stdout);
     logger_json_end_success();
 }
 

@@ -13,6 +13,9 @@
 #define LOGGER_UPLOAD_DETAIL_MAX 160
 #define LOGGER_UPLOAD_MESSAGE_MAX 160
 
+#define LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS "public_roots"
+#define LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE "logger-public-roots-v1"
+
 typedef struct {
     const char *wifi_join_result;
     char wifi_join_details[LOGGER_UPLOAD_DETAIL_MAX + 1];

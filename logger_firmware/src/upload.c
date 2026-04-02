@@ -954,15 +954,19 @@ bool logger_upload_net_test(
             result->tls_result = "pass";
             snprintf(result->tls_details,
                      sizeof(result->tls_details),
-                     "verified peer via TLS remote=%s",
+                     "mode=%s profile=%s verified peer via TLS remote=%s",
+                     LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS,
+                     LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE,
                      logger_string_present(probe_response.remote_address) ? probe_response.remote_address : "unknown");
         } else {
             result->tls_result = "fail";
-            logger_copy_string(result->tls_details,
-                               sizeof(result->tls_details),
-                               strcmp(probe_response.transport_failure_class, "dns_failed") == 0
-                                   ? "TLS handshake was not attempted because DNS resolution failed"
-                                   : "TLS handshake or certificate verification failed");
+            snprintf(result->tls_details,
+                     sizeof(result->tls_details),
+                     strcmp(probe_response.transport_failure_class, "dns_failed") == 0
+                         ? "mode=%s profile=%s TLS handshake was not attempted because DNS resolution failed"
+                         : "mode=%s profile=%s TLS handshake or certificate verification failed",
+                     LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS,
+                     LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE);
         }
     }
 

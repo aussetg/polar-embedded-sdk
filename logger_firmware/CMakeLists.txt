@@ -25,13 +25,34 @@ project(logger_firmware C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
 set(LOGGER_FIRMWARE_VERSION "0.1.0-dev" CACHE STRING "Semantic firmware version string")
 set(LOGGER_BUILD_ID "logger-fw-dev" CACHE STRING "Opaque firmware build identifier")
 set(PICO_MBEDTLS_CONFIG_FILE "logger_mbedtls_config.h" CACHE STRING "Project-local Mbed TLS configuration header")
 
+set(LOGGER_TLS_ROOTS_SOURCE_PEM "${CMAKE_CURRENT_LIST_DIR}/tls/public_roots_v1.pem")
+set(LOGGER_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(LOGGER_UPLOAD_TLS_ROOTS_HEADER "${LOGGER_GENERATED_DIR}/upload_tls_roots.h")
+
+add_custom_command(
+    OUTPUT "${LOGGER_UPLOAD_TLS_ROOTS_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${LOGGER_GENERATED_DIR}"
+    COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_LIST_DIR}/../scripts/logger_tls_codegen.py"
+            --input-pem "${LOGGER_TLS_ROOTS_SOURCE_PEM}"
+            --output-header "${LOGGER_UPLOAD_TLS_ROOTS_HEADER}"
+            --profile-name "logger-public-roots-v1"
+    DEPENDS
+        "${LOGGER_TLS_ROOTS_SOURCE_PEM}"
+        "${CMAKE_CURRENT_LIST_DIR}/../scripts/logger_tls_codegen.py"
+    VERBATIM
+)
+
 pico_sdk_init()
 
 add_executable(logger_appliance
+    ${LOGGER_UPLOAD_TLS_ROOTS_HEADER}
     src/main.c
     src/app_main.c
     src/app_state.c
@@ -80,6 +101,7 @@ add_executable(logger_appliance
 )
 
 target_include_directories(logger_appliance PRIVATE
+    ${LOGGER_GENERATED_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/boards/rp2_2
