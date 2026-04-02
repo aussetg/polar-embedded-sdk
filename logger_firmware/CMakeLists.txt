@@ -27,6 +27,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(LOGGER_FIRMWARE_VERSION "0.1.0-dev" CACHE STRING "Semantic firmware version string")
 set(LOGGER_BUILD_ID "logger-fw-dev" CACHE STRING "Opaque firmware build identifier")
+set(PICO_MBEDTLS_CONFIG_FILE "logger_mbedtls_config.h" CACHE STRING "Project-local Mbed TLS configuration header")
 
 pico_sdk_init()
 
@@ -41,6 +42,7 @@ add_executable(logger_appliance
     src/faults.c
     src/h10.c
     src/identity.c
+    src/mbedtls_platform.c
     src/json.c
     src/journal.c
     src/queue.c
@@ -90,8 +92,10 @@ target_include_directories(logger_appliance PRIVATE
 target_link_libraries(logger_appliance PRIVATE
     pico_stdlib
     pico_cyw43_arch_lwip_poll
+    pico_lwip_mbedtls
     pico_btstack_ble
     pico_btstack_cyw43
+    pico_mbedtls
     pico_rand
     pico_sha256
     pico_unique_id

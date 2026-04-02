@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
@@ -145,6 +146,21 @@ static bool logger_clock_status_to_observed_utc_ns(const logger_clock_status_t *
     return true;
 }
 
+static void logger_clock_sync_posix_time(const logger_clock_status_t *status) {
+    if (status == NULL || !status->valid || !logger_clock_datetime_reasonable(status)) {
+        return;
+    }
+    const int64_t days = logger_days_from_civil(status->year, status->month, status->day);
+    const int64_t seconds = days * 86400ll +
+                            ((int64_t)status->hour * 3600ll) +
+                            ((int64_t)status->minute * 60ll) +
+                            (int64_t)status->second;
+    struct timeval tv;
+    tv.tv_sec = (time_t)seconds;
+    tv.tv_usec = 0;
+    (void)settimeofday(&tv, NULL);
+}
+
 static bool logger_clock_read_reg(uint8_t reg, uint8_t *value) {
     if (i2c_write_blocking(i2c0, LOGGER_RTC_I2C_ADDR, &reg, 1, true) != 1) {
         return false;
@@ -227,6 +243,7 @@ void logger_clock_sample(logger_clock_status_t *status) {
     if (logger_clock_datetime_reasonable(status)) {
         logger_clock_format_now(status);
     }
+    logger_clock_sync_posix_time(status);
 }
 
 bool logger_clock_set_utc(const char *rfc3339_utc, logger_clock_status_t *status_out) {
@@ -275,6 +292,9 @@ bool logger_clock_set_utc(const char *rfc3339_utc, logger_clock_status_t *status
 
     if (status_out != NULL) {
         logger_clock_sample(status_out);
+    } else {
+        logger_clock_status_t sampled;
+        logger_clock_sample(&sampled);
     }
     return true;
 }

@@ -9,14 +9,19 @@
 #include "pico/error.h"
 #include "pico/stdlib.h"
 
+#include "lwip/altcp.h"
+#include "lwip/altcp_tls.h"
 #include "lwip/dns.h"
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
-#include "lwip/tcp.h"
+
+#include "mbedtls/ssl.h"
 
 #include "logger/json.h"
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
+
+#include "upload_tls_roots.h"
 
 #ifndef LOGGER_FIRMWARE_VERSION
 #define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
@@ -43,7 +48,9 @@ typedef struct {
 } logger_upload_url_t;
 
 typedef struct {
-    struct tcp_pcb *pcb;
+    struct altcp_pcb *pcb;
+    struct altcp_tls_config *tls_config;
+    bool https;
     ip_addr_t remote_addr;
     bool dns_done;
     err_t dns_err;
@@ -77,6 +84,7 @@ typedef struct {
     bool body_truncated;
     char body[LOGGER_UPLOAD_HTTP_RESPONSE_MAX + 1u];
     char remote_address[48];
+    char transport_failure_class[LOGGER_UPLOAD_QUEUE_FAILURE_CLASS_MAX + 1u];
 } logger_upload_http_response_t;
 
 typedef struct {
@@ -239,6 +247,24 @@ static bool logger_upload_parse_url(const char *url, logger_upload_url_t *parsed
     return true;
 }
 
+static bool logger_upload_format_host_header(const logger_upload_url_t *url, char *out, size_t out_len) {
+    if (url == NULL || out == NULL || out_len == 0u) {
+        return false;
+    }
+    const bool default_port = (!url->https && url->port == 80u) || (url->https && url->port == 443u);
+    const int n = snprintf(out,
+                           out_len,
+                           default_port ? "%s" : "%s:%u",
+                           url->host,
+                           (unsigned)url->port);
+    return n > 0 && (size_t)n < out_len;
+}
+
+static struct altcp_tls_config *logger_upload_tls_create_client_config(void) {
+    return altcp_tls_create_config_client((const u8_t *)logger_upload_tls_ca_bundle_pem,
+                                          sizeof(logger_upload_tls_ca_bundle_pem));
+}
+
 static bool logger_wifi_join(const logger_config_t *config, int *rc_out, char ip_buf[48]) {
     if (rc_out != NULL) {
         *rc_out = PICO_ERROR_GENERIC;
@@ -315,19 +341,38 @@ static void logger_upload_http_request_init(logger_upload_http_request_t *reques
     request->content_length = -1;
 }
 
+static void logger_upload_http_response_init(logger_upload_http_response_t *response) {
+    memset(response, 0, sizeof(*response));
+    response->http_status = -1;
+}
+
 static void logger_upload_http_close_pcb(logger_upload_http_request_t *request) {
     if (request->pcb == NULL) {
         return;
     }
-    tcp_arg(request->pcb, NULL);
-    tcp_recv(request->pcb, NULL);
-    tcp_sent(request->pcb, NULL);
-    tcp_err(request->pcb, NULL);
-    tcp_poll(request->pcb, NULL, 0u);
-    if (tcp_close(request->pcb) != ERR_OK) {
-        tcp_abort(request->pcb);
+    altcp_arg(request->pcb, NULL);
+    altcp_recv(request->pcb, NULL);
+    altcp_sent(request->pcb, NULL);
+    altcp_err(request->pcb, NULL);
+    altcp_poll(request->pcb, NULL, 0u);
+    if (altcp_close(request->pcb) != ERR_OK) {
+        altcp_abort(request->pcb);
     }
     request->pcb = NULL;
+}
+
+static void logger_upload_http_free_tls_config(logger_upload_http_request_t *request) {
+    if (request->tls_config == NULL) {
+        return;
+    }
+    altcp_tls_free_config(request->tls_config);
+    altcp_tls_free_entropy();
+    request->tls_config = NULL;
+}
+
+static void logger_upload_http_cleanup(logger_upload_http_request_t *request) {
+    logger_upload_http_close_pcb(request);
+    logger_upload_http_free_tls_config(request);
 }
 
 static void logger_upload_http_parse_response_progress(logger_upload_http_request_t *request) {
@@ -361,7 +406,7 @@ static void logger_upload_http_parse_response_progress(logger_upload_http_reques
     }
 }
 
-static err_t logger_upload_http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
+static err_t logger_upload_http_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
     (void)pcb;
     logger_upload_http_request_t *request = (logger_upload_http_request_t *)arg;
     if (err == ERR_OK) {
@@ -374,14 +419,14 @@ static err_t logger_upload_http_connected_cb(void *arg, struct tcp_pcb *pcb, err
     return ERR_OK;
 }
 
-static err_t logger_upload_http_sent_cb(void *arg, struct tcp_pcb *pcb, u16_t len) {
+static err_t logger_upload_http_sent_cb(void *arg, struct altcp_pcb *pcb, u16_t len) {
     (void)arg;
     (void)pcb;
     (void)len;
     return ERR_OK;
 }
 
-static err_t logger_upload_http_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
+static err_t logger_upload_http_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err) {
     logger_upload_http_request_t *request = (logger_upload_http_request_t *)arg;
     if (err != ERR_OK) {
         if (p != NULL) {
@@ -399,7 +444,7 @@ static err_t logger_upload_http_recv_cb(void *arg, struct tcp_pcb *pcb, struct p
         return ERR_OK;
     }
 
-    tcp_recved(pcb, p->tot_len);
+    altcp_recved(pcb, p->tot_len);
     if ((request->response_len + p->tot_len) >= sizeof(request->response)) {
         request->response_truncated = true;
         request->transport_failed = true;
@@ -472,7 +517,7 @@ static bool logger_upload_http_send_more(logger_upload_http_request_t *request) 
     }
 
     while (!request->transport_failed) {
-        const u16_t sndbuf = tcp_sndbuf(request->pcb);
+        const u16_t sndbuf = altcp_sndbuf(request->pcb);
         if (sndbuf == 0u) {
             break;
         }
@@ -501,7 +546,7 @@ static bool logger_upload_http_send_more(logger_upload_http_request_t *request) 
             break;
         }
 
-        const err_t err = tcp_write(request->pcb, src, (u16_t)len, TCP_WRITE_FLAG_COPY);
+        const err_t err = altcp_write(request->pcb, src, (u16_t)len, TCP_WRITE_FLAG_COPY);
         if (err == ERR_OK) {
             if (request->request_offset < request->request_len) {
                 request->request_offset += len;
@@ -519,7 +564,7 @@ static bool logger_upload_http_send_more(logger_upload_http_request_t *request) 
     }
 
     if (request->pcb != NULL) {
-        (void)tcp_output(request->pcb);
+        (void)altcp_output(request->pcb);
     }
     return true;
 }
@@ -547,24 +592,45 @@ static bool logger_upload_http_resolve(logger_upload_http_request_t *request, co
 }
 
 static bool logger_upload_http_connect(logger_upload_http_request_t *request, const logger_upload_url_t *url) {
-    request->pcb = tcp_new_ip_type(IP_GET_TYPE(&request->remote_addr));
+    request->https = url->https;
+    if (url->https) {
+        request->tls_config = logger_upload_tls_create_client_config();
+        if (request->tls_config == NULL) {
+            request->transport_failed = true;
+            request->transport_err = ERR_MEM;
+            return false;
+        }
+        request->pcb = altcp_tls_new(request->tls_config, IP_GET_TYPE(&request->remote_addr));
+    } else {
+        request->pcb = altcp_new_ip_type(NULL, IP_GET_TYPE(&request->remote_addr));
+    }
     if (request->pcb == NULL) {
         request->transport_failed = true;
         request->transport_err = ERR_MEM;
+        logger_upload_http_free_tls_config(request);
         return false;
     }
-    tcp_arg(request->pcb, request);
-    tcp_recv(request->pcb, logger_upload_http_recv_cb);
-    tcp_sent(request->pcb, logger_upload_http_sent_cb);
-    tcp_err(request->pcb, logger_upload_http_err_cb);
-    tcp_poll(request->pcb, NULL, LOGGER_UPLOAD_TCP_POLL_INTERVAL);
-    const err_t err = tcp_connect(request->pcb, &request->remote_addr, url->port, logger_upload_http_connected_cb);
+    if (url->https) {
+        mbedtls_ssl_context *ssl = (mbedtls_ssl_context *)altcp_tls_context(request->pcb);
+        if (ssl == NULL || mbedtls_ssl_set_hostname(ssl, url->host) != 0) {
+            request->transport_failed = true;
+            request->transport_err = ERR_ARG;
+            logger_upload_http_cleanup(request);
+            return false;
+        }
+    }
+    altcp_arg(request->pcb, request);
+    altcp_recv(request->pcb, logger_upload_http_recv_cb);
+    altcp_sent(request->pcb, logger_upload_http_sent_cb);
+    altcp_err(request->pcb, logger_upload_http_err_cb);
+    altcp_poll(request->pcb, NULL, LOGGER_UPLOAD_TCP_POLL_INTERVAL);
+    const err_t err = altcp_connect(request->pcb, &request->remote_addr, url->port, logger_upload_http_connected_cb);
     request->connect_started = true;
     if (err != ERR_OK) {
         request->connect_err = err;
         request->transport_failed = true;
         request->transport_err = err;
-        logger_upload_http_close_pcb(request);
+        logger_upload_http_cleanup(request);
         return false;
     }
     return true;
@@ -578,6 +644,7 @@ static bool logger_upload_http_execute(
     logger_upload_http_response_t *response) {
     logger_upload_http_request_t request;
     logger_upload_http_request_init(&request);
+    logger_upload_http_response_init(response);
     logger_copy_string(request.request, sizeof(request.request), request_text);
     request.request_len = strlen(request.request);
     request.body_enabled = bundle_stream != NULL;
@@ -623,16 +690,27 @@ static bool logger_upload_http_execute(
         sleep_ms(2);
     }
 
+    if (request.dns_done && request.dns_err == ERR_OK) {
+        ipaddr_ntoa_r(&request.remote_addr, response->remote_address, sizeof(response->remote_address));
+    }
+
     if (!request.response_complete && request.transport_failed) {
-        logger_upload_http_close_pcb(&request);
+        logger_copy_string(response->transport_failure_class,
+                           sizeof(response->transport_failure_class),
+                           (request.dns_done && request.dns_err != ERR_OK) ? "dns_failed" :
+                           (url->https ? "tls_failed" : "tcp_failed"));
+        logger_upload_http_cleanup(&request);
         return false;
     }
 
     if (request.header_len == 0u || request.http_status < 0) {
+        logger_copy_string(response->transport_failure_class,
+                           sizeof(response->transport_failure_class),
+                           url->https ? "tls_failed" : "tcp_failed");
+        logger_upload_http_cleanup(&request);
         return false;
     }
 
-    memset(response, 0, sizeof(*response));
     response->http_status = request.http_status;
     response->body_truncated = request.response_truncated;
     if (request.header_len < request.response_len) {
@@ -641,7 +719,7 @@ static bool logger_upload_http_execute(
         memcpy(response->body, request.response + request.header_len, copy_len);
         response->body[copy_len] = '\0';
     }
-    ipaddr_ntoa_r(&request.remote_addr, response->remote_address, sizeof(response->remote_address));
+    logger_upload_http_cleanup(&request);
     return true;
 }
 
@@ -831,32 +909,17 @@ bool logger_upload_net_test(
     result->wifi_join_result = "pass";
     snprintf(result->wifi_join_details, sizeof(result->wifi_join_details), "ssid=%s ip=%s", config->wifi_ssid, ip_buf);
 
-    if (url.https) {
-        result->tls_result = "fail";
-        logger_copy_string(result->tls_details, sizeof(result->tls_details), "HTTPS/TLS uploads are not implemented yet");
-        result->dns_result = url.host_is_literal ? "pass" : "fail";
-        if (url.host_is_literal) {
-            snprintf(result->dns_details, sizeof(result->dns_details), "literal=%s", url.host);
-        } else {
-            logger_copy_string(result->dns_details, sizeof(result->dns_details), "DNS skipped because HTTPS uploads are not implemented yet");
-        }
-        result->upload_endpoint_reachable_result = "fail";
-        logger_copy_string(result->upload_endpoint_reachable_details,
-                           sizeof(result->upload_endpoint_reachable_details),
-                           "endpoint probe skipped because HTTPS uploads are not implemented yet");
-        logger_wifi_leave();
-        return false;
-    }
-
-    result->tls_result = "not_applicable";
-    logger_copy_string(result->tls_details, sizeof(result->tls_details), "HTTP upload URL does not use TLS");
+    result->tls_result = url.https ? "fail" : "not_applicable";
+    logger_copy_string(result->tls_details,
+                       sizeof(result->tls_details),
+                       url.https ? "TLS handshake not attempted yet" : "HTTP upload URL does not use TLS");
 
     char probe_request[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
     char host_header[LOGGER_UPLOAD_URL_HOST_MAX + 8];
-    if (url.port == 80u) {
-        snprintf(host_header, sizeof(host_header), "%s", url.host);
-    } else {
-        snprintf(host_header, sizeof(host_header), "%s:%u", url.host, (unsigned)url.port);
+    if (!logger_upload_format_host_header(&url, host_header, sizeof(host_header))) {
+        logger_wifi_leave();
+        logger_upload_net_test_result_fail_all(result, "Host header buffer overflow");
+        return false;
     }
     const int n = snprintf(
         probe_request,
@@ -878,7 +941,7 @@ bool logger_upload_net_test(
     if (url.host_is_literal) {
         result->dns_result = "pass";
         snprintf(result->dns_details, sizeof(result->dns_details), "literal=%s", url.host);
-    } else if (reachable) {
+    } else if (logger_string_present(probe_response.remote_address)) {
         result->dns_result = "pass";
         snprintf(result->dns_details, sizeof(result->dns_details), "resolved=%s", probe_response.remote_address);
     } else {
@@ -886,18 +949,38 @@ bool logger_upload_net_test(
         logger_copy_string(result->dns_details, sizeof(result->dns_details), "failed to resolve or connect to upload host");
     }
 
+    if (url.https) {
+        if (reachable) {
+            result->tls_result = "pass";
+            snprintf(result->tls_details,
+                     sizeof(result->tls_details),
+                     "verified peer via TLS remote=%s",
+                     logger_string_present(probe_response.remote_address) ? probe_response.remote_address : "unknown");
+        } else {
+            result->tls_result = "fail";
+            logger_copy_string(result->tls_details,
+                               sizeof(result->tls_details),
+                               strcmp(probe_response.transport_failure_class, "dns_failed") == 0
+                                   ? "TLS handshake was not attempted because DNS resolution failed"
+                                   : "TLS handshake or certificate verification failed");
+        }
+    }
+
     if (reachable) {
         result->upload_endpoint_reachable_result = "pass";
         snprintf(result->upload_endpoint_reachable_details,
                  sizeof(result->upload_endpoint_reachable_details),
-                 "http_status=%d remote=%s",
+                 "%s_status=%d remote=%s",
+                 url.https ? "https" : "http",
                  probe_response.http_status,
                  probe_response.remote_address);
     } else {
         result->upload_endpoint_reachable_result = "fail";
         logger_copy_string(result->upload_endpoint_reachable_details,
                            sizeof(result->upload_endpoint_reachable_details),
-                           "failed to receive an HTTP response from the upload endpoint");
+                           url.https
+                               ? "failed to receive an HTTPS response from the upload endpoint"
+                               : "failed to receive an HTTP response from the upload endpoint");
     }
 
     logger_wifi_leave();
@@ -930,13 +1013,6 @@ static bool logger_upload_process_selected(
         logger_copy_string(result->message, sizeof(result->message), "upload URL is invalid");
         return false;
     }
-    if (url.https) {
-        result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
-        logger_copy_string(result->failure_class, sizeof(result->failure_class), "tls_failed");
-        logger_copy_string(result->message, sizeof(result->message), "HTTPS/TLS uploads are not implemented yet");
-        return false;
-    }
-
     logger_upload_queue_t queue;
     if (!logger_upload_queue_load(&queue)) {
         result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
@@ -1028,10 +1104,11 @@ static bool logger_upload_process_selected(
 
     char request_text[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
     char host_header[LOGGER_UPLOAD_URL_HOST_MAX + 8];
-    if (url.port == 80u) {
-        snprintf(host_header, sizeof(host_header), "%s", url.host);
-    } else {
-        snprintf(host_header, sizeof(host_header), "%s:%u", url.host, (unsigned)url.port);
+    if (!logger_upload_format_host_header(&url, host_header, sizeof(host_header))) {
+        logger_wifi_leave();
+        result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
+        logger_copy_string(result->message, sizeof(result->message), "Host header buffer overflow");
+        return false;
     }
 
     const int request_n = snprintf(
@@ -1096,21 +1173,31 @@ static bool logger_upload_process_selected(
     logger_wifi_leave();
 
     if (!http_ok) {
+        const char *transport_failure_class = logger_string_present(http_response.transport_failure_class)
+            ? http_response.transport_failure_class
+            : (url.https ? "tls_failed" : "tcp_failed");
         logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
         logger_copy_string(entry->status, sizeof(entry->status), "failed");
-        logger_copy_string(entry->last_failure_class, sizeof(entry->last_failure_class), "tcp_failed");
+        logger_copy_string(entry->last_failure_class, sizeof(entry->last_failure_class), transport_failure_class);
         (void)logger_upload_queue_write(&queue);
         result->attempted = true;
         result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
         logger_copy_string(result->final_status, sizeof(result->final_status), entry->status);
         logger_copy_string(result->failure_class, sizeof(result->failure_class), entry->last_failure_class);
-        logger_copy_string(result->message, sizeof(result->message), "HTTP upload transport failed");
+        logger_copy_string(result->message,
+                           sizeof(result->message),
+                           url.https ? "HTTPS upload transport failed" : "HTTP upload transport failed");
+        char extra[160];
+        snprintf(extra,
+                 sizeof(extra),
+                 "\"failure_class\":\"%s\"",
+                 entry->last_failure_class);
         logger_upload_append_event(system_log,
                                    now_utc_or_null,
                                    "upload_failed",
                                    LOGGER_SYSTEM_LOG_SEVERITY_WARN,
                                    entry->session_id,
-                                   "\"failure_class\":\"tcp_failed\"");
+                                   extra);
         return false;
     }
 

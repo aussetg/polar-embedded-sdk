@@ -10,8 +10,15 @@
 #define LWIP_NETCONN 0
 #define LWIP_RAW 1
 
+#define LWIP_ALTCP 1
+#define LWIP_ALTCP_TLS 1
+#define LWIP_ALTCP_TLS_MBEDTLS 1
+
+// MBEDTLS_SSL_VERIFY_REQUIRED
+#define ALTCP_MBEDTLS_AUTHMODE 2
+
 #define MEM_ALIGNMENT 4
-#define MEM_SIZE (24 * 1024)
+#define MEM_SIZE (96 * 1024)
 
 #define LWIP_TCP 1
 #define LWIP_UDP 1
