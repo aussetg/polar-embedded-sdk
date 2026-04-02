@@ -1,5 +1,6 @@
 #include "logger/service_cli.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -83,6 +84,414 @@ static bool logger_parse_bool01(const char *text, bool *value_out) {
         return true;
     }
     return false;
+}
+
+#define LOGGER_CONFIG_IMPORT_JSON_TOKEN_MAX 256u
+
+static bool logger_json_token_copy_primitive(
+    const logger_json_doc_t *doc,
+    const jsmntok_t *tok,
+    char *out,
+    size_t out_len) {
+    if (out == NULL || out_len == 0u) {
+        return false;
+    }
+    out[0] = '\0';
+    if (doc == NULL || tok == NULL || tok->type != JSMN_PRIMITIVE || tok->start < 0 || tok->end < tok->start) {
+        return false;
+    }
+
+    const size_t len = (size_t)(tok->end - tok->start);
+    if ((len + 1u) > out_len) {
+        return false;
+    }
+    memcpy(out, doc->json + tok->start, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool logger_json_token_get_double(
+    const logger_json_doc_t *doc,
+    const jsmntok_t *tok,
+    double *value_out) {
+    if (value_out == NULL) {
+        return false;
+    }
+    char number_buf[32];
+    if (!logger_json_token_copy_primitive(doc, tok, number_buf, sizeof(number_buf))) {
+        return false;
+    }
+    char *end = NULL;
+    const double value = strtod(number_buf, &end);
+    if (end == NULL || *end != '\0') {
+        return false;
+    }
+    *value_out = value;
+    return true;
+}
+
+static bool logger_double_nearly_equal(double a, double b) {
+    double diff = a - b;
+    if (diff < 0.0) {
+        diff = -diff;
+    }
+    return diff <= 0.0005;
+}
+
+static bool logger_json_object_has_key(
+    const logger_json_doc_t *doc,
+    const jsmntok_t *object_tok,
+    const char *key) {
+    return logger_json_object_get(doc, object_tok, key) != NULL;
+}
+
+static bool logger_json_object_copy_string_or_empty_required(
+    const logger_json_doc_t *doc,
+    const jsmntok_t *object_tok,
+    const char *key,
+    char *out,
+    size_t out_len) {
+    if (!logger_json_object_has_key(doc, object_tok, key)) {
+        return false;
+    }
+    return logger_json_object_copy_string_or_null(doc, object_tok, key, out, out_len);
+}
+
+static bool logger_json_array_copy_single_string(
+    const logger_json_doc_t *doc,
+    const jsmntok_t *array_tok,
+    char *out,
+    size_t out_len) {
+    if (out == NULL || out_len == 0u || array_tok == NULL || array_tok->type != JSMN_ARRAY) {
+        return false;
+    }
+    out[0] = '\0';
+    if (array_tok->size == 0) {
+        return true;
+    }
+    if (array_tok->size != 1) {
+        return false;
+    }
+    const jsmntok_t *value_tok = logger_json_array_get(doc, array_tok, 0u);
+    return logger_json_token_copy_string(doc, value_tok, out, out_len);
+}
+
+static bool logger_upload_url_supported(const char *url) {
+    return url != NULL &&
+           (strncmp(url, "http://", 7u) == 0 || strncmp(url, "https://", 8u) == 0);
+}
+
+static bool logger_normalize_h10_address_local(const char *src, char out[LOGGER_CONFIG_BOUND_H10_ADDR_MAX]) {
+    if (src == NULL || strlen(src) != 17u) {
+        return false;
+    }
+    for (size_t i = 0u; i < 17u; ++i) {
+        const char ch = src[i];
+        if ((i % 3u) == 2u) {
+            if (ch != ':') {
+                return false;
+            }
+            out[i] = ':';
+            continue;
+        }
+        if (!isxdigit((unsigned char)ch)) {
+            return false;
+        }
+        out[i] = (char)toupper((unsigned char)ch);
+    }
+    out[17] = '\0';
+    return true;
+}
+
+static bool logger_validate_fixed_policy_string(const char *value, const char *expected) {
+    return value != NULL && expected != NULL && strcmp(value, expected) == 0;
+}
+
+static bool logger_parse_config_import_document(
+    logger_app_t *app,
+    const char *json,
+    logger_persisted_state_t *state_out,
+    bool *bond_cleared_out,
+    const char **error_message_out) {
+    static jsmntok_t tokens[LOGGER_CONFIG_IMPORT_JSON_TOKEN_MAX];
+    logger_json_doc_t doc;
+    if (!logger_json_parse(&doc, json, strlen(json), tokens, LOGGER_CONFIG_IMPORT_JSON_TOKEN_MAX)) {
+        *error_message_out = "config import JSON parse failed";
+        return false;
+    }
+
+    const jsmntok_t *root = logger_json_root(&doc);
+    if (root == NULL || root->type != JSMN_OBJECT) {
+        *error_message_out = "config import requires a top-level JSON object";
+        return false;
+    }
+
+    uint32_t schema_version = 0u;
+    bool secrets_included = false;
+    if (!logger_json_object_get_uint32(&doc, root, "schema_version", &schema_version) || schema_version != 1u) {
+        *error_message_out = "config import requires schema_version 1";
+        return false;
+    }
+    if (!logger_json_object_get_bool(&doc, root, "secrets_included", &secrets_included)) {
+        *error_message_out = "config import requires secrets_included";
+        return false;
+    }
+
+    char hardware_id[LOGGER_HARDWARE_ID_HEX_LEN + 1];
+    if (!logger_json_object_copy_string(&doc, root, "hardware_id", hardware_id, sizeof(hardware_id))) {
+        *error_message_out = "config import requires hardware_id";
+        return false;
+    }
+    if (strcmp(hardware_id, app->hardware_id) != 0) {
+        *error_message_out = "config import hardware_id does not match this device";
+        return false;
+    }
+    if (!logger_json_object_has_key(&doc, root, "exported_at_utc")) {
+        *error_message_out = "config import requires exported_at_utc";
+        return false;
+    }
+
+    const jsmntok_t *identity_tok = logger_json_object_get(&doc, root, "identity");
+    const jsmntok_t *recording_tok = logger_json_object_get(&doc, root, "recording");
+    const jsmntok_t *time_tok = logger_json_object_get(&doc, root, "time");
+    const jsmntok_t *battery_tok = logger_json_object_get(&doc, root, "battery_policy");
+    const jsmntok_t *wifi_tok = logger_json_object_get(&doc, root, "wifi");
+    const jsmntok_t *upload_tok = logger_json_object_get(&doc, root, "upload");
+    if (identity_tok == NULL || identity_tok->type != JSMN_OBJECT ||
+        recording_tok == NULL || recording_tok->type != JSMN_OBJECT ||
+        time_tok == NULL || time_tok->type != JSMN_OBJECT ||
+        battery_tok == NULL || battery_tok->type != JSMN_OBJECT ||
+        wifi_tok == NULL || wifi_tok->type != JSMN_OBJECT ||
+        upload_tok == NULL || upload_tok->type != JSMN_OBJECT) {
+        *error_message_out = "config import is missing one or more required sections";
+        return false;
+    }
+
+    logger_persisted_state_t imported = app->persisted;
+    logger_config_init(&imported.config);
+
+    if (!logger_json_object_copy_string_or_empty_required(&doc,
+                                                          identity_tok,
+                                                          "logger_id",
+                                                          imported.config.logger_id,
+                                                          sizeof(imported.config.logger_id)) ||
+        !logger_json_object_copy_string_or_empty_required(&doc,
+                                                          identity_tok,
+                                                          "subject_id",
+                                                          imported.config.subject_id,
+                                                          sizeof(imported.config.subject_id))) {
+        *error_message_out = "config import identity section is invalid";
+        return false;
+    }
+
+    char imported_bound_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX] = {0};
+    if (!logger_json_object_copy_string_or_empty_required(&doc,
+                                                          recording_tok,
+                                                          "bound_h10_address",
+                                                          imported_bound_address,
+                                                          sizeof(imported_bound_address))) {
+        *error_message_out = "config import recording.bound_h10_address is invalid";
+        return false;
+    }
+    if (logger_string_present(imported_bound_address)) {
+        char normalized_bound_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
+        if (!logger_normalize_h10_address_local(imported_bound_address, normalized_bound_address)) {
+            *error_message_out = "config import recording.bound_h10_address is invalid";
+            return false;
+        }
+        logger_copy_string(imported.config.bound_h10_address,
+                           sizeof(imported.config.bound_h10_address),
+                           normalized_bound_address);
+    } else {
+        imported.config.bound_h10_address[0] = '\0';
+    }
+
+    char rollover_local[16];
+    char upload_start_local[16];
+    char upload_end_local[16];
+    if (!logger_json_object_copy_string(&doc, recording_tok, "study_day_rollover_local", rollover_local, sizeof(rollover_local)) ||
+        !logger_json_object_copy_string(&doc, recording_tok, "overnight_upload_window_start_local", upload_start_local, sizeof(upload_start_local)) ||
+        !logger_json_object_copy_string(&doc, recording_tok, "overnight_upload_window_end_local", upload_end_local, sizeof(upload_end_local))) {
+        *error_message_out = "config import recording policy fields are invalid";
+        return false;
+    }
+    if (!logger_validate_fixed_policy_string(rollover_local, "04:00:00") ||
+        !logger_validate_fixed_policy_string(upload_start_local, "22:00:00") ||
+        !logger_validate_fixed_policy_string(upload_end_local, "06:00:00")) {
+        *error_message_out = "config import contains unsupported non-default recording policy values";
+        return false;
+    }
+
+    if (!logger_json_object_copy_string_or_empty_required(&doc,
+                                                          time_tok,
+                                                          "timezone",
+                                                          imported.config.timezone,
+                                                          sizeof(imported.config.timezone))) {
+        *error_message_out = "config import time.timezone is invalid";
+        return false;
+    }
+
+    const jsmntok_t *critical_tok = logger_json_object_get(&doc, battery_tok, "critical_stop_voltage_v");
+    const jsmntok_t *low_tok = logger_json_object_get(&doc, battery_tok, "low_start_voltage_v");
+    const jsmntok_t *off_tok = logger_json_object_get(&doc, battery_tok, "off_charger_upload_voltage_v");
+    double critical_v = 0.0;
+    double low_v = 0.0;
+    double off_v = 0.0;
+    if (!logger_json_token_get_double(&doc, critical_tok, &critical_v) ||
+        !logger_json_token_get_double(&doc, low_tok, &low_v) ||
+        !logger_json_token_get_double(&doc, off_tok, &off_v)) {
+        *error_message_out = "config import battery_policy values are invalid";
+        return false;
+    }
+    if (!logger_double_nearly_equal(critical_v, 3.5) ||
+        !logger_double_nearly_equal(low_v, 3.65) ||
+        !logger_double_nearly_equal(off_v, 3.85)) {
+        *error_message_out = "config import contains unsupported non-default battery policy values";
+        return false;
+    }
+
+    const jsmntok_t *allowed_ssids_tok = logger_json_object_get(&doc, wifi_tok, "allowed_ssids");
+    const jsmntok_t *networks_tok = logger_json_object_get(&doc, wifi_tok, "networks");
+    if (allowed_ssids_tok == NULL || allowed_ssids_tok->type != JSMN_ARRAY ||
+        networks_tok == NULL || networks_tok->type != JSMN_ARRAY) {
+        *error_message_out = "config import wifi section is invalid";
+        return false;
+    }
+
+    char allowed_ssid[LOGGER_CONFIG_WIFI_SSID_MAX] = {0};
+    if (!logger_json_array_copy_single_string(&doc, allowed_ssids_tok, allowed_ssid, sizeof(allowed_ssid)) ||
+        networks_tok->size > 1) {
+        *error_message_out = "config import currently supports at most one Wi-Fi network";
+        return false;
+    }
+
+    char network_ssid[LOGGER_CONFIG_WIFI_SSID_MAX] = {0};
+    char network_psk[LOGGER_CONFIG_WIFI_PSK_MAX] = {0};
+    bool network_psk_present_marker = false;
+    if (networks_tok->size == 1) {
+        const jsmntok_t *network_tok = logger_json_array_get(&doc, networks_tok, 0u);
+        if (network_tok == NULL || network_tok->type != JSMN_OBJECT ||
+            !logger_json_object_copy_string(&doc, network_tok, "ssid", network_ssid, sizeof(network_ssid))) {
+            *error_message_out = "config import wifi.networks[0].ssid is invalid";
+            return false;
+        }
+        if (secrets_included && !logger_json_object_has_key(&doc, network_tok, "psk")) {
+            *error_message_out = "config import wifi.networks[0] requires psk when secrets_included is true";
+            return false;
+        }
+        if (!secrets_included && !logger_json_object_has_key(&doc, network_tok, "psk_present")) {
+            *error_message_out = "config import wifi.networks[0] requires psk_present when secrets_included is false";
+            return false;
+        }
+        if (!logger_json_object_has_key(&doc, network_tok, "psk") &&
+            !logger_json_object_has_key(&doc, network_tok, "psk_present")) {
+            *error_message_out = "config import wifi.networks[0] requires psk or psk_present";
+            return false;
+        }
+        if (logger_json_object_has_key(&doc, network_tok, "psk") &&
+            !logger_json_object_copy_string_or_empty_required(&doc, network_tok, "psk", network_psk, sizeof(network_psk))) {
+            *error_message_out = "config import wifi.networks[0].psk is invalid";
+            return false;
+        }
+        if (logger_json_object_has_key(&doc, network_tok, "psk_present") &&
+            !logger_json_object_get_bool(&doc, network_tok, "psk_present", &network_psk_present_marker)) {
+            *error_message_out = "config import wifi.networks[0].psk_present is invalid";
+            return false;
+        }
+        (void)network_psk_present_marker;
+    }
+
+    if ((logger_string_present(allowed_ssid) || logger_string_present(network_ssid)) &&
+        strcmp(allowed_ssid, network_ssid) != 0) {
+        *error_message_out = "config import requires allowed_ssids[0] to match wifi.networks[0].ssid";
+        return false;
+    }
+    if (logger_string_present(network_ssid)) {
+        logger_copy_string(imported.config.wifi_ssid, sizeof(imported.config.wifi_ssid), network_ssid);
+        if (secrets_included) {
+            logger_copy_string(imported.config.wifi_psk, sizeof(imported.config.wifi_psk), network_psk);
+        } else {
+            imported.config.wifi_psk[0] = '\0';
+        }
+    }
+
+    bool upload_enabled = false;
+    if (!logger_json_object_get_bool(&doc, upload_tok, "enabled", &upload_enabled)) {
+        *error_message_out = "config import upload.enabled is invalid";
+        return false;
+    }
+
+    char upload_url[LOGGER_CONFIG_UPLOAD_URL_MAX] = {0};
+    if (!logger_json_object_copy_string_or_empty_required(&doc,
+                                                          upload_tok,
+                                                          "url",
+                                                          upload_url,
+                                                          sizeof(upload_url))) {
+        *error_message_out = "config import upload.url is invalid";
+        return false;
+    }
+    const jsmntok_t *auth_tok = logger_json_object_get(&doc, upload_tok, "auth");
+    if (auth_tok == NULL || auth_tok->type != JSMN_OBJECT) {
+        *error_message_out = "config import upload.auth is invalid";
+        return false;
+    }
+
+    char auth_type[16];
+    char auth_token[LOGGER_CONFIG_UPLOAD_TOKEN_MAX] = {0};
+    bool token_present_marker = false;
+    if (!logger_json_object_copy_string(&doc, auth_tok, "type", auth_type, sizeof(auth_type))) {
+        *error_message_out = "config import upload.auth.type is invalid";
+        return false;
+    }
+    if (strcmp(auth_type, "none") != 0 && strcmp(auth_type, "bearer") != 0) {
+        *error_message_out = "config import upload.auth.type must be none or bearer";
+        return false;
+    }
+    if (logger_json_object_has_key(&doc, auth_tok, "token") &&
+        !logger_json_object_copy_string_or_empty_required(&doc, auth_tok, "token", auth_token, sizeof(auth_token))) {
+        *error_message_out = "config import upload.auth.token is invalid";
+        return false;
+    }
+    if (logger_json_object_has_key(&doc, auth_tok, "token_present") &&
+        !logger_json_object_get_bool(&doc, auth_tok, "token_present", &token_present_marker)) {
+        *error_message_out = "config import upload.auth.token_present is invalid";
+        return false;
+    }
+    (void)token_present_marker;
+
+    if (upload_enabled) {
+        if (!logger_upload_url_supported(upload_url)) {
+            *error_message_out = "config import requires upload.url to be an absolute http:// or https:// URL";
+            return false;
+        }
+        logger_copy_string(imported.config.upload_url, sizeof(imported.config.upload_url), upload_url);
+        if (strcmp(auth_type, "bearer") == 0) {
+            if (secrets_included) {
+                if (!logger_string_present(auth_token)) {
+                    *error_message_out = "config import bearer auth requires token when secrets_included is true";
+                    return false;
+                }
+                logger_copy_string(imported.config.upload_token, sizeof(imported.config.upload_token), auth_token);
+            } else {
+                if (!logger_json_object_has_key(&doc, auth_tok, "token_present")) {
+                    *error_message_out = "config import bearer auth requires token_present when secrets_included is false";
+                    return false;
+                }
+                imported.config.upload_token[0] = '\0';
+            }
+        } else {
+            imported.config.upload_token[0] = '\0';
+        }
+    } else {
+        imported.config.upload_url[0] = '\0';
+        imported.config.upload_token[0] = '\0';
+    }
+
+    if (bond_cleared_out != NULL) {
+        *bond_cleared_out = strcmp(app->persisted.config.bound_h10_address, imported.config.bound_h10_address) != 0;
+    }
+    *state_out = imported;
+    return true;
 }
 
 #define logger_json_write_string_or_null(value) logger_json_fwrite_string_or_null(stdout, (value))
@@ -827,6 +1236,69 @@ static void logger_handle_clock_set(logger_service_cli_t *cli, logger_app_t *app
     logger_json_begin_success("clock set", logger_now_utc_or_null(app));
     fputs("{\"applied\":true,\"now_utc\":", stdout);
     logger_json_write_string_or_null(logger_now_utc_or_null(app));
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_config_import(logger_service_cli_t *cli, logger_app_t *app, const char *json) {
+    if (logger_cli_is_logging_mode(app)) {
+        logger_json_begin_error("config import", logger_now_utc_or_null(app), "busy_logging", "config import is not permitted while logging");
+        return;
+    }
+    if (!logger_cli_is_service_mode(app)) {
+        logger_json_begin_error("config import", logger_now_utc_or_null(app), "not_permitted_in_mode", "config import is only allowed in service mode");
+        return;
+    }
+    if (!logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error("config import", logger_now_utc_or_null(app), "service_locked", "service unlock is required before config import");
+        return;
+    }
+    if (!logger_string_present(json)) {
+        logger_json_begin_error("config import", logger_now_utc_or_null(app), "invalid_config", "expected: config import <json>\nuse a compact single-line JSON document");
+        return;
+    }
+
+    logger_persisted_state_t imported;
+    bool bond_cleared = false;
+    const char *error_message = "config import failed";
+    if (!logger_parse_config_import_document(app, json, &imported, &bond_cleared, &error_message)) {
+        logger_json_begin_error("config import", logger_now_utc_or_null(app), "invalid_config", error_message);
+        return;
+    }
+    if (!logger_config_store_save(&imported)) {
+        logger_json_begin_error("config import", logger_now_utc_or_null(app), "storage_unavailable", "failed to persist imported config");
+        return;
+    }
+
+    app->persisted = imported;
+    if (bond_cleared) {
+        app->h10.bonded = false;
+        app->h10.connected = false;
+        app->h10.encrypted = false;
+        app->h10.last_seen_address[0] = '\0';
+    }
+    (void)logger_h10_set_bound_address(&app->h10, app->persisted.config.bound_h10_address);
+    app->runtime.provisioning_complete = logger_config_normal_logging_ready(&app->persisted.config);
+
+    char details[128];
+    snprintf(details,
+             sizeof(details),
+             "{\"source\":\"config_import\",\"bond_cleared\":%s}",
+             bond_cleared ? "true" : "false");
+    (void)logger_system_log_append(
+        &app->system_log,
+        logger_now_utc_or_null(app),
+        "config_changed",
+        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        details);
+
+    cli->unlocked = false;
+
+    logger_json_begin_success("config import", logger_now_utc_or_null(app));
+    fputs("{\"applied\":true,\"normal_logging_ready\":", stdout);
+    fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true" : "false", stdout);
+    fputs(",\"bond_cleared\":", stdout);
+    fputs(bond_cleared ? "true" : "false", stdout);
     fputs("}", stdout);
     logger_json_end_success();
 }
@@ -1763,6 +2235,14 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
         logger_handle_factory_reset(cli, app);
         return;
     }
+    if (strcmp(line, "config import") == 0) {
+        logger_handle_config_import(cli, app, "");
+        return;
+    }
+    if (strncmp(line, "config import ", 14) == 0) {
+        logger_handle_config_import(cli, app, line + 14);
+        return;
+    }
     if (strncmp(line, "clock set ", 10) == 0) {
         logger_handle_clock_set(cli, app, line + 10);
         return;
@@ -1860,8 +2340,7 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
         logger_json_end_success();
         return;
     }
-    if (strcmp(line, "sd format") == 0 ||
-        strncmp(line, "config import ", 14) == 0) {
+    if (strcmp(line, "sd format") == 0) {
         logger_json_begin_error(line, logger_now_utc_or_null(app), "internal_error", "command not implemented yet");
         return;
     }

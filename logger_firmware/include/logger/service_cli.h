@@ -8,7 +8,7 @@
 typedef struct logger_app logger_app_t;
 
 typedef struct {
-    char line_buf[512];
+    char line_buf[2048];
     size_t line_len;
     bool unlocked;
     uint32_t unlock_deadline_mono_ms;
