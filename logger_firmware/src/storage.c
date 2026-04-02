@@ -21,6 +21,7 @@
 #define LOGGER_SD_SPI_RUN_BAUD_HZ 12000000u
 #define LOGGER_SD_CMD_TIMEOUT_MS 500u
 #define LOGGER_SD_DATA_TIMEOUT_MS 500u
+#define LOGGER_SD_MKFS_WORK_BYTES 4096u
 
 #define LOGGER_SD_TOKEN_START_BLOCK 0xfeu
 
@@ -389,6 +390,20 @@ static bool logger_storage_mount_if_needed(void) {
     return true;
 }
 
+static void logger_storage_reset_mount_state(void) {
+    g_sd.mounted = false;
+    g_sd.logger_root_ready = false;
+    g_sd.writable = false;
+    memset(&g_sd.fatfs, 0, sizeof(g_sd.fatfs));
+}
+
+static void logger_storage_unmount(void) {
+    if (g_sd.mounted) {
+        (void)f_mount(NULL, LOGGER_SD_DRIVE_PATH, 1u);
+    }
+    logger_storage_reset_mount_state();
+}
+
 static bool logger_storage_prepare_root(void) {
     if (g_sd.logger_root_ready) {
         return true;
@@ -487,6 +502,61 @@ bool logger_storage_refresh(logger_storage_status_t *status) {
 
     status->reserve_ok = status->free_bytes >= LOGGER_SD_MIN_FREE_RESERVE_BYTES;
     return logger_storage_ready_for_logging(status);
+}
+
+bool logger_storage_format(logger_storage_status_t *status) {
+    logger_storage_init();
+
+#if !LOGGER_SD_DETECT_OPTIONAL
+    if (!logger_sd_detect_pin_active()) {
+        if (status != NULL) {
+            logger_storage_zero_status(status);
+            status->initialized = true;
+            status->detect_pin_configured = true;
+            status->detect_pin_asserted = false;
+        }
+        g_sd.dstatus = STA_NOINIT | STA_NODISK;
+        logger_storage_reset_mount_state();
+        return false;
+    }
+#endif
+
+    logger_storage_unmount();
+
+    static uint8_t mkfs_work[LOGGER_SD_MKFS_WORK_BYTES];
+    const MKFS_PARM mkfs = {
+        .fmt = FM_FAT32,
+        .n_fat = 2u,
+        .align = 0u,
+        .n_root = 0u,
+        .au_size = 0u,
+    };
+    if (f_mkfs(LOGGER_SD_DRIVE_PATH, &mkfs, mkfs_work, sizeof(mkfs_work)) != FR_OK) {
+        if (status != NULL) {
+            (void)logger_storage_refresh(status);
+        }
+        return false;
+    }
+    if (!logger_storage_mount_if_needed()) {
+        if (status != NULL) {
+            (void)logger_storage_refresh(status);
+        }
+        return false;
+    }
+    if (g_sd.fatfs.fs_type != FS_FAT32 || !logger_storage_prepare_root()) {
+        if (status != NULL) {
+            (void)logger_storage_refresh(status);
+        }
+        return false;
+    }
+
+    logger_storage_status_t refreshed;
+    (void)logger_storage_refresh(&refreshed);
+    if (status != NULL) {
+        *status = refreshed;
+    }
+    return refreshed.mounted && refreshed.writable && refreshed.logger_root_ready &&
+           strcmp(refreshed.filesystem, "fat32") == 0;
 }
 
 bool logger_storage_ready_for_logging(const logger_storage_status_t *status) {

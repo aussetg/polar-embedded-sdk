@@ -31,6 +31,7 @@ typedef struct {
 
 void logger_storage_init(void);
 bool logger_storage_refresh(logger_storage_status_t *status);
+bool logger_storage_format(logger_storage_status_t *status);
 bool logger_storage_ready_for_logging(const logger_storage_status_t *status);
 
 bool logger_storage_ensure_dir(const char *path);

@@ -1208,6 +1208,54 @@ static void logger_handle_factory_reset(logger_service_cli_t *cli, logger_app_t 
     logger_json_end_success();
 }
 
+static void logger_handle_sd_format(logger_service_cli_t *cli, logger_app_t *app) {
+    if (logger_cli_is_logging_mode(app)) {
+        logger_json_begin_error("sd format", logger_now_utc_or_null(app), "busy_logging", "sd format is not permitted while logging");
+        return;
+    }
+    if (!logger_cli_is_service_mode(app)) {
+        logger_json_begin_error("sd format", logger_now_utc_or_null(app), "not_permitted_in_mode", "sd format is only allowed in service mode");
+        return;
+    }
+    if (app->session.active) {
+        logger_json_begin_error("sd format", logger_now_utc_or_null(app), "not_permitted_in_mode", "sd format is not permitted while a session is active");
+        return;
+    }
+    if (!logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error("sd format", logger_now_utc_or_null(app), "service_locked", "service unlock is required before sd format");
+        return;
+    }
+
+    logger_storage_status_t formatted;
+    if (!logger_storage_format(&formatted)) {
+        (void)logger_storage_refresh(&app->storage);
+        logger_json_begin_error("sd format", logger_now_utc_or_null(app), "storage_unavailable", "failed to format and remount the SD card as FAT32");
+        return;
+    }
+
+    logger_upload_queue_summary_t queue_summary;
+    if (!logger_upload_queue_refresh_file(&app->system_log, logger_now_utc_or_null(app), &queue_summary)) {
+        (void)logger_storage_refresh(&app->storage);
+        logger_json_begin_error("sd format", logger_now_utc_or_null(app), "storage_unavailable", "formatted SD card but failed to initialize logger queue state");
+        return;
+    }
+
+    (void)logger_storage_refresh(&app->storage);
+    (void)queue_summary;
+    (void)logger_system_log_append(
+        &app->system_log,
+        logger_now_utc_or_null(app),
+        "sd_formatted",
+        LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+        "{\"filesystem\":\"fat32\",\"logger_root_created\":true}");
+
+    cli->unlocked = false;
+
+    logger_json_begin_success("sd format", logger_now_utc_or_null(app));
+    fputs("{\"formatted\":true,\"filesystem\":\"fat32\",\"logger_root_created\":true}", stdout);
+    logger_json_end_success();
+}
+
 static void logger_handle_clock_set(logger_service_cli_t *cli, logger_app_t *app, const char *value) {
     if (logger_cli_is_logging_mode(app)) {
         logger_json_begin_error("clock set", logger_now_utc_or_null(app), "busy_logging", "clock set is not permitted while logging");
@@ -2341,7 +2389,7 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
         return;
     }
     if (strcmp(line, "sd format") == 0) {
-        logger_json_begin_error(line, logger_now_utc_or_null(app), "internal_error", "command not implemented yet");
+        logger_handle_sd_format(cli, app);
         return;
     }
 
