@@ -86,6 +86,19 @@ static bool logger_parse_bool01(const char *text, bool *value_out) {
     return false;
 }
 
+static bool logger_parse_size_t_strict(const char *text, size_t *value_out) {
+    if (text == NULL || value_out == NULL || text[0] == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    const unsigned long value = strtoul(text, &end, 10);
+    if (end == NULL || *end != '\0') {
+        return false;
+    }
+    *value_out = (size_t)value;
+    return true;
+}
+
 #define LOGGER_CONFIG_IMPORT_JSON_TOKEN_MAX 256u
 
 static bool logger_json_token_copy_primitive(
@@ -699,6 +712,37 @@ static bool logger_cli_is_service_mode(const logger_app_t *app) {
 
 static bool logger_cli_is_logging_mode(const logger_app_t *app) {
     return logger_runtime_state_is_logging(app->runtime.current_state);
+}
+
+static void logger_config_import_transfer_reset(logger_service_cli_t *cli) {
+    if (cli == NULL) {
+        return;
+    }
+    cli->config_import_active = false;
+    cli->config_import_expected_len = 0u;
+    cli->config_import_received_len = 0u;
+    cli->config_import_chunk_count = 0u;
+    cli->config_import_buf[0] = '\0';
+}
+
+static bool logger_require_config_import_context(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    const char *command,
+    bool require_unlock) {
+    if (logger_cli_is_logging_mode(app)) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "busy_logging", "config import is not permitted while logging");
+        return false;
+    }
+    if (!logger_cli_is_service_mode(app)) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "not_permitted_in_mode", "config import is only allowed in service mode");
+        return false;
+    }
+    if (require_unlock && !logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "service_locked", "service unlock is required before config import");
+        return false;
+    }
+    return true;
 }
 
 static bool logger_cli_is_upload_mode(const logger_app_t *app) {
@@ -1363,33 +1407,21 @@ static void logger_handle_clock_set(logger_service_cli_t *cli, logger_app_t *app
     logger_json_end_success();
 }
 
-static void logger_handle_config_import(logger_service_cli_t *cli, logger_app_t *app, const char *json) {
-    if (logger_cli_is_logging_mode(app)) {
-        logger_json_begin_error("config import", logger_now_utc_or_null(app), "busy_logging", "config import is not permitted while logging");
-        return;
-    }
-    if (!logger_cli_is_service_mode(app)) {
-        logger_json_begin_error("config import", logger_now_utc_or_null(app), "not_permitted_in_mode", "config import is only allowed in service mode");
-        return;
-    }
-    if (!logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
-        logger_json_begin_error("config import", logger_now_utc_or_null(app), "service_locked", "service unlock is required before config import");
-        return;
-    }
-    if (!logger_string_present(json)) {
-        logger_json_begin_error("config import", logger_now_utc_or_null(app), "invalid_config", "expected: config import <json>\nuse a compact single-line JSON document");
-        return;
-    }
-
+static void logger_apply_config_import_json(
+    logger_service_cli_t *cli,
+    logger_app_t *app,
+    const char *command,
+    const char *json,
+    bool clear_transfer_on_success) {
     logger_persisted_state_t imported;
     bool bond_cleared = false;
     const char *error_message = "config import failed";
     if (!logger_parse_config_import_document(app, json, &imported, &bond_cleared, &error_message)) {
-        logger_json_begin_error("config import", logger_now_utc_or_null(app), "invalid_config", error_message);
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "invalid_config", error_message);
         return;
     }
     if (!logger_config_store_save(&imported)) {
-        logger_json_begin_error("config import", logger_now_utc_or_null(app), "storage_unavailable", "failed to persist imported config");
+        logger_json_begin_error(command, logger_now_utc_or_null(app), "storage_unavailable", "failed to persist imported config");
         return;
     }
 
@@ -1415,15 +1447,213 @@ static void logger_handle_config_import(logger_service_cli_t *cli, logger_app_t 
         LOGGER_SYSTEM_LOG_SEVERITY_INFO,
         details);
 
+    if (clear_transfer_on_success) {
+        logger_config_import_transfer_reset(cli);
+    }
     cli->unlocked = false;
 
-    logger_json_begin_success("config import", logger_now_utc_or_null(app));
+    logger_json_begin_success(command, logger_now_utc_or_null(app));
     fputs("{\"applied\":true,\"normal_logging_ready\":", stdout);
     fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true" : "false", stdout);
     fputs(",\"bond_cleared\":", stdout);
     fputs(bond_cleared ? "true" : "false", stdout);
     fputs("}", stdout);
     logger_json_end_success();
+}
+
+static void logger_handle_config_import(logger_service_cli_t *cli, logger_app_t *app, const char *json) {
+    if (!logger_require_config_import_context(cli, app, "config import", true)) {
+        return;
+    }
+    if (!logger_string_present(json)) {
+        logger_json_begin_error(
+            "config import",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "expected: config import <json>\nor use: config import begin <bytes> / chunk / commit");
+        return;
+    }
+    logger_apply_config_import_json(cli, app, "config import", json, true);
+}
+
+static void logger_handle_config_import_begin(logger_service_cli_t *cli, logger_app_t *app, const char *args) {
+    if (!logger_require_config_import_context(cli, app, "config import begin", true)) {
+        return;
+    }
+
+    char size_text[24] = {0};
+    char extra[8] = {0};
+    const int matched = sscanf(args, "%23s %7s", size_text, extra);
+    if (matched != 1) {
+        logger_json_begin_error(
+            "config import begin",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "expected: config import begin <total_bytes>");
+        return;
+    }
+
+    size_t expected_len = 0u;
+    if (!logger_parse_size_t_strict(size_text, &expected_len) || expected_len == 0u) {
+        logger_json_begin_error(
+            "config import begin",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "config import begin requires a positive byte count");
+        return;
+    }
+    if (expected_len > LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX) {
+        logger_json_begin_error(
+            "config import begin",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "config import size exceeds transport buffer");
+        return;
+    }
+
+    const bool replaced_existing = cli->config_import_active;
+    logger_config_import_transfer_reset(cli);
+    cli->config_import_active = true;
+    cli->config_import_expected_len = expected_len;
+
+    logger_json_begin_success("config import begin", logger_now_utc_or_null(app));
+    fputs("{\"started\":true,\"expected_bytes\":", stdout);
+    printf("%llu", (unsigned long long)cli->config_import_expected_len);
+    fputs(",\"received_bytes\":0,\"remaining_bytes\":", stdout);
+    printf("%llu", (unsigned long long)cli->config_import_expected_len);
+    fputs(",\"max_bytes\":", stdout);
+    printf("%u", (unsigned)LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX);
+    fputs(",\"replaced_existing\":", stdout);
+    fputs(replaced_existing ? "true" : "false", stdout);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_config_import_chunk(logger_service_cli_t *cli, logger_app_t *app, const char *chunk) {
+    if (!logger_require_config_import_context(cli, app, "config import chunk", true)) {
+        return;
+    }
+    if (!cli->config_import_active) {
+        logger_json_begin_error(
+            "config import chunk",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "no config import transfer is active; use config import begin first");
+        return;
+    }
+
+    const size_t chunk_len = strlen(chunk);
+    if (chunk_len == 0u) {
+        logger_json_begin_error(
+            "config import chunk",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "config import chunk requires a non-empty payload fragment");
+        return;
+    }
+
+    if ((cli->config_import_received_len + chunk_len) > cli->config_import_expected_len ||
+        (cli->config_import_received_len + chunk_len) > LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX) {
+        logger_config_import_transfer_reset(cli);
+        logger_json_begin_error(
+            "config import chunk",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "config import chunk exceeds announced transfer size; transfer aborted");
+        return;
+    }
+
+    memcpy(cli->config_import_buf + cli->config_import_received_len, chunk, chunk_len);
+    cli->config_import_received_len += chunk_len;
+    cli->config_import_buf[cli->config_import_received_len] = '\0';
+    cli->config_import_chunk_count += 1u;
+
+    logger_json_begin_success("config import chunk", logger_now_utc_or_null(app));
+    fputs("{\"accepted\":true,\"chunk_bytes\":", stdout);
+    printf("%llu", (unsigned long long)chunk_len);
+    fputs(",\"received_bytes\":", stdout);
+    printf("%llu", (unsigned long long)cli->config_import_received_len);
+    fputs(",\"expected_bytes\":", stdout);
+    printf("%llu", (unsigned long long)cli->config_import_expected_len);
+    fputs(",\"remaining_bytes\":", stdout);
+    printf("%llu", (unsigned long long)(cli->config_import_expected_len - cli->config_import_received_len));
+    fputs(",\"chunk_count\":", stdout);
+    printf("%lu", (unsigned long)cli->config_import_chunk_count);
+    fputs(",\"complete\":", stdout);
+    fputs(cli->config_import_received_len == cli->config_import_expected_len ? "true" : "false", stdout);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_config_import_status(logger_service_cli_t *cli, logger_app_t *app) {
+    if (!logger_require_config_import_context(cli, app, "config import status", false)) {
+        return;
+    }
+
+    logger_json_begin_success("config import status", logger_now_utc_or_null(app));
+    fputs("{\"active\":", stdout);
+    fputs(cli->config_import_active ? "true" : "false", stdout);
+    fputs(",\"expected_bytes\":", stdout);
+    printf("%llu", (unsigned long long)cli->config_import_expected_len);
+    fputs(",\"received_bytes\":", stdout);
+    printf("%llu", (unsigned long long)cli->config_import_received_len);
+    fputs(",\"remaining_bytes\":", stdout);
+    if (cli->config_import_received_len <= cli->config_import_expected_len) {
+        printf("%llu", (unsigned long long)(cli->config_import_expected_len - cli->config_import_received_len));
+    } else {
+        fputs("0", stdout);
+    }
+    fputs(",\"chunk_count\":", stdout);
+    printf("%lu", (unsigned long)cli->config_import_chunk_count);
+    fputs(",\"max_bytes\":", stdout);
+    printf("%u", (unsigned)LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX);
+    fputs(",\"ready_to_commit\":", stdout);
+    fputs(cli->config_import_active && cli->config_import_received_len == cli->config_import_expected_len ? "true" : "false", stdout);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_config_import_cancel(logger_service_cli_t *cli, logger_app_t *app) {
+    if (!logger_require_config_import_context(cli, app, "config import cancel", false)) {
+        return;
+    }
+
+    const bool had_transfer = cli->config_import_active ||
+                              cli->config_import_received_len != 0u ||
+                              cli->config_import_expected_len != 0u ||
+                              cli->config_import_chunk_count != 0u;
+    logger_config_import_transfer_reset(cli);
+
+    logger_json_begin_success("config import cancel", logger_now_utc_or_null(app));
+    fputs("{\"cleared\":true,\"had_transfer\":", stdout);
+    fputs(had_transfer ? "true" : "false", stdout);
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_config_import_commit(logger_service_cli_t *cli, logger_app_t *app) {
+    if (!logger_require_config_import_context(cli, app, "config import commit", true)) {
+        return;
+    }
+    if (!cli->config_import_active) {
+        logger_json_begin_error(
+            "config import commit",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "no config import transfer is active; use config import begin first");
+        return;
+    }
+    if (cli->config_import_received_len != cli->config_import_expected_len) {
+        logger_json_begin_error(
+            "config import commit",
+            logger_now_utc_or_null(app),
+            "invalid_config",
+            "config import transfer is incomplete");
+        return;
+    }
+
+    cli->config_import_buf[cli->config_import_received_len] = '\0';
+    logger_apply_config_import_json(cli, app, "config import commit", cli->config_import_buf, true);
 }
 
 static void logger_handle_debug_config_set(logger_service_cli_t *cli, logger_app_t *app, const char *args) {
@@ -2356,6 +2586,34 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
     }
     if (strcmp(line, "factory-reset") == 0) {
         logger_handle_factory_reset(cli, app);
+        return;
+    }
+    if (strcmp(line, "config import status") == 0) {
+        logger_handle_config_import_status(cli, app);
+        return;
+    }
+    if (strcmp(line, "config import cancel") == 0) {
+        logger_handle_config_import_cancel(cli, app);
+        return;
+    }
+    if (strcmp(line, "config import commit") == 0) {
+        logger_handle_config_import_commit(cli, app);
+        return;
+    }
+    if (strcmp(line, "config import begin") == 0) {
+        logger_handle_config_import_begin(cli, app, "");
+        return;
+    }
+    if (strncmp(line, "config import begin ", 20) == 0) {
+        logger_handle_config_import_begin(cli, app, line + 20);
+        return;
+    }
+    if (strcmp(line, "config import chunk") == 0) {
+        logger_handle_config_import_chunk(cli, app, "");
+        return;
+    }
+    if (strncmp(line, "config import chunk ", 20) == 0) {
+        logger_handle_config_import_chunk(cli, app, line + 20);
         return;
     }
     if (strcmp(line, "config import") == 0) {
