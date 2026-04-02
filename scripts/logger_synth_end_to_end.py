@@ -44,11 +44,27 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - import path depends on invocation style
     from scripts.logger_system_log_validate import find_events_by_kind, validate_system_log_document
 
+try:
+    from logger_tls import LOGGER_PUBLIC_ROOT_PROFILE
+    from logger_tls import LOGGER_TLS_MODE_PROVISIONED_ANCHOR
+    from logger_tls import LOGGER_TLS_MODE_PUBLIC_ROOTS
+    from logger_tls import TlsProbeResult
+    from logger_tls import TlsTrustPlan
+    from logger_tls import plan_logger_tls
+except ModuleNotFoundError:  # pragma: no cover - import path depends on invocation style
+    from scripts.logger_tls import LOGGER_PUBLIC_ROOT_PROFILE
+    from scripts.logger_tls import LOGGER_TLS_MODE_PROVISIONED_ANCHOR
+    from scripts.logger_tls import LOGGER_TLS_MODE_PUBLIC_ROOTS
+    from scripts.logger_tls import TlsProbeResult
+    from scripts.logger_tls import TlsTrustPlan
+    from scripts.logger_tls import plan_logger_tls
+
 
 INTERRUPTED_UPLOAD_DELAY_MS = 30_000
 INTERRUPTED_UPLOAD_REQUEST_WAIT_S = 20.0
 INTERRUPTED_UPLOAD_REBOOT_SETTLE_S = 1.0
 POST_REBOOT_READY_TIMEOUT_S = 45.0
+CONFIG_IMPORT_CHUNK_SIZE = 1200
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIRMWARE_ELF = REPO_ROOT / "build" / "logger_firmware_rp2_2" / "logger_appliance.elf"
 DEFAULT_REQUEUE_TEMP_BUILD_ID = "logger-fw-regression-requeue"
@@ -78,6 +94,7 @@ class RefServerConfig:
     data_dir: Path
     bearer_token: str | None
     min_firmware: str | None
+    origin_upload_url: str | None = None
     bind_host: str = "0.0.0.0"
 
 
@@ -203,11 +220,11 @@ class SerialJsonClient:
 class RefServerProcess:
     def __init__(self, config: RefServerConfig) -> None:
         self.config = config
-        parsed = urlparse(config.upload_url)
+        parsed = urlparse(config.origin_upload_url or config.upload_url)
         if parsed.scheme != "http":
-            raise ValueError("reference upload server can only be spawned for http:// upload URLs")
+            raise ValueError("reference upload server requires an http:// origin URL")
         if not parsed.hostname or not parsed.port:
-            raise ValueError("upload URL must include an explicit host and port")
+            raise ValueError("reference upload server origin URL must include an explicit host and port")
         self._parsed_upload_url = parsed
         self._proc: subprocess.Popen[bytes] | None = None
         self._log_handle: Any = None
@@ -359,6 +376,67 @@ def find_events_by_kind_after_seq(response: dict[str, Any], kind: str, minimum_e
     ]
 
 
+def summarize_tls_probe(probe: TlsProbeResult) -> dict[str, Any]:
+    return {
+        "url": probe.url,
+        "host": probe.host,
+        "port": probe.port,
+        "remote_ip": probe.remote_ip,
+        "tls_version": probe.tls_version,
+        "cipher_suite": probe.cipher_suite,
+        "verification_source": probe.verification_source,
+        "chain": [
+            {
+                "sha256": cert.sha256,
+                "subject": cert.subject,
+                "issuer": cert.issuer,
+                "self_signed": cert.self_signed,
+                "not_before": cert.not_before,
+                "not_after": cert.not_after,
+            }
+            for cert in probe.chain
+        ],
+    }
+
+
+def summarize_tls_plan(plan: TlsTrustPlan) -> dict[str, Any]:
+    return {
+        "mode": plan.mode,
+        "root_profile": plan.root_profile,
+        "reason": plan.reason,
+        "selected_anchor_sha256": plan.selected_anchor_sha256,
+        "selected_anchor_subject": plan.selected_anchor_subject,
+    }
+
+
+def build_upload_tls_document(*, upload_url: str, trust_plan: TlsTrustPlan | None) -> dict[str, Any] | None:
+    parsed = urlparse(upload_url)
+    if parsed.scheme != "https":
+        return {"mode": None, "root_profile": None, "anchor": None}
+    if trust_plan is None:
+        raise ValueError("https:// upload requires a trust plan")
+    if trust_plan.mode == LOGGER_TLS_MODE_PUBLIC_ROOTS:
+        return {
+            "mode": LOGGER_TLS_MODE_PUBLIC_ROOTS,
+            "root_profile": LOGGER_PUBLIC_ROOT_PROFILE,
+            "anchor": None,
+        }
+    if trust_plan.mode == LOGGER_TLS_MODE_PROVISIONED_ANCHOR:
+        if not isinstance(trust_plan.anchor, dict):
+            raise ValueError("provisioned-anchor trust plan is missing anchor material")
+        anchor = {
+            "format": trust_plan.anchor["format"],
+            "der_base64": trust_plan.anchor["der_base64"],
+            "sha256": trust_plan.anchor["sha256"],
+        }
+        return {
+            "mode": LOGGER_TLS_MODE_PROVISIONED_ANCHOR,
+            "root_profile": None,
+            "anchor": anchor,
+        }
+    raise ValueError(f"unsupported trust-plan mode {trust_plan.mode!r}")
+
+
 def build_config_import_document(
     *,
     exported_at_utc: str,
@@ -372,6 +450,7 @@ def build_config_import_document(
     upload_url: str,
     upload_token: str | None,
     secrets_included: bool,
+    upload_tls: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     upload_enabled = True
     upload_auth: dict[str, Any]
@@ -419,12 +498,34 @@ def build_config_import_document(
             "enabled": upload_enabled,
             "url": upload_url,
             "auth": upload_auth,
+            **({"tls": upload_tls} if upload_tls is not None else {}),
         },
     }
 
 
 def build_config_import_command(document: dict[str, Any]) -> str:
     return "config import " + json.dumps(document, separators=(",", ":"), sort_keys=True)
+
+
+def build_chunked_config_import_steps(prefix: str, document: dict[str, Any], *, chunk_size: int = CONFIG_IMPORT_CHUNK_SIZE) -> list[Step]:
+    compact = json.dumps(document, separators=(",", ":"), sort_keys=True)
+    steps = [
+        Step(f"{prefix}_unlock", "service unlock", "service unlock"),
+        Step(f"{prefix}_begin", f"config import begin {len(compact)}", "config import begin", timeout_s=10.0),
+    ]
+    for index in range(0, len(compact), chunk_size):
+        chunk = compact[index : index + chunk_size]
+        steps.append(
+            Step(
+                f"{prefix}_chunk_{(index // chunk_size) + 1}",
+                f"config import chunk {chunk}",
+                "config import chunk",
+                timeout_s=10.0,
+            )
+        )
+    steps.append(Step(f"{prefix}_status", "config import status", "config import status", timeout_s=10.0))
+    steps.append(Step(f"{prefix}_commit", "config import commit", "config import commit", timeout_s=15.0))
+    return steps
 
 
 def validate_config_export_payload(
@@ -440,8 +541,16 @@ def validate_config_export_payload(
     expect_wifi_psk_present: bool,
     expect_upload_token_present: bool,
     expected_auth_type: str,
+    expected_tls_mode: str | None = None,
+    expected_tls_root_profile: str | None = None,
+    expected_anchor_sha256: str | None = None,
 ) -> dict[str, Any]:
     payload = payload_from_response(response)
+    if expected_tls_mode is None:
+        expected_tls_mode = LOGGER_TLS_MODE_PUBLIC_ROOTS if upload_url.startswith("https://") else None
+    if expected_tls_root_profile is None and expected_tls_mode == LOGGER_TLS_MODE_PUBLIC_ROOTS:
+        expected_tls_root_profile = LOGGER_PUBLIC_ROOT_PROFILE
+
     if payload.get("schema_version") != 1:
         raise RuntimeError("config export payload schema_version must be 1")
     if payload.get("hardware_id") != hardware_id:
@@ -490,6 +599,62 @@ def validate_config_export_payload(
             f"expected {expect_upload_token_present!r}, got {auth.get('token_present')!r}"
         )
 
+    tls = upload.get("tls") if isinstance(upload.get("tls"), dict) else {}
+    if tls.get("mode") != expected_tls_mode:
+        raise RuntimeError(
+            f"config export upload.tls.mode mismatch: expected {expected_tls_mode!r}, got {tls.get('mode')!r}"
+        )
+    if tls.get("root_profile") != expected_tls_root_profile:
+        raise RuntimeError(
+            "config export upload.tls.root_profile mismatch: "
+            f"expected {expected_tls_root_profile!r}, got {tls.get('root_profile')!r}"
+        )
+
+    anchor = tls.get("anchor")
+    if expected_anchor_sha256 is None:
+        if anchor is not None:
+            raise RuntimeError("config export upload.tls.anchor must be null")
+    else:
+        if not isinstance(anchor, dict):
+            raise RuntimeError("config export upload.tls.anchor must be an object")
+        if anchor.get("sha256") != expected_anchor_sha256:
+            raise RuntimeError(
+                "config export upload.tls.anchor.sha256 mismatch: "
+                f"expected {expected_anchor_sha256!r}, got {anchor.get('sha256')!r}"
+            )
+        if anchor.get("format") != "x509_der_base64":
+            raise RuntimeError("config export upload.tls.anchor.format must be x509_der_base64")
+        if not isinstance(anchor.get("der_base64"), str) or not anchor.get("der_base64"):
+            raise RuntimeError("config export upload.tls.anchor.der_base64 must be present")
+        if not isinstance(anchor.get("subject"), str) or not anchor.get("subject"):
+            raise RuntimeError("config export upload.tls.anchor.subject must be present")
+
+    return payload
+
+
+def validate_net_test_response(
+    response: dict[str, Any],
+    *,
+    expected_tls_mode: str,
+    expected_anchor_sha256: str | None = None,
+) -> dict[str, Any]:
+    payload = payload_from_response(response)
+    for key in ("wifi_join", "dns", "tls", "upload_endpoint_reachable"):
+        entry = payload.get(key) if isinstance(payload.get(key), dict) else {}
+        if entry.get("result") != "pass":
+            raise RuntimeError(f"net-test expected {key}.result='pass', got {entry.get('result')!r}")
+
+    tls = payload.get("tls") if isinstance(payload.get("tls"), dict) else {}
+    details = tls.get("details") if isinstance(tls.get("details"), dict) else {}
+    message = details.get("message") if isinstance(details.get("message"), str) else ""
+    if expected_tls_mode == LOGGER_TLS_MODE_PUBLIC_ROOTS:
+        expected_fragment = f"mode=public_roots profile={LOGGER_PUBLIC_ROOT_PROFILE}"
+    else:
+        expected_fragment = f"mode=provisioned_anchor sha256={expected_anchor_sha256}"
+    if expected_fragment not in message:
+        raise RuntimeError(
+            f"net-test TLS details mismatch: expected fragment {expected_fragment!r}, got {message!r}"
+        )
     return payload
 
 
@@ -525,19 +690,21 @@ def http_get_json(url: str) -> dict[str, Any]:
     return payload
 
 
-def derive_local_ref_server_healthz_url(upload_url: str | None) -> str | None:
-    if upload_url is None:
+def derive_local_ref_server_healthz_url(upload_url: str | None, *, origin_upload_url: str | None = None) -> str | None:
+    target_url = origin_upload_url or upload_url
+    if target_url is None:
         return None
-    parsed = urlparse(upload_url)
+    parsed = urlparse(target_url)
     if parsed.scheme != "http" or parsed.port is None:
         return None
     return f"http://127.0.0.1:{parsed.port}/healthz"
 
 
-def derive_local_ref_server_uploads_url(upload_url: str | None) -> str | None:
-    if upload_url is None:
+def derive_local_ref_server_uploads_url(upload_url: str | None, *, origin_upload_url: str | None = None) -> str | None:
+    target_url = origin_upload_url or upload_url
+    if target_url is None:
         return None
-    parsed = urlparse(upload_url)
+    parsed = urlparse(target_url)
     if parsed.scheme != "http" or parsed.port is None:
         return None
     return f"http://127.0.0.1:{parsed.port}/uploads"
@@ -754,6 +921,8 @@ def expected_upload_error_code(scenario: str) -> str | None:
 def default_wifi_args_required(scenario: str) -> bool:
     return scenario in {
         "config-import",
+        "https-public-roots",
+        "https-provisioned-anchor",
         "upload-verified",
         "upload-failed",
         "upload-blocked-min-firmware",
@@ -909,6 +1078,8 @@ def default_start_time(scenario: str) -> datetime:
         return parse_rfc3339_utc("2026-04-02T21:00:00Z")
     if scenario in {
         "config-import",
+        "https-public-roots",
+        "https-provisioned-anchor",
         "upload-verified",
         "upload-failed",
         "upload-blocked-min-firmware",
@@ -1438,6 +1609,320 @@ def run_config_import_scenario(
     }
 
 
+def run_https_trust_scenario(
+    port: Path,
+    scenario: str,
+    start_utc: datetime,
+    *,
+    upload_url: str,
+    wifi_ssid: str,
+    wifi_psk: str,
+    upload_token: str | None,
+    trust_mode: str,
+    spawn_ref_server: bool,
+    ref_server_data_dir: Path | None,
+    ref_server_origin_url: str | None,
+    tls_ca_cert: Path | None,
+) -> dict[str, Any]:
+    parsed_upload_url = urlparse(upload_url)
+    if parsed_upload_url.scheme != "https":
+        raise ValueError(f"{scenario} requires an https:// upload_url")
+    if spawn_ref_server and ref_server_origin_url is None:
+        raise ValueError(f"{scenario} requires --ref-server-origin-url when --spawn-ref-server is used with an HTTPS upload URL")
+
+    tls_probe, trust_plan = plan_logger_tls(upload_url, trust_mode=trust_mode, ca_cert_path=tls_ca_cert, timeout_s=15.0)
+    expected_anchor_sha256 = (
+        trust_plan.selected_anchor_sha256 if trust_plan.mode == LOGGER_TLS_MODE_PROVISIONED_ANCHOR else None
+    )
+    ref_server_uploads_url = derive_local_ref_server_uploads_url(
+        upload_url,
+        origin_upload_url=ref_server_origin_url,
+    )
+
+    with ExitStack() as stack:
+        if spawn_ref_server:
+            if ref_server_data_dir is None:
+                stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+                ref_server_data_dir = Path("build") / f"logger_upload_ref_server_runner_{scenario}_{stamp}"
+            ref_server = stack.enter_context(
+                RefServerProcess(
+                    RefServerConfig(
+                        upload_url=upload_url,
+                        data_dir=ref_server_data_dir,
+                        bearer_token=upload_token,
+                        min_firmware=None,
+                        origin_upload_url=ref_server_origin_url,
+                    )
+                )
+            )
+            ref_server_uploads_url = ref_server.uploads_url
+
+        restore_clock_utc = format_rfc3339_utc(datetime.now(UTC))
+        prune_clock_utc = format_rfc3339_utc(start_utc + timedelta(days=18))
+
+        with SerialJsonClient(port) as client:
+            drained = client.drain_input()
+            _, initial_responses, initial_stray = run_steps(
+                client,
+                [
+                    Step("status_before", "status --json", "status"),
+                    Step("queue_before", "queue --json", "queue"),
+                    Step("config_export_before", "config export --json", "config export"),
+                    Step("system_log_before", "system-log export --json", "system-log export"),
+                ],
+            )
+
+            export_before = payload_from_response(response_by_label(initial_responses, "config_export_before"))
+            hardware_id = export_before.get("hardware_id")
+            if not isinstance(hardware_id, str) or not hardware_id:
+                raise RuntimeError(f"{scenario} could not determine hardware_id")
+
+            identity_before = export_before.get("identity") if isinstance(export_before.get("identity"), dict) else {}
+            recording_before = export_before.get("recording") if isinstance(export_before.get("recording"), dict) else {}
+            time_before = export_before.get("time") if isinstance(export_before.get("time"), dict) else {}
+
+            logger_id = (
+                identity_before.get("logger_id")
+                if isinstance(identity_before.get("logger_id"), str) and identity_before.get("logger_id")
+                else "logger-regression"
+            )
+            subject_id = (
+                identity_before.get("subject_id")
+                if isinstance(identity_before.get("subject_id"), str) and identity_before.get("subject_id")
+                else "subject-regression"
+            )
+            bound_h10_address = (
+                recording_before.get("bound_h10_address")
+                if isinstance(recording_before.get("bound_h10_address"), str) and recording_before.get("bound_h10_address")
+                else "24:AC:AC:05:A3:10"
+            )
+            timezone = (
+                time_before.get("timezone")
+                if isinstance(time_before.get("timezone"), str) and time_before.get("timezone")
+                else "UTC"
+            )
+
+            import_doc = build_config_import_document(
+                exported_at_utc=format_rfc3339_utc(start_utc),
+                hardware_id=hardware_id,
+                logger_id=logger_id,
+                subject_id=subject_id,
+                bound_h10_address=bound_h10_address,
+                timezone=timezone,
+                wifi_ssid=wifi_ssid,
+                wifi_psk=wifi_psk,
+                upload_url=upload_url,
+                upload_token=upload_token,
+                secrets_included=True,
+                upload_tls=build_upload_tls_document(upload_url=upload_url, trust_plan=trust_plan),
+            )
+
+            steps = [
+                *build_chunked_config_import_steps("import", import_doc),
+                Step("config_export_after_import", "config export --json", "config export"),
+                Step("net_test_after_import", "net-test --json", "net-test", timeout_s=120.0),
+                Step("unlock_clock", "service unlock", "service unlock"),
+                Step("clock_set", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
+                Step("session_start", "debug session start", "debug session start"),
+                Step("ecg_1", "debug synth ecg 4", "debug synth ecg"),
+                Step("session_stop", "debug session stop", "debug session stop"),
+                Step("queue_mid", "queue --json", "queue"),
+                Step("unlock_upload", "service unlock", "service unlock"),
+                Step("upload_once", "debug upload once", "debug upload once", timeout_s=120.0),
+                Step("queue_after", "queue --json", "queue"),
+                Step("system_log", "system-log export --json", "system-log export"),
+            ]
+            if trust_plan.mode == LOGGER_TLS_MODE_PROVISIONED_ANCHOR:
+                steps.extend(
+                    [
+                        Step("unlock_clear", "service unlock", "service unlock"),
+                        Step(
+                            "clear_anchor",
+                            "upload tls clear-provisioned-anchor",
+                            "upload tls clear-provisioned-anchor",
+                        ),
+                        Step("config_export_after_clear", "config export --json", "config export"),
+                        Step("net_test_after_clear", "net-test --json", "net-test", timeout_s=120.0),
+                    ]
+                )
+            steps.extend(
+                [
+                    Step("unlock_prune_clock", "service unlock", "service unlock"),
+                    Step("clock_set_prune", f"clock set {prune_clock_utc}", "clock set"),
+                    Step("unlock_prune", "service unlock", "service unlock"),
+                    Step("prune_once", "debug prune once", "debug prune once", timeout_s=10.0),
+                    Step("queue_after_prune", "queue --json", "queue"),
+                    Step("system_log_after_cleanup", "system-log export --json", "system-log export"),
+                    Step("unlock_restore_clock", "service unlock", "service unlock"),
+                    Step("clock_restore", f"clock set {restore_clock_utc}", "clock set"),
+                    Step("reboot", "debug reboot", "debug reboot"),
+                ]
+            )
+
+            _, scenario_responses, scenario_stray = run_steps(client, steps, require_service_mode=False)
+
+        post_port, post_drained, post_responses, post_stray = run_steps_after_reboot(
+            port,
+            [
+                Step("status_after_reboot", "status --json", "status", timeout_s=5.0),
+                Step("queue_after_reboot", "queue --json", "queue", timeout_s=5.0),
+                Step("config_export_after_reboot", "config export --json", "config export", timeout_s=5.0),
+            ],
+            timeout_s=POST_REBOOT_READY_TIMEOUT_S,
+        )
+
+        responses = initial_responses + scenario_responses + post_responses
+        stray_responses = initial_stray + scenario_stray + post_stray
+
+        import_payload = payload_from_response(response_by_label(responses, "import_commit"))
+        if import_payload.get("applied") is not True or import_payload.get("normal_logging_ready") is not True:
+            raise RuntimeError(f"{scenario} import did not apply a normal-logging-ready config")
+
+        validate_config_export_payload(
+            response_by_label(responses, "config_export_after_import"),
+            hardware_id=hardware_id,
+            logger_id=logger_id,
+            subject_id=subject_id,
+            bound_h10_address=bound_h10_address,
+            timezone=timezone,
+            wifi_ssid=wifi_ssid,
+            upload_url=upload_url,
+            expect_wifi_psk_present=True,
+            expect_upload_token_present=upload_token is not None,
+            expected_auth_type="bearer" if upload_token is not None else "none",
+            expected_tls_mode=trust_plan.mode,
+            expected_tls_root_profile=trust_plan.root_profile,
+            expected_anchor_sha256=expected_anchor_sha256,
+        )
+        validate_net_test_response(
+            response_by_label(responses, "net_test_after_import"),
+            expected_tls_mode=trust_plan.mode,
+            expected_anchor_sha256=expected_anchor_sha256,
+        )
+
+        upload_analysis = validate_upload_outcome(
+            "upload-verified",
+            responses,
+            ref_server_uploads_url=ref_server_uploads_url,
+        )
+        session_id = upload_analysis["started_session_id"]
+
+        prune_payload = payload_from_response(response_by_label(responses, "prune_once"))
+        if int(prune_payload.get("retention_pruned_count", 0)) < 1:
+            raise RuntimeError(f"{scenario} expected retention_pruned_count >= 1")
+        if prune_payload.get("reserve_met") is not True:
+            raise RuntimeError(f"{scenario} expected reserve_met=true")
+
+        queue_after_prune = response_by_label(responses, "queue_after_prune")
+        if session_id in session_ids_from_queue_response(queue_after_prune):
+            raise RuntimeError(f"{scenario} expected the uploaded session to be pruned during cleanup")
+
+        system_log_after_cleanup = response_by_label(responses, "system_log_after_cleanup")
+        system_log_summary = validate_system_log_response(system_log_after_cleanup)
+        config_changed_events = find_events_by_kind_after_seq(
+            system_log_after_cleanup,
+            "config_changed",
+            max_system_log_event_seq(response_by_label(responses, "system_log_before")),
+        )
+        if not any(
+            isinstance(event.get("details"), dict) and event["details"].get("source") == "config_import"
+            for event in config_changed_events
+        ):
+            raise RuntimeError(f"{scenario} expected a config_changed event from config_import")
+
+        clear_payload = None
+        if trust_plan.mode == LOGGER_TLS_MODE_PROVISIONED_ANCHOR:
+            clear_payload = payload_from_response(response_by_label(responses, "clear_anchor"))
+            if clear_payload.get("cleared") is not True or clear_payload.get("had_anchor") is not True:
+                raise RuntimeError(f"{scenario} expected upload tls clear-provisioned-anchor to clear an existing anchor")
+            if clear_payload.get("current_tls_mode") != LOGGER_TLS_MODE_PUBLIC_ROOTS:
+                raise RuntimeError(f"{scenario} expected clear-provisioned-anchor to fall back to public_roots")
+            if clear_payload.get("upload_ready") is not True:
+                raise RuntimeError(f"{scenario} expected upload_ready=true after clear-provisioned-anchor")
+
+            validate_config_export_payload(
+                response_by_label(responses, "config_export_after_clear"),
+                hardware_id=hardware_id,
+                logger_id=logger_id,
+                subject_id=subject_id,
+                bound_h10_address=bound_h10_address,
+                timezone=timezone,
+                wifi_ssid=wifi_ssid,
+                upload_url=upload_url,
+                expect_wifi_psk_present=True,
+                expect_upload_token_present=upload_token is not None,
+                expected_auth_type="bearer" if upload_token is not None else "none",
+                expected_tls_mode=LOGGER_TLS_MODE_PUBLIC_ROOTS,
+                expected_tls_root_profile=LOGGER_PUBLIC_ROOT_PROFILE,
+                expected_anchor_sha256=None,
+            )
+            validate_net_test_response(
+                response_by_label(responses, "net_test_after_clear"),
+                expected_tls_mode=LOGGER_TLS_MODE_PUBLIC_ROOTS,
+            )
+            if not any(
+                isinstance(event.get("details"), dict)
+                and event["details"].get("source") == "upload_tls_clear_provisioned_anchor"
+                for event in config_changed_events
+            ):
+                raise RuntimeError(f"{scenario} expected a config_changed event from upload_tls_clear_provisioned_anchor")
+
+        status_after_reboot = payload_from_response(response_by_label(responses, "status_after_reboot"))
+        if status_after_reboot.get("mode") != "logging":
+            raise RuntimeError(f"{scenario} expected the device to return to logging mode after reboot")
+        if status_after_reboot.get("runtime_state") != "log_wait_h10":
+            raise RuntimeError(f"{scenario} expected runtime_state=log_wait_h10 after reboot")
+
+        if session_id in session_ids_from_queue_response(response_by_label(responses, "queue_after_reboot")):
+            raise RuntimeError(f"{scenario} expected cleanup to remove the uploaded session before reboot")
+
+        validate_config_export_payload(
+            response_by_label(responses, "config_export_after_reboot"),
+            hardware_id=hardware_id,
+            logger_id=logger_id,
+            subject_id=subject_id,
+            bound_h10_address=bound_h10_address,
+            timezone=timezone,
+            wifi_ssid=wifi_ssid,
+            upload_url=upload_url,
+            expect_wifi_psk_present=True,
+            expect_upload_token_present=upload_token is not None,
+            expected_auth_type="bearer" if upload_token is not None else "none",
+            expected_tls_mode=LOGGER_TLS_MODE_PUBLIC_ROOTS,
+            expected_tls_root_profile=LOGGER_PUBLIC_ROOT_PROFILE,
+            expected_anchor_sha256=None,
+        )
+
+        return {
+            "scenario": scenario,
+            "port": str(port),
+            "post_reboot_port": post_port,
+            "start_utc": format_rfc3339_utc(start_utc),
+            "effective_upload_url": upload_url,
+            "drained_preamble": drained,
+            "post_reboot_drained_preamble": post_drained,
+            "responses": responses,
+            "stray_responses": stray_responses,
+            "started_session_id": session_id,
+            "queue_before_session_ids": sorted(session_ids_from_queue_response(response_by_label(responses, "queue_before"))),
+            "queue_after_session_ids": sorted(session_ids_from_queue_response(response_by_label(responses, "queue_after_reboot"))),
+            "new_session_ids": [session_id],
+            "system_log_validation": system_log_summary,
+            "final_queue_entry": upload_analysis["final_queue_entry"],
+            "ref_server_uploads": upload_analysis["ref_server_uploads"],
+            "tls_probe": summarize_tls_probe(tls_probe),
+            "tls_plan": summarize_tls_plan(trust_plan),
+            "net_test_after_import": payload_from_response(response_by_label(responses, "net_test_after_import")),
+            "net_test_after_clear": (
+                payload_from_response(response_by_label(responses, "net_test_after_clear"))
+                if trust_plan.mode == LOGGER_TLS_MODE_PROVISIONED_ANCHOR
+                else None
+            ),
+            "clear_anchor": clear_payload,
+            "prune_result": prune_payload,
+        }
+
+
 def run_firmware_change_requeue_scenario(
     port: Path,
     start_utc: datetime,
@@ -1863,6 +2348,8 @@ def run_scenario(
     spawn_ref_server: bool = False,
     ref_server_data_dir: Path | None = None,
     ref_server_min_firmware: str | None = None,
+    ref_server_origin_url: str | None = None,
+    tls_ca_cert: Path | None = None,
     firmware_elf: Path = DEFAULT_FIRMWARE_ELF,
     requeue_temp_build_id: str = DEFAULT_REQUEUE_TEMP_BUILD_ID,
     requeue_temp_build_dir: Path | None = None,
@@ -1877,6 +2364,40 @@ def run_scenario(
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
             upload_token=upload_token,
+        )
+    if scenario == "https-public-roots":
+        if upload_url is None or wifi_ssid is None or wifi_psk is None:
+            raise ValueError("https-public-roots requires upload_url, wifi_ssid, and wifi_psk")
+        return run_https_trust_scenario(
+            port,
+            scenario,
+            start_utc,
+            upload_url=upload_url,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_token=upload_token,
+            trust_mode=LOGGER_TLS_MODE_PUBLIC_ROOTS,
+            spawn_ref_server=spawn_ref_server,
+            ref_server_data_dir=ref_server_data_dir,
+            ref_server_origin_url=ref_server_origin_url,
+            tls_ca_cert=tls_ca_cert,
+        )
+    if scenario == "https-provisioned-anchor":
+        if upload_url is None or wifi_ssid is None or wifi_psk is None:
+            raise ValueError("https-provisioned-anchor requires upload_url, wifi_ssid, and wifi_psk")
+        return run_https_trust_scenario(
+            port,
+            scenario,
+            start_utc,
+            upload_url=upload_url,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_token=upload_token,
+            trust_mode=LOGGER_TLS_MODE_PROVISIONED_ANCHOR,
+            spawn_ref_server=spawn_ref_server,
+            ref_server_data_dir=ref_server_data_dir,
+            ref_server_origin_url=ref_server_origin_url,
+            tls_ca_cert=tls_ca_cert,
         )
     if scenario == "firmware-change-requeue":
         if upload_url is None or wifi_ssid is None or wifi_psk is None:
@@ -2114,6 +2635,8 @@ def main() -> int:
         "--scenario",
         choices=[
             "config-import",
+            "https-public-roots",
+            "https-provisioned-anchor",
             "smoke",
             "clock-fix",
             "rollover",
@@ -2141,7 +2664,7 @@ def main() -> int:
     )
     parser.add_argument("--wifi-ssid", default=None, help="Wi-Fi SSID for upload scenarios")
     parser.add_argument("--wifi-psk", default=None, help="Wi-Fi PSK for upload scenarios")
-    parser.add_argument("--upload-url", default=None, help="HTTP upload URL for upload scenarios")
+    parser.add_argument("--upload-url", default=None, help="HTTP or HTTPS upload URL for upload scenarios")
     parser.add_argument("--upload-token", default=None, help="optional bearer token for upload scenarios")
     parser.add_argument(
         "--spawn-ref-server",
@@ -2155,9 +2678,20 @@ def main() -> int:
         help="data dir for a spawned reference upload server",
     )
     parser.add_argument(
+        "--ref-server-origin-url",
+        default=None,
+        help="local http:// origin URL for a spawned reference server when the device upload URL is tunneled HTTPS",
+    )
+    parser.add_argument(
         "--ref-server-min-firmware",
         default=None,
         help="minimum firmware for a spawned reference server or upload URL preparation",
+    )
+    parser.add_argument(
+        "--tls-ca-cert",
+        type=Path,
+        default=None,
+        help="optional CA certificate or bundle used for host-side HTTPS trust planning",
     )
     parser.add_argument(
         "--firmware-elf",
@@ -2203,6 +2737,8 @@ def main() -> int:
             spawn_ref_server=args.spawn_ref_server,
             ref_server_data_dir=args.ref_server_data_dir,
             ref_server_min_firmware=args.ref_server_min_firmware,
+            ref_server_origin_url=args.ref_server_origin_url,
+            tls_ca_cert=args.tls_ca_cert,
             firmware_elf=args.firmware_elf,
             requeue_temp_build_id=args.requeue_temp_build_id,
             requeue_temp_build_dir=args.requeue_temp_build_dir,
