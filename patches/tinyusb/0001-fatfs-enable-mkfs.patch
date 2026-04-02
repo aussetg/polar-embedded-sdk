@@ -1,0 +1,28 @@
+From 8f7ad7f3f1f5a0db10f2ddf2f7e2c6d676d3c201 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Thu, 2 Apr 2026 12:10:00 +0200
+Subject: [PATCH] fatfs: enable f_mkfs for appliance-managed sd format
+
+The logger appliance already uses FatFs for SD card access. Enable mkfs
+support so service-mode FAT32 formatting can delegate filesystem layout
+to FatFs instead of relying on any custom formatter.
+
+---
+ lib/fatfs/source/ffconf.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/fatfs/source/ffconf.h b/lib/fatfs/source/ffconf.h
+index 96ff77155..5cfc91dc9 100644
+--- a/lib/fatfs/source/ffconf.h
++++ b/lib/fatfs/source/ffconf.h
+@@ -30,7 +30,7 @@
+ /  f_findnext(). (0:Disable, 1:Enable 2:Enable with matching altname[] too) */
+ 
+ 
+-#define FF_USE_MKFS		0
++#define FF_USE_MKFS		1
+ /* This option switches f_mkfs() function. (0:Disable or 1:Enable) */
+ 
+ 
+-- 
+2.49.0
