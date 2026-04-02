@@ -1,0 +1,32 @@
+From 6db6fb1d3ddf7abf6cfcece846fef4f7922b8a32 Mon Sep 17 00:00:00 2001
+From: Guillaume Ausset <guillaume@ausset.me>
+Date: Thu, 2 Apr 2026 13:25:00 +0200
+Subject: [PATCH] rp2_common/pico_mbedtls: drop psa storage sources lacking sdk
+ headers
+
+The pico-sdk vendored mbedtls tree does not carry the headers needed by
+psa_crypto_storage.c / psa_its_file.c on this target, so linking
+pico_mbedtls into firmware projects fails.
+
+Our appliance TLS client path does not use PSA ITS/file-backed storage, so
+exclude those source files from the rp2 pico_mbedtls source list.
+
+---
+ src/rp2_common/pico_mbedtls/CMakeLists.txt | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/src/rp2_common/pico_mbedtls/CMakeLists.txt b/src/rp2_common/pico_mbedtls/CMakeLists.txt
+index d3289cc0..db6c9b45 100644
+--- a/src/rp2_common/pico_mbedtls/CMakeLists.txt
++++ b/src/rp2_common/pico_mbedtls/CMakeLists.txt
+@@ -82,8 +82,6 @@ if (EXISTS ${PICO_MBEDTLS_PATH}/${MBEDTLS_TEST_PATH})
+             psa_crypto_rsa.c
+             psa_crypto_se.c
+             psa_crypto_slot_management.c
+-            psa_crypto_storage.c
+-            psa_its_file.c
+             ripemd160.c
+             rsa.c
+             sha1.c
+-- 
+2.49.0

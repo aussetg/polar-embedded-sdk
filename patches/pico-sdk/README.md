@@ -6,6 +6,7 @@ These patches target the `vendors/pico-sdk` submodule.
 
 Order:
 1. `0001-rp2-common-pico-btstack-rename-hids-client-to-hids-host.patch`
+2. `0002-rp2-common-pico-mbedtls-drop-psa-storage-sources.patch`
 
 ## Apply
 
@@ -45,3 +46,5 @@ git -C vendors/pico-sdk reset --hard HEAD~1
   - `src/ble/gatt-service/hids_client.c`
   - -> `src/ble/gatt-service/hids_host.c`
 - Updates both CMake and Bazel source lists.
+- Drops the rp2 pico_mbedtls PSA storage source files that currently require
+  missing vendored headers and are not needed by the appliance TLS client path.
