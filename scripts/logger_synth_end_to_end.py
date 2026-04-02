@@ -49,6 +49,9 @@ INTERRUPTED_UPLOAD_DELAY_MS = 30_000
 INTERRUPTED_UPLOAD_REQUEST_WAIT_S = 20.0
 INTERRUPTED_UPLOAD_REBOOT_SETTLE_S = 1.0
 POST_REBOOT_READY_TIMEOUT_S = 45.0
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_FIRMWARE_ELF = REPO_ROOT / "build" / "logger_firmware_rp2_2" / "logger_appliance.elf"
+DEFAULT_REQUEUE_TEMP_BUILD_ID = "logger-fw-regression-requeue"
 DEFAULT_RESET_COMMAND = [
     "openocd",
     "-f",
@@ -325,6 +328,171 @@ def eligible_queue_session_ids(response: dict[str, Any]) -> list[str]:
     ]
 
 
+def verified_queue_session_ids(response: dict[str, Any]) -> list[str]:
+    return [
+        entry["session_id"]
+        for entry in queue_entries_from_response(response)
+        if entry.get("status") == "verified" and isinstance(entry.get("session_id"), str)
+    ]
+
+
+def system_log_events_from_response(response: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = payload_from_response(response)
+    events = payload.get("events")
+    return [event for event in events if isinstance(event, dict)] if isinstance(events, list) else []
+
+
+def max_system_log_event_seq(response: dict[str, Any]) -> int:
+    max_seq = 0
+    for event in system_log_events_from_response(response):
+        seq = event.get("event_seq")
+        if isinstance(seq, int) and seq > max_seq:
+            max_seq = seq
+    return max_seq
+
+
+def find_events_by_kind_after_seq(response: dict[str, Any], kind: str, minimum_event_seq: int) -> list[dict[str, Any]]:
+    return [
+        event
+        for event in find_events_by_kind(response, kind)
+        if isinstance(event.get("event_seq"), int) and event["event_seq"] > minimum_event_seq
+    ]
+
+
+def build_config_import_document(
+    *,
+    exported_at_utc: str,
+    hardware_id: str,
+    logger_id: str,
+    subject_id: str,
+    bound_h10_address: str,
+    timezone: str,
+    wifi_ssid: str,
+    wifi_psk: str,
+    upload_url: str,
+    upload_token: str | None,
+    secrets_included: bool,
+) -> dict[str, Any]:
+    upload_enabled = True
+    upload_auth: dict[str, Any]
+    if upload_token is None:
+        upload_auth = {"type": "none"}
+    elif secrets_included:
+        upload_auth = {"type": "bearer", "token": upload_token}
+    else:
+        upload_auth = {"type": "bearer", "token_present": True}
+
+    wifi_network: dict[str, Any] = {"ssid": wifi_ssid}
+    if secrets_included:
+        wifi_network["psk"] = wifi_psk
+    else:
+        wifi_network["psk_present"] = True
+
+    return {
+        "schema_version": 1,
+        "exported_at_utc": exported_at_utc,
+        "hardware_id": hardware_id,
+        "secrets_included": secrets_included,
+        "identity": {
+            "logger_id": logger_id,
+            "subject_id": subject_id,
+        },
+        "recording": {
+            "bound_h10_address": bound_h10_address,
+            "study_day_rollover_local": "04:00:00",
+            "overnight_upload_window_start_local": "22:00:00",
+            "overnight_upload_window_end_local": "06:00:00",
+        },
+        "time": {
+            "timezone": timezone,
+        },
+        "battery_policy": {
+            "critical_stop_voltage_v": 3.5,
+            "low_start_voltage_v": 3.65,
+            "off_charger_upload_voltage_v": 3.85,
+        },
+        "wifi": {
+            "allowed_ssids": [wifi_ssid],
+            "networks": [wifi_network],
+        },
+        "upload": {
+            "enabled": upload_enabled,
+            "url": upload_url,
+            "auth": upload_auth,
+        },
+    }
+
+
+def build_config_import_command(document: dict[str, Any]) -> str:
+    return "config import " + json.dumps(document, separators=(",", ":"), sort_keys=True)
+
+
+def validate_config_export_payload(
+    response: dict[str, Any],
+    *,
+    hardware_id: str,
+    logger_id: str,
+    subject_id: str,
+    bound_h10_address: str,
+    timezone: str,
+    wifi_ssid: str,
+    upload_url: str,
+    expect_wifi_psk_present: bool,
+    expect_upload_token_present: bool,
+    expected_auth_type: str,
+) -> dict[str, Any]:
+    payload = payload_from_response(response)
+    if payload.get("schema_version") != 1:
+        raise RuntimeError("config export payload schema_version must be 1")
+    if payload.get("hardware_id") != hardware_id:
+        raise RuntimeError("config export payload hardware_id mismatch")
+    if payload.get("secrets_included") is not False:
+        raise RuntimeError("config export payload must omit secrets")
+
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    if identity.get("logger_id") != logger_id or identity.get("subject_id") != subject_id:
+        raise RuntimeError("config export identity payload mismatch")
+
+    recording = payload.get("recording") if isinstance(payload.get("recording"), dict) else {}
+    if recording.get("bound_h10_address") != bound_h10_address:
+        raise RuntimeError("config export recording.bound_h10_address mismatch")
+
+    time_config = payload.get("time") if isinstance(payload.get("time"), dict) else {}
+    if time_config.get("timezone") != timezone:
+        raise RuntimeError("config export time.timezone mismatch")
+
+    wifi = payload.get("wifi") if isinstance(payload.get("wifi"), dict) else {}
+    allowed_ssids = wifi.get("allowed_ssids") if isinstance(wifi.get("allowed_ssids"), list) else []
+    if allowed_ssids != [wifi_ssid]:
+        raise RuntimeError(f"config export allowed_ssids mismatch: expected {[wifi_ssid]!r}, got {allowed_ssids!r}")
+    networks = wifi.get("networks") if isinstance(wifi.get("networks"), list) else []
+    if len(networks) != 1 or not isinstance(networks[0], dict):
+        raise RuntimeError("config export wifi.networks must contain exactly one object")
+    if networks[0].get("ssid") != wifi_ssid:
+        raise RuntimeError("config export wifi.networks[0].ssid mismatch")
+    if networks[0].get("psk_present") is not expect_wifi_psk_present:
+        raise RuntimeError(
+            "config export wifi.networks[0].psk_present mismatch: "
+            f"expected {expect_wifi_psk_present!r}, got {networks[0].get('psk_present')!r}"
+        )
+
+    upload = payload.get("upload") if isinstance(payload.get("upload"), dict) else {}
+    if upload.get("enabled") is not True or upload.get("url") != upload_url:
+        raise RuntimeError("config export upload settings mismatch")
+    auth = upload.get("auth") if isinstance(upload.get("auth"), dict) else {}
+    if auth.get("type") != expected_auth_type:
+        raise RuntimeError(
+            f"config export upload.auth.type mismatch: expected {expected_auth_type!r}, got {auth.get('type')!r}"
+        )
+    if auth.get("token_present") is not expect_upload_token_present:
+        raise RuntimeError(
+            "config export upload.auth.token_present mismatch: "
+            f"expected {expect_upload_token_present!r}, got {auth.get('token_present')!r}"
+        )
+
+    return payload
+
+
 def append_or_replace_query(url: str, key: str, value: str) -> str:
     parsed = urlparse(url)
     query_pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != key]
@@ -415,20 +583,112 @@ def reset_target_via_openocd() -> dict[str, Any]:
     }
 
 
+def candidate_serial_ports(preferred_port: Path) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(port: Path) -> None:
+        if port not in seen:
+            seen.add(port)
+            candidates.append(port)
+
+    add(preferred_port)
+    for port in sorted(Path("/dev").glob("ttyACM*")):
+        add(port)
+    return candidates
+
+
+def run_subprocess(command: list[str], *, timeout_s: float, cwd: Path | None = None) -> dict[str, Any]:
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        cwd=cwd,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "subprocess failed: "
+            f"command={command!r} rc={completed.returncode} "
+            f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+        )
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def build_firmware_variant(
+    *,
+    firmware_version: str,
+    build_id: str,
+    build_dir: Path,
+) -> dict[str, Any]:
+    configure_command = [
+        "cmake",
+        "-S",
+        str(REPO_ROOT / "logger_firmware"),
+        "-B",
+        str(build_dir),
+        f"-DLOGGER_FIRMWARE_VERSION={firmware_version}",
+        f"-DLOGGER_BUILD_ID={build_id}",
+    ]
+    build_command = [
+        "cmake",
+        "--build",
+        str(build_dir),
+        f"-j{os.cpu_count() or 4}",
+    ]
+    configure_result = run_subprocess(configure_command, timeout_s=180.0, cwd=REPO_ROOT)
+    build_result = run_subprocess(build_command, timeout_s=1_200.0, cwd=REPO_ROOT)
+    elf_path = build_dir / "logger_appliance.elf"
+    if not elf_path.exists():
+        raise RuntimeError(f"expected built firmware ELF at {elf_path}")
+    return {
+        "build_dir": str(build_dir),
+        "build_id": build_id,
+        "firmware_version": firmware_version,
+        "elf_path": str(elf_path),
+        "configure": configure_result,
+        "build": build_result,
+    }
+
+
+def flash_firmware_via_openocd(elf_path: Path) -> dict[str, Any]:
+    elf_path = elf_path.resolve()
+    command = [
+        "openocd",
+        "-f",
+        "interface/cmsis-dap.cfg",
+        "-f",
+        "target/rp2350.cfg",
+        "-c",
+        f"adapter speed 5000; program {elf_path} verify reset exit",
+    ]
+    result = run_subprocess(command, timeout_s=600.0, cwd=REPO_ROOT)
+    result["elf_path"] = str(elf_path)
+    return result
+
+
 def run_steps_after_reboot(
     port: Path,
     steps: list[Step],
     *,
     timeout_s: float,
-) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]:
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
     while time.monotonic() < deadline:
-        try:
-            with SerialJsonClient(port) as client:
-                return run_steps(client, steps, require_service_mode=False)
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
+        for candidate in candidate_serial_ports(port):
+            try:
+                with SerialJsonClient(candidate) as client:
+                    drained, responses, stray = run_steps(client, steps, require_service_mode=False)
+                return str(candidate), drained, responses, stray
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
             time.sleep(0.5)
     raise RuntimeError(f"timed out waiting for post-reboot serial recovery: {last_error}")
 
@@ -492,7 +752,15 @@ def expected_upload_error_code(scenario: str) -> str | None:
 
 
 def default_wifi_args_required(scenario: str) -> bool:
-    return scenario in {"upload-verified", "upload-failed", "upload-blocked-min-firmware", "upload-interrupted-reboot"}
+    return scenario in {
+        "config-import",
+        "upload-verified",
+        "upload-failed",
+        "upload-blocked-min-firmware",
+        "upload-interrupted-reboot",
+        "firmware-change-requeue",
+        "retention-prune",
+    }
 
 
 def build_scenario(
@@ -639,7 +907,15 @@ def default_start_time(scenario: str) -> datetime:
         return parse_rfc3339_utc("2026-04-02T03:59:50Z")
     if scenario == "no-session-day":
         return parse_rfc3339_utc("2026-04-02T21:00:00Z")
-    if scenario in {"upload-verified", "upload-failed", "upload-blocked-min-firmware", "upload-interrupted-reboot"}:
+    if scenario in {
+        "config-import",
+        "upload-verified",
+        "upload-failed",
+        "upload-blocked-min-firmware",
+        "upload-interrupted-reboot",
+        "firmware-change-requeue",
+        "retention-prune",
+    }:
         return parse_rfc3339_utc("2026-04-02T14:00:00Z")
     return parse_rfc3339_utc("2026-04-02T12:00:00Z")
 
@@ -931,6 +1207,650 @@ def validate_interrupted_upload_recovery(
     }
 
 
+def run_config_import_scenario(
+    port: Path,
+    start_utc: datetime,
+    *,
+    upload_url: str,
+    wifi_ssid: str,
+    wifi_psk: str,
+    upload_token: str | None,
+) -> dict[str, Any]:
+    with SerialJsonClient(port) as client:
+        drained = client.drain_input()
+        _, initial_responses, initial_stray = run_steps(
+            client,
+            [
+                Step("status_before", "status --json", "status"),
+                Step("config_export_before", "config export --json", "config export"),
+                Step("system_log_before", "system-log export --json", "system-log export"),
+            ],
+        )
+
+        export_before = payload_from_response(response_by_label(initial_responses, "config_export_before"))
+        hardware_id = export_before.get("hardware_id")
+        if not isinstance(hardware_id, str) or not hardware_id:
+            raise RuntimeError("config-import scenario could not determine hardware_id")
+
+        identity_before = export_before.get("identity") if isinstance(export_before.get("identity"), dict) else {}
+        recording_before = export_before.get("recording") if isinstance(export_before.get("recording"), dict) else {}
+        time_before = export_before.get("time") if isinstance(export_before.get("time"), dict) else {}
+
+        logger_id = identity_before.get("logger_id") if isinstance(identity_before.get("logger_id"), str) and identity_before.get("logger_id") else "logger-regression"
+        subject_id = identity_before.get("subject_id") if isinstance(identity_before.get("subject_id"), str) and identity_before.get("subject_id") else "subject-regression"
+        primary_bound_address = (
+            recording_before.get("bound_h10_address")
+            if isinstance(recording_before.get("bound_h10_address"), str) and recording_before.get("bound_h10_address")
+            else "24:AC:AC:05:A3:10"
+        )
+        alternate_bound_address = "24:AC:AC:05:A3:11" if primary_bound_address != "24:AC:AC:05:A3:11" else "24:AC:AC:05:A3:10"
+        timezone = time_before.get("timezone") if isinstance(time_before.get("timezone"), str) and time_before.get("timezone") else "UTC"
+
+        seeded_doc = build_config_import_document(
+            exported_at_utc=format_rfc3339_utc(start_utc),
+            hardware_id=hardware_id,
+            logger_id=logger_id,
+            subject_id=subject_id,
+            bound_h10_address=primary_bound_address,
+            timezone=timezone,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_url=upload_url,
+            upload_token=upload_token,
+            secrets_included=True,
+        )
+        cleared_doc = build_config_import_document(
+            exported_at_utc=format_rfc3339_utc(start_utc + timedelta(seconds=10)),
+            hardware_id=hardware_id,
+            logger_id=logger_id,
+            subject_id=subject_id,
+            bound_h10_address=alternate_bound_address,
+            timezone=timezone,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_url=upload_url,
+            upload_token=upload_token,
+            secrets_included=False,
+        )
+        restore_doc = build_config_import_document(
+            exported_at_utc=format_rfc3339_utc(start_utc + timedelta(seconds=20)),
+            hardware_id=hardware_id,
+            logger_id=logger_id,
+            subject_id=subject_id,
+            bound_h10_address=primary_bound_address,
+            timezone=timezone,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_url=upload_url,
+            upload_token=upload_token,
+            secrets_included=True,
+        )
+
+        _, seed_responses, seed_stray = run_steps(
+            client,
+            [
+                Step("unlock_seed", "service unlock", "service unlock"),
+                Step("import_seed", build_config_import_command(seeded_doc), "config import", timeout_s=10.0),
+                Step("config_export_seed", "config export --json", "config export"),
+            ],
+            require_service_mode=False,
+        )
+        _, clear_responses, clear_stray = run_steps(
+            client,
+            [
+                Step("unlock_clear", "service unlock", "service unlock"),
+                Step("import_clear", build_config_import_command(cleared_doc), "config import", timeout_s=10.0),
+                Step("config_export_clear", "config export --json", "config export"),
+            ],
+            require_service_mode=False,
+        )
+        _, restore_responses, restore_stray = run_steps(
+            client,
+            [
+                Step("unlock_restore", "service unlock", "service unlock"),
+                Step("import_restore", build_config_import_command(restore_doc), "config import", timeout_s=10.0),
+                Step("config_export_restore", "config export --json", "config export"),
+                Step("reboot", "debug reboot", "debug reboot"),
+            ],
+            require_service_mode=False,
+        )
+
+    post_port, post_drained, post_responses, post_stray = run_steps_after_reboot(
+        port,
+        [
+            Step("status_after_reboot", "status --json", "status", timeout_s=5.0),
+            Step("config_export_after_reboot", "config export --json", "config export", timeout_s=5.0),
+            Step("system_log_after_reboot", "system-log export --json", "system-log export", timeout_s=5.0),
+        ],
+        timeout_s=POST_REBOOT_READY_TIMEOUT_S,
+    )
+
+    responses = initial_responses + seed_responses + clear_responses + restore_responses + post_responses
+    stray_responses = initial_stray + seed_stray + clear_stray + restore_stray + post_stray
+
+    import_seed_payload = payload_from_response(response_by_label(responses, "import_seed"))
+    if import_seed_payload.get("applied") is not True or import_seed_payload.get("normal_logging_ready") is not True:
+        raise RuntimeError("config-import seed import did not apply a normal-logging-ready config")
+    validate_config_export_payload(
+        response_by_label(responses, "config_export_seed"),
+        hardware_id=hardware_id,
+        logger_id=logger_id,
+        subject_id=subject_id,
+        bound_h10_address=primary_bound_address,
+        timezone=timezone,
+        wifi_ssid=wifi_ssid,
+        upload_url=upload_url,
+        expect_wifi_psk_present=True,
+        expect_upload_token_present=upload_token is not None,
+        expected_auth_type="bearer" if upload_token is not None else "none",
+    )
+
+    import_clear_payload = payload_from_response(response_by_label(responses, "import_clear"))
+    if import_clear_payload.get("applied") is not True or import_clear_payload.get("normal_logging_ready") is not True:
+        raise RuntimeError("config-import clear import did not apply a normal-logging-ready config")
+    if import_clear_payload.get("bond_cleared") is not True:
+        raise RuntimeError("config-import clear import expected bond_cleared=true after changing bound_h10_address")
+    validate_config_export_payload(
+        response_by_label(responses, "config_export_clear"),
+        hardware_id=hardware_id,
+        logger_id=logger_id,
+        subject_id=subject_id,
+        bound_h10_address=alternate_bound_address,
+        timezone=timezone,
+        wifi_ssid=wifi_ssid,
+        upload_url=upload_url,
+        expect_wifi_psk_present=False,
+        expect_upload_token_present=False,
+        expected_auth_type="none",
+    )
+
+    import_restore_payload = payload_from_response(response_by_label(responses, "import_restore"))
+    if import_restore_payload.get("applied") is not True or import_restore_payload.get("normal_logging_ready") is not True:
+        raise RuntimeError("config-import restore import did not apply a normal-logging-ready config")
+    if import_restore_payload.get("bond_cleared") is not True:
+        raise RuntimeError("config-import restore import expected bond_cleared=true when restoring the prior bound_h10_address")
+    validate_config_export_payload(
+        response_by_label(responses, "config_export_restore"),
+        hardware_id=hardware_id,
+        logger_id=logger_id,
+        subject_id=subject_id,
+        bound_h10_address=primary_bound_address,
+        timezone=timezone,
+        wifi_ssid=wifi_ssid,
+        upload_url=upload_url,
+        expect_wifi_psk_present=True,
+        expect_upload_token_present=upload_token is not None,
+        expected_auth_type="bearer" if upload_token is not None else "none",
+    )
+
+    status_after_reboot = payload_from_response(response_by_label(responses, "status_after_reboot"))
+    if status_after_reboot.get("mode") != "logging":
+        raise RuntimeError("config-import scenario expected the device to return to logging mode after reboot")
+    if status_after_reboot.get("runtime_state") != "log_wait_h10":
+        raise RuntimeError("config-import scenario expected runtime_state=log_wait_h10 after reboot")
+    validate_config_export_payload(
+        response_by_label(responses, "config_export_after_reboot"),
+        hardware_id=hardware_id,
+        logger_id=logger_id,
+        subject_id=subject_id,
+        bound_h10_address=primary_bound_address,
+        timezone=timezone,
+        wifi_ssid=wifi_ssid,
+        upload_url=upload_url,
+        expect_wifi_psk_present=True,
+        expect_upload_token_present=upload_token is not None,
+        expected_auth_type="bearer" if upload_token is not None else "none",
+    )
+
+    system_log_before = response_by_label(responses, "system_log_before")
+    system_log_after_reboot = response_by_label(responses, "system_log_after_reboot")
+    system_log_summary = validate_system_log_response(system_log_after_reboot)
+    config_change_events = [
+        event
+        for event in find_events_by_kind_after_seq(
+            system_log_after_reboot,
+            "config_changed",
+            max_system_log_event_seq(system_log_before),
+        )
+        if isinstance(event.get("details"), dict) and event["details"].get("source") == "config_import"
+    ]
+    if len(config_change_events) < 3:
+        raise RuntimeError("config-import scenario expected at least three new config_changed events from config_import")
+    if not any(event["details"].get("bond_cleared") is True for event in config_change_events):
+        raise RuntimeError("config-import scenario expected at least one config_changed event with bond_cleared=true")
+
+    return {
+        "scenario": "config-import",
+        "port": str(port),
+        "post_reboot_port": post_port,
+        "start_utc": format_rfc3339_utc(start_utc),
+        "effective_upload_url": upload_url,
+        "drained_preamble": drained,
+        "post_reboot_drained_preamble": post_drained,
+        "responses": responses,
+        "stray_responses": stray_responses,
+        "hardware_id": hardware_id,
+        "started_session_id": None,
+        "queue_before_session_ids": [],
+        "queue_after_session_ids": [],
+        "new_session_ids": [],
+        "system_log_validation": system_log_summary,
+    }
+
+
+def run_firmware_change_requeue_scenario(
+    port: Path,
+    start_utc: datetime,
+    *,
+    upload_url: str,
+    wifi_ssid: str,
+    wifi_psk: str,
+    upload_token: str | None,
+    spawn_ref_server: bool,
+    ref_server_data_dir: Path | None,
+    firmware_elf: Path,
+    requeue_temp_build_id: str,
+    requeue_temp_build_dir: Path | None,
+) -> dict[str, Any]:
+    blocked_upload_url = append_or_replace_query(upload_url, "force", "minimum_firmware")
+    ref_server_uploads_url = derive_local_ref_server_uploads_url(upload_url)
+
+    with ExitStack() as stack:
+        if spawn_ref_server:
+            if ref_server_data_dir is None:
+                stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+                ref_server_data_dir = Path("build") / f"logger_upload_ref_server_runner_firmware_change_requeue_{stamp}"
+            ref_server = stack.enter_context(
+                RefServerProcess(
+                    RefServerConfig(
+                        upload_url=upload_url,
+                        data_dir=ref_server_data_dir,
+                        bearer_token=upload_token,
+                        min_firmware=None,
+                    )
+                )
+            )
+            ref_server_uploads_url = ref_server.uploads_url
+
+        with SerialJsonClient(port) as client:
+            drained = client.drain_input()
+            _, setup_responses, setup_stray = run_steps(
+                client,
+                [
+                    Step("status_before", "status --json", "status"),
+                    Step("queue_before", "queue --json", "queue"),
+                    Step("system_log_before", "system-log export --json", "system-log export"),
+                    Step("fault_clear_before", "fault clear", "fault clear"),
+                    Step("unlock_1", "service unlock", "service unlock"),
+                    Step("clock_set", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
+                    Step("session_start", "debug session start", "debug session start"),
+                    Step("ecg_1", "debug synth ecg 4", "debug synth ecg"),
+                    Step("session_stop", "debug session stop", "debug session stop"),
+                    Step("queue_mid", "queue --json", "queue"),
+                    Step("unlock_2", "service unlock", "service unlock"),
+                    Step("set_wifi_ssid", f"debug config set wifi_ssid {wifi_ssid}", "debug config set"),
+                    Step("set_wifi_psk", f"debug config set wifi_psk {wifi_psk}", "debug config set"),
+                    Step("set_upload_url", f"debug config set upload_url {blocked_upload_url}", "debug config set"),
+                    *(
+                        [Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set")]
+                        if upload_token is not None
+                        else []
+                    ),
+                    Step("unlock_3", "service unlock", "service unlock"),
+                    Step("upload_once", "debug upload once", "debug upload once", timeout_s=90.0, allow_error=True),
+                    Step("queue_after", "queue --json", "queue"),
+                    Step("system_log", "system-log export --json", "system-log export"),
+                ],
+            )
+
+        blocked_analysis = validate_upload_outcome(
+            "upload-blocked-min-firmware",
+            setup_responses,
+            ref_server_uploads_url=ref_server_uploads_url,
+        )
+        session_id = blocked_analysis["started_session_id"]
+        status_before = payload_from_response(response_by_label(setup_responses, "status_before"))
+        firmware_before = status_before.get("firmware") if isinstance(status_before.get("firmware"), dict) else {}
+        firmware_version = firmware_before.get("version") if isinstance(firmware_before.get("version"), str) else None
+        current_build_id = firmware_before.get("build_id") if isinstance(firmware_before.get("build_id"), str) else None
+        if firmware_version is None or current_build_id is None:
+            raise RuntimeError("firmware-change-requeue could not determine the current firmware identity")
+        if current_build_id == requeue_temp_build_id:
+            raise RuntimeError("requeue_temp_build_id must differ from the currently running build_id")
+
+        temp_build_dir = requeue_temp_build_dir or (REPO_ROOT / "build" / "logger_firmware_requeue_variant")
+        temp_build = build_firmware_variant(
+            firmware_version=firmware_version,
+            build_id=requeue_temp_build_id,
+            build_dir=temp_build_dir,
+        )
+        flash_temp_result = flash_firmware_via_openocd(Path(temp_build["elf_path"]))
+        time.sleep(INTERRUPTED_UPLOAD_REBOOT_SETTLE_S)
+
+        requeue_port, requeue_drained, requeue_responses, requeue_stray = run_steps_after_reboot(
+            port,
+            [
+                Step("status_after_requeue_boot", "status --json", "status", timeout_s=5.0),
+                Step("queue_after_requeue_boot", "queue --json", "queue", timeout_s=5.0),
+                Step("system_log_after_requeue_boot", "system-log export --json", "system-log export", timeout_s=5.0),
+            ],
+            timeout_s=POST_REBOOT_READY_TIMEOUT_S,
+        )
+
+        flash_restore_result = flash_firmware_via_openocd(firmware_elf)
+        time.sleep(INTERRUPTED_UPLOAD_REBOOT_SETTLE_S)
+
+        cleanup_steps = [Step("status_after_restore_boot", "status --json", "status", timeout_s=5.0)]
+        if blocked_upload_url != upload_url:
+            cleanup_steps.append(
+                Step("restore_upload_url", f"debug config set upload_url {upload_url}", "debug config set", timeout_s=5.0)
+            )
+        cleanup_steps.extend(
+            [
+                Step("upload_cleanup", "debug upload once", "debug upload once", timeout_s=90.0),
+                Step("queue_after_cleanup", "queue --json", "queue", timeout_s=5.0),
+                Step("system_log_after_cleanup", "system-log export --json", "system-log export", timeout_s=5.0),
+                Step("status_final", "status --json", "status", timeout_s=5.0),
+            ]
+        )
+        cleanup_port, cleanup_drained, cleanup_responses, cleanup_stray = run_steps_after_reboot(
+            port,
+            cleanup_steps,
+            timeout_s=POST_REBOOT_READY_TIMEOUT_S + 60.0,
+        )
+
+        responses = setup_responses + requeue_responses + cleanup_responses
+        stray_responses = setup_stray + requeue_stray + cleanup_stray
+
+        requeue_status = payload_from_response(response_by_label(responses, "status_after_requeue_boot"))
+        if requeue_status.get("mode") != "logging":
+            raise RuntimeError("firmware-change-requeue expected the reflashed device to boot into logging mode")
+        requeue_firmware = requeue_status.get("firmware") if isinstance(requeue_status.get("firmware"), dict) else {}
+        if requeue_firmware.get("build_id") != requeue_temp_build_id:
+            raise RuntimeError("firmware-change-requeue did not boot the temporary build variant")
+
+        requeued_entry = queue_entry_map_from_response(response_by_label(responses, "queue_after_requeue_boot")).get(session_id)
+        if requeued_entry is None:
+            raise RuntimeError("firmware-change-requeue could not find the blocked session after reflashing")
+        if requeued_entry.get("status") != "pending":
+            raise RuntimeError(
+                "firmware-change-requeue expected the blocked session to become pending after reflashing, "
+                f"got {requeued_entry.get('status')!r}"
+            )
+        if requeued_entry.get("attempt_count") != 1:
+            raise RuntimeError("firmware-change-requeue expected attempt_count=1 to be preserved")
+        if requeued_entry.get("last_failure_class") is not None:
+            raise RuntimeError("firmware-change-requeue expected last_failure_class to be cleared after requeue")
+
+        requeue_system_log = response_by_label(responses, "system_log_after_requeue_boot")
+        requeue_system_log_summary = validate_system_log_response(requeue_system_log)
+        requeue_events = [
+            event
+            for event in find_events_by_kind_after_seq(
+                requeue_system_log,
+                "upload_queue_requeued",
+                max_system_log_event_seq(response_by_label(responses, "system_log")),
+            )
+            if isinstance(event.get("details"), dict)
+        ]
+        if not any(
+            event["details"].get("reason") == "firmware_changed" and event["details"].get("count", 0) >= 1
+            for event in requeue_events
+        ):
+            raise RuntimeError("firmware-change-requeue expected an upload_queue_requeued event with reason=firmware_changed")
+
+        restore_status = payload_from_response(response_by_label(responses, "status_after_restore_boot"))
+        if restore_status.get("mode") != "logging":
+            raise RuntimeError("firmware-change-requeue expected the restored firmware to boot into logging mode")
+        restore_firmware = restore_status.get("firmware") if isinstance(restore_status.get("firmware"), dict) else {}
+        if restore_firmware.get("build_id") != current_build_id:
+            raise RuntimeError("firmware-change-requeue did not restore the original firmware build_id")
+
+        cleanup_upload = response_by_label(responses, "upload_cleanup")
+        require_ok(cleanup_upload, Step("upload_cleanup", "debug upload once", "debug upload once"))
+        cleanup_payload = payload_from_response(cleanup_upload)
+        if cleanup_payload.get("session_id") != session_id or cleanup_payload.get("final_status") != "verified":
+            raise RuntimeError("firmware-change-requeue cleanup upload did not verify the requeued session")
+
+        cleanup_entry = queue_entry_map_from_response(response_by_label(responses, "queue_after_cleanup")).get(session_id)
+        if cleanup_entry is None:
+            raise RuntimeError("firmware-change-requeue cleanup could not find the session in queue_after_cleanup")
+        if cleanup_entry.get("status") != "verified":
+            raise RuntimeError("firmware-change-requeue cleanup expected final queue status verified")
+        if not isinstance(cleanup_entry.get("receipt_id"), str):
+            raise RuntimeError("firmware-change-requeue cleanup expected a receipt_id after upload verification")
+
+        cleanup_system_log = response_by_label(responses, "system_log_after_cleanup")
+        cleanup_system_log_summary = validate_system_log_response(cleanup_system_log)
+        cleanup_events = find_events_by_kind_after_seq(
+            cleanup_system_log,
+            "upload_verified",
+            max_system_log_event_seq(requeue_system_log),
+        )
+        if not any(
+            isinstance(event.get("details"), dict) and event["details"].get("session_id") == session_id
+            for event in cleanup_events
+        ):
+            raise RuntimeError("firmware-change-requeue cleanup expected an upload_verified event for the requeued session")
+
+        ref_server_uploads = None
+        if ref_server_uploads_url is not None:
+            ref_server_doc = http_get_json(ref_server_uploads_url)
+            uploads = ref_server_doc.get("uploads") if isinstance(ref_server_doc.get("uploads"), list) else []
+            ref_server_uploads = uploads
+            if not any(isinstance(upload, dict) and upload.get("session_id") == session_id for upload in uploads):
+                raise RuntimeError("firmware-change-requeue cleanup expected the reference server to accept the requeued session")
+
+        return {
+            "scenario": "firmware-change-requeue",
+            "port": str(port),
+            "requeue_port": requeue_port,
+            "cleanup_port": cleanup_port,
+            "start_utc": format_rfc3339_utc(start_utc),
+            "effective_upload_url": blocked_upload_url,
+            "drained_preamble": drained,
+            "post_requeue_drained_preamble": requeue_drained,
+            "post_restore_drained_preamble": cleanup_drained,
+            "responses": responses,
+            "stray_responses": stray_responses,
+            "started_session_id": session_id,
+            "queue_before_session_ids": blocked_analysis["queue_before_session_ids"],
+            "queue_after_session_ids": sorted(session_ids_from_queue_response(response_by_label(responses, "queue_after_cleanup"))),
+            "new_session_ids": blocked_analysis["new_session_ids"],
+            "system_log_validation": cleanup_system_log_summary,
+            "final_queue_entry": cleanup_entry,
+            "requeued_queue_entry": requeued_entry,
+            "ref_server_uploads": ref_server_uploads,
+            "temp_build": temp_build,
+            "flash_temp_result": flash_temp_result,
+            "flash_restore_result": flash_restore_result,
+            "requeue_system_log_validation": requeue_system_log_summary,
+        }
+
+
+def run_retention_prune_scenario(
+    port: Path,
+    start_utc: datetime,
+    *,
+    upload_url: str,
+    wifi_ssid: str,
+    wifi_psk: str,
+    upload_token: str | None,
+    spawn_ref_server: bool,
+    ref_server_data_dir: Path | None,
+) -> dict[str, Any]:
+    effective_upload_url = upload_url
+    ref_server_uploads_url = derive_local_ref_server_uploads_url(upload_url)
+
+    with ExitStack() as stack:
+        if spawn_ref_server:
+            if ref_server_data_dir is None:
+                stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+                ref_server_data_dir = Path("build") / f"logger_upload_ref_server_runner_retention_prune_{stamp}"
+            ref_server = stack.enter_context(
+                RefServerProcess(
+                    RefServerConfig(
+                        upload_url=effective_upload_url,
+                        data_dir=ref_server_data_dir,
+                        bearer_token=upload_token,
+                        min_firmware=None,
+                    )
+                )
+            )
+            ref_server_uploads_url = ref_server.uploads_url
+
+        restore_clock_utc = format_rfc3339_utc(datetime.now(UTC))
+        prune_clock_utc = format_rfc3339_utc(start_utc + timedelta(days=18))
+
+        with SerialJsonClient(port) as client:
+            drained = client.drain_input()
+            _, responses, stray_responses = run_steps(
+                client,
+                [
+                    Step("status_before", "status --json", "status"),
+                    Step("queue_before", "queue --json", "queue"),
+                    Step("system_log_before", "system-log export --json", "system-log export"),
+                    Step("fault_clear_before", "fault clear", "fault clear"),
+                    Step("unlock_1", "service unlock", "service unlock"),
+                    Step("clock_set_start", f"clock set {format_rfc3339_utc(start_utc)}", "clock set"),
+                    Step("session_start", "debug session start", "debug session start"),
+                    Step("ecg_1", "debug synth ecg 4", "debug synth ecg"),
+                    Step("session_stop", "debug session stop", "debug session stop"),
+                    Step("queue_mid", "queue --json", "queue"),
+                    Step("unlock_2", "service unlock", "service unlock"),
+                    Step("set_wifi_ssid", f"debug config set wifi_ssid {wifi_ssid}", "debug config set"),
+                    Step("set_wifi_psk", f"debug config set wifi_psk {wifi_psk}", "debug config set"),
+                    Step("set_upload_url", f"debug config set upload_url {effective_upload_url}", "debug config set"),
+                    *(
+                        [Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set")]
+                        if upload_token is not None
+                        else []
+                    ),
+                    Step("unlock_3", "service unlock", "service unlock"),
+                    Step("upload_once", "debug upload once", "debug upload once", timeout_s=90.0),
+                    Step("queue_after_upload", "queue --json", "queue"),
+                    Step("system_log_after_upload", "system-log export --json", "system-log export"),
+                    Step("unlock_4", "service unlock", "service unlock"),
+                    Step("clock_set_prune", f"clock set {prune_clock_utc}", "clock set"),
+                    Step("unlock_5", "service unlock", "service unlock"),
+                    Step("prune_once", "debug prune once", "debug prune once", timeout_s=10.0),
+                    Step("queue_after_prune", "queue --json", "queue"),
+                    Step("system_log_after_prune", "system-log export --json", "system-log export"),
+                    Step("unlock_6", "service unlock", "service unlock"),
+                    Step("clock_restore", f"clock set {restore_clock_utc}", "clock set"),
+                    Step("reboot", "debug reboot", "debug reboot"),
+                ],
+            )
+
+        post_port, post_drained, post_responses, post_stray = run_steps_after_reboot(
+            port,
+            [
+                Step("status_after_reboot", "status --json", "status", timeout_s=5.0),
+                Step("queue_after_reboot", "queue --json", "queue", timeout_s=5.0),
+            ],
+            timeout_s=POST_REBOOT_READY_TIMEOUT_S,
+        )
+
+        responses = responses + post_responses
+        stray_responses = stray_responses + post_stray
+
+        queue_before = response_by_label(responses, "queue_before")
+        queue_mid = response_by_label(responses, "queue_mid")
+        queue_after_upload = response_by_label(responses, "queue_after_upload")
+        if eligible_queue_session_ids(queue_before):
+            raise RuntimeError("retention-prune requires a clean eligible queue before starting")
+        new_session_ids = extract_new_session_ids(queue_before, queue_mid)
+        if len(new_session_ids) != 1:
+            raise RuntimeError("retention-prune expected exactly one new closed session before upload")
+        session_id = new_session_ids[0]
+
+        upload_response = response_by_label(responses, "upload_once")
+        require_ok(upload_response, Step("upload_once", "debug upload once", "debug upload once"))
+        upload_payload = payload_from_response(upload_response)
+        if upload_payload.get("session_id") != session_id or upload_payload.get("final_status") != "verified":
+            raise RuntimeError("retention-prune expected debug upload once to verify the newly created session")
+
+        verified_entry = queue_entry_map_from_response(queue_after_upload).get(session_id)
+        if verified_entry is None:
+            raise RuntimeError("retention-prune expected the verified session to appear in queue_after_upload")
+        if verified_entry.get("status") != "verified":
+            raise RuntimeError("retention-prune expected queue_after_upload status=verified")
+
+        upload_system_log = response_by_label(responses, "system_log_after_upload")
+        validate_system_log_response(upload_system_log)
+        upload_events = find_events_by_kind_after_seq(
+            upload_system_log,
+            "upload_verified",
+            max_system_log_event_seq(response_by_label(responses, "system_log_before")),
+        )
+        if not any(
+            isinstance(event.get("details"), dict) and event["details"].get("session_id") == session_id
+            for event in upload_events
+        ):
+            raise RuntimeError("retention-prune expected an upload_verified event for the newly created session")
+
+        ref_server_uploads = None
+        if ref_server_uploads_url is not None:
+            ref_server_doc = http_get_json(ref_server_uploads_url)
+            uploads = ref_server_doc.get("uploads") if isinstance(ref_server_doc.get("uploads"), list) else []
+            ref_server_uploads = uploads
+            if not any(isinstance(upload, dict) and upload.get("session_id") == session_id for upload in uploads):
+                raise RuntimeError("retention-prune expected the reference server to accept the verified session before pruning")
+
+        prune_payload = payload_from_response(response_by_label(responses, "prune_once"))
+        if int(prune_payload.get("retention_pruned_count", 0)) < 1:
+            raise RuntimeError("retention-prune expected retention_pruned_count >= 1")
+        if prune_payload.get("reserve_pruned_count") != 0:
+            raise RuntimeError("retention-prune expected reserve_pruned_count == 0")
+        if prune_payload.get("reserve_met") is not True:
+            raise RuntimeError("retention-prune expected reserve_met=true")
+
+        queue_after_prune = response_by_label(responses, "queue_after_prune")
+        if session_id in session_ids_from_queue_response(queue_after_prune):
+            raise RuntimeError("retention-prune expected the newly verified session to be removed from queue_after_prune")
+
+        system_log_after_prune = response_by_label(responses, "system_log_after_prune")
+        system_log_summary = validate_system_log_response(system_log_after_prune)
+        pruned_events = find_events_by_kind_after_seq(
+            system_log_after_prune,
+            "session_pruned",
+            max_system_log_event_seq(response_by_label(responses, "system_log_after_upload")),
+        )
+        if not any(
+            isinstance(event.get("details"), dict)
+            and event["details"].get("session_id") == session_id
+            and event["details"].get("reason") == "retention_expired"
+            for event in pruned_events
+        ):
+            raise RuntimeError("retention-prune expected a session_pruned event for the newly verified session")
+
+        status_after_reboot = payload_from_response(response_by_label(responses, "status_after_reboot"))
+        if status_after_reboot.get("mode") != "logging":
+            raise RuntimeError("retention-prune expected the device to return to logging mode after reboot")
+        if session_id in session_ids_from_queue_response(response_by_label(responses, "queue_after_reboot")):
+            raise RuntimeError("retention-prune expected the pruned session to remain absent after reboot")
+
+        return {
+            "scenario": "retention-prune",
+            "port": str(port),
+            "post_reboot_port": post_port,
+            "start_utc": format_rfc3339_utc(start_utc),
+            "effective_upload_url": effective_upload_url,
+            "drained_preamble": drained,
+            "post_reboot_drained_preamble": post_drained,
+            "responses": responses,
+            "stray_responses": stray_responses,
+            "started_session_id": session_id,
+            "queue_before_session_ids": sorted(session_ids_from_queue_response(response_by_label(responses, "queue_before"))),
+            "queue_after_session_ids": sorted(session_ids_from_queue_response(response_by_label(responses, "queue_after_reboot"))),
+            "new_session_ids": [session_id],
+            "system_log_validation": system_log_summary,
+            "final_queue_entry": None,
+            "ref_server_uploads": ref_server_uploads,
+            "prune_result": prune_payload,
+        }
+
+
 def run_scenario(
     port: Path,
     scenario: str,
@@ -943,7 +1863,50 @@ def run_scenario(
     spawn_ref_server: bool = False,
     ref_server_data_dir: Path | None = None,
     ref_server_min_firmware: str | None = None,
+    firmware_elf: Path = DEFAULT_FIRMWARE_ELF,
+    requeue_temp_build_id: str = DEFAULT_REQUEUE_TEMP_BUILD_ID,
+    requeue_temp_build_dir: Path | None = None,
 ) -> dict[str, Any]:
+    if scenario == "config-import":
+        if upload_url is None or wifi_ssid is None or wifi_psk is None:
+            raise ValueError("config-import requires upload_url, wifi_ssid, and wifi_psk")
+        return run_config_import_scenario(
+            port,
+            start_utc,
+            upload_url=upload_url,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_token=upload_token,
+        )
+    if scenario == "firmware-change-requeue":
+        if upload_url is None or wifi_ssid is None or wifi_psk is None:
+            raise ValueError("firmware-change-requeue requires upload_url, wifi_ssid, and wifi_psk")
+        return run_firmware_change_requeue_scenario(
+            port,
+            start_utc,
+            upload_url=upload_url,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_token=upload_token,
+            spawn_ref_server=spawn_ref_server,
+            ref_server_data_dir=ref_server_data_dir,
+            firmware_elf=firmware_elf,
+            requeue_temp_build_id=requeue_temp_build_id,
+            requeue_temp_build_dir=requeue_temp_build_dir,
+        )
+    if scenario == "retention-prune":
+        if upload_url is None or wifi_ssid is None or wifi_psk is None:
+            raise ValueError("retention-prune requires upload_url, wifi_ssid, and wifi_psk")
+        return run_retention_prune_scenario(
+            port,
+            start_utc,
+            upload_url=upload_url,
+            wifi_ssid=wifi_ssid,
+            wifi_psk=wifi_psk,
+            upload_token=upload_token,
+            spawn_ref_server=spawn_ref_server,
+            ref_server_data_dir=ref_server_data_dir,
+        )
     if scenario == "upload-interrupted-reboot":
         return run_interrupted_upload_reboot_scenario(
             port,
@@ -1087,7 +2050,7 @@ def run_interrupted_upload_reboot_scenario(
             Step("queue_after_reboot", "queue --json", "queue", timeout_s=5.0),
             Step("system_log_after_reboot", "system-log export --json", "system-log export", timeout_s=5.0),
         ]
-        post_drained, post_responses, post_stray_responses = run_steps_after_reboot(
+        post_port, post_drained, post_responses, post_stray_responses = run_steps_after_reboot(
             port,
             post_steps,
             timeout_s=POST_REBOOT_READY_TIMEOUT_S,
@@ -1106,6 +2069,7 @@ def run_interrupted_upload_reboot_scenario(
             "start_utc": format_rfc3339_utc(start_utc),
             "effective_upload_url": effective_upload_url,
             "drained_preamble": drained,
+            "post_reboot_port": post_port,
             "post_reboot_drained_preamble": post_drained,
             "responses": all_responses,
             "stray_responses": all_stray_responses,
@@ -1149,6 +2113,7 @@ def main() -> int:
     parser.add_argument(
         "--scenario",
         choices=[
+            "config-import",
             "smoke",
             "clock-fix",
             "rollover",
@@ -1157,6 +2122,8 @@ def main() -> int:
             "upload-failed",
             "upload-blocked-min-firmware",
             "upload-interrupted-reboot",
+            "firmware-change-requeue",
+            "retention-prune",
         ],
         default="smoke",
         help="synthetic scenario to run",
@@ -1192,6 +2159,23 @@ def main() -> int:
         default=None,
         help="minimum firmware for a spawned reference server or upload URL preparation",
     )
+    parser.add_argument(
+        "--firmware-elf",
+        type=Path,
+        default=DEFAULT_FIRMWARE_ELF,
+        help="firmware ELF used to restore the primary build after firmware-change-requeue",
+    )
+    parser.add_argument(
+        "--requeue-temp-build-id",
+        default=DEFAULT_REQUEUE_TEMP_BUILD_ID,
+        help="temporary build_id used for firmware-change-requeue coverage",
+    )
+    parser.add_argument(
+        "--requeue-temp-build-dir",
+        type=Path,
+        default=None,
+        help="optional build directory for the temporary firmware-change-requeue variant",
+    )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = parser.parse_args()
 
@@ -1219,6 +2203,9 @@ def main() -> int:
             spawn_ref_server=args.spawn_ref_server,
             ref_server_data_dir=args.ref_server_data_dir,
             ref_server_min_firmware=args.ref_server_min_firmware,
+            firmware_elf=args.firmware_elf,
+            requeue_temp_build_id=args.requeue_temp_build_id,
+            requeue_temp_build_dir=args.requeue_temp_build_dir,
         )
     except Exception as exc:  # noqa: BLE001
         summary = {
@@ -1231,7 +2218,9 @@ def main() -> int:
         errors.append(str(exc))
 
     artifact_validation = None
-    if args.logger_root is not None and not errors:
+    artifact_validation_supported = args.scenario not in {"config-import", "retention-prune"}
+
+    if args.logger_root is not None and not errors and artifact_validation_supported:
         resolved_root = resolve_logger_root(args.logger_root)
         if resolved_root is None:
             errors.append("--logger-root is not a logger root and does not contain ./logger")
@@ -1244,6 +2233,12 @@ def main() -> int:
                     validate_session_artifacts_for_scenario(args.scenario, artifact_validation, summary["new_session_ids"])
                 except Exception as exc:  # noqa: BLE001
                     errors.append(str(exc))
+    elif args.logger_root is not None and not artifact_validation_supported:
+        artifact_validation = {
+            "ok": True,
+            "skipped": True,
+            "reason": f"artifact validation is not applicable to scenario {args.scenario!r}",
+        }
 
     summary["artifact_validation"] = artifact_validation
     summary["errors"] = errors
