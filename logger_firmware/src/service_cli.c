@@ -13,6 +13,7 @@
 #include "board_config.h"
 #include "logger/app_main.h"
 #include "logger/json.h"
+#include "logger/json_writer.h"
 #include "logger/queue.h"
 #include "logger/sha256.h"
 #include "logger/upload.h"
@@ -1636,17 +1637,19 @@ static void logger_apply_config_import_json(
     (void)logger_h10_set_bound_address(&app->h10, app->persisted.config.bound_h10_address);
     app->runtime.provisioning_complete = logger_config_normal_logging_ready(&app->persisted.config);
 
-    char details[128];
-    snprintf(details,
-             sizeof(details),
-             "{\"source\":\"config_import\",\"bond_cleared\":%s}",
-             bond_cleared ? "true" : "false");
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (logger_json_object_writer_string_field(&writer, "source", "config_import") &&
+        logger_json_object_writer_bool_field(&writer, "bond_cleared", bond_cleared) &&
+        logger_json_object_writer_finish(&writer)) {
     (void)logger_system_log_append(
         &app->system_log,
         logger_now_utc_or_null(app),
         "config_changed",
         LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        details);
+        logger_json_object_writer_data(&writer));
+    }
 
     if (clear_transfer_on_success) {
         logger_config_import_transfer_reset(cli);
@@ -1893,17 +1896,19 @@ static void logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli
         return;
     }
 
-    char details[160];
-    snprintf(details,
-             sizeof(details),
-             "{\"source\":\"upload_tls_clear_provisioned_anchor\",\"had_anchor\":%s}",
-             had_anchor ? "true" : "false");
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (logger_json_object_writer_string_field(&writer, "source", "upload_tls_clear_provisioned_anchor") &&
+        logger_json_object_writer_bool_field(&writer, "had_anchor", had_anchor) &&
+        logger_json_object_writer_finish(&writer)) {
     (void)logger_system_log_append(
         &app->system_log,
         logger_now_utc_or_null(app),
         "config_changed",
         LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        details);
+        logger_json_object_writer_data(&writer));
+    }
 
     cli->unlocked = false;
 
@@ -1976,14 +1981,18 @@ static void logger_handle_debug_config_set(logger_service_cli_t *cli, logger_app
         return;
     }
 
-    char details[96];
-    snprintf(details, sizeof(details), "{\"field\":\"%s\"}", field);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (logger_json_object_writer_string_field(&writer, "field", field) &&
+        logger_json_object_writer_finish(&writer)) {
     (void)logger_system_log_append(
         &app->system_log,
         logger_now_utc_or_null(app),
         "config_changed",
         LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        details);
+        logger_json_object_writer_data(&writer));
+    }
 
     logger_json_begin_success("debug config set", logger_now_utc_or_null(app));
     fputs("{\"applied\":true,\"field\":", stdout);
@@ -2351,20 +2360,23 @@ static void logger_handle_debug_synth_no_session_day(
         return;
     }
 
-    char details[160];
-    snprintf(details,
-             sizeof(details),
-             "{\"study_day_local\":\"%s\",\"reason\":\"%s\",\"seen_bound_device\":%s,\"ble_connected\":%s,\"ecg_start_attempted\":%s}",
-             study_day_local,
-             reason,
-             seen_bound_device ? "true" : "false",
-             ble_connected ? "true" : "false",
-             ecg_start_attempted ? "true" : "false");
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "study_day_local", study_day_local) ||
+        !logger_json_object_writer_string_field(&writer, "reason", reason) ||
+        !logger_json_object_writer_bool_field(&writer, "seen_bound_device", seen_bound_device) ||
+        !logger_json_object_writer_bool_field(&writer, "ble_connected", ble_connected) ||
+        !logger_json_object_writer_bool_field(&writer, "ecg_start_attempted", ecg_start_attempted) ||
+        !logger_json_object_writer_finish(&writer)) {
+        logger_json_begin_error("debug synth no-session-day", logger_now_utc_or_null(app), "storage_unavailable", "failed to build synthetic no_session_day_summary details");
+        return;
+    }
     if (!logger_system_log_append(&app->system_log,
                                   logger_now_utc_or_null(app),
                                   "no_session_day_summary",
                                   LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-                                  details)) {
+                                  logger_json_object_writer_data(&writer))) {
         logger_json_begin_error("debug synth no-session-day", logger_now_utc_or_null(app), "storage_unavailable", "failed to append synthetic no_session_day_summary");
         return;
     }

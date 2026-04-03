@@ -9,6 +9,7 @@
 #include "pico/stdlib.h"
 
 #include "board_config.h"
+#include "logger/json_writer.h"
 #include "logger/queue.h"
 #include "logger/upload.h"
 
@@ -166,17 +167,19 @@ static void logger_app_maybe_latch_new_fault(logger_app_t *app, logger_fault_cod
     app->persisted.current_fault_code = code;
     (void)logger_config_store_save(&app->persisted);
 
-    char details[96];
-    snprintf(details,
-             sizeof(details),
-             "{\"code\":\"%s\"}",
-             logger_fault_code_name(code));
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "code", logger_fault_code_name(code)) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
     (void)logger_system_log_append(
         &app->system_log,
         app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
         "fault_latched",
         LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-        details);
+        logger_json_object_writer_data(&writer));
 }
 
 static bool logger_app_local_time_evaluable(const logger_app_t *app) {
@@ -413,21 +416,23 @@ static bool logger_app_finalize_no_session_day(logger_app_t *app, const char *fo
         }
     }
 
-    char details[160];
-    snprintf(details,
-             sizeof(details),
-             "{\"study_day_local\":\"%s\",\"reason\":\"%s\",\"seen_bound_device\":%s,\"ble_connected\":%s,\"ecg_start_attempted\":%s}",
-             app->current_day_study_day_local,
-             reason,
-             seen_bound_device ? "true" : "false",
-             ble_connected ? "true" : "false",
-             ecg_start_attempted ? "true" : "false");
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "study_day_local", app->current_day_study_day_local) ||
+        !logger_json_object_writer_string_field(&writer, "reason", reason) ||
+        !logger_json_object_writer_bool_field(&writer, "seen_bound_device", seen_bound_device) ||
+        !logger_json_object_writer_bool_field(&writer, "ble_connected", ble_connected) ||
+        !logger_json_object_writer_bool_field(&writer, "ecg_start_attempted", ecg_start_attempted) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return false;
+    }
     if (!logger_system_log_append(
             &app->system_log,
             app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
             "no_session_day_summary",
             LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-            details)) {
+            logger_json_object_writer_data(&writer))) {
         return false;
     }
 
@@ -777,20 +782,21 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms, logger_boot_gesture_t b
     logger_print_boot_banner(app);
     app->boot_banner_printed = true;
 
-    char boot_details[128];
-    snprintf(boot_details,
-             sizeof(boot_details),
-             "{\"gesture\":\"%s\",\"firmware_version\":\"%s\",\"build_id\":\"%s\",\"firmware_changed\":%s}",
-             logger_app_boot_gesture_name(boot_gesture),
-             LOGGER_FIRMWARE_VERSION,
-             LOGGER_BUILD_ID,
-             app->boot_firmware_identity_changed ? "true" : "false");
+    char boot_details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t boot_writer;
+    logger_json_object_writer_init(&boot_writer, boot_details, sizeof(boot_details));
+    if (logger_json_object_writer_string_field(&boot_writer, "gesture", logger_app_boot_gesture_name(boot_gesture)) &&
+        logger_json_object_writer_string_field(&boot_writer, "firmware_version", LOGGER_FIRMWARE_VERSION) &&
+        logger_json_object_writer_string_field(&boot_writer, "build_id", LOGGER_BUILD_ID) &&
+        logger_json_object_writer_bool_field(&boot_writer, "firmware_changed", app->boot_firmware_identity_changed) &&
+        logger_json_object_writer_finish(&boot_writer)) {
     (void)logger_system_log_append(
         &app->system_log,
         app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
         "boot",
         LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        boot_details);
+        logger_json_object_writer_data(&boot_writer));
+    }
     if (app->clock.lost_power) {
         (void)logger_system_log_append(
             &app->system_log,

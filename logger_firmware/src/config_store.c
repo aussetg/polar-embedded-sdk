@@ -18,11 +18,16 @@
 #define LOGGER_FLASH_METADATA_MAGIC 0x3141544du
 #define LOGGER_FLASH_METADATA_SCHEMA_VERSION 1u
 
-#define LOGGER_FLASH_CONFIG_SLOT0_OFFSET LOGGER_FLASH_CONFIG_REGION_OFFSET
-#define LOGGER_FLASH_CONFIG_SLOT1_OFFSET (LOGGER_FLASH_CONFIG_SLOT0_OFFSET + LOGGER_FLASH_CONFIG_SLOT_SIZE)
-
-#define LOGGER_FLASH_METADATA_SLOT0_OFFSET LOGGER_FLASH_METADATA_REGION_OFFSET
-#define LOGGER_FLASH_METADATA_SLOT1_OFFSET (LOGGER_FLASH_METADATA_SLOT0_OFFSET + LOGGER_FLASH_METADATA_SLOT_SIZE)
+#define LOGGER_FLASH_LEGACY_PERSIST_REGION_SIZE (16u * FLASH_SECTOR_SIZE)
+#define LOGGER_FLASH_LEGACY_PERSIST_REGION_OFFSET (LOGGER_BTSTACK_STORAGE_OFFSET - LOGGER_FLASH_LEGACY_PERSIST_REGION_SIZE)
+#define LOGGER_FLASH_LEGACY_CONFIG_SLOT_COUNT 2u
+#define LOGGER_FLASH_LEGACY_CONFIG_REGION_OFFSET LOGGER_FLASH_LEGACY_PERSIST_REGION_OFFSET
+#define LOGGER_FLASH_LEGACY_CONFIG_SLOT_SIZE FLASH_SECTOR_SIZE
+#define LOGGER_FLASH_LEGACY_SYSTEM_LOG_REGION_OFFSET (LOGGER_FLASH_LEGACY_CONFIG_REGION_OFFSET + (LOGGER_FLASH_LEGACY_CONFIG_SLOT_COUNT * LOGGER_FLASH_LEGACY_CONFIG_SLOT_SIZE))
+#define LOGGER_FLASH_LEGACY_SYSTEM_LOG_REGION_SIZE (12u * FLASH_SECTOR_SIZE)
+#define LOGGER_FLASH_LEGACY_METADATA_REGION_OFFSET (LOGGER_FLASH_LEGACY_SYSTEM_LOG_REGION_OFFSET + LOGGER_FLASH_LEGACY_SYSTEM_LOG_REGION_SIZE)
+#define LOGGER_FLASH_LEGACY_METADATA_SLOT_COUNT 2u
+#define LOGGER_FLASH_LEGACY_METADATA_SLOT_SIZE FLASH_SECTOR_SIZE
 
 extern char __flash_binary_end;
 
@@ -133,10 +138,12 @@ typedef struct {
     bool loaded;
     bool config_valid;
     bool config_split_format;
+    bool config_in_legacy_region;
     uint32_t config_sequence;
     int config_slot;
     logger_config_t config;
     bool metadata_region_valid;
+    bool metadata_in_legacy_region;
     uint32_t metadata_sequence;
     int metadata_slot;
     logger_persisted_metadata_t metadata;
@@ -157,11 +164,26 @@ static uint32_t logger_crc32_ieee(const uint8_t *data, size_t len) {
 }
 
 static uint32_t logger_flash_config_slot_offset(unsigned slot) {
-    return slot == 0u ? LOGGER_FLASH_CONFIG_SLOT0_OFFSET : LOGGER_FLASH_CONFIG_SLOT1_OFFSET;
+    return LOGGER_FLASH_CONFIG_REGION_OFFSET + (slot * LOGGER_FLASH_CONFIG_SLOT_SIZE);
 }
 
 static uint32_t logger_flash_metadata_slot_offset(unsigned slot) {
-    return slot == 0u ? LOGGER_FLASH_METADATA_SLOT0_OFFSET : LOGGER_FLASH_METADATA_SLOT1_OFFSET;
+    return LOGGER_FLASH_METADATA_REGION_OFFSET + (slot * LOGGER_FLASH_METADATA_SLOT_SIZE);
+}
+
+static uint32_t logger_flash_legacy_config_slot_offset(unsigned slot) {
+    return LOGGER_FLASH_LEGACY_CONFIG_REGION_OFFSET + (slot * LOGGER_FLASH_LEGACY_CONFIG_SLOT_SIZE);
+}
+
+static uint32_t logger_flash_legacy_metadata_slot_offset(unsigned slot) {
+    return LOGGER_FLASH_LEGACY_METADATA_REGION_OFFSET + (slot * LOGGER_FLASH_LEGACY_METADATA_SLOT_SIZE);
+}
+
+static unsigned logger_flash_next_slot(int current_slot, unsigned slot_count) {
+    if (slot_count == 0u || current_slot < 0) {
+        return 0u;
+    }
+    return ((unsigned)current_slot + 1u) % slot_count;
 }
 
 static void logger_copy_string(char *dst, size_t dst_len, const char *src) {
@@ -450,11 +472,11 @@ static void logger_store_cache_reset(void) {
     g_store.metadata_slot = -1;
 }
 
-static bool logger_flash_config_slot_load(unsigned slot, logger_flash_config_slot_state_t *out) {
+static bool logger_flash_config_slot_load_at_offset(uint32_t flash_offset, int slot_index, logger_flash_config_slot_state_t *out) {
     memset(out, 0, sizeof(*out));
-    out->slot = (int)slot;
+    out->slot = slot_index;
 
-    const uint8_t *raw = (const uint8_t *)(XIP_BASE + logger_flash_config_slot_offset(slot));
+    const uint8_t *raw = (const uint8_t *)(XIP_BASE + flash_offset);
     const uint32_t magic = *(const uint32_t *)raw;
     const uint16_t schema_version = *(const uint16_t *)(raw + 4u);
 
@@ -539,11 +561,15 @@ static bool logger_flash_config_slot_load(unsigned slot, logger_flash_config_slo
     return false;
 }
 
-static bool logger_flash_metadata_slot_load(unsigned slot, logger_flash_metadata_slot_state_t *out) {
-    memset(out, 0, sizeof(*out));
-    out->slot = (int)slot;
+static bool logger_flash_config_slot_load(unsigned slot, logger_flash_config_slot_state_t *out) {
+    return logger_flash_config_slot_load_at_offset(logger_flash_config_slot_offset(slot), (int)slot, out);
+}
 
-    const uint8_t *raw = (const uint8_t *)(XIP_BASE + logger_flash_metadata_slot_offset(slot));
+static bool logger_flash_metadata_slot_load_at_offset(uint32_t flash_offset, int slot_index, logger_flash_metadata_slot_state_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->slot = slot_index;
+
+    const uint8_t *raw = (const uint8_t *)(XIP_BASE + flash_offset);
     const logger_flash_metadata_record_t *record = (const logger_flash_metadata_record_t *)raw;
     if (!logger_flash_metadata_record_valid(record)) {
         return false;
@@ -564,39 +590,107 @@ static bool logger_flash_metadata_slot_load(unsigned slot, logger_flash_metadata
     return true;
 }
 
-static bool logger_flash_select_latest_config(logger_flash_config_slot_state_t *out) {
-    logger_flash_config_slot_state_t slot0;
-    logger_flash_config_slot_state_t slot1;
-    const bool valid0 = logger_flash_config_slot_load(0u, &slot0);
-    const bool valid1 = logger_flash_config_slot_load(1u, &slot1);
+static bool logger_flash_metadata_slot_load(unsigned slot, logger_flash_metadata_slot_state_t *out) {
+    return logger_flash_metadata_slot_load_at_offset(logger_flash_metadata_slot_offset(slot), (int)slot, out);
+}
 
-    if (valid0 && (!valid1 || slot0.sequence >= slot1.sequence)) {
-        *out = slot0;
+static bool logger_flash_select_latest_config(logger_flash_config_slot_state_t *out) {
+    bool found = false;
+    logger_flash_config_slot_state_t best = {0};
+
+    for (unsigned slot = 0u; slot < LOGGER_FLASH_CONFIG_SLOT_COUNT; ++slot) {
+        logger_flash_config_slot_state_t candidate;
+        if (!logger_flash_config_slot_load(slot, &candidate)) {
+            continue;
+        }
+        if (!found || candidate.sequence >= best.sequence) {
+            best = candidate;
+            found = true;
+        }
+    }
+
+    if (found) {
+        *out = best;
         return true;
     }
-    if (valid1) {
-        *out = slot1;
-        return true;
-    }
+
     memset(out, 0, sizeof(*out));
     out->slot = -1;
     return false;
 }
 
 static bool logger_flash_select_latest_metadata(logger_flash_metadata_slot_state_t *out) {
-    logger_flash_metadata_slot_state_t slot0;
-    logger_flash_metadata_slot_state_t slot1;
-    const bool valid0 = logger_flash_metadata_slot_load(0u, &slot0);
-    const bool valid1 = logger_flash_metadata_slot_load(1u, &slot1);
+    bool found = false;
+    logger_flash_metadata_slot_state_t best = {0};
 
-    if (valid0 && (!valid1 || slot0.sequence >= slot1.sequence)) {
-        *out = slot0;
+    for (unsigned slot = 0u; slot < LOGGER_FLASH_METADATA_SLOT_COUNT; ++slot) {
+        logger_flash_metadata_slot_state_t candidate;
+        if (!logger_flash_metadata_slot_load(slot, &candidate)) {
+            continue;
+        }
+        if (!found || candidate.sequence >= best.sequence) {
+            best = candidate;
+            found = true;
+        }
+    }
+
+    if (found) {
+        *out = best;
         return true;
     }
-    if (valid1) {
-        *out = slot1;
+
+    memset(out, 0, sizeof(*out));
+    out->slot = -1;
+    return false;
+}
+
+static bool logger_flash_select_latest_legacy_config(logger_flash_config_slot_state_t *out) {
+    bool found = false;
+    logger_flash_config_slot_state_t best = {0};
+
+    for (unsigned slot = 0u; slot < LOGGER_FLASH_LEGACY_CONFIG_SLOT_COUNT; ++slot) {
+        logger_flash_config_slot_state_t candidate;
+        if (!logger_flash_config_slot_load_at_offset(logger_flash_legacy_config_slot_offset(slot), -1, &candidate)) {
+            continue;
+        }
+        if (!found || candidate.sequence >= best.sequence) {
+            best = candidate;
+            found = true;
+        }
+    }
+
+    if (found) {
+        *out = best;
+        out->slot = -1;
         return true;
     }
+
+    memset(out, 0, sizeof(*out));
+    out->slot = -1;
+    return false;
+}
+
+static bool logger_flash_select_latest_legacy_metadata(logger_flash_metadata_slot_state_t *out) {
+    bool found = false;
+    logger_flash_metadata_slot_state_t best = {0};
+
+    for (unsigned slot = 0u; slot < LOGGER_FLASH_LEGACY_METADATA_SLOT_COUNT; ++slot) {
+        logger_flash_metadata_slot_state_t candidate;
+        if (!logger_flash_metadata_slot_load_at_offset(logger_flash_legacy_metadata_slot_offset(slot), -1, &candidate)) {
+            continue;
+        }
+        if (!found || candidate.sequence >= best.sequence) {
+            best = candidate;
+            found = true;
+        }
+    }
+
+    if (found) {
+        *out = best;
+        out->slot = -1;
+        return true;
+    }
+
     memset(out, 0, sizeof(*out));
     out->slot = -1;
     return false;
@@ -613,13 +707,20 @@ bool logger_config_store_load(logger_persisted_state_t *state) {
 
     logger_flash_config_slot_state_t config_slot;
     logger_flash_metadata_slot_state_t metadata_slot;
-    const bool have_config = logger_flash_select_latest_config(&config_slot);
-    const bool have_metadata = logger_flash_select_latest_metadata(&metadata_slot);
+    bool have_config = logger_flash_select_latest_config(&config_slot);
+    bool have_metadata = logger_flash_select_latest_metadata(&metadata_slot);
+    if (!have_config) {
+        have_config = logger_flash_select_latest_legacy_config(&config_slot);
+    }
+    if (!have_metadata) {
+        have_metadata = logger_flash_select_latest_legacy_metadata(&metadata_slot);
+    }
 
     if (have_config) {
         state->config = config_slot.config;
         g_store.config_valid = true;
         g_store.config_split_format = config_slot.split_format;
+        g_store.config_in_legacy_region = config_slot.slot < 0;
         g_store.config_sequence = config_slot.sequence;
         g_store.config_slot = config_slot.slot;
         g_store.config = config_slot.config;
@@ -628,18 +729,21 @@ bool logger_config_store_load(logger_persisted_state_t *state) {
     if (have_metadata) {
         logger_state_apply_metadata(state, &metadata_slot.metadata);
         g_store.metadata_region_valid = true;
+        g_store.metadata_in_legacy_region = metadata_slot.slot < 0;
         g_store.metadata_sequence = metadata_slot.sequence;
         g_store.metadata_slot = metadata_slot.slot;
         g_store.metadata = metadata_slot.metadata;
     } else if (have_config && config_slot.carries_legacy_metadata) {
         logger_state_apply_metadata(state, &config_slot.metadata);
         g_store.metadata_region_valid = false;
+        g_store.metadata_in_legacy_region = false;
         g_store.metadata_sequence = config_slot.sequence;
         g_store.metadata_slot = -1;
         g_store.metadata = config_slot.metadata;
     } else {
         logger_metadata_init(&g_store.metadata);
         g_store.metadata_region_valid = false;
+        g_store.metadata_in_legacy_region = false;
         g_store.metadata_sequence = 0u;
         g_store.metadata_slot = -1;
     }
@@ -678,10 +782,11 @@ static bool logger_config_store_write_metadata(const logger_persisted_metadata_t
                        metadata->last_boot_build_id);
     record.crc32 = logger_crc32_ieee((const uint8_t *)&record, sizeof(record));
 
-    const unsigned target_slot = (g_store.metadata_slot == 0) ? 1u : 0u;
+    const unsigned target_slot = logger_flash_next_slot(g_store.metadata_slot, LOGGER_FLASH_METADATA_SLOT_COUNT);
     logger_flash_program_slot(logger_flash_metadata_slot_offset(target_slot), &record, sizeof(record));
 
     g_store.metadata_region_valid = true;
+    g_store.metadata_in_legacy_region = false;
     g_store.metadata_sequence = record.sequence;
     g_store.metadata_slot = (int)target_slot;
     g_store.metadata = *metadata;
@@ -699,11 +804,12 @@ static bool logger_config_store_write_config(const logger_config_t *config) {
     record.config = *config;
     record.crc32 = logger_crc32_ieee((const uint8_t *)&record, sizeof(record));
 
-    const unsigned target_slot = (g_store.config_slot == 0) ? 1u : 0u;
+    const unsigned target_slot = logger_flash_next_slot(g_store.config_slot, LOGGER_FLASH_CONFIG_SLOT_COUNT);
     logger_flash_program_slot(logger_flash_config_slot_offset(target_slot), &record, sizeof(record));
 
     g_store.config_valid = true;
     g_store.config_split_format = true;
+    g_store.config_in_legacy_region = false;
     g_store.config_sequence = record.sequence;
     g_store.config_slot = (int)target_slot;
     g_store.config = *config;
@@ -726,8 +832,8 @@ bool logger_config_store_save(logger_persisted_state_t *state) {
 
     const bool config_changed = memcmp(&normalized_config, &g_store.config, sizeof(normalized_config)) != 0;
     const bool metadata_changed = memcmp(&normalized_metadata, &g_store.metadata, sizeof(normalized_metadata)) != 0;
-    const bool write_metadata = metadata_changed || !g_store.metadata_region_valid;
-    const bool write_config = config_changed || (g_store.config_valid && !g_store.config_split_format);
+    const bool write_metadata = metadata_changed || !g_store.metadata_region_valid || g_store.metadata_in_legacy_region;
+    const bool write_config = config_changed || (g_store.config_valid && !g_store.config_split_format) || g_store.config_in_legacy_region;
 
     if (write_metadata && !logger_config_store_write_metadata(&normalized_metadata)) {
         return false;

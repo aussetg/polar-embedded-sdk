@@ -18,6 +18,7 @@
 #include "mbedtls/ssl.h"
 
 #include "logger/json.h"
+#include "logger/json_writer.h"
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
 
@@ -906,23 +907,58 @@ static logger_upload_queue_entry_t *logger_upload_queue_find_eligible_session(
     return NULL;
 }
 
-static void logger_upload_append_event(
+static void logger_upload_append_failure_event(
     logger_system_log_t *system_log,
     const char *now_utc_or_null,
     const char *kind,
     logger_system_log_severity_t severity,
     const char *session_id,
-    const char *extra_json_tail) {
+    const char *failure_class) {
     if (system_log == NULL) {
         return;
     }
+
     char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
-    if (logger_string_present(extra_json_tail)) {
-        snprintf(details, sizeof(details), "{\"session_id\":\"%s\",%s}", session_id, extra_json_tail);
-    } else {
-        snprintf(details, sizeof(details), "{\"session_id\":\"%s\"}", session_id);
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "session_id", session_id) ||
+        !logger_json_object_writer_string_field(&writer, "failure_class", failure_class) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
     }
-    (void)logger_system_log_append(system_log, now_utc_or_null, kind, severity, details);
+
+    (void)logger_system_log_append(system_log,
+                                   now_utc_or_null,
+                                   kind,
+                                   severity,
+                                   logger_json_object_writer_data(&writer));
+}
+
+static void logger_upload_append_verified_event(
+    logger_system_log_t *system_log,
+    const char *now_utc_or_null,
+    const char *session_id,
+    const char *receipt_id,
+    bool deduplicated) {
+    if (system_log == NULL) {
+        return;
+    }
+
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "session_id", session_id) ||
+        !logger_json_object_writer_string_field(&writer, "receipt_id", receipt_id) ||
+        !logger_json_object_writer_bool_field(&writer, "deduplicated", deduplicated) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
+
+    (void)logger_system_log_append(system_log,
+                                   now_utc_or_null,
+                                   "upload_verified",
+                                   LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+                                   logger_json_object_writer_data(&writer));
 }
 
 static bool logger_upload_recompute_entry_bundle(logger_upload_queue_entry_t *entry, char *message, size_t message_len) {
@@ -1145,12 +1181,12 @@ static bool logger_upload_process_selected(
         result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
         logger_copy_string(result->final_status, sizeof(result->final_status), entry->status);
         logger_copy_string(result->failure_class, sizeof(result->failure_class), entry->last_failure_class);
-        logger_upload_append_event(system_log,
-                                   now_utc_or_null,
-                                   "upload_failed",
-                                   LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-                                   entry->session_id,
-                                   "\"failure_class\":\"local_corrupt\"");
+        logger_upload_append_failure_event(system_log,
+                                           now_utc_or_null,
+                                           "upload_failed",
+                                           LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+                                           entry->session_id,
+                                           "local_corrupt");
         return false;
     }
 
@@ -1188,12 +1224,12 @@ static bool logger_upload_process_selected(
         logger_copy_string(result->final_status, sizeof(result->final_status), entry->status);
         logger_copy_string(result->failure_class, sizeof(result->failure_class), entry->last_failure_class);
         snprintf(result->message, sizeof(result->message), "Wi-Fi join failed rc=%d", wifi_rc);
-        logger_upload_append_event(system_log,
-                                   now_utc_or_null,
-                                   "upload_failed",
-                                   LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-                                   entry->session_id,
-                                   "\"failure_class\":\"wifi_join_failed\"");
+        logger_upload_append_failure_event(system_log,
+                                           now_utc_or_null,
+                                           "upload_failed",
+                                           LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+                                           entry->session_id,
+                                           "wifi_join_failed");
         return false;
     }
 
@@ -1289,17 +1325,12 @@ static bool logger_upload_process_selected(
         logger_copy_string(result->message,
                            sizeof(result->message),
                            url.https ? "HTTPS upload transport failed" : "HTTP upload transport failed");
-        char extra[160];
-        snprintf(extra,
-                 sizeof(extra),
-                 "\"failure_class\":\"%s\"",
-                 entry->last_failure_class);
-        logger_upload_append_event(system_log,
-                                   now_utc_or_null,
-                                   "upload_failed",
-                                   LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-                                   entry->session_id,
-                                   extra);
+        logger_upload_append_failure_event(system_log,
+                                           now_utc_or_null,
+                                           "upload_failed",
+                                           LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+                                           entry->session_id,
+                                           entry->last_failure_class);
         return false;
     }
 
@@ -1318,12 +1349,12 @@ static bool logger_upload_process_selected(
                  sizeof(result->message),
                  "server reply parse failed: %.104s",
                  http_response.body);
-        logger_upload_append_event(system_log,
-                                   now_utc_or_null,
-                                   "upload_failed",
-                                   LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-                                   entry->session_id,
-                                   "\"failure_class\":\"server_validation_failed\"");
+        logger_upload_append_failure_event(system_log,
+                                           now_utc_or_null,
+                                           "upload_failed",
+                                           LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+                                           entry->session_id,
+                                           "server_validation_failed");
         return false;
     }
 
@@ -1341,12 +1372,12 @@ static bool logger_upload_process_selected(
             logger_copy_string(result->final_status, sizeof(result->final_status), entry->status);
             logger_copy_string(result->failure_class, sizeof(result->failure_class), entry->last_failure_class);
             logger_copy_string(result->message, sizeof(result->message), "server acknowledgment did not match uploaded bundle");
-            logger_upload_append_event(system_log,
-                                       now_utc_or_null,
-                                       "upload_failed",
-                                       LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-                                       entry->session_id,
-                                       "\"failure_class\":\"hash_mismatch\"");
+            logger_upload_append_failure_event(system_log,
+                                               now_utc_or_null,
+                                               "upload_failed",
+                                               LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+                                               entry->session_id,
+                                               "hash_mismatch");
             return false;
         }
 
@@ -1368,18 +1399,11 @@ static bool logger_upload_process_selected(
         logger_copy_string(result->receipt_id, sizeof(result->receipt_id), entry->receipt_id);
         logger_copy_string(result->verified_upload_utc, sizeof(result->verified_upload_utc), entry->verified_upload_utc);
         snprintf(result->message, sizeof(result->message), "verified via %s", reply.deduplicated ? "deduplicated ack" : "server ack");
-        char extra[160];
-        snprintf(extra,
-                 sizeof(extra),
-                 "\"receipt_id\":\"%s\",\"deduplicated\":%s",
-                 entry->receipt_id,
-                 reply.deduplicated ? "true" : "false");
-        logger_upload_append_event(system_log,
-                                   now_utc_or_null,
-                                   "upload_verified",
-                                   LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-                                   entry->session_id,
-                                   extra);
+        logger_upload_append_verified_event(system_log,
+                                            now_utc_or_null,
+                                            entry->session_id,
+                                            entry->receipt_id,
+                                            reply.deduplicated);
         return true;
     }
 
@@ -1402,14 +1426,14 @@ static bool logger_upload_process_selected(
     logger_copy_string(result->message,
                        sizeof(result->message),
                        logger_string_present(reply.error_message) ? reply.error_message : "server rejected upload");
-    logger_upload_append_event(system_log,
-                               now_utc_or_null,
-                               result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE ? "upload_blocked_min_firmware" : "upload_failed",
-                               LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-                               entry->session_id,
-                               result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE
-                                   ? "\"failure_class\":\"min_firmware_rejected\""
-                                   : "\"failure_class\":\"http_rejected\"");
+    logger_upload_append_failure_event(system_log,
+                                       now_utc_or_null,
+                                       result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE ? "upload_blocked_min_firmware" : "upload_failed",
+                                       LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+                                       entry->session_id,
+                                       result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE
+                                           ? "min_firmware_rejected"
+                                           : "http_rejected");
     return result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE;
 }
 

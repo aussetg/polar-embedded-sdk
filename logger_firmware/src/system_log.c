@@ -26,10 +26,12 @@ typedef struct __attribute__((packed)) {
     uint8_t reserved[3];
     char utc[32];
     char kind[32];
-    char details_json[168];
+    char details_json[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1u];
 } logger_system_log_record_t;
 
-static_assert(sizeof(logger_system_log_record_t) == LOGGER_FLASH_SYSTEM_LOG_RECORD_SIZE, "system log record must fit one flash page");
+static_assert(sizeof(logger_system_log_record_t) == LOGGER_FLASH_SYSTEM_LOG_RECORD_SIZE, "system log record size mismatch");
+static_assert((sizeof(logger_system_log_record_t) - sizeof(((logger_system_log_record_t *)0)->details_json)) == LOGGER_SYSTEM_LOG_RECORD_FIXED_BYTES,
+              "system log fixed record bytes mismatch");
 
 static uint32_t logger_crc32_ieee(const uint8_t *data, size_t len) {
     uint32_t crc = 0xffffffffu;

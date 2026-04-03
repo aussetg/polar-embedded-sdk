@@ -40,6 +40,12 @@ The appliance keeps its hot-path study data on the SD card.
 
 The internal flash layout deliberately separates cold config from hotter boot/fault metadata so ordinary boots and fault latching do not rewrite the large config/certificate blob.
 
+The reserved internal-flash region is intentionally generous:
+
+- config/TLS and boot/fault metadata each use multi-slot append-only sector rotation for simple wear spreading,
+- the system log uses larger fixed records so detail payloads do not have to be squeezed into tiny JSON fragments,
+- everything remains raw-flash and sequence/CRC based rather than pulling in a filesystem for a handful of structured records.
+
 ## Build
 
 The build defaults to the canonical RP2-2 board profile and reuses the existing pico-sdk board header from:

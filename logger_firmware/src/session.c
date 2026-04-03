@@ -10,6 +10,7 @@
 #include "board_config.h"
 #include "logger/h10.h"
 #include "logger/json.h"
+#include "logger/json_writer.h"
 #include "logger/queue.h"
 #include "logger/sha256.h"
 
@@ -752,18 +753,19 @@ static bool logger_session_finalize_internal(
         return false;
     }
 
-    char details[128];
-    snprintf(details,
-             sizeof(details),
-             "{\"debug\":%s,\"reason\":\"%s\"}",
-             debug_session ? "true" : "false",
-             end_reason);
-    (void)logger_system_log_append(
-        system_log,
-        clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
-        "session_closed",
-        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        details);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (logger_json_object_writer_bool_field(&writer, "debug", debug_session) &&
+        logger_json_object_writer_string_field(&writer, "reason", end_reason) &&
+        logger_json_object_writer_finish(&writer)) {
+        (void)logger_system_log_append(
+            system_log,
+            clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
+            "session_closed",
+            LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+            logger_json_object_writer_data(&writer));
+    }
     logger_session_init(session);
     return true;
 }
@@ -887,17 +889,18 @@ static bool logger_session_start_new_active_internal(
         return false;
     }
 
-    char details[96];
-    snprintf(details,
-             sizeof(details),
-             "{\"debug\":%s}",
-             debug_session ? "true" : "false");
-    (void)logger_system_log_append(
-        system_log,
-        clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
-        "session_started",
-        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        details);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (logger_json_object_writer_bool_field(&writer, "debug", debug_session) &&
+        logger_json_object_writer_finish(&writer)) {
+        (void)logger_system_log_append(
+            system_log,
+            clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
+            "session_started",
+            LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+            logger_json_object_writer_data(&writer));
+    }
     return true;
 }
 

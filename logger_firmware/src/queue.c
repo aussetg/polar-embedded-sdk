@@ -6,6 +6,7 @@
 #include "ff.h"
 
 #include "logger/json.h"
+#include "logger/json_writer.h"
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
 
@@ -116,22 +117,20 @@ static void logger_log_local_corrupt(
     if (system_log == NULL) {
         return;
     }
-    char dir_escaped[160];
-    char reason_escaped[96];
-    logger_json_escape_into(dir_escaped, sizeof(dir_escaped), dir_name);
-    logger_json_escape_into(reason_escaped, sizeof(reason_escaped), reason);
-    char details[320];
-    snprintf(details,
-             sizeof(details),
-             "{\"dir_name\":\"%s\",\"reason\":\"%s\"}",
-             dir_escaped,
-             reason_escaped);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "dir_name", dir_name) ||
+        !logger_json_object_writer_string_field(&writer, "reason", reason) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
     (void)logger_system_log_append(
         system_log,
         updated_at_utc_or_null,
         "local_session_corrupt",
         LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-        details);
+        logger_json_object_writer_data(&writer));
 }
 
 static void logger_log_queue_missing_local(
@@ -141,22 +140,20 @@ static void logger_log_queue_missing_local(
     if (system_log == NULL || entry == NULL) {
         return;
     }
-    char dir_escaped[160];
-    char session_escaped[96];
-    logger_json_escape_into(dir_escaped, sizeof(dir_escaped), entry->dir_name);
-    logger_json_escape_into(session_escaped, sizeof(session_escaped), entry->session_id);
-    char details[320];
-    snprintf(details,
-             sizeof(details),
-             "{\"dir_name\":\"%s\",\"session_id\":\"%s\"}",
-             dir_escaped,
-             session_escaped);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "dir_name", entry->dir_name) ||
+        !logger_json_object_writer_string_field(&writer, "session_id", entry->session_id) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
     (void)logger_system_log_append(
         system_log,
         updated_at_utc_or_null,
         "queue_missing_local_removed",
         LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-        details);
+        logger_json_object_writer_data(&writer));
 }
 
 static void logger_log_queue_rebuilt(
@@ -166,16 +163,19 @@ static void logger_log_queue_rebuilt(
     if (system_log == NULL) {
         return;
     }
-    char reason_escaped[96];
-    logger_json_escape_into(reason_escaped, sizeof(reason_escaped), reason);
-    char details[160];
-    snprintf(details, sizeof(details), "{\"reason\":\"%s\"}", reason_escaped);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "reason", reason) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
     (void)logger_system_log_append(
         system_log,
         updated_at_utc_or_null,
         "upload_queue_rebuilt",
         LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-        details);
+        logger_json_object_writer_data(&writer));
 }
 
 static void logger_log_queue_requeued(
@@ -186,20 +186,20 @@ static void logger_log_queue_requeued(
     if (system_log == NULL) {
         return;
     }
-    char reason_escaped[96];
-    logger_json_escape_into(reason_escaped, sizeof(reason_escaped), reason);
-    char details[192];
-    snprintf(details,
-             sizeof(details),
-             "{\"reason\":\"%s\",\"count\":%lu}",
-             reason_escaped,
-             (unsigned long)count);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "reason", reason) ||
+        !logger_json_object_writer_size_field(&writer, "count", count) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
     (void)logger_system_log_append(
         system_log,
         updated_at_utc_or_null,
         "upload_queue_requeued",
         LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        details);
+        logger_json_object_writer_data(&writer));
 }
 
 static void logger_log_session_pruned(
@@ -210,25 +210,21 @@ static void logger_log_session_pruned(
     if (system_log == NULL || entry == NULL) {
         return;
     }
-    char session_escaped[96];
-    char dir_escaped[160];
-    char reason_escaped[64];
-    logger_json_escape_into(session_escaped, sizeof(session_escaped), entry->session_id);
-    logger_json_escape_into(dir_escaped, sizeof(dir_escaped), entry->dir_name);
-    logger_json_escape_into(reason_escaped, sizeof(reason_escaped), reason);
-    char details[384];
-    snprintf(details,
-             sizeof(details),
-             "{\"session_id\":\"%s\",\"dir_name\":\"%s\",\"reason\":\"%s\"}",
-             session_escaped,
-             dir_escaped,
-             reason_escaped);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "session_id", entry->session_id) ||
+        !logger_json_object_writer_string_field(&writer, "dir_name", entry->dir_name) ||
+        !logger_json_object_writer_string_field(&writer, "reason", reason) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
     (void)logger_system_log_append(
         system_log,
         updated_at_utc_or_null,
         "session_pruned",
         LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        details);
+        logger_json_object_writer_data(&writer));
 }
 
 static void logger_log_upload_interrupted(
@@ -238,16 +234,19 @@ static void logger_log_upload_interrupted(
     if (system_log == NULL || entry == NULL) {
         return;
     }
-    char session_escaped[96];
-    logger_json_escape_into(session_escaped, sizeof(session_escaped), entry->session_id);
-    char details[160];
-    snprintf(details, sizeof(details), "{\"session_id\":\"%s\"}", session_escaped);
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+    if (!logger_json_object_writer_string_field(&writer, "session_id", entry->session_id) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
     (void)logger_system_log_append(
         system_log,
         updated_at_utc_or_null,
         "upload_interrupted_recovered",
         LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-        details);
+        logger_json_object_writer_data(&writer));
 }
 
 static bool logger_queue_status_valid(const char *status) {
@@ -452,13 +451,13 @@ static bool logger_queue_entry_retention_expired(
            (uint64_t)(now_seconds - verified_seconds) >= (uint64_t)LOGGER_UPLOAD_RETENTION_SECONDS;
 }
 
-static ssize_t logger_upload_queue_find_oldest_verified(const logger_upload_queue_t *queue) {
+static int logger_upload_queue_find_oldest_verified(const logger_upload_queue_t *queue) {
     if (queue == NULL) {
         return -1;
     }
     for (size_t i = 0u; i < queue->session_count; ++i) {
         if (strcmp(queue->sessions[i].status, "verified") == 0) {
-            return (ssize_t)i;
+            return (int)i;
         }
     }
     return -1;
@@ -972,7 +971,7 @@ bool logger_upload_queue_prune_file(
     }
 
     while (storage.free_bytes < reserve_bytes) {
-        const ssize_t oldest_verified_index = logger_upload_queue_find_oldest_verified(&queue);
+        const int oldest_verified_index = logger_upload_queue_find_oldest_verified(&queue);
         if (oldest_verified_index < 0) {
             break;
         }
