@@ -28,6 +28,18 @@ It is intentionally separate from:
 - `examples/pico_sdk/` — isolation probes and experiments
 - `firmware/` — current MicroPython board/build support
 
+## Persistence
+
+The appliance keeps its hot-path study data on the SD card.
+
+- `journal.bin`, manifests, queue state, and other log-like artifacts live on FAT32 SD storage.
+- Onboard flash is reserved for small internal state only:
+  - provisioned config + TLS material,
+  - boot/fault metadata,
+  - the sparse internal system log.
+
+The internal flash layout deliberately separates cold config from hotter boot/fault metadata so ordinary boots and fault latching do not rewrite the large config/certificate blob.
+
 ## Build
 
 The build defaults to the canonical RP2-2 board profile and reuses the existing pico-sdk board header from:

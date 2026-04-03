@@ -51,10 +51,13 @@ typedef struct {
     logger_config_t config;
     char last_boot_firmware_version[LOGGER_PERSISTED_FIRMWARE_VERSION_MAX];
     char last_boot_build_id[LOGGER_PERSISTED_BUILD_ID_MAX];
-    uint32_t storage_sequence;
-    int storage_slot;
-    bool storage_valid;
 } logger_persisted_state_t;
+
+/*
+ * Unified persisted state exposed to the firmware. The storage backend keeps
+ * cold config/TLS material and hotter boot/fault metadata in separate flash
+ * regions so ordinary boots do not rewrite the large config blob.
+ */
 
 void logger_config_init(logger_config_t *config);
 void logger_persisted_state_init(logger_persisted_state_t *state);

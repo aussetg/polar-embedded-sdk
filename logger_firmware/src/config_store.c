@@ -12,11 +12,17 @@
 
 #include "logger/flash_layout.h"
 
-#define LOGGER_FLASH_MAGIC 0x31474643u
-#define LOGGER_FLASH_SCHEMA_VERSION 3u
+#define LOGGER_FLASH_CONFIG_MAGIC 0x31474643u
+#define LOGGER_FLASH_CONFIG_SCHEMA_VERSION 4u
+
+#define LOGGER_FLASH_METADATA_MAGIC 0x3141544du
+#define LOGGER_FLASH_METADATA_SCHEMA_VERSION 1u
 
 #define LOGGER_FLASH_CONFIG_SLOT0_OFFSET LOGGER_FLASH_CONFIG_REGION_OFFSET
 #define LOGGER_FLASH_CONFIG_SLOT1_OFFSET (LOGGER_FLASH_CONFIG_SLOT0_OFFSET + LOGGER_FLASH_CONFIG_SLOT_SIZE)
+
+#define LOGGER_FLASH_METADATA_SLOT0_OFFSET LOGGER_FLASH_METADATA_REGION_OFFSET
+#define LOGGER_FLASH_METADATA_SLOT1_OFFSET (LOGGER_FLASH_METADATA_SLOT0_OFFSET + LOGGER_FLASH_METADATA_SLOT_SIZE)
 
 extern char __flash_binary_end;
 
@@ -69,17 +75,74 @@ typedef struct {
     logger_config_t config;
     char last_boot_firmware_version[LOGGER_PERSISTED_FIRMWARE_VERSION_MAX];
     char last_boot_build_id[LOGGER_PERSISTED_BUILD_ID_MAX];
-} logger_flash_record_t;
+} logger_flash_record_v3_t;
 
-_Static_assert(sizeof(logger_flash_record_t) <= LOGGER_FLASH_CONFIG_SLOT_SIZE,
+typedef struct {
+    uint32_t magic;
+    uint16_t schema_version;
+    uint16_t payload_bytes;
+    uint32_t sequence;
+    uint32_t crc32;
+    logger_config_t config;
+} logger_flash_config_record_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t schema_version;
+    uint16_t payload_bytes;
+    uint32_t sequence;
+    uint32_t crc32;
+    uint32_t boot_counter;
+    uint16_t current_fault_code;
+    uint16_t last_cleared_fault_code;
+    char last_boot_firmware_version[LOGGER_PERSISTED_FIRMWARE_VERSION_MAX];
+    char last_boot_build_id[LOGGER_PERSISTED_BUILD_ID_MAX];
+} logger_flash_metadata_record_t;
+
+_Static_assert(sizeof(logger_flash_config_record_t) <= LOGGER_FLASH_CONFIG_SLOT_SIZE,
                "config record no longer fits in a flash slot");
+_Static_assert(sizeof(logger_flash_metadata_record_t) <= LOGGER_FLASH_METADATA_SLOT_SIZE,
+               "metadata record no longer fits in a flash slot");
+
+typedef struct {
+    uint32_t boot_counter;
+    uint16_t current_fault_code;
+    uint16_t last_cleared_fault_code;
+    char last_boot_firmware_version[LOGGER_PERSISTED_FIRMWARE_VERSION_MAX];
+    char last_boot_build_id[LOGGER_PERSISTED_BUILD_ID_MAX];
+} logger_persisted_metadata_t;
 
 typedef struct {
     bool valid;
     uint32_t sequence;
-    logger_persisted_state_t state;
     int slot;
-} logger_flash_slot_state_t;
+    bool split_format;
+    bool carries_legacy_metadata;
+    logger_config_t config;
+    logger_persisted_metadata_t metadata;
+} logger_flash_config_slot_state_t;
+
+typedef struct {
+    bool valid;
+    uint32_t sequence;
+    int slot;
+    logger_persisted_metadata_t metadata;
+} logger_flash_metadata_slot_state_t;
+
+typedef struct {
+    bool loaded;
+    bool config_valid;
+    bool config_split_format;
+    uint32_t config_sequence;
+    int config_slot;
+    logger_config_t config;
+    bool metadata_region_valid;
+    uint32_t metadata_sequence;
+    int metadata_slot;
+    logger_persisted_metadata_t metadata;
+} logger_flash_store_cache_t;
+
+static logger_flash_store_cache_t g_store;
 
 static uint32_t logger_crc32_ieee(const uint8_t *data, size_t len) {
     uint32_t crc = 0xffffffffu;
@@ -93,59 +156,12 @@ static uint32_t logger_crc32_ieee(const uint8_t *data, size_t len) {
     return crc ^ 0xffffffffu;
 }
 
-static uint32_t logger_flash_slot_offset(unsigned slot) {
+static uint32_t logger_flash_config_slot_offset(unsigned slot) {
     return slot == 0u ? LOGGER_FLASH_CONFIG_SLOT0_OFFSET : LOGGER_FLASH_CONFIG_SLOT1_OFFSET;
 }
 
-static bool logger_flash_record_v1_valid(const logger_flash_record_v1_t *record) {
-    if (record->magic != LOGGER_FLASH_MAGIC) {
-        return false;
-    }
-    if (record->schema_version != 1u) {
-        return false;
-    }
-    if (record->payload_bytes != sizeof(logger_flash_record_v1_t)) {
-        return false;
-    }
-
-    logger_flash_record_v1_t copy = *record;
-    copy.crc32 = 0u;
-    const uint32_t crc = logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy));
-    return crc == record->crc32;
-}
-
-static bool logger_flash_record_v2_valid(const logger_flash_record_v2_t *record) {
-    if (record->magic != LOGGER_FLASH_MAGIC) {
-        return false;
-    }
-    if (record->schema_version != 2u) {
-        return false;
-    }
-    if (record->payload_bytes != sizeof(logger_flash_record_v2_t)) {
-        return false;
-    }
-
-    logger_flash_record_v2_t copy = *record;
-    copy.crc32 = 0u;
-    const uint32_t crc = logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy));
-    return crc == record->crc32;
-}
-
-static bool logger_flash_record_valid(const logger_flash_record_t *record) {
-    if (record->magic != LOGGER_FLASH_MAGIC) {
-        return false;
-    }
-    if (record->schema_version != LOGGER_FLASH_SCHEMA_VERSION) {
-        return false;
-    }
-    if (record->payload_bytes != sizeof(logger_flash_record_t)) {
-        return false;
-    }
-
-    logger_flash_record_t copy = *record;
-    copy.crc32 = 0u;
-    const uint32_t crc = logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy));
-    return crc == record->crc32;
+static uint32_t logger_flash_metadata_slot_offset(unsigned slot) {
+    return slot == 0u ? LOGGER_FLASH_METADATA_SLOT0_OFFSET : LOGGER_FLASH_METADATA_SLOT1_OFFSET;
 }
 
 static void logger_copy_string(char *dst, size_t dst_len, const char *src) {
@@ -170,6 +186,86 @@ static bool logger_string_present(const char *value) {
 
 static bool logger_upload_url_uses_https(const char *value) {
     return logger_string_present(value) && strncmp(value, "https://", 8u) == 0;
+}
+
+static bool logger_flash_record_v1_valid(const logger_flash_record_v1_t *record) {
+    if (record->magic != LOGGER_FLASH_CONFIG_MAGIC) {
+        return false;
+    }
+    if (record->schema_version != 1u) {
+        return false;
+    }
+    if (record->payload_bytes != sizeof(logger_flash_record_v1_t)) {
+        return false;
+    }
+
+    logger_flash_record_v1_t copy = *record;
+    copy.crc32 = 0u;
+    return logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy)) == record->crc32;
+}
+
+static bool logger_flash_record_v2_valid(const logger_flash_record_v2_t *record) {
+    if (record->magic != LOGGER_FLASH_CONFIG_MAGIC) {
+        return false;
+    }
+    if (record->schema_version != 2u) {
+        return false;
+    }
+    if (record->payload_bytes != sizeof(logger_flash_record_v2_t)) {
+        return false;
+    }
+
+    logger_flash_record_v2_t copy = *record;
+    copy.crc32 = 0u;
+    return logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy)) == record->crc32;
+}
+
+static bool logger_flash_record_v3_valid(const logger_flash_record_v3_t *record) {
+    if (record->magic != LOGGER_FLASH_CONFIG_MAGIC) {
+        return false;
+    }
+    if (record->schema_version != 3u) {
+        return false;
+    }
+    if (record->payload_bytes != sizeof(logger_flash_record_v3_t)) {
+        return false;
+    }
+
+    logger_flash_record_v3_t copy = *record;
+    copy.crc32 = 0u;
+    return logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy)) == record->crc32;
+}
+
+static bool logger_flash_config_record_valid(const logger_flash_config_record_t *record) {
+    if (record->magic != LOGGER_FLASH_CONFIG_MAGIC) {
+        return false;
+    }
+    if (record->schema_version != LOGGER_FLASH_CONFIG_SCHEMA_VERSION) {
+        return false;
+    }
+    if (record->payload_bytes != sizeof(logger_flash_config_record_t)) {
+        return false;
+    }
+
+    logger_flash_config_record_t copy = *record;
+    copy.crc32 = 0u;
+    return logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy)) == record->crc32;
+}
+
+static bool logger_flash_metadata_record_valid(const logger_flash_metadata_record_t *record) {
+    if (record->magic != LOGGER_FLASH_METADATA_MAGIC) {
+        return false;
+    }
+    if (record->schema_version != LOGGER_FLASH_METADATA_SCHEMA_VERSION) {
+        return false;
+    }
+    if (record->payload_bytes != sizeof(logger_flash_metadata_record_t)) {
+        return false;
+    }
+
+    logger_flash_metadata_record_t copy = *record;
+    copy.crc32 = 0u;
+    return logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy)) == record->crc32;
 }
 
 static void logger_copy_legacy_config(logger_config_t *dst, const logger_flash_config_v1_v2_t *src) {
@@ -272,105 +368,113 @@ void logger_persisted_state_init(logger_persisted_state_t *state) {
     logger_config_init(&state->config);
     state->current_fault_code = LOGGER_FAULT_NONE;
     state->last_cleared_fault_code = LOGGER_FAULT_NONE;
-    state->storage_slot = -1;
 }
 
-static void logger_state_from_record(logger_persisted_state_t *state, const logger_flash_record_t *record, int slot) {
-    state->boot_counter = record->boot_counter;
-    state->current_fault_code = (logger_fault_code_t)record->current_fault_code;
-    state->last_cleared_fault_code = (logger_fault_code_t)record->last_cleared_fault_code;
-    state->config = record->config;
-    logger_config_sanitize_upload_tls(&state->config);
+static void logger_metadata_init(logger_persisted_metadata_t *metadata) {
+    memset(metadata, 0, sizeof(*metadata));
+    metadata->current_fault_code = (uint16_t)LOGGER_FAULT_NONE;
+    metadata->last_cleared_fault_code = (uint16_t)LOGGER_FAULT_NONE;
+}
+
+static void logger_metadata_from_state(
+    const logger_persisted_state_t *state,
+    logger_persisted_metadata_t *metadata) {
+    logger_metadata_init(metadata);
+    metadata->boot_counter = state->boot_counter;
+    metadata->current_fault_code = (uint16_t)state->current_fault_code;
+    metadata->last_cleared_fault_code = (uint16_t)state->last_cleared_fault_code;
+    logger_copy_string(metadata->last_boot_firmware_version,
+                       sizeof(metadata->last_boot_firmware_version),
+                       state->last_boot_firmware_version);
+    logger_copy_string(metadata->last_boot_build_id,
+                       sizeof(metadata->last_boot_build_id),
+                       state->last_boot_build_id);
+}
+
+static void logger_state_apply_metadata(
+    logger_persisted_state_t *state,
+    const logger_persisted_metadata_t *metadata) {
+    state->boot_counter = metadata->boot_counter;
+    state->current_fault_code = (logger_fault_code_t)metadata->current_fault_code;
+    state->last_cleared_fault_code = (logger_fault_code_t)metadata->last_cleared_fault_code;
     logger_copy_string(state->last_boot_firmware_version,
                        sizeof(state->last_boot_firmware_version),
-                       record->last_boot_firmware_version);
+                       metadata->last_boot_firmware_version);
     logger_copy_string(state->last_boot_build_id,
                        sizeof(state->last_boot_build_id),
-                       record->last_boot_build_id);
-    state->storage_sequence = record->sequence;
-    state->storage_slot = slot;
-    state->storage_valid = true;
+                       metadata->last_boot_build_id);
 }
 
-static void logger_state_from_record_v2(
-    logger_persisted_state_t *state,
-    const logger_flash_record_v2_t *record,
-    int slot) {
-    state->boot_counter = record->boot_counter;
-    state->current_fault_code = (logger_fault_code_t)record->current_fault_code;
-    state->last_cleared_fault_code = (logger_fault_code_t)record->last_cleared_fault_code;
-    logger_copy_legacy_config(&state->config, &record->config);
-    logger_config_sanitize_upload_tls(&state->config);
-    logger_copy_string(state->last_boot_firmware_version,
-                       sizeof(state->last_boot_firmware_version),
-                       record->last_boot_firmware_version);
-    logger_copy_string(state->last_boot_build_id,
-                       sizeof(state->last_boot_build_id),
-                       record->last_boot_build_id);
-    state->storage_sequence = record->sequence;
-    state->storage_slot = slot;
-    state->storage_valid = true;
+static void logger_config_normalize(const logger_config_t *src, logger_config_t *dst) {
+    logger_config_init(dst);
+    if (src == NULL) {
+        return;
+    }
+
+    logger_copy_string(dst->logger_id, sizeof(dst->logger_id), src->logger_id);
+    logger_copy_string(dst->subject_id, sizeof(dst->subject_id), src->subject_id);
+    logger_copy_string(dst->bound_h10_address, sizeof(dst->bound_h10_address), src->bound_h10_address);
+    logger_copy_string(dst->timezone, sizeof(dst->timezone), src->timezone);
+    logger_copy_string(dst->upload_url, sizeof(dst->upload_url), src->upload_url);
+    logger_copy_string(dst->upload_token, sizeof(dst->upload_token), src->upload_token);
+    logger_copy_string(dst->wifi_ssid, sizeof(dst->wifi_ssid), src->wifi_ssid);
+    logger_copy_string(dst->wifi_psk, sizeof(dst->wifi_psk), src->wifi_psk);
+    logger_copy_string(dst->upload_tls_mode, sizeof(dst->upload_tls_mode), src->upload_tls_mode);
+
+    if (src->upload_tls_anchor_der_len <= LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX) {
+        dst->upload_tls_anchor_der_len = src->upload_tls_anchor_der_len;
+        if (dst->upload_tls_anchor_der_len > 0u) {
+            memcpy(dst->upload_tls_anchor_der,
+                   src->upload_tls_anchor_der,
+                   dst->upload_tls_anchor_der_len);
+        }
+    }
+    logger_copy_string(dst->upload_tls_anchor_sha256,
+                       sizeof(dst->upload_tls_anchor_sha256),
+                       src->upload_tls_anchor_sha256);
+    logger_copy_string(dst->upload_tls_anchor_subject,
+                       sizeof(dst->upload_tls_anchor_subject),
+                       src->upload_tls_anchor_subject);
+
+    logger_config_sanitize_upload_tls(dst);
 }
 
-static void logger_state_from_record_v1(
-    logger_persisted_state_t *state,
-    const logger_flash_record_v1_t *record,
-    int slot) {
-    state->boot_counter = record->boot_counter;
-    state->current_fault_code = (logger_fault_code_t)record->current_fault_code;
-    state->last_cleared_fault_code = (logger_fault_code_t)record->last_cleared_fault_code;
-    logger_copy_legacy_config(&state->config, &record->config);
-    logger_config_sanitize_upload_tls(&state->config);
-    state->last_boot_firmware_version[0] = '\0';
-    state->last_boot_build_id[0] = '\0';
-    state->storage_sequence = record->sequence;
-    state->storage_slot = slot;
-    state->storage_valid = true;
+static bool logger_flash_layout_is_safe(void) {
+    const uintptr_t binary_end_offset = (uintptr_t)&__flash_binary_end - XIP_BASE;
+    return binary_end_offset <= LOGGER_FLASH_PERSIST_REGION_OFFSET;
 }
 
-static void logger_record_from_state(const logger_persisted_state_t *state, logger_flash_record_t *record) {
-    logger_persisted_state_t sanitized = *state;
-    logger_config_sanitize_upload_tls(&sanitized.config);
-
-    memset(record, 0xff, sizeof(*record));
-    record->magic = LOGGER_FLASH_MAGIC;
-    record->schema_version = LOGGER_FLASH_SCHEMA_VERSION;
-    record->payload_bytes = sizeof(logger_flash_record_t);
-    record->sequence = sanitized.storage_sequence;
-    record->crc32 = 0u;
-    record->boot_counter = sanitized.boot_counter;
-    record->current_fault_code = (uint16_t)sanitized.current_fault_code;
-    record->last_cleared_fault_code = (uint16_t)sanitized.last_cleared_fault_code;
-    record->config = sanitized.config;
-    logger_copy_string(record->last_boot_firmware_version,
-                       sizeof(record->last_boot_firmware_version),
-                       sanitized.last_boot_firmware_version);
-    logger_copy_string(record->last_boot_build_id,
-                       sizeof(record->last_boot_build_id),
-                       sanitized.last_boot_build_id);
-    record->crc32 = logger_crc32_ieee((const uint8_t *)record, sizeof(*record));
+static void logger_store_cache_reset(void) {
+    memset(&g_store, 0, sizeof(g_store));
+    g_store.config_slot = -1;
+    g_store.metadata_slot = -1;
 }
 
-static bool logger_flash_slot_load(unsigned slot, logger_flash_slot_state_t *out) {
+static bool logger_flash_config_slot_load(unsigned slot, logger_flash_config_slot_state_t *out) {
     memset(out, 0, sizeof(*out));
     out->slot = (int)slot;
 
-    const uint8_t *raw = (const uint8_t *)(XIP_BASE + logger_flash_slot_offset(slot));
+    const uint8_t *raw = (const uint8_t *)(XIP_BASE + logger_flash_config_slot_offset(slot));
     const uint32_t magic = *(const uint32_t *)raw;
     const uint16_t schema_version = *(const uint16_t *)(raw + 4u);
 
-    if (magic != LOGGER_FLASH_MAGIC) {
+    if (magic != LOGGER_FLASH_CONFIG_MAGIC) {
         return false;
     }
 
-    logger_persisted_state_init(&out->state);
+    logger_metadata_init(&out->metadata);
     if (schema_version == 1u) {
         const logger_flash_record_v1_t *record = (const logger_flash_record_v1_t *)raw;
         if (!logger_flash_record_v1_valid(record)) {
             return false;
         }
-        logger_state_from_record_v1(&out->state, record, (int)slot);
+        logger_copy_legacy_config(&out->config, &record->config);
+        out->metadata.boot_counter = record->boot_counter;
+        out->metadata.current_fault_code = record->current_fault_code;
+        out->metadata.last_cleared_fault_code = record->last_cleared_fault_code;
         out->sequence = record->sequence;
+        out->split_format = false;
+        out->carries_legacy_metadata = true;
         out->valid = true;
         return true;
     }
@@ -380,19 +484,54 @@ static bool logger_flash_slot_load(unsigned slot, logger_flash_slot_state_t *out
         if (!logger_flash_record_v2_valid(record)) {
             return false;
         }
-        logger_state_from_record_v2(&out->state, record, (int)slot);
+        logger_copy_legacy_config(&out->config, &record->config);
+        out->metadata.boot_counter = record->boot_counter;
+        out->metadata.current_fault_code = record->current_fault_code;
+        out->metadata.last_cleared_fault_code = record->last_cleared_fault_code;
+        logger_copy_string(out->metadata.last_boot_firmware_version,
+                           sizeof(out->metadata.last_boot_firmware_version),
+                           record->last_boot_firmware_version);
+        logger_copy_string(out->metadata.last_boot_build_id,
+                           sizeof(out->metadata.last_boot_build_id),
+                           record->last_boot_build_id);
         out->sequence = record->sequence;
+        out->split_format = false;
+        out->carries_legacy_metadata = true;
         out->valid = true;
         return true;
     }
 
-    if (schema_version == LOGGER_FLASH_SCHEMA_VERSION) {
-        const logger_flash_record_t *record = (const logger_flash_record_t *)raw;
-        if (!logger_flash_record_valid(record)) {
+    if (schema_version == 3u) {
+        const logger_flash_record_v3_t *record = (const logger_flash_record_v3_t *)raw;
+        if (!logger_flash_record_v3_valid(record)) {
             return false;
         }
-        logger_state_from_record(&out->state, record, (int)slot);
+        logger_config_normalize(&record->config, &out->config);
+        out->metadata.boot_counter = record->boot_counter;
+        out->metadata.current_fault_code = record->current_fault_code;
+        out->metadata.last_cleared_fault_code = record->last_cleared_fault_code;
+        logger_copy_string(out->metadata.last_boot_firmware_version,
+                           sizeof(out->metadata.last_boot_firmware_version),
+                           record->last_boot_firmware_version);
+        logger_copy_string(out->metadata.last_boot_build_id,
+                           sizeof(out->metadata.last_boot_build_id),
+                           record->last_boot_build_id);
         out->sequence = record->sequence;
+        out->split_format = false;
+        out->carries_legacy_metadata = true;
+        out->valid = true;
+        return true;
+    }
+
+    if (schema_version == LOGGER_FLASH_CONFIG_SCHEMA_VERSION) {
+        const logger_flash_config_record_t *record = (const logger_flash_config_record_t *)raw;
+        if (!logger_flash_config_record_valid(record)) {
+            return false;
+        }
+        logger_config_normalize(&record->config, &out->config);
+        out->sequence = record->sequence;
+        out->split_format = true;
+        out->carries_legacy_metadata = false;
         out->valid = true;
         return true;
     }
@@ -400,59 +539,205 @@ static bool logger_flash_slot_load(unsigned slot, logger_flash_slot_state_t *out
     return false;
 }
 
-static bool logger_flash_layout_is_safe(void) {
-    const uintptr_t binary_end_offset = (uintptr_t)&__flash_binary_end - XIP_BASE;
-    return binary_end_offset <= LOGGER_FLASH_PERSIST_REGION_OFFSET;
+static bool logger_flash_metadata_slot_load(unsigned slot, logger_flash_metadata_slot_state_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->slot = (int)slot;
+
+    const uint8_t *raw = (const uint8_t *)(XIP_BASE + logger_flash_metadata_slot_offset(slot));
+    const logger_flash_metadata_record_t *record = (const logger_flash_metadata_record_t *)raw;
+    if (!logger_flash_metadata_record_valid(record)) {
+        return false;
+    }
+
+    logger_metadata_init(&out->metadata);
+    out->metadata.boot_counter = record->boot_counter;
+    out->metadata.current_fault_code = record->current_fault_code;
+    out->metadata.last_cleared_fault_code = record->last_cleared_fault_code;
+    logger_copy_string(out->metadata.last_boot_firmware_version,
+                       sizeof(out->metadata.last_boot_firmware_version),
+                       record->last_boot_firmware_version);
+    logger_copy_string(out->metadata.last_boot_build_id,
+                       sizeof(out->metadata.last_boot_build_id),
+                       record->last_boot_build_id);
+    out->sequence = record->sequence;
+    out->valid = true;
+    return true;
+}
+
+static bool logger_flash_select_latest_config(logger_flash_config_slot_state_t *out) {
+    logger_flash_config_slot_state_t slot0;
+    logger_flash_config_slot_state_t slot1;
+    const bool valid0 = logger_flash_config_slot_load(0u, &slot0);
+    const bool valid1 = logger_flash_config_slot_load(1u, &slot1);
+
+    if (valid0 && (!valid1 || slot0.sequence >= slot1.sequence)) {
+        *out = slot0;
+        return true;
+    }
+    if (valid1) {
+        *out = slot1;
+        return true;
+    }
+    memset(out, 0, sizeof(*out));
+    out->slot = -1;
+    return false;
+}
+
+static bool logger_flash_select_latest_metadata(logger_flash_metadata_slot_state_t *out) {
+    logger_flash_metadata_slot_state_t slot0;
+    logger_flash_metadata_slot_state_t slot1;
+    const bool valid0 = logger_flash_metadata_slot_load(0u, &slot0);
+    const bool valid1 = logger_flash_metadata_slot_load(1u, &slot1);
+
+    if (valid0 && (!valid1 || slot0.sequence >= slot1.sequence)) {
+        *out = slot0;
+        return true;
+    }
+    if (valid1) {
+        *out = slot1;
+        return true;
+    }
+    memset(out, 0, sizeof(*out));
+    out->slot = -1;
+    return false;
 }
 
 bool logger_config_store_load(logger_persisted_state_t *state) {
     logger_persisted_state_init(state);
+    logger_store_cache_reset();
+    g_store.loaded = true;
+
     if (!logger_flash_layout_is_safe()) {
         return false;
     }
 
-    logger_flash_slot_state_t slot0;
-    logger_flash_slot_state_t slot1;
-    const bool valid0 = logger_flash_slot_load(0u, &slot0);
-    const bool valid1 = logger_flash_slot_load(1u, &slot1);
+    logger_flash_config_slot_state_t config_slot;
+    logger_flash_metadata_slot_state_t metadata_slot;
+    const bool have_config = logger_flash_select_latest_config(&config_slot);
+    const bool have_metadata = logger_flash_select_latest_metadata(&metadata_slot);
 
-    if (valid0 && (!valid1 || slot0.sequence >= slot1.sequence)) {
-        *state = slot0.state;
-        return true;
-    }
-    if (valid1) {
-        *state = slot1.state;
-        return true;
+    if (have_config) {
+        state->config = config_slot.config;
+        g_store.config_valid = true;
+        g_store.config_split_format = config_slot.split_format;
+        g_store.config_sequence = config_slot.sequence;
+        g_store.config_slot = config_slot.slot;
+        g_store.config = config_slot.config;
     }
 
-    state->storage_valid = false;
-    return false;
+    if (have_metadata) {
+        logger_state_apply_metadata(state, &metadata_slot.metadata);
+        g_store.metadata_region_valid = true;
+        g_store.metadata_sequence = metadata_slot.sequence;
+        g_store.metadata_slot = metadata_slot.slot;
+        g_store.metadata = metadata_slot.metadata;
+    } else if (have_config && config_slot.carries_legacy_metadata) {
+        logger_state_apply_metadata(state, &config_slot.metadata);
+        g_store.metadata_region_valid = false;
+        g_store.metadata_sequence = config_slot.sequence;
+        g_store.metadata_slot = -1;
+        g_store.metadata = config_slot.metadata;
+    } else {
+        logger_metadata_init(&g_store.metadata);
+        g_store.metadata_region_valid = false;
+        g_store.metadata_sequence = 0u;
+        g_store.metadata_slot = -1;
+    }
+
+    return have_config || have_metadata;
 }
 
-bool logger_config_store_save(logger_persisted_state_t *state) {
-    if (!logger_flash_layout_is_safe()) {
-        return false;
-    }
-
-    logger_flash_record_t record;
-    logger_config_sanitize_upload_tls(&state->config);
-    state->storage_sequence += 1u;
-    logger_record_from_state(state, &record);
-
-    const unsigned target_slot = (state->storage_slot == 0) ? 1u : 0u;
-    const uint32_t flash_offset = logger_flash_slot_offset(target_slot);
-
+static void logger_flash_program_slot(uint32_t flash_offset, const void *record, size_t record_bytes) {
     static uint8_t sector_buf[FLASH_SECTOR_SIZE];
+
     memset(sector_buf, 0xff, sizeof(sector_buf));
-    memcpy(sector_buf, &record, sizeof(record));
+    memcpy(sector_buf, record, record_bytes);
 
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(flash_offset, FLASH_SECTOR_SIZE);
     flash_range_program(flash_offset, sector_buf, FLASH_SECTOR_SIZE);
     restore_interrupts(ints);
+}
 
-    state->storage_slot = (int)target_slot;
-    state->storage_valid = true;
+static bool logger_config_store_write_metadata(const logger_persisted_metadata_t *metadata) {
+    logger_flash_metadata_record_t record;
+    memset(&record, 0xff, sizeof(record));
+    record.magic = LOGGER_FLASH_METADATA_MAGIC;
+    record.schema_version = LOGGER_FLASH_METADATA_SCHEMA_VERSION;
+    record.payload_bytes = sizeof(record);
+    record.sequence = g_store.metadata_sequence + 1u;
+    record.crc32 = 0u;
+    record.boot_counter = metadata->boot_counter;
+    record.current_fault_code = metadata->current_fault_code;
+    record.last_cleared_fault_code = metadata->last_cleared_fault_code;
+    logger_copy_string(record.last_boot_firmware_version,
+                       sizeof(record.last_boot_firmware_version),
+                       metadata->last_boot_firmware_version);
+    logger_copy_string(record.last_boot_build_id,
+                       sizeof(record.last_boot_build_id),
+                       metadata->last_boot_build_id);
+    record.crc32 = logger_crc32_ieee((const uint8_t *)&record, sizeof(record));
+
+    const unsigned target_slot = (g_store.metadata_slot == 0) ? 1u : 0u;
+    logger_flash_program_slot(logger_flash_metadata_slot_offset(target_slot), &record, sizeof(record));
+
+    g_store.metadata_region_valid = true;
+    g_store.metadata_sequence = record.sequence;
+    g_store.metadata_slot = (int)target_slot;
+    g_store.metadata = *metadata;
+    return true;
+}
+
+static bool logger_config_store_write_config(const logger_config_t *config) {
+    logger_flash_config_record_t record;
+    memset(&record, 0xff, sizeof(record));
+    record.magic = LOGGER_FLASH_CONFIG_MAGIC;
+    record.schema_version = LOGGER_FLASH_CONFIG_SCHEMA_VERSION;
+    record.payload_bytes = sizeof(record);
+    record.sequence = g_store.config_sequence + 1u;
+    record.crc32 = 0u;
+    record.config = *config;
+    record.crc32 = logger_crc32_ieee((const uint8_t *)&record, sizeof(record));
+
+    const unsigned target_slot = (g_store.config_slot == 0) ? 1u : 0u;
+    logger_flash_program_slot(logger_flash_config_slot_offset(target_slot), &record, sizeof(record));
+
+    g_store.config_valid = true;
+    g_store.config_split_format = true;
+    g_store.config_sequence = record.sequence;
+    g_store.config_slot = (int)target_slot;
+    g_store.config = *config;
+    return true;
+}
+
+bool logger_config_store_save(logger_persisted_state_t *state) {
+    if (!g_store.loaded) {
+        logger_persisted_state_t ignored;
+        (void)logger_config_store_load(&ignored);
+    }
+    if (!logger_flash_layout_is_safe()) {
+        return false;
+    }
+
+    logger_config_t normalized_config;
+    logger_persisted_metadata_t normalized_metadata;
+    logger_config_normalize(&state->config, &normalized_config);
+    logger_metadata_from_state(state, &normalized_metadata);
+
+    const bool config_changed = memcmp(&normalized_config, &g_store.config, sizeof(normalized_config)) != 0;
+    const bool metadata_changed = memcmp(&normalized_metadata, &g_store.metadata, sizeof(normalized_metadata)) != 0;
+    const bool write_metadata = metadata_changed || !g_store.metadata_region_valid;
+    const bool write_config = config_changed || (g_store.config_valid && !g_store.config_split_format);
+
+    if (write_metadata && !logger_config_store_write_metadata(&normalized_metadata)) {
+        return false;
+    }
+    if (write_config && !logger_config_store_write_config(&normalized_config)) {
+        return false;
+    }
+
+    state->config = normalized_config;
+    logger_state_apply_metadata(state, &normalized_metadata);
     return true;
 }
 
@@ -505,7 +790,7 @@ static bool logger_normalize_h10_address(const char *src, char out[LOGGER_CONFIG
     if (src == NULL || strlen(src) != 17u) {
         return false;
     }
-    for (size_t i = 0; i < 17u; ++i) {
+    for (size_t i = 0u; i < 17u; ++i) {
         char ch = src[i];
         if ((i % 3u) == 2u) {
             if (ch != ':') {
