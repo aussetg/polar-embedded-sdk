@@ -64,6 +64,7 @@ add_executable(logger_appliance
     src/h10.c
     src/identity.c
     src/mbedtls_platform.c
+    src/net.c
     src/json.c
     src/json_writer.c
     src/journal.c

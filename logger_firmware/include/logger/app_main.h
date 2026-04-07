@@ -52,6 +52,7 @@ typedef struct logger_app {
     uint8_t upload_pass_next_index;
     char upload_pass_session_ids[LOGGER_UPLOAD_QUEUE_MAX_SESSIONS][33];
     bool upload_manual_off_charger;
+    bool upload_ntp_attempted;
     bool upload_pass_had_success;
     bool idle_resume_on_unplug;
     bool day_tracking_initialized;
@@ -67,6 +68,8 @@ typedef struct logger_app {
 } logger_app_t;
 
 void logger_app_init(logger_app_t *app, uint32_t now_ms, logger_boot_gesture_t boot_gesture);
+void logger_app_note_wall_clock_changed(logger_app_t *app);
+bool logger_app_clock_sync_ntp(logger_app_t *app, logger_clock_ntp_sync_result_t *result);
 void logger_app_step(logger_app_t *app, uint32_t now_ms);
 
 #endif

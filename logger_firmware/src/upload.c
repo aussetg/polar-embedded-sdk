@@ -19,6 +19,7 @@
 
 #include "logger/json.h"
 #include "logger/json_writer.h"
+#include "logger/net.h"
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
 
@@ -329,76 +330,6 @@ static void logger_upload_format_tls_details(
 static struct altcp_tls_config *logger_upload_tls_create_client_config(const logger_upload_tls_trust_t *trust) {
     return altcp_tls_create_config_client((const u8_t *)trust->ca_data,
                                           trust->ca_len);
-}
-
-static bool logger_wifi_join(const logger_config_t *config, int *rc_out, char ip_buf[48]) {
-    if (rc_out != NULL) {
-        *rc_out = PICO_ERROR_GENERIC;
-    }
-    if (ip_buf != NULL) {
-        ip_buf[0] = '\0';
-    }
-    if (!logger_string_present(config->wifi_ssid)) {
-        return false;
-    }
-
-    int rc = PICO_ERROR_CONNECT_FAILED;
-    if (!logger_string_present(config->wifi_psk)) {
-        cyw43_arch_enable_sta_mode();
-        rc = cyw43_arch_wifi_connect_timeout_ms(config->wifi_ssid, NULL, CYW43_AUTH_OPEN, 30000u);
-    } else {
-        static const uint32_t auth_modes[] = {
-            CYW43_AUTH_WPA2_AES_PSK,
-            CYW43_AUTH_WPA2_MIXED_PSK,
-            CYW43_AUTH_WPA3_WPA2_AES_PSK,
-        };
-        for (size_t i = 0u; i < sizeof(auth_modes) / sizeof(auth_modes[0]); ++i) {
-            cyw43_arch_disable_sta_mode();
-            sleep_ms(100);
-            cyw43_arch_enable_sta_mode();
-            rc = cyw43_arch_wifi_connect_timeout_ms(
-                config->wifi_ssid,
-                config->wifi_psk,
-                auth_modes[i],
-                30000u);
-            if (rc == 0 || rc == PICO_ERROR_BADAUTH) {
-                break;
-            }
-        }
-    }
-    if (rc_out != NULL) {
-        *rc_out = rc;
-    }
-    if (rc != 0) {
-        return false;
-    }
-
-    const uint32_t dhcp_deadline = to_ms_since_boot(get_absolute_time()) + 15000u;
-    while (true) {
-        cyw43_arch_poll();
-        if (netif_default != NULL &&
-            netif_is_up(netif_default) &&
-            netif_is_link_up(netif_default) &&
-            !ip4_addr_isany(netif_ip4_addr(netif_default))) {
-            break;
-        }
-        if (to_ms_since_boot(get_absolute_time()) >= dhcp_deadline) {
-            if (rc_out != NULL) {
-                *rc_out = PICO_ERROR_TIMEOUT;
-            }
-            return false;
-        }
-        sleep_ms(25);
-    }
-
-    if (ip_buf != NULL && netif_default != NULL) {
-        ip4addr_ntoa_r(netif_ip4_addr(netif_default), ip_buf, 48);
-    }
-    return true;
-}
-
-static void logger_wifi_leave(void) {
-    cyw43_arch_disable_sta_mode();
 }
 
 static void logger_upload_http_request_init(logger_upload_http_request_t *request) {
@@ -1013,7 +944,7 @@ bool logger_upload_net_test(
 
     char ip_buf[48] = {0};
     int wifi_rc = 0;
-    if (!logger_wifi_join(config, &wifi_rc, ip_buf)) {
+    if (!logger_net_wifi_join(config, &wifi_rc, ip_buf)) {
         result->wifi_join_result = "fail";
         snprintf(result->wifi_join_details, sizeof(result->wifi_join_details), "ssid=%s rc=%d", config->wifi_ssid, wifi_rc);
         result->dns_result = "fail";
@@ -1040,7 +971,7 @@ bool logger_upload_net_test(
     char probe_request[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
     char host_header[LOGGER_UPLOAD_URL_HOST_MAX + 8];
     if (!logger_upload_format_host_header(&url, host_header, sizeof(host_header))) {
-        logger_wifi_leave();
+        logger_net_wifi_leave();
         logger_upload_net_test_result_fail_all(result, "Host header buffer overflow");
         return false;
     }
@@ -1054,7 +985,7 @@ bool logger_upload_net_test(
         url.path,
         host_header);
     if (n <= 0 || (size_t)n >= sizeof(probe_request)) {
-        logger_wifi_leave();
+        logger_net_wifi_leave();
         logger_upload_net_test_result_fail_all(result, "probe request buffer overflow");
         return false;
     }
@@ -1115,7 +1046,7 @@ bool logger_upload_net_test(
                                : "failed to receive an HTTP response from the upload endpoint");
     }
 
-    logger_wifi_leave();
+    logger_net_wifi_leave();
     return reachable;
 }
 
@@ -1214,7 +1145,7 @@ static bool logger_upload_process_selected(
 
     char ip_buf[48] = {0};
     int wifi_rc = 0;
-    if (!logger_wifi_join(config, &wifi_rc, ip_buf)) {
+    if (!logger_net_wifi_join(config, &wifi_rc, ip_buf)) {
         logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
         logger_copy_string(entry->status, sizeof(entry->status), "failed");
         logger_copy_string(entry->last_failure_class, sizeof(entry->last_failure_class), "wifi_join_failed");
@@ -1242,7 +1173,7 @@ static bool logger_upload_process_selected(
     char request_text[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
     char host_header[LOGGER_UPLOAD_URL_HOST_MAX + 8];
     if (!logger_upload_format_host_header(&url, host_header, sizeof(host_header))) {
-        logger_wifi_leave();
+        logger_net_wifi_leave();
         result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
         logger_copy_string(result->message, sizeof(result->message), "Host header buffer overflow");
         return false;
@@ -1278,7 +1209,7 @@ static bool logger_upload_process_selected(
         entry->bundle_sha256,
         auth_header);
     if (request_n <= 0 || (size_t)request_n >= sizeof(request_text)) {
-        logger_wifi_leave();
+        logger_net_wifi_leave();
         result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
         logger_copy_string(result->message, sizeof(result->message), "HTTP request buffer overflow");
         return false;
@@ -1286,7 +1217,7 @@ static bool logger_upload_process_selected(
 
     logger_upload_bundle_stream_t bundle_stream;
     if (!logger_upload_bundle_stream_open(&bundle_stream, entry->dir_name, manifest_path, journal_path)) {
-        logger_wifi_leave();
+        logger_net_wifi_leave();
         logger_copy_string(entry->status, sizeof(entry->status), "failed");
         logger_copy_string(entry->last_failure_class, sizeof(entry->last_failure_class), "local_corrupt");
         logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
@@ -1308,7 +1239,7 @@ static bool logger_upload_process_selected(
         LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS,
         &http_response);
     logger_upload_bundle_stream_close(&bundle_stream);
-    logger_wifi_leave();
+    logger_net_wifi_leave();
 
     if (!http_ok) {
         const char *transport_failure_class = logger_string_present(http_response.transport_failure_class)

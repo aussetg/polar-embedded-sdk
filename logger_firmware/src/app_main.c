@@ -10,6 +10,7 @@
 
 #include "board_config.h"
 #include "logger/json_writer.h"
+#include "logger/net.h"
 #include "logger/queue.h"
 #include "logger/upload.h"
 
@@ -218,6 +219,7 @@ static void logger_app_reset_upload_pass(logger_app_t *app) {
 
 static void logger_app_begin_upload_flow(logger_app_t *app, bool manual_off_charger) {
     app->upload_manual_off_charger = manual_off_charger;
+    app->upload_ntp_attempted = false;
     app->upload_next_attempt_mono_ms = 0u;
     app->upload_retry_backoff_index = 0u;
     logger_app_reset_upload_pass(app);
@@ -351,6 +353,100 @@ static void logger_app_reset_day_tracking(logger_app_t *app, const char *study_d
     app->day_ecg_start_baseline = app->h10.ecg_start_attempt_count;
     app->day_tracking_initialized = study_day_local != NULL && study_day_local[0] != '\0';
     app->current_day_has_session = app->session.active;
+}
+
+void logger_app_note_wall_clock_changed(logger_app_t *app) {
+    if (app == NULL) {
+        return;
+    }
+
+    app->runtime.wall_clock_valid = app->clock.valid;
+    if (app->session.active) {
+        return;
+    }
+
+    char observed_study_day_local[11] = {0};
+    if (!logger_app_observed_study_day(app, observed_study_day_local)) {
+        app->day_tracking_initialized = false;
+        app->current_day_study_day_local[0] = '\0';
+        app->pending_day_study_day_local[0] = '\0';
+        app->current_day_has_session = false;
+        return;
+    }
+
+    const bool same_day = app->day_tracking_initialized &&
+                          strcmp(app->current_day_study_day_local, observed_study_day_local) == 0;
+    const bool preserve_has_session = same_day && app->current_day_has_session;
+    logger_app_reset_day_tracking(app, observed_study_day_local);
+    app->current_day_has_session = preserve_has_session;
+    app->pending_day_study_day_local[0] = '\0';
+}
+
+static void logger_app_log_ntp_sync_result(
+    logger_app_t *app,
+    const char *event_kind,
+    logger_system_log_severity_t severity,
+    const logger_clock_ntp_sync_result_t *result) {
+    char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+    logger_json_object_writer_t writer;
+    logger_json_object_writer_init(&writer, details, sizeof(details));
+
+    if (!logger_json_object_writer_string_field(&writer, "server", result->server) ||
+        !logger_json_object_writer_string_field(&writer, "message", result->message) ||
+        !logger_json_object_writer_bool_field(&writer, "applied", result->applied) ||
+        !logger_json_object_writer_bool_field(&writer, "previous_valid", result->previous_valid) ||
+        !logger_json_object_writer_bool_field(&writer, "large_correction", result->large_correction) ||
+        !logger_json_object_writer_int64_field(&writer, "correction_seconds", result->correction_seconds) ||
+        !logger_json_object_writer_uint32_field(&writer, "stratum", result->stratum) ||
+        !logger_json_object_writer_string_field(&writer, "remote_address", result->remote_address) ||
+        !logger_json_object_writer_string_field(&writer, "previous_utc", result->previous_utc) ||
+        !logger_json_object_writer_string_field(&writer, "applied_utc", result->applied_utc) ||
+        !logger_json_object_writer_finish(&writer)) {
+        return;
+    }
+
+    (void)logger_system_log_append(
+        &app->system_log,
+        app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+        event_kind,
+        severity,
+        logger_json_object_writer_data(&writer));
+}
+
+bool logger_app_clock_sync_ntp(logger_app_t *app, logger_clock_ntp_sync_result_t *result) {
+    if (app == NULL || result == NULL) {
+        return false;
+    }
+
+    logger_clock_ntp_sync_result_init(result);
+    if (app->persisted.config.wifi_ssid[0] == '\0') {
+        logger_app_copy_string(result->message,
+                               sizeof(result->message),
+                               "wifi network is not configured");
+        return false;
+    }
+
+    int wifi_rc = 0;
+    if (!logger_net_wifi_join(&app->persisted.config, &wifi_rc, NULL)) {
+        snprintf(result->message,
+                 sizeof(result->message),
+                 "Wi-Fi join failed rc=%d",
+                 wifi_rc);
+        logger_app_log_ntp_sync_result(app, "ntp_sync_failed", LOGGER_SYSTEM_LOG_SEVERITY_WARN, result);
+        return false;
+    }
+
+    const bool synced = logger_clock_ntp_sync(&app->clock, result, &app->clock);
+    logger_net_wifi_leave();
+    logger_app_note_wall_clock_changed(app);
+
+    if (synced) {
+        logger_app_log_ntp_sync_result(app, "ntp_sync", LOGGER_SYSTEM_LOG_SEVERITY_INFO, result);
+        return true;
+    }
+
+    logger_app_log_ntp_sync_result(app, "ntp_sync_failed", LOGGER_SYSTEM_LOG_SEVERITY_WARN, result);
+    return false;
 }
 
 static bool logger_app_current_day_seen_bound_device(const logger_app_t *app) {
@@ -1116,6 +1212,12 @@ static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
     if (app->upload_manual_off_charger && !logger_battery_off_charger_upload_allowed(&app->battery)) {
         logger_app_transition_idle_waiting_for_charger(app, true, "manual_upload_battery_too_low", now_ms);
         return;
+    }
+
+    if (!app->upload_ntp_attempted) {
+        logger_clock_ntp_sync_result_t ntp_result;
+        app->upload_ntp_attempted = true;
+        (void)logger_app_clock_sync_ntp(app, &ntp_result);
     }
 
     logger_upload_queue_summary_t summary;

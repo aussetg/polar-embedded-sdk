@@ -1594,6 +1594,7 @@ static void logger_handle_clock_set(logger_service_cli_t *cli, logger_app_t *app
         logger_json_begin_error("clock set", logger_now_utc_or_null(app), "invalid_config", "invalid RFC3339 UTC timestamp");
         return;
     }
+    logger_app_note_wall_clock_changed(app);
     (void)logger_system_log_append(
         &app->system_log,
         logger_now_utc_or_null(app),
@@ -1605,6 +1606,54 @@ static void logger_handle_clock_set(logger_service_cli_t *cli, logger_app_t *app
     logger_json_begin_success("clock set", logger_now_utc_or_null(app));
     fputs("{\"applied\":true,\"now_utc\":", stdout);
     logger_json_write_string_or_null(logger_now_utc_or_null(app));
+    fputs("}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_clock_sync(logger_service_cli_t *cli, logger_app_t *app) {
+    if (logger_cli_is_logging_mode(app)) {
+        logger_json_begin_error("clock sync", logger_now_utc_or_null(app), "busy_logging", "clock sync is not permitted while logging");
+        return;
+    }
+    if (!logger_cli_is_service_mode(app)) {
+        logger_json_begin_error("clock sync", logger_now_utc_or_null(app), "not_permitted_in_mode", "clock sync is only allowed in service mode");
+        return;
+    }
+    if (!logger_service_cli_is_unlocked(cli, to_ms_since_boot(get_absolute_time()))) {
+        logger_json_begin_error("clock sync", logger_now_utc_or_null(app), "service_locked", "service unlock is required before clock sync");
+        return;
+    }
+
+    logger_clock_ntp_sync_result_t result;
+    const bool ok = logger_app_clock_sync_ntp(app, &result);
+
+    logger_json_begin_success("clock sync", logger_now_utc_or_null(app));
+    fputs("{\"attempted\":", stdout);
+    fputs(result.attempted ? "true" : "false", stdout);
+    fputs(",\"applied\":", stdout);
+    fputs(ok ? "true" : "false", stdout);
+    fputs(",\"previous_valid\":", stdout);
+    fputs(result.previous_valid ? "true" : "false", stdout);
+    fputs(",\"large_correction\":", stdout);
+    fputs(result.large_correction ? "true" : "false", stdout);
+    fputs(",\"correction_seconds\":", stdout);
+    printf("%lld", (long long)result.correction_seconds);
+    fputs(",\"server\":", stdout);
+    logger_json_write_string_or_null(result.server[0] != '\0' ? result.server : NULL);
+    fputs(",\"remote_address\":", stdout);
+    logger_json_write_string_or_null(result.remote_address[0] != '\0' ? result.remote_address : NULL);
+    fputs(",\"stratum\":", stdout);
+    if (result.stratum != 0u) {
+        printf("%u", (unsigned)result.stratum);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs(",\"previous_utc\":", stdout);
+    logger_json_write_string_or_null(result.previous_utc[0] != '\0' ? result.previous_utc : NULL);
+    fputs(",\"now_utc\":", stdout);
+    logger_json_write_string_or_null(logger_now_utc_or_null(app));
+    fputs(",\"message\":", stdout);
+    logger_json_write_string_or_null(result.message[0] != '\0' ? result.message : NULL);
     fputs("}", stdout);
     logger_json_end_success();
 }
@@ -2848,6 +2897,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
     }
     if (strcmp(line, "clock status --json") == 0) {
         logger_handle_clock_status_json(app);
+        return;
+    }
+    if (strcmp(line, "clock sync --json") == 0) {
+        logger_handle_clock_sync(cli, app);
         return;
     }
     if (strcmp(line, "service unlock") == 0) {

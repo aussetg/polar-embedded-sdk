@@ -565,6 +565,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         spec=DeviceCommandSpec("factory-reset", "factory-reset", timeout_s=20.0),
     )
 
+    clock_parser = subparsers.add_parser("clock", help="clock and time-sync operations")
+    clock_subparsers = clock_parser.add_subparsers(dest="clock_command", required=True)
+    add_device_command_parser(
+        clock_subparsers,
+        "status",
+        help_text="read RTC and clock-validity status",
+        spec=DeviceCommandSpec("clock status --json", "clock status"),
+    )
+    add_device_command_parser(
+        clock_subparsers,
+        "sync",
+        help_text="attempt an NTP sync in service mode",
+        spec=DeviceCommandSpec("clock sync --json", "clock sync", timeout_s=45.0),
+    )
+
     config_parser = subparsers.add_parser("config", help="export or import persisted config")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
     config_export = add_device_command_parser(
