@@ -331,6 +331,21 @@ static void logger_h10_sleep_ms(uint32_t ms) {
     }
 }
 
+static void logger_h10_refresh_link_security_state(logger_h10_state_t *state) {
+    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
+        return;
+    }
+
+    if (!state->encrypted) {
+        state->encryption_key_size = 0u;
+        state->secure = false;
+        return;
+    }
+
+    state->encryption_key_size = gap_encryption_key_size(g_conn_handle);
+    state->secure = state->encrypted && state->encryption_key_size > 0u;
+}
+
 static bool logger_h10_wait_flag_until_true(const volatile bool *flag, uint32_t timeout_ms) {
     uint32_t elapsed = 0u;
     while (elapsed < timeout_ms) {
@@ -479,7 +494,6 @@ static int logger_h10_enable_notifications_once(logger_h10_state_t *state) {
     if (status != POLAR_SDK_PMD_OP_OK) {
         return status;
     }
-
     return POLAR_SDK_PMD_OP_OK;
 }
 
@@ -490,7 +504,11 @@ static bool logger_h10_pmd_is_connected(void *ctx) {
 
 static uint8_t logger_h10_pmd_encryption_key_size(void *ctx) {
     logger_h10_state_t *state = (logger_h10_state_t *)ctx;
-    return state != NULL ? state->encryption_key_size : 0u;
+    if (state == NULL) {
+        return 0u;
+    }
+    logger_h10_refresh_link_security_state(state);
+    return state->encryption_key_size;
 }
 
 static void logger_h10_pmd_request_pairing(void *ctx) {
@@ -499,7 +517,7 @@ static void logger_h10_pmd_request_pairing(void *ctx) {
         return;
     }
     polar_sdk_btstack_sm_apply_default_auth_policy();
-    (void)sm_request_pairing(g_conn_handle);
+    sm_request_pairing(g_conn_handle);
     state->pairing_requested = true;
 }
 
@@ -550,6 +568,11 @@ static int logger_h10_ensure_minimum_mtu_cb(void *ctx, uint16_t minimum_mtu) {
     logger_h10_state_t *state = (logger_h10_state_t *)ctx;
     if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
         return POLAR_SDK_PMD_OP_NOT_CONNECTED;
+    }
+
+    uint16_t mtu_before = state->att_mtu;
+    if (gatt_client_get_mtu(g_conn_handle, &mtu_before) == ERROR_CODE_SUCCESS) {
+        state->att_mtu = mtu_before;
     }
 
     polar_sdk_gatt_mtu_ops_t mtu_ops = {
@@ -970,9 +993,9 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
             }
             const bool encrypted = hci_event_encryption_change_get_encryption_enabled(packet) != 0u;
             g_h10->encrypted = encrypted;
-            g_h10->secure = encrypted;
-            g_h10->bonded = g_h10->bonded || encrypted;
-            logger_h10_set_phase(g_h10, encrypted ? LOGGER_H10_PHASE_STARTING : LOGGER_H10_PHASE_SECURING);
+            logger_h10_refresh_link_security_state(g_h10);
+            g_h10->bonded = g_h10->bonded || g_h10->secure;
+            logger_h10_set_phase(g_h10, g_h10->secure ? LOGGER_H10_PHASE_STARTING : LOGGER_H10_PHASE_SECURING);
             break;
         }
 
@@ -981,9 +1004,9 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
                 break;
             }
             const bool encrypted = hci_event_encryption_change_v2_get_encryption_enabled(packet) != 0u;
-            g_h10->encryption_key_size = hci_event_encryption_change_v2_get_encryption_key_size(packet);
             g_h10->encrypted = encrypted;
-            g_h10->secure = encrypted && g_h10->encryption_key_size > 0u;
+            g_h10->encryption_key_size = encrypted ? hci_event_encryption_change_v2_get_encryption_key_size(packet) : 0u;
+            g_h10->secure = g_h10->encrypted && g_h10->encryption_key_size > 0u;
             g_h10->bonded = g_h10->bonded || g_h10->secure;
             logger_h10_set_phase(g_h10, g_h10->secure ? LOGGER_H10_PHASE_STARTING : LOGGER_H10_PHASE_SECURING);
             break;
@@ -1255,6 +1278,8 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
     }
 
     if (state->connected) {
+        logger_h10_refresh_link_security_state(state);
+
         if (state->streaming) {
             logger_h10_maybe_schedule_battery_read(state, now_ms);
             logger_h10_set_phase(state, LOGGER_H10_PHASE_STREAMING);
