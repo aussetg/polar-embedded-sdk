@@ -583,7 +583,7 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
 
     logger_h10_packet_t packet;
     bool appended_any = false;
-    while (logger_h10_pop_ecg_packet(&app->h10, &packet)) {
+    while (logger_h10_pop_packet(&app->h10, &packet)) {
         const char *span_start_reason = logger_app_take_next_span_start_reason(
             app,
             app->session.active ? "reconnect" : "session_start");
@@ -618,9 +618,10 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
             app->last_session_snapshot_mono_ms = now_ms;
         }
 
-        if (!logger_session_append_ecg_packet(
+        if (!logger_session_append_pmd_packet(
                 &app->session,
                 &app->clock,
+                packet.stream_kind,
                 packet.mono_us,
                 packet.value,
                 packet.value_len)) {
@@ -632,7 +633,7 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
     }
 
     if (appended_any && app->runtime.current_state != LOGGER_RUNTIME_LOG_STREAMING) {
-        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_LOG_STREAMING, "h10_ecg_packets", now_ms);
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_LOG_STREAMING, "h10_pmd_packets", now_ms);
     }
 
     return true;

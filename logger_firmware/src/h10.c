@@ -36,6 +36,9 @@
 #define LOGGER_H10_PMD_CCC_ATTEMPTS 4u
 #define LOGGER_H10_ECG_SAMPLE_RATE 130u
 #define LOGGER_H10_ECG_RESOLUTION 14u
+#define LOGGER_H10_ACC_SAMPLE_RATE 50u
+#define LOGGER_H10_ACC_RESOLUTION 16u
+#define LOGGER_H10_ACC_RANGE 8u
 #define LOGGER_H10_STREAM_START_TIMEOUT_MS 5000u
 #define LOGGER_H10_BATTERY_PERIOD_MS 3600000u
 
@@ -154,6 +157,14 @@ static void logger_h10_reset_packet_queue(logger_h10_state_t *state) {
     memset(state->packets, 0, sizeof(state->packets));
 }
 
+static void logger_h10_note_packet_drop(logger_h10_state_t *state, logger_h10_stream_kind_t stream_kind) {
+    if (stream_kind == LOGGER_H10_STREAM_KIND_ACC) {
+        state->acc_packet_drop_count += 1u;
+    } else {
+        state->ecg_packet_drop_count += 1u;
+    }
+}
+
 static void logger_h10_reset_pmd_state(logger_h10_state_t *state) {
     if (g_pmd_cp_listener_registered) {
         gatt_client_stop_listening_for_characteristic_value_updates(&g_pmd_cp_listener);
@@ -256,22 +267,25 @@ static void logger_h10_disconnect_for_restart(logger_h10_state_t *state) {
     logger_h10_schedule_retry(state, btstack_run_loop_get_time_ms());
 }
 
-static bool logger_h10_queue_push_ecg_packet(
+static bool logger_h10_queue_push_packet(
     logger_h10_state_t *state,
+    logger_h10_stream_kind_t stream_kind,
     uint64_t mono_us,
     const uint8_t *value,
     uint16_t value_len) {
-    if (value == NULL || value_len == 0u || value_len > LOGGER_H10_PACKET_MAX_BYTES) {
-        state->ecg_packet_drop_count += 1u;
+    if (value == NULL || value_len == 0u || value_len > LOGGER_H10_PACKET_MAX_BYTES ||
+        (stream_kind != LOGGER_H10_STREAM_KIND_ECG && stream_kind != LOGGER_H10_STREAM_KIND_ACC)) {
+        logger_h10_note_packet_drop(state, stream_kind);
         return false;
     }
     if (state->packet_count >= LOGGER_H10_PACKET_QUEUE_DEPTH) {
         state->packet_overflow = true;
-        state->ecg_packet_drop_count += 1u;
+        logger_h10_note_packet_drop(state, stream_kind);
         return false;
     }
 
     logger_h10_packet_t *slot = &state->packets[state->packet_write_index];
+    slot->stream_kind = (uint16_t)stream_kind;
     slot->mono_us = mono_us;
     slot->value_len = value_len;
     memcpy(slot->value, value, value_len);
@@ -280,7 +294,7 @@ static bool logger_h10_queue_push_ecg_packet(
     return true;
 }
 
-bool logger_h10_pop_ecg_packet(logger_h10_state_t *state, logger_h10_packet_t *out) {
+bool logger_h10_pop_packet(logger_h10_state_t *state, logger_h10_packet_t *out) {
     if (state == NULL || out == NULL || state->packet_count == 0u) {
         return false;
     }
@@ -765,24 +779,31 @@ static void logger_h10_maybe_schedule_battery_read(logger_h10_state_t *state, ui
     (void)logger_h10_request_battery_read(state, LOGGER_H10_BATTERY_REASON_PERIODIC);
 }
 
-static bool logger_h10_start_ecg(logger_h10_state_t *state, uint32_t now_ms) {
+static bool logger_h10_start_measurement(logger_h10_state_t *state, logger_h10_stream_kind_t stream_kind) {
     if (state == NULL || !state->connected || !state->secure || !g_pmd_cp_found || !g_pmd_data_found) {
         return false;
     }
 
-    state->start_in_progress = true;
-    state->start_succeeded = false;
+    const bool is_acc = stream_kind == LOGGER_H10_STREAM_KIND_ACC;
+    if (stream_kind != LOGGER_H10_STREAM_KIND_ECG && !is_acc) {
+        return false;
+    }
+
     state->last_start_response_status = 0xffu;
-    state->ecg_start_attempt_count += 1u;
+    if (is_acc) {
+        state->acc_start_attempt_count += 1u;
+    } else {
+        state->ecg_start_attempt_count += 1u;
+    }
 
     polar_sdk_pmd_start_policy_t policy = {
         .ccc_attempts = LOGGER_H10_PMD_CCC_ATTEMPTS,
         .minimum_mtu = LOGGER_H10_PMD_MIN_MTU,
-        .sample_rate = LOGGER_H10_ECG_SAMPLE_RATE,
+        .sample_rate = is_acc ? LOGGER_H10_ACC_SAMPLE_RATE : LOGGER_H10_ECG_SAMPLE_RATE,
         .include_resolution = true,
-        .resolution = LOGGER_H10_ECG_RESOLUTION,
-        .include_range = false,
-        .range = 0u,
+        .resolution = is_acc ? LOGGER_H10_ACC_RESOLUTION : LOGGER_H10_ECG_RESOLUTION,
+        .include_range = is_acc,
+        .range = is_acc ? LOGGER_H10_ACC_RANGE : 0u,
     };
     polar_sdk_pmd_start_ops_t ops = {
         .ctx = state,
@@ -796,31 +817,54 @@ static bool logger_h10_start_ecg(logger_h10_state_t *state, uint32_t now_ms) {
 
     uint8_t response_status = 0xffu;
     int last_ccc_att_status = 0;
-    const polar_sdk_pmd_start_result_t result = polar_sdk_pmd_start_ecg_with_policy(
-        &policy,
-        &ops,
-        &response_status,
-        &last_ccc_att_status);
+    const polar_sdk_pmd_start_result_t result = is_acc
+        ? polar_sdk_pmd_start_acc_with_policy(&policy, &ops, &response_status, &last_ccc_att_status)
+        : polar_sdk_pmd_start_ecg_with_policy(&policy, &ops, &response_status, &last_ccc_att_status);
 
     state->last_start_response_status = response_status;
     if (last_ccc_att_status > 0 && last_ccc_att_status <= UINT8_MAX) {
         state->last_gatt_att_status = (uint8_t)last_ccc_att_status;
     }
-    state->start_in_progress = false;
 
     if (result != POLAR_SDK_PMD_START_RESULT_OK) {
-        printf("[logger] h10 ecg start failed result=%d att=0x%02x resp=0x%02x\n",
+        printf("[logger] h10 %s start failed result=%d att=0x%02x resp=0x%02x\n",
+               is_acc ? "acc" : "ecg",
                (int)result,
                (unsigned)state->last_gatt_att_status,
                (unsigned)state->last_start_response_status);
         return false;
     }
 
-    state->ecg_start_success_count += 1u;
+    if (is_acc) {
+        state->acc_start_success_count += 1u;
+    } else {
+        state->ecg_start_success_count += 1u;
+    }
+    printf("[logger] h10 %s start ok mtu=%u\n", is_acc ? "acc" : "ecg", (unsigned)state->att_mtu);
+    return true;
+}
+
+static bool logger_h10_start_streams(logger_h10_state_t *state, uint32_t now_ms) {
+    if (state == NULL) {
+        return false;
+    }
+
+    state->start_in_progress = true;
+    state->start_succeeded = false;
+    state->last_start_response_status = 0xffu;
+
+    const bool ecg_ok = logger_h10_start_measurement(state, LOGGER_H10_STREAM_KIND_ECG);
+    const bool acc_ok = ecg_ok && logger_h10_start_measurement(state, LOGGER_H10_STREAM_KIND_ACC);
+    state->start_in_progress = false;
+
+    if (!ecg_ok || !acc_ok) {
+        return false;
+    }
+
     state->start_succeeded = true;
     state->start_deadline_mono_ms = now_ms + LOGGER_H10_STREAM_START_TIMEOUT_MS;
     logger_h10_set_phase(state, LOGGER_H10_PHASE_STARTING);
-    printf("[logger] h10 ecg start ok mtu=%u\n", (unsigned)state->att_mtu);
+    printf("[logger] h10 ecg+acc start ok mtu=%u\n", (unsigned)state->att_mtu);
     return true;
 }
 
@@ -1200,8 +1244,19 @@ static void logger_h10_gatt_packet_handler(uint8_t packet_type, uint16_t channel
         return;
     }
 
+    logger_h10_stream_kind_t stream_kind;
     if (value_event.value[0] == POLAR_SDK_PMD_MEASUREMENT_ECG) {
-        if (logger_h10_queue_push_ecg_packet(g_h10, time_us_64(), value_event.value, value_event.value_len)) {
+        stream_kind = LOGGER_H10_STREAM_KIND_ECG;
+    } else if (value_event.value[0] == POLAR_SDK_PMD_MEASUREMENT_ACC) {
+        stream_kind = LOGGER_H10_STREAM_KIND_ACC;
+    } else {
+        return;
+    }
+
+    if (logger_h10_queue_push_packet(g_h10, stream_kind, time_us_64(), value_event.value, value_event.value_len)) {
+        if (stream_kind == LOGGER_H10_STREAM_KIND_ACC) {
+            g_h10->acc_packet_count += 1u;
+        } else {
             g_h10->ecg_packet_count += 1u;
         }
         g_h10->streaming = true;
@@ -1316,7 +1371,7 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
         if (state->start_succeeded) {
             logger_h10_maybe_schedule_battery_read(state, now_ms);
             if (state->start_deadline_mono_ms != 0u && (int32_t)(now_ms - state->start_deadline_mono_ms) >= 0) {
-                printf("[logger] h10 ecg start timed out waiting for packets\n");
+                printf("[logger] h10 pmd start timed out waiting for packets\n");
                 logger_h10_disconnect_for_restart(state);
             }
             return;
@@ -1334,7 +1389,7 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
             }
             return;
         }
-        if (!logger_h10_start_ecg(state, now_ms)) {
+        if (!logger_h10_start_streams(state, now_ms)) {
             logger_h10_disconnect_for_restart(state);
         }
         return;

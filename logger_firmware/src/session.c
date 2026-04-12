@@ -27,7 +27,6 @@
 #define LOGGER_SESSION_LIVE_JSON_TOKEN_MAX 64u
 #define LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES 80u
 #define LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES 28u
-#define LOGGER_SESSION_STREAM_KIND_ECG 1u
 #define LOGGER_SESSION_DATA_ENCODING_RAW_PMD_NOTIFICATION_LIST_V1 1u
 
 typedef struct {
@@ -1199,14 +1198,16 @@ bool logger_session_ensure_active_span(
     return true;
 }
 
-bool logger_session_append_ecg_packet(
+bool logger_session_append_pmd_packet(
     logger_session_state_t *session,
     const logger_clock_status_t *clock,
+    uint16_t stream_kind,
     uint64_t mono_us,
     const uint8_t *value,
     size_t value_len) {
     if (!session->active || !session->span_active || value == NULL || value_len == 0u ||
-        value_len > LOGGER_H10_PACKET_MAX_BYTES || session->current_span_index >= session->span_count) {
+        value_len > LOGGER_H10_PACKET_MAX_BYTES || session->current_span_index >= session->span_count ||
+        (stream_kind != LOGGER_SESSION_STREAM_KIND_ECG && stream_kind != LOGGER_SESSION_STREAM_KIND_ACC)) {
         return false;
     }
 
@@ -1241,7 +1242,7 @@ bool logger_session_append_ecg_packet(
         return false;
     }
 
-    logger_put_u16le(payload + 0u, LOGGER_SESSION_STREAM_KIND_ECG);
+    logger_put_u16le(payload + 0u, stream_kind);
     logger_put_u16le(payload + 2u, LOGGER_SESSION_DATA_ENCODING_RAW_PMD_NOTIFICATION_LIST_V1);
     logger_put_u32le(payload + 4u, session->next_chunk_seq_in_session);
     logger_put_u32le(payload + 24u, 1u);
@@ -1279,6 +1280,21 @@ bool logger_session_append_ecg_packet(
 
     session->next_chunk_seq_in_session += 1u;
     return true;
+}
+
+bool logger_session_append_ecg_packet(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint64_t mono_us,
+    const uint8_t *value,
+    size_t value_len) {
+    return logger_session_append_pmd_packet(
+        session,
+        clock,
+        LOGGER_SESSION_STREAM_KIND_ECG,
+        mono_us,
+        value,
+        value_len);
 }
 
 bool logger_session_handle_disconnect(

@@ -15,6 +15,11 @@
 
 #define LOGGER_SESSION_ID_HEX_LEN 32
 
+enum {
+    LOGGER_SESSION_STREAM_KIND_ECG = 1u,
+    LOGGER_SESSION_STREAM_KIND_ACC = 2u,
+};
+
 typedef struct {
     bool active;
     bool span_active;
@@ -102,6 +107,14 @@ bool logger_session_ensure_active_span(
 bool logger_session_append_ecg_packet(
     logger_session_state_t *session,
     const logger_clock_status_t *clock,
+    uint64_t mono_us,
+    const uint8_t *value,
+    size_t value_len);
+
+bool logger_session_append_pmd_packet(
+    logger_session_state_t *session,
+    const logger_clock_status_t *clock,
+    uint16_t stream_kind,
     uint64_t mono_us,
     const uint8_t *value,
     size_t value_len);

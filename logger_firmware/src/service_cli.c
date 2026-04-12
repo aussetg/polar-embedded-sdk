@@ -1063,6 +1063,28 @@ static void logger_write_status_payload(const logger_app_t *app) {
     } else {
         fputs("null", stdout);
     }
+    fputs(",\"phase\":", stdout);
+    logger_json_write_string_or_null(logger_h10_phase_name(app->h10.phase));
+    fputs(",\"att_mtu\":", stdout);
+    printf("%u", (unsigned)app->h10.att_mtu);
+    fputs(",\"encryption_key_size\":", stdout);
+    printf("%u", (unsigned)app->h10.encryption_key_size);
+    fputs(",\"ecg_start_attempts\":", stdout);
+    printf("%lu", (unsigned long)app->h10.ecg_start_attempt_count);
+    fputs(",\"ecg_start_successes\":", stdout);
+    printf("%lu", (unsigned long)app->h10.ecg_start_success_count);
+    fputs(",\"ecg_packets\":", stdout);
+    printf("%lu", (unsigned long)app->h10.ecg_packet_count);
+    fputs(",\"ecg_packet_drops\":", stdout);
+    printf("%lu", (unsigned long)app->h10.ecg_packet_drop_count);
+    fputs(",\"acc_start_attempts\":", stdout);
+    printf("%lu", (unsigned long)app->h10.acc_start_attempt_count);
+    fputs(",\"acc_start_successes\":", stdout);
+    printf("%lu", (unsigned long)app->h10.acc_start_success_count);
+    fputs(",\"acc_packets\":", stdout);
+    printf("%lu", (unsigned long)app->h10.acc_packet_count);
+    fputs(",\"acc_packet_drops\":", stdout);
+    printf("%lu", (unsigned long)app->h10.acc_packet_drop_count);
     fputs("}", stdout);
 
     fputs(",\"session\":{\"active\":", stdout);

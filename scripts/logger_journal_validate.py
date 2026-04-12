@@ -79,6 +79,7 @@ class EntrySummary:
 
 @dataclass
 class ChunkSummary:
+    stream_kind: int
     chunk_seq_in_session: int
     span_id: str
     packet_count: int
@@ -242,7 +243,7 @@ def parse_data_chunk(payload: bytes, record_seq: int, state: ValidationState) ->
     entries_bytes = u32le(payload, 72)
     reserved1 = u32le(payload, 76)
 
-    if stream_kind != 1:
+    if stream_kind not in (1, 2):
         state.error(f"record_seq={record_seq}: unexpected stream_kind={stream_kind}")
     if encoding != 1:
         state.error(f"record_seq={record_seq}: unexpected encoding={encoding}")
@@ -331,6 +332,7 @@ def parse_data_chunk(payload: bytes, record_seq: int, state: ValidationState) ->
 
     state.chunks.append(
         ChunkSummary(
+            stream_kind=stream_kind,
             chunk_seq_in_session=chunk_seq_in_session,
             span_id=span_id,
             packet_count=packet_count,

@@ -6,7 +6,12 @@
 
 #define LOGGER_H10_ADDR_STR_LEN 17
 #define LOGGER_H10_PACKET_MAX_BYTES 244
-#define LOGGER_H10_PACKET_QUEUE_DEPTH 16
+#define LOGGER_H10_PACKET_QUEUE_DEPTH 32
+
+typedef enum {
+    LOGGER_H10_STREAM_KIND_ECG = 1,
+    LOGGER_H10_STREAM_KIND_ACC = 2,
+} logger_h10_stream_kind_t;
 
 typedef enum {
     LOGGER_H10_PHASE_OFF = 0,
@@ -19,6 +24,7 @@ typedef enum {
 } logger_h10_phase_t;
 
 typedef struct {
+    uint16_t stream_kind;
     uint64_t mono_us;
     uint16_t value_len;
     uint8_t value[LOGGER_H10_PACKET_MAX_BYTES];
@@ -71,6 +77,10 @@ typedef struct {
     uint32_t ecg_start_success_count;
     uint32_t ecg_packet_count;
     uint32_t ecg_packet_drop_count;
+    uint32_t acc_start_attempt_count;
+    uint32_t acc_start_success_count;
+    uint32_t acc_packet_count;
+    uint32_t acc_packet_drop_count;
     uint8_t packet_read_index;
     uint8_t packet_write_index;
     uint8_t packet_count;
@@ -84,7 +94,7 @@ void logger_h10_init(logger_h10_state_t *state);
 bool logger_h10_set_bound_address(logger_h10_state_t *state, const char *bound_address);
 void logger_h10_set_enabled(logger_h10_state_t *state, bool enabled);
 void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms);
-bool logger_h10_pop_ecg_packet(logger_h10_state_t *state, logger_h10_packet_t *out);
+bool logger_h10_pop_packet(logger_h10_state_t *state, logger_h10_packet_t *out);
 bool logger_h10_take_battery_event(logger_h10_state_t *state, logger_h10_battery_event_t *out);
 
 const char *logger_h10_phase_name(logger_h10_phase_t phase);
