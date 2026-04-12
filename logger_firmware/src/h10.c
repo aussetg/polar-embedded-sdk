@@ -13,6 +13,7 @@
 #include "polar_sdk_btstack_gatt.h"
 #include "polar_sdk_btstack_helpers.h"
 #include "polar_sdk_btstack_scan.h"
+#include "polar_sdk_btstack_security.h"
 #include "polar_sdk_btstack_sm.h"
 #include "polar_sdk_connect.h"
 #include "polar_sdk_discovery_apply.h"
@@ -342,7 +343,9 @@ static void logger_h10_refresh_link_security_state(logger_h10_state_t *state) {
         return;
     }
 
-    state->encryption_key_size = gap_encryption_key_size(g_conn_handle);
+    state->encryption_key_size = polar_sdk_btstack_security_encryption_key_size(
+        g_conn_handle,
+        HCI_CON_HANDLE_INVALID);
     state->secure = state->encrypted && state->encryption_key_size > 0u;
 }
 
@@ -502,28 +505,42 @@ static bool logger_h10_pmd_is_connected(void *ctx) {
     return state != NULL && state->connected && g_conn_handle != HCI_CON_HANDLE_INVALID;
 }
 
-static uint8_t logger_h10_pmd_encryption_key_size(void *ctx) {
+static bool logger_h10_pmd_security_ready(void *ctx) {
     logger_h10_state_t *state = (logger_h10_state_t *)ctx;
-    if (state == NULL) {
-        return 0u;
+    if (!logger_h10_pmd_is_connected(ctx)) {
+        return false;
     }
     logger_h10_refresh_link_security_state(state);
-    return state->encryption_key_size;
+    return state->secure;
 }
 
-static void logger_h10_pmd_request_pairing(void *ctx) {
-    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
-    if (state == NULL || !state->connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
-        return;
-    }
-    polar_sdk_btstack_sm_apply_default_auth_policy();
-    sm_request_pairing(g_conn_handle);
-    state->pairing_requested = true;
-}
-
-static void logger_h10_pmd_sleep_ms(void *ctx, uint32_t ms) {
+static void logger_h10_pmd_security_sleep_ms(void *ctx, uint32_t ms) {
     (void)ctx;
     logger_h10_sleep_ms(ms);
+}
+
+static polar_sdk_security_result_t logger_h10_pmd_ensure_security(void *ctx) {
+    logger_h10_state_t *state = (logger_h10_state_t *)ctx;
+    if (state == NULL || !logger_h10_pmd_is_connected(ctx)) {
+        return POLAR_SDK_SECURITY_RESULT_NOT_CONNECTED;
+    }
+
+    polar_sdk_security_policy_t policy = {
+        .rounds = LOGGER_H10_PMD_SECURITY_ROUNDS,
+        .wait_ms_per_round = LOGGER_H10_PMD_SECURITY_WAIT_MS,
+        .request_gap_ms = 120u,
+        .poll_ms = 20u,
+    };
+
+    state->pairing_requested = true;
+    polar_sdk_security_result_t result = polar_sdk_btstack_security_ensure(
+        &g_conn_handle,
+        HCI_CON_HANDLE_INVALID,
+        &policy,
+        logger_h10_pmd_security_sleep_ms,
+        state);
+    logger_h10_refresh_link_security_state(state);
+    return result;
 }
 
 static int logger_h10_pmd_enable_notifications_cb(void *ctx) {
@@ -760,8 +777,6 @@ static bool logger_h10_start_ecg(logger_h10_state_t *state, uint32_t now_ms) {
 
     polar_sdk_pmd_start_policy_t policy = {
         .ccc_attempts = LOGGER_H10_PMD_CCC_ATTEMPTS,
-        .security_rounds_per_attempt = LOGGER_H10_PMD_SECURITY_ROUNDS,
-        .security_wait_ms = LOGGER_H10_PMD_SECURITY_WAIT_MS,
         .minimum_mtu = LOGGER_H10_PMD_MIN_MTU,
         .sample_rate = LOGGER_H10_ECG_SAMPLE_RATE,
         .include_resolution = true,
@@ -772,9 +787,8 @@ static bool logger_h10_start_ecg(logger_h10_state_t *state, uint32_t now_ms) {
     polar_sdk_pmd_start_ops_t ops = {
         .ctx = state,
         .is_connected = logger_h10_pmd_is_connected,
-        .encryption_key_size = logger_h10_pmd_encryption_key_size,
-        .request_pairing = logger_h10_pmd_request_pairing,
-        .sleep_ms = logger_h10_pmd_sleep_ms,
+        .security_ready = logger_h10_pmd_security_ready,
+        .ensure_security = logger_h10_pmd_ensure_security,
         .enable_notifications = logger_h10_pmd_enable_notifications_cb,
         .ensure_minimum_mtu = logger_h10_ensure_minimum_mtu_cb,
         .start_ecg_and_wait_response = logger_h10_start_ecg_and_wait_response_cb,
@@ -1005,8 +1019,7 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
             }
             const bool encrypted = hci_event_encryption_change_v2_get_encryption_enabled(packet) != 0u;
             g_h10->encrypted = encrypted;
-            g_h10->encryption_key_size = encrypted ? hci_event_encryption_change_v2_get_encryption_key_size(packet) : 0u;
-            g_h10->secure = g_h10->encrypted && g_h10->encryption_key_size > 0u;
+            logger_h10_refresh_link_security_state(g_h10);
             g_h10->bonded = g_h10->bonded || g_h10->secure;
             logger_h10_set_phase(g_h10, g_h10->secure ? LOGGER_H10_PHASE_STARTING : LOGGER_H10_PHASE_SECURING);
             break;
@@ -1207,7 +1220,7 @@ static void logger_h10_init_btstack_core(void) {
     l2cap_init();
     sm_init();
     gatt_client_init();
-    polar_sdk_btstack_sm_apply_default_auth_policy();
+    polar_sdk_btstack_sm_configure_default_central_policy();
 
     polar_sdk_runtime_link_init(&g_runtime_link, HCI_CON_HANDLE_INVALID);
     polar_sdk_connect_init(&g_reconnect_state, 0u);
@@ -1289,8 +1302,7 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
         if (!state->secure) {
             logger_h10_set_phase(state, LOGGER_H10_PHASE_SECURING);
             if (!state->pairing_requested && g_conn_handle != HCI_CON_HANDLE_INVALID) {
-                polar_sdk_btstack_sm_apply_default_auth_policy();
-                (void)sm_request_pairing(g_conn_handle);
+                polar_sdk_btstack_security_request_pairing(g_conn_handle, HCI_CON_HANDLE_INVALID);
                 state->pairing_requested = true;
             }
             return;

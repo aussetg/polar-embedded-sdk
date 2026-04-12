@@ -157,6 +157,10 @@ If these change, core decode helpers might still compile, but the Python module 
 - `gap_encryption_key_size`, `gap_bonded`
 - `gap_delete_bonding`
 
+Preferred repo-level wrapper for live link-security checks:
+- `polar_sdk_btstack_security_encryption_key_size(...)`
+- `polar_sdk_btstack_security_ready(...)`
+
 #### B2) GATT client operation calls
 
 Types:
@@ -190,6 +194,11 @@ Integration note:
 - `sm_just_works_confirm`
 - `sm_numeric_comparison_confirm`
 - `sm_authorization_grant`
+
+Preferred repo-level wrappers for pairing/security recovery:
+- `polar_sdk_btstack_sm_configure_default_central_policy()`
+- `polar_sdk_btstack_security_request_pairing(...)`
+- `polar_sdk_btstack_security_ensure(...)`
 
 Current runtime policy note:
 - Authorization requests are auto-granted in this module (embedded/default policy).

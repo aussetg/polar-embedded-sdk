@@ -28,7 +28,7 @@ Common `stats()` fields:
 | `pmd_*_att_status = 0x05` | ATT insufficient authentication | Trigger/verify pairing flow, wait for encryption, retry operation. |
 | `pmd_*_att_status = 0x08` | ATT insufficient authorization | Same as above: pairing/authorization/encryption path + retry. |
 | `psftp_*_att_status = 0x05` or `0x08` | PSFTP op blocked by security state | Ensure SM policy applied, pairing completed, and connection is encrypted before retry. |
-| `conn_encryption_key_size = 0` while protected ops fail | Link not encrypted | Request pairing and wait for SM completion before retrying PMD/PSFTP writes/CCC. |
+| `conn_encryption_key_size = 0` while protected ops fail | Link not encrypted | Use `polar_sdk_btstack_security_request_pairing(...)` or `polar_sdk_btstack_security_ensure(...)`, then retry PMD/PSFTP writes/CCC after the link is secure. |
 | `conn_bonded = false` after repeated attempts | Bond not established/reused | Clear stale bond both sides, re-pair, then repeat operation. |
 | `sm_last_pairing_status != 0` | Pairing failed | Use `sm_last_pairing_reason`, clear stale bond if needed, retry from clean session. |
 | `sm_last_pairing_status = 19` with `conn_encryption_key_size=0` and PSFTP timeouts | Observed sticky pairing-failed session signature in current MicroPython path | Reset board/session and retry from clean state; see KI-04. |

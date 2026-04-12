@@ -79,6 +79,7 @@ add_executable(logger_appliance
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_helpers.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_gatt.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_adv_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_dispatch.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_link.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_scan.c

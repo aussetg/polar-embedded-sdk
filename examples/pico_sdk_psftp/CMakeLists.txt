@@ -62,6 +62,7 @@ add_executable(h10_btstack_psftp_probe
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_helpers.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_scan.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_adv_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_sm.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_sm_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_dispatch.c

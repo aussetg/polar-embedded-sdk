@@ -1,64 +1,74 @@
 // SPDX-License-Identifier: MIT
 #include "polar_sdk_pmd.h"
 
-#include "polar_sdk_security.h"
-
 static bool polar_sdk_pmd_ops_ready(const polar_sdk_pmd_start_ops_t *ops) {
     return ops != 0 &&
         ops->is_connected != 0 &&
-        ops->encryption_key_size != 0 &&
-        ops->request_pairing != 0 &&
-        ops->sleep_ms != 0 &&
+        ops->security_ready != 0 &&
+        ops->ensure_security != 0 &&
         ops->enable_notifications != 0 &&
         ops->ensure_minimum_mtu != 0 &&
         ops->start_ecg_and_wait_response != 0;
 }
 
-static bool polar_sdk_pmd_security_is_connected(const void *ctx) {
-    const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
-    return ops->is_connected(ops->ctx);
+static polar_sdk_pmd_start_result_t polar_sdk_pmd_map_security_result(
+    polar_sdk_security_result_t security_result) {
+    if (security_result == POLAR_SDK_SECURITY_RESULT_OK) {
+        return POLAR_SDK_PMD_START_RESULT_OK;
+    }
+    if (security_result == POLAR_SDK_SECURITY_RESULT_NOT_CONNECTED) {
+        return POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED;
+    }
+    return POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT;
 }
 
-static bool polar_sdk_pmd_security_is_secure(const void *ctx) {
-    const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
-    return polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx));
-}
-
-static void polar_sdk_pmd_security_request_pairing(const void *ctx) {
-    const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
-    ops->request_pairing(ops->ctx);
-}
-
-static void polar_sdk_pmd_security_sleep_ms(const void *ctx, uint32_t ms) {
-    const polar_sdk_pmd_start_ops_t *ops = (const polar_sdk_pmd_start_ops_t *)ctx;
-    ops->sleep_ms(ops->ctx, ms);
-}
-
-static bool polar_sdk_pmd_ensure_security(
-    const polar_sdk_pmd_start_policy_t *policy,
+static polar_sdk_pmd_start_result_t polar_sdk_pmd_require_security(
     const polar_sdk_pmd_start_ops_t *ops) {
-    if (policy == 0 || ops == 0) {
-        return false;
+    if (ops == 0) {
+        return POLAR_SDK_PMD_START_RESULT_TRANSPORT_ERROR;
+    }
+    if (!ops->is_connected(ops->ctx)) {
+        return POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED;
+    }
+    if (ops->security_ready(ops->ctx)) {
+        return POLAR_SDK_PMD_START_RESULT_OK;
     }
 
-    polar_sdk_security_policy_t security_policy = {
-        .rounds = policy->security_rounds_per_attempt,
-        .wait_ms_per_round = policy->security_wait_ms,
-        .request_gap_ms = 120,
-        .poll_ms = 20,
-    };
-    polar_sdk_security_ops_t security_ops = {
-        .ctx = ops,
-        .is_connected = polar_sdk_pmd_security_is_connected,
-        .is_secure = polar_sdk_pmd_security_is_secure,
-        .request_pairing = polar_sdk_pmd_security_request_pairing,
-        .sleep_ms = polar_sdk_pmd_security_sleep_ms,
-    };
+    polar_sdk_pmd_start_result_t mapped = polar_sdk_pmd_map_security_result(
+        ops->ensure_security(ops->ctx));
+    if (mapped != POLAR_SDK_PMD_START_RESULT_OK) {
+        return mapped;
+    }
+    if (!ops->is_connected(ops->ctx)) {
+        return POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED;
+    }
+    if (!ops->security_ready(ops->ctx)) {
+        return POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT;
+    }
+    return POLAR_SDK_PMD_START_RESULT_OK;
+}
 
-    polar_sdk_security_result_t r = polar_sdk_security_request_with_retry(
-        &security_policy,
-        &security_ops);
-    return r == POLAR_SDK_SECURITY_RESULT_OK;
+static polar_sdk_pmd_start_result_t polar_sdk_pmd_recover_security(
+    const polar_sdk_pmd_start_ops_t *ops) {
+    if (ops == 0) {
+        return POLAR_SDK_PMD_START_RESULT_TRANSPORT_ERROR;
+    }
+    if (!ops->is_connected(ops->ctx)) {
+        return POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED;
+    }
+
+    polar_sdk_pmd_start_result_t mapped = polar_sdk_pmd_map_security_result(
+        ops->ensure_security(ops->ctx));
+    if (mapped != POLAR_SDK_PMD_START_RESULT_OK) {
+        return mapped;
+    }
+    if (!ops->is_connected(ops->ctx)) {
+        return POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED;
+    }
+    if (!ops->security_ready(ops->ctx)) {
+        return POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT;
+    }
+    return POLAR_SDK_PMD_START_RESULT_OK;
 }
 
 static polar_sdk_pmd_start_result_t polar_sdk_pmd_start_with_command(
@@ -92,8 +102,9 @@ static polar_sdk_pmd_start_result_t polar_sdk_pmd_start_with_command(
             return POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED;
         }
 
-        if (!polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx))) {
-            (void)polar_sdk_pmd_ensure_security(policy, ops);
+        polar_sdk_pmd_start_result_t security_result = polar_sdk_pmd_require_security(ops);
+        if (security_result != POLAR_SDK_PMD_START_RESULT_OK) {
+            return security_result;
         }
 
         int notify_status = ops->enable_notifications(ops->ctx);
@@ -105,7 +116,13 @@ static polar_sdk_pmd_start_result_t polar_sdk_pmd_start_with_command(
         if (notify_status > 0) {
             last_att_status = notify_status;
             if (polar_sdk_pmd_att_status_requires_security((uint8_t)notify_status)) {
-                (void)polar_sdk_pmd_ensure_security(policy, ops);
+                security_result = polar_sdk_pmd_recover_security(ops);
+                if (security_result != POLAR_SDK_PMD_START_RESULT_OK) {
+                    if (out_last_ccc_att_status != 0) {
+                        *out_last_ccc_att_status = last_att_status;
+                    }
+                    return security_result;
+                }
                 continue;
             }
             if (out_last_ccc_att_status != 0) {
@@ -133,7 +150,7 @@ static polar_sdk_pmd_start_result_t polar_sdk_pmd_start_with_command(
         if (!ops->is_connected(ops->ctx)) {
             return POLAR_SDK_PMD_START_RESULT_NOT_CONNECTED;
         }
-        if (!polar_sdk_pmd_security_ready(ops->encryption_key_size(ops->ctx))) {
+        if (!ops->security_ready(ops->ctx)) {
             return POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT;
         }
         if (last_att_status > 0) {

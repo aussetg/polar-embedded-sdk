@@ -19,6 +19,7 @@
 #include "polar_sdk_btstack_helpers.h"
 #include "polar_sdk_btstack_scan.h"
 #include "polar_sdk_btstack_adv_runtime.h"
+#include "polar_sdk_btstack_security.h"
 #include "polar_sdk_btstack_sm.h"
 #include "polar_sdk_sm_control.h"
 #include "polar_sdk_btstack_dispatch.h"
@@ -423,26 +424,30 @@ static bool pmd_is_connected(void *ctx) {
     return connected && conn_handle != HCI_CON_HANDLE_INVALID;
 }
 
-static uint8_t pmd_encryption_key_size(void *ctx) {
+static bool pmd_security_ready(void *ctx) {
     UNUSED(ctx);
-    if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-        return 0;
-    }
-    return gap_encryption_key_size(conn_handle);
+    return polar_sdk_btstack_security_ready(conn_handle, HCI_CON_HANDLE_INVALID);
 }
 
-static void pmd_request_pairing(void *ctx) {
-    UNUSED(ctx);
-    if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-        return;
-    }
-    polar_sdk_btstack_sm_apply_default_auth_policy();
-    sm_request_pairing(conn_handle);
-}
-
-static void pmd_sleep_ms_cb(void *ctx, uint32_t ms) {
+static void pmd_security_sleep_ms_cb(void *ctx, uint32_t ms) {
     UNUSED(ctx);
     probe_sleep_ms(ms);
+}
+
+static polar_sdk_security_result_t pmd_ensure_security_cb(void *ctx) {
+    UNUSED(ctx);
+    polar_sdk_security_policy_t policy = {
+        .rounds = H10_PMD_SECURITY_ROUNDS,
+        .wait_ms_per_round = H10_PMD_SECURITY_WAIT_MS,
+        .request_gap_ms = 120,
+        .poll_ms = 20,
+    };
+    return polar_sdk_btstack_security_ensure(
+        &conn_handle,
+        HCI_CON_HANDLE_INVALID,
+        &policy,
+        pmd_security_sleep_ms_cb,
+        NULL);
 }
 
 static int pmd_enable_notifications_cb(void *ctx) {
@@ -881,7 +886,9 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
                 } else {
                     if (polar_sdk_pmd_att_status_requires_security(att_status)) {
                         printf("[h10probe] HR CCC requires security, requesting pairing\n");
-                        sm_request_pairing(conn_handle);
+                        polar_sdk_btstack_security_request_pairing(
+                            conn_handle,
+                            HCI_CON_HANDLE_INVALID);
                     }
                     app_state = APP_CONNECTED;
                 }
@@ -1153,7 +1160,7 @@ static void run_pmd_policy_tick(void) {
            state_name(app_state),
            ecg_start_attempts_total,
            imu_start_attempts_total + 1,
-           gap_encryption_key_size(conn_handle),
+           polar_sdk_btstack_security_encryption_key_size(conn_handle, HCI_CON_HANDLE_INVALID),
            att_mtu,
            pmd_cp_char.value_handle,
            pmd_data_char.value_handle);
@@ -1161,9 +1168,8 @@ static void run_pmd_policy_tick(void) {
     polar_sdk_pmd_start_ops_t ops = {
         .ctx = NULL,
         .is_connected = pmd_is_connected,
-        .encryption_key_size = pmd_encryption_key_size,
-        .request_pairing = pmd_request_pairing,
-        .sleep_ms = pmd_sleep_ms_cb,
+        .security_ready = pmd_security_ready,
+        .ensure_security = pmd_ensure_security_cb,
         .enable_notifications = pmd_enable_notifications_cb,
         .ensure_minimum_mtu = pmd_ensure_minimum_mtu_cb,
         .start_ecg_and_wait_response = pmd_start_measurement_and_wait_response_cb,
@@ -1176,8 +1182,6 @@ static void run_pmd_policy_tick(void) {
 
     polar_sdk_pmd_start_policy_t ecg_policy = {
         .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
-        .security_rounds_per_attempt = H10_PMD_SECURITY_ROUNDS,
-        .security_wait_ms = H10_PMD_SECURITY_WAIT_MS,
         .minimum_mtu = H10_PMD_MIN_MTU,
         .sample_rate = H10_PMD_ECG_SAMPLE_RATE,
         .include_resolution = true,
@@ -1199,7 +1203,7 @@ static void run_pmd_policy_tick(void) {
            pmd_start_result_name(ecg_result),
            ecg_last_ccc_att_status,
            ecg_response_status,
-           gap_encryption_key_size(conn_handle),
+           polar_sdk_btstack_security_encryption_key_size(conn_handle, HCI_CON_HANDLE_INVALID),
            att_mtu);
 
     if (ecg_result != POLAR_SDK_PMD_START_RESULT_OK) {
@@ -1213,8 +1217,6 @@ static void run_pmd_policy_tick(void) {
 
     polar_sdk_pmd_start_policy_t imu_policy = {
         .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
-        .security_rounds_per_attempt = H10_PMD_SECURITY_ROUNDS,
-        .security_wait_ms = H10_PMD_SECURITY_WAIT_MS,
         .minimum_mtu = H10_PMD_MIN_MTU,
         .sample_rate = H10_PMD_IMU_SAMPLE_RATE,
         .include_resolution = true,
@@ -1236,7 +1238,7 @@ static void run_pmd_policy_tick(void) {
            pmd_start_result_name(imu_result),
            imu_last_ccc_att_status,
            imu_response_status,
-           gap_encryption_key_size(conn_handle),
+           polar_sdk_btstack_security_encryption_key_size(conn_handle, HCI_CON_HANDLE_INVALID),
            att_mtu);
 
     if (imu_result == POLAR_SDK_PMD_START_RESULT_OK) {
@@ -1378,8 +1380,8 @@ static void on_connection_ready_common(hci_con_handle_t handle) {
     request_post_connect_update(conn_handle);
 
 #if H10_FORCE_PAIRING
-    int perr = sm_request_pairing(conn_handle);
-    printf("[h10probe] sm_request_pairing err=%d\n", perr);
+    polar_sdk_btstack_security_request_pairing(conn_handle, HCI_CON_HANDLE_INVALID);
+    printf("[h10probe] forced pairing requested\n");
 #endif
 
     app_state = APP_CONNECTED;
@@ -1695,7 +1697,7 @@ int main(void) {
     l2cap_init();
     sm_init();
     gatt_client_init();
-    polar_sdk_btstack_sm_apply_default_auth_policy();
+    polar_sdk_btstack_sm_configure_default_central_policy();
 
     polar_sdk_runtime_link_init(&runtime_link, HCI_CON_HANDLE_INVALID);
 

@@ -204,6 +204,7 @@ target_sources(usermod_polar_sdk INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_btstack_helpers.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_btstack_scan.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_btstack_adv_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_btstack_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_btstack_sm.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_sm_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../core/src/polar_sdk_btstack_dispatch.c

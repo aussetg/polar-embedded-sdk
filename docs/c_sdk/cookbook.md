@@ -195,22 +195,27 @@ The probe builds one ops table:
 polar_sdk_pmd_start_ops_t ops = {
     .ctx = NULL,
     .is_connected = pmd_is_connected,
-    .encryption_key_size = pmd_encryption_key_size,
-    .request_pairing = pmd_request_pairing,
-    .sleep_ms = pmd_sleep_ms_cb,
+    .security_ready = pmd_security_ready,
+    .ensure_security = pmd_ensure_security_cb,
     .enable_notifications = pmd_enable_notifications_cb,
     .ensure_minimum_mtu = pmd_ensure_minimum_mtu_cb,
     .start_ecg_and_wait_response = pmd_start_measurement_and_wait_response_cb,
 };
 ```
 
+For BTstack-backed targets, `security_ready` should come from the live link
+state, typically via `polar_sdk_btstack_security_ready(conn_handle, HCI_CON_HANDLE_INVALID)`,
+not from cached encryption-event fields.
+
+Configure BTstack SM defaults once during transport bring-up with
+`polar_sdk_btstack_sm_configure_default_central_policy()`. For one-shot pairing
+requests outside PMD start, prefer `polar_sdk_btstack_security_request_pairing(...)`.
+
 Then it declares an explicit start policy:
 
 ```c
 polar_sdk_pmd_start_policy_t ecg_policy = {
     .ccc_attempts = H10_PMD_CCC_ATTEMPTS,
-    .security_rounds_per_attempt = H10_PMD_SECURITY_ROUNDS,
-    .security_wait_ms = H10_PMD_SECURITY_WAIT_MS,
     .minimum_mtu = H10_PMD_MIN_MTU,
     .sample_rate = H10_PMD_ECG_SAMPLE_RATE,
     .include_resolution = true,

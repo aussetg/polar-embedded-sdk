@@ -57,6 +57,7 @@
 #include "polar_sdk_btstack_helpers.h"
 #include "polar_sdk_btstack_scan.h"
 #include "polar_sdk_btstack_adv_runtime.h"
+#include "polar_sdk_btstack_security.h"
 #include "polar_sdk_btstack_sm.h"
 #include "polar_sdk_sm_control.h"
 #include "polar_sdk_btstack_dispatch.h"
@@ -1247,9 +1248,9 @@ static void polar_raise_for_pmd_notify_status(int status, bool missing_char);
 static void polar_pmd_expect_response(polar_h10_obj_t *self, uint8_t opcode, uint8_t type);
 
 static bool polar_pmd_policy_is_connected(void *ctx);
-static uint8_t polar_pmd_policy_encryption_key_size(void *ctx);
-static void polar_pmd_policy_request_pairing(void *ctx);
-static void polar_pmd_policy_sleep_ms(void *ctx, uint32_t ms);
+static bool polar_pmd_policy_security_ready(void *ctx);
+static polar_sdk_security_result_t polar_pmd_policy_ensure_security(void *ctx);
+static void polar_pmd_policy_security_sleep_ms(void *ctx, uint32_t ms);
 
 typedef enum {
     POLAR_RECORDING_KIND_KEY_INVALID = -1,
@@ -1985,25 +1986,12 @@ static bool polar_psftp_security_ready(polar_h10_obj_t *self) {
         self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
         return false;
     }
-    return gap_encryption_key_size(self->runtime_link.conn_handle) > 0;
-}
-
-static bool polar_psftp_security_is_connected_cb(const void *ctx) {
-    const polar_h10_obj_t *self = (const polar_h10_obj_t *)ctx;
-    return self->runtime_link.connected && self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID;
+    return polar_sdk_btstack_security_ready(self->runtime_link.conn_handle, HCI_CON_HANDLE_INVALID);
 }
 
 static bool polar_psftp_security_is_secure_cb(const void *ctx) {
     polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
     return polar_psftp_security_ready(self);
-}
-
-static void polar_psftp_security_request_pairing_cb(const void *ctx) {
-    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
-    if (!self->runtime_link.connected || self->runtime_link.conn_handle == HCI_CON_HANDLE_INVALID) {
-        return;
-    }
-    sm_request_pairing(self->runtime_link.conn_handle);
 }
 
 static void polar_psftp_security_sleep_ms_cb(const void *ctx, uint32_t ms) {
@@ -2048,7 +2036,6 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
         return false;
     }
 
-    polar_sdk_btstack_sm_apply_default_auth_policy();
     polar_psftp_clear_local_bond_once(self);
 
     polar_sdk_security_policy_t policy = {
@@ -2056,13 +2043,6 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
         .wait_ms_per_round = POLAR_SDK_PMD_SECURITY_WAIT_MS,
         .request_gap_ms = 120,
         .poll_ms = 20,
-    };
-    polar_sdk_security_ops_t ops = {
-        .ctx = self,
-        .is_connected = polar_psftp_security_is_connected_cb,
-        .is_secure = polar_psftp_security_is_secure_cb,
-        .request_pairing = polar_psftp_security_request_pairing_cb,
-        .sleep_ms = polar_psftp_security_sleep_ms_cb,
     };
 
     bool dropped_stale_bond = false;
@@ -2073,7 +2053,12 @@ static bool polar_psftp_request_pairing_and_wait(polar_h10_obj_t *self) {
         }
 
         uint32_t pair_before = self->sm_pairing_complete_total;
-        polar_sdk_security_result_t r = polar_sdk_security_request_with_retry(&policy, &ops);
+        polar_sdk_security_result_t r = polar_sdk_btstack_security_ensure(
+            &self->runtime_link.conn_handle,
+            HCI_CON_HANDLE_INVALID,
+            &policy,
+            polar_psftp_security_sleep_ms_cb,
+            self);
         if (r == POLAR_SDK_SECURITY_RESULT_OK) {
             return true;
         }
@@ -3720,9 +3705,9 @@ static void polar_ensure_ble_ready(void) {
     polar_apply_btstack_host_identity_keys();
 
     // Keep Security Manager defaults aligned with probe/examples.
-    // Apply after BLE stack is active so all subsequent pairing requests follow
+    // Configure after BLE stack is active so later pairing requests inherit
     // the same bonding + secure-connection policy.
-    polar_sdk_btstack_sm_apply_default_auth_policy();
+    polar_sdk_btstack_sm_configure_default_central_policy();
 
     // Ensure GATT client is initialized for our direct btstack usage.
     // On MicroPython BTstack ports with GATT client enabled, mp_bluetooth_init()
@@ -4267,7 +4252,9 @@ static mp_obj_t polar_h10_capabilities(mp_obj_t self_in) {
 #if POLAR_SDK_HAS_BTSTACK
     if (self->runtime_link.connected && self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID) {
         bonded = gap_bonded(self->runtime_link.conn_handle);
-        key_size = gap_encryption_key_size(self->runtime_link.conn_handle);
+        key_size = polar_sdk_btstack_security_encryption_key_size(
+            self->runtime_link.conn_handle,
+            HCI_CON_HANDLE_INVALID);
     }
 #endif
     mp_obj_dict_store(security, mp_obj_new_str("bonded", 6), mp_obj_new_bool(bonded));
@@ -4415,7 +4402,9 @@ static mp_obj_t polar_h10_stats(mp_obj_t self_in) {
     uint8_t conn_encryption_key_size = 0;
     bool conn_bonded = false;
     if (self->runtime_link.connected && self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID) {
-        conn_encryption_key_size = gap_encryption_key_size(self->runtime_link.conn_handle);
+        conn_encryption_key_size = polar_sdk_btstack_security_encryption_key_size(
+            self->runtime_link.conn_handle,
+            HCI_CON_HANDLE_INVALID);
         conn_bonded = gap_bonded(self->runtime_link.conn_handle);
     }
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_conn_encryption_key_size), mp_obj_new_int_from_uint(conn_encryption_key_size));
@@ -4828,26 +4817,37 @@ static bool polar_pmd_policy_is_connected(void *ctx) {
     return self->runtime_link.connected && self->runtime_link.state == POLAR_SDK_STATE_READY && self->runtime_link.conn_handle != HCI_CON_HANDLE_INVALID;
 }
 
-static uint8_t polar_pmd_policy_encryption_key_size(void *ctx) {
+static bool polar_pmd_policy_security_ready(void *ctx) {
     polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
     if (!polar_pmd_policy_is_connected(ctx)) {
-        return 0;
+        return false;
     }
-    return gap_encryption_key_size(self->runtime_link.conn_handle);
+    return polar_sdk_btstack_security_ready(self->runtime_link.conn_handle, HCI_CON_HANDLE_INVALID);
 }
 
-static void polar_pmd_policy_request_pairing(void *ctx) {
-    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
-    if (!polar_pmd_policy_is_connected(ctx)) {
-        return;
-    }
-    polar_sdk_btstack_sm_apply_default_auth_policy();
-    sm_request_pairing(self->runtime_link.conn_handle);
-}
-
-static void polar_pmd_policy_sleep_ms(void *ctx, uint32_t ms) {
+static void polar_pmd_policy_security_sleep_ms(void *ctx, uint32_t ms) {
     (void)ctx;
     mp_event_wait_ms((mp_uint_t)ms);
+}
+
+static polar_sdk_security_result_t polar_pmd_policy_ensure_security(void *ctx) {
+    polar_h10_obj_t *self = (polar_h10_obj_t *)ctx;
+    if (!polar_pmd_policy_is_connected(ctx)) {
+        return POLAR_SDK_SECURITY_RESULT_NOT_CONNECTED;
+    }
+
+    polar_sdk_security_policy_t policy = {
+        .rounds = POLAR_SDK_PMD_SECURITY_ROUNDS,
+        .wait_ms_per_round = POLAR_SDK_PMD_SECURITY_WAIT_MS,
+        .request_gap_ms = 120u,
+        .poll_ms = 20u,
+    };
+    return polar_sdk_btstack_security_ensure(
+        &self->runtime_link.conn_handle,
+        HCI_CON_HANDLE_INVALID,
+        &policy,
+        polar_pmd_policy_security_sleep_ms,
+        self);
 }
 
 static int polar_pmd_policy_enable_cp_notify(void *ctx) {
@@ -4995,8 +4995,6 @@ static polar_sdk_pmd_start_result_t polar_h10_start_ecg_raw(
     int *out_last_ccc_att_status) {
     polar_sdk_pmd_start_policy_t policy = {
         .ccc_attempts = POLAR_SDK_PMD_CCC_ATTEMPTS,
-        .security_rounds_per_attempt = POLAR_SDK_PMD_SECURITY_ROUNDS,
-        .security_wait_ms = POLAR_SDK_PMD_SECURITY_WAIT_MS,
         .minimum_mtu = POLAR_SDK_PMD_MIN_MTU,
         .sample_rate = sample_rate,
         .include_resolution = true,
@@ -5007,9 +5005,8 @@ static polar_sdk_pmd_start_result_t polar_h10_start_ecg_raw(
     polar_sdk_pmd_start_ops_t ops = {
         .ctx = self,
         .is_connected = polar_pmd_policy_is_connected,
-        .encryption_key_size = polar_pmd_policy_encryption_key_size,
-        .request_pairing = polar_pmd_policy_request_pairing,
-        .sleep_ms = polar_pmd_policy_sleep_ms,
+        .security_ready = polar_pmd_policy_security_ready,
+        .ensure_security = polar_pmd_policy_ensure_security,
         .enable_notifications = polar_pmd_policy_enable_notifications,
         .ensure_minimum_mtu = polar_pmd_policy_ensure_minimum_mtu,
         .start_ecg_and_wait_response = polar_pmd_policy_start_measurement_and_wait_response,
@@ -5351,8 +5348,6 @@ static mp_obj_t polar_h10_start_imu(size_t n_args, const mp_obj_t *args, mp_map_
 
     polar_sdk_pmd_start_policy_t policy = {
         .ccc_attempts = POLAR_SDK_PMD_CCC_ATTEMPTS,
-        .security_rounds_per_attempt = POLAR_SDK_PMD_SECURITY_ROUNDS,
-        .security_wait_ms = POLAR_SDK_PMD_SECURITY_WAIT_MS,
         .minimum_mtu = POLAR_SDK_PMD_MIN_MTU,
         .sample_rate = (uint16_t)sample_rate,
         .include_resolution = true,
@@ -5363,9 +5358,8 @@ static mp_obj_t polar_h10_start_imu(size_t n_args, const mp_obj_t *args, mp_map_
     polar_sdk_pmd_start_ops_t ops = {
         .ctx = self,
         .is_connected = polar_pmd_policy_is_connected,
-        .encryption_key_size = polar_pmd_policy_encryption_key_size,
-        .request_pairing = polar_pmd_policy_request_pairing,
-        .sleep_ms = polar_pmd_policy_sleep_ms,
+        .security_ready = polar_pmd_policy_security_ready,
+        .ensure_security = polar_pmd_policy_ensure_security,
         .enable_notifications = polar_pmd_policy_enable_notifications,
         .ensure_minimum_mtu = polar_pmd_policy_ensure_minimum_mtu,
         .start_ecg_and_wait_response = polar_pmd_policy_start_measurement_and_wait_response,

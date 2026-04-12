@@ -115,7 +115,8 @@ Polar intent:
 - recover from ATT security errors and proceed after pairing.
 
 BTstack path:
-- request pairing: `sm_request_pairing`
+- preferred helper: `polar_sdk_btstack_security_request_pairing(...)`
+- underlying BTstack call: `sm_request_pairing`
 - interactive events:
   - `SM_EVENT_JUST_WORKS_REQUEST`
   - `SM_EVENT_NUMERIC_COMPARISON_REQUEST`

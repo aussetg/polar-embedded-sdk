@@ -34,9 +34,10 @@ bool polar_sdk_sm_event_matches_handle(
     uint16_t active_handle,
     uint16_t invalid_conn_handle);
 
-// Apply project-default Security Manager policy for central/client role.
-// Keeps BLE security setup consistent across probes and MicroPython binding.
-void polar_sdk_btstack_sm_apply_default_auth_policy(void);
+// Configure project-default Security Manager settings for central/client role.
+// Call during BTstack bring-up so later pairing requests all inherit the same
+// bonding + secure-connections policy.
+void polar_sdk_btstack_sm_configure_default_central_policy(void);
 
 #ifdef __cplusplus
 }

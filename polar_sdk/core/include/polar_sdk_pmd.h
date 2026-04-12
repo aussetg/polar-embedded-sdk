@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "polar_sdk_security.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -82,8 +84,6 @@ typedef enum {
 
 typedef struct {
     size_t ccc_attempts;
-    size_t security_rounds_per_attempt;
-    uint32_t security_wait_ms;
     uint16_t minimum_mtu;
     uint16_t sample_rate;
     bool include_resolution;
@@ -102,9 +102,13 @@ typedef enum {
 typedef struct {
     void *ctx;
     bool (*is_connected)(void *ctx);
-    uint8_t (*encryption_key_size)(void *ctx);
-    void (*request_pairing)(void *ctx);
-    void (*sleep_ms)(void *ctx, uint32_t ms);
+
+    // Must reflect the live transport security state, not a stale cache.
+    // BTstack-backed callers should typically use polar_sdk_btstack_security_ready().
+    bool (*security_ready)(void *ctx);
+
+    // Request and wait for link security according to caller policy.
+    polar_sdk_security_result_t (*ensure_security)(void *ctx);
 
     // 0 on success, >0 ATT status on ATT-level failure, <0 on transport errors.
     int (*enable_notifications)(void *ctx);

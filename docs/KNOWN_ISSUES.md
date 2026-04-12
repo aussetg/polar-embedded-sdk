@@ -89,7 +89,7 @@ Platform-level Pico 2 W BLE stability notes (CYW43 bus/IRQ coupling, WiFi conten
 ### Mitigations / best practices
 - Initialize SM auth policy consistently in all entry points (MicroPython binding + probes/examples).
 - Use the shared helper in this repo:
-  - `polar_sdk_btstack_sm_apply_default_auth_policy()`
+  - `polar_sdk_btstack_sm_configure_default_central_policy()`
 - Keep reconnect-on-security-failure behavior and explicit diagnostics in place for regressions.
 
 ### Current state

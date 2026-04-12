@@ -57,6 +57,7 @@ add_executable(h10_btstack_probe
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_helpers.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_scan.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_adv_runtime.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_sm.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_sm_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../../polar_sdk/core/src/polar_sdk_btstack_dispatch.c
@@ -93,7 +94,7 @@ target_link_libraries(h10_btstack_probe
 
 # Optional compile-time knobs (can be overridden with -D... at CMake configure time)
 set(H10_TARGET_ADDR "24:AC:AC:05:A3:10" CACHE STRING "Target H10 BLE address")
-set(H10_FORCE_PAIRING "0" CACHE STRING "Call sm_request_pairing() after connect")
+set(H10_FORCE_PAIRING "0" CACHE STRING "Force an immediate pairing request after connect")
 set(H10_ENABLE_HR "1" CACHE STRING "Enable HR service discovery + notify")
 set(H10_ENABLE_ECG_POLICY "1" CACHE STRING "Enable shared-sdk PMD ECG start policy run")
 set(H10_POST_CONNECT_UPDATE "1" CACHE STRING "Use gap_update_connection_parameters after connect")

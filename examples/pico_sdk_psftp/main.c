@@ -16,6 +16,7 @@
 #include "polar_sdk_btstack_dispatch.h"
 #include "polar_sdk_btstack_adv_runtime.h"
 #include "polar_sdk_btstack_scan.h"
+#include "polar_sdk_btstack_security.h"
 #include "polar_sdk_btstack_helpers.h"
 #include "polar_sdk_btstack_sm.h"
 #include "polar_sdk_sm_control.h"
@@ -479,10 +480,7 @@ static bool wait_flag_until_true(volatile bool *flag, uint32_t timeout_ms) {
 }
 
 static bool psftp_security_ready(void) {
-    if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-        return false;
-    }
-    return gap_encryption_key_size(conn_handle) > 0;
+    return polar_sdk_btstack_security_ready(conn_handle, HCI_CON_HANDLE_INVALID);
 }
 
 static void schedule_reconnect(uint32_t delay_ms);
@@ -1102,34 +1100,9 @@ static int psftp_write_frame(const uint8_t *frame, uint16_t frame_len) {
     return PSFTP_OP_OK;
 }
 
-static bool psftp_security_is_connected_cb(void *ctx) {
-    (void)ctx;
-    return connected && conn_handle != HCI_CON_HANDLE_INVALID;
-}
-
-static bool psftp_security_is_connected_const_cb(const void *ctx) {
-    return psftp_security_is_connected_cb((void *)ctx);
-}
-
 static bool psftp_security_is_secure_cb(void *ctx) {
     (void)ctx;
     return psftp_security_ready();
-}
-
-static bool psftp_security_is_secure_const_cb(const void *ctx) {
-    return psftp_security_is_secure_cb((void *)ctx);
-}
-
-static void psftp_security_request_pairing_cb(void *ctx) {
-    (void)ctx;
-    if (!connected || conn_handle == HCI_CON_HANDLE_INVALID) {
-        return;
-    }
-    sm_request_pairing(conn_handle);
-}
-
-static void psftp_security_request_pairing_const_cb(const void *ctx) {
-    psftp_security_request_pairing_cb((void *)ctx);
 }
 
 static void psftp_security_sleep_ms_cb(void *ctx, uint32_t ms) {
@@ -1137,32 +1110,19 @@ static void psftp_security_sleep_ms_cb(void *ctx, uint32_t ms) {
     probe_sleep_ms(ms);
 }
 
-static void psftp_security_sleep_ms_const_cb(const void *ctx, uint32_t ms) {
-    psftp_security_sleep_ms_cb((void *)ctx, ms);
-}
-
 static bool psftp_request_pairing_and_wait(void) {
-    if (psftp_security_ready()) {
-        return true;
-    }
-
-    polar_sdk_btstack_sm_apply_default_auth_policy();
-
     polar_sdk_security_policy_t policy = {
         .rounds = PSFTP_SECURITY_ROUNDS,
         .wait_ms_per_round = PSFTP_SECURITY_WAIT_MS,
         .request_gap_ms = 120,
         .poll_ms = 20,
     };
-    polar_sdk_security_ops_t ops = {
-        .ctx = NULL,
-        .is_connected = psftp_security_is_connected_const_cb,
-        .is_secure = psftp_security_is_secure_const_cb,
-        .request_pairing = psftp_security_request_pairing_const_cb,
-        .sleep_ms = psftp_security_sleep_ms_const_cb,
-    };
-
-    polar_sdk_security_result_t r = polar_sdk_security_request_with_retry(&policy, &ops);
+    polar_sdk_security_result_t r = polar_sdk_btstack_security_ensure(
+        &conn_handle,
+        HCI_CON_HANDLE_INVALID,
+        &policy,
+        psftp_security_sleep_ms_cb,
+        NULL);
     return r == POLAR_SDK_SECURITY_RESULT_OK;
 }
 
@@ -1774,7 +1734,7 @@ static void run_psftp_round_tick(void) {
 
     printf("[psftp-probe] ===== round %" PRIu32 " =====\n", rounds_total);
     printf("[psftp-probe] pre-round enc_key=%u pair_total=%" PRIu32 " pair_status=0x%02x state=%s\n",
-           gap_encryption_key_size(conn_handle),
+           polar_sdk_btstack_security_encryption_key_size(conn_handle, HCI_CON_HANDLE_INVALID),
            sm_pairing_complete_total,
            sm_last_pairing_status,
            state_name(app_state));
@@ -2090,7 +2050,7 @@ static void handle_gatt_event(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
 static void heartbeat_timer_handler(btstack_timer_source_t *ts) {
     uint32_t now = btstack_run_loop_get_time_ms();
-    uint8_t enc_key = (connected && conn_handle != HCI_CON_HANDLE_INVALID) ? gap_encryption_key_size(conn_handle) : 0;
+    uint8_t enc_key = polar_sdk_btstack_security_encryption_key_size(conn_handle, HCI_CON_HANDLE_INVALID);
 
     printf("[psftp-probe] hb t=%" PRIu32 " state=%s conn=%d handle=0x%04x enc=%u tx_mode=%s write_mode=%s jw=%" PRIu32 " pair=%" PRIu32 " pair_status=0x%02x rounds=%" PRIu32 "/ok=%" PRIu32 "/fail=%" PRIu32 " tx=%" PRIu32 " rx=%" PRIu32 " raw=%" PRIu32 "(mtu=%" PRIu32 ",d2h=%" PRIu32 ",other=%" PRIu32 ") routed(mtu=%" PRIu32 ",d2h=%" PRIu32 ",qc=%" PRIu32 ") qc(total=%" PRIu32 ",cfg=%" PRIu32 ",write=%" PRIu32 ",last=0x%04x/0x%04x/0x%02x)\n",
            now,
@@ -2171,7 +2131,7 @@ int main(void) {
     l2cap_init();
     sm_init();
     gatt_client_init();
-    polar_sdk_btstack_sm_apply_default_auth_policy();
+    polar_sdk_btstack_sm_configure_default_central_policy();
 
     polar_sdk_runtime_link_init(&runtime_link, HCI_CON_HANDLE_INVALID);
     psftp_diag_reset();
