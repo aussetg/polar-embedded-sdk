@@ -947,7 +947,7 @@ static bool logger_cli_fault_condition_still_present(const logger_app_t *app) {
         case LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET:
             return logger_cli_storage_fault_code(app) == app->persisted.current_fault_code;
         case LOGGER_FAULT_SD_WRITE_FAILED:
-            return true;
+            return logger_cli_storage_fault_code(app) != LOGGER_FAULT_NONE;
         case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
             return logger_cli_upload_blocked_fault_present();
         case LOGGER_FAULT_NONE:
