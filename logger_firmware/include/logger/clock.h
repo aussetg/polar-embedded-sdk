@@ -2,6 +2,7 @@
 #define LOGGER_FIRMWARE_CLOCK_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define LOGGER_CLOCK_RFC3339_UTC_LEN 30
@@ -68,5 +69,10 @@ bool logger_clock_derive_study_day_local(const logger_clock_status_t *status,
 bool logger_clock_derive_study_day_local_observed(
     const logger_clock_status_t *status, const char *timezone,
     char out_study_day[11]);
+
+static inline const char *
+logger_clock_now_utc_or_null(const logger_clock_status_t *clock) {
+  return clock->now_utc[0] != '\0' ? clock->now_utc : NULL;
+}
 
 #endif

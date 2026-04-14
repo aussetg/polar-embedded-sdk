@@ -144,8 +144,7 @@ static void logger_app_maybe_latch_new_fault(logger_app_t *app,
     return;
   }
   (void)logger_system_log_append(
-      &app->system_log,
-      app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
       "fault_latched", LOGGER_SYSTEM_LOG_SEVERITY_WARN,
       logger_json_object_writer_data(&writer));
 }
@@ -299,8 +298,7 @@ static bool logger_app_run_queue_maintenance(logger_app_t *app, uint32_t now_ms,
   size_t reserve_pruned_count = 0u;
   bool reserve_met = false;
   if (!logger_upload_queue_prune_file(
-          &app->system_log,
-          app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           LOGGER_SD_MIN_FREE_RESERVE_BYTES, &retention_pruned_count,
           &reserve_pruned_count, &reserve_met, NULL)) {
     return false;
@@ -394,8 +392,7 @@ logger_app_log_ntp_sync_result(logger_app_t *app, const char *event_kind,
   }
 
   (void)logger_system_log_append(
-      &app->system_log,
-      app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL, event_kind,
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock), event_kind,
       severity, logger_json_object_writer_data(&writer));
 }
 
@@ -593,8 +590,7 @@ static bool logger_app_finalize_no_session_day(logger_app_t *app,
     return false;
   }
   if (!logger_system_log_append(
-          &app->system_log,
-          app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           "no_session_day_summary", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
           logger_json_object_writer_data(&writer))) {
     return false;
@@ -974,15 +970,13 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
           app->boot_firmware_identity_changed) &&
       logger_json_object_writer_finish(&boot_writer)) {
     (void)logger_system_log_append(
-        &app->system_log,
-        app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL, "boot",
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock), "boot",
         LOGGER_SYSTEM_LOG_SEVERITY_INFO,
         logger_json_object_writer_data(&boot_writer));
   }
   if (app->clock.lost_power) {
     (void)logger_system_log_append(
-        &app->system_log,
-        app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
         "rtc_lost_power", LOGGER_SYSTEM_LOG_SEVERITY_WARN, "{}");
   }
 }
@@ -993,8 +987,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
   if (app->boot_gesture == LOGGER_BOOT_GESTURE_FACTORY_RESET) {
     printf("[logger] boot gesture: factory reset\n");
     (void)logger_system_log_append(
-        &app->system_log,
-        app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
         "factory_reset", LOGGER_SYSTEM_LOG_SEVERITY_WARN,
         "{\"source\":\"boot_gesture\"}");
     (void)logger_config_store_factory_reset(&app->persisted);
@@ -1007,8 +1000,8 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
   if (app->storage.mounted && app->storage.writable &&
       app->storage.logger_root_ready) {
     if (!logger_upload_queue_refresh_file(
-            &app->system_log,
-            app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL, NULL)) {
+            &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+            NULL)) {
       logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
       logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
                                   "queue_refresh_failed", now_ms);
@@ -1016,8 +1009,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
     }
     if (app->boot_firmware_identity_changed) {
       if (!logger_upload_queue_requeue_blocked_file(
-              &app->system_log,
-              app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL,
+              &app->system_log, logger_clock_now_utc_or_null(&app->clock),
               "firmware_changed", NULL, NULL)) {
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
         logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
@@ -1434,8 +1426,7 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
   logger_upload_process_result_t result;
   (void)logger_upload_process_session(
       &app->system_log, &app->persisted.config, app->hardware_id,
-      app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL, session_id,
-      &result);
+      logger_clock_now_utc_or_null(&app->clock), session_id, &result);
 
   if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED) {
     app->upload_pass_had_success = true;

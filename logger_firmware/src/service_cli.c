@@ -21,10 +21,6 @@
 #include "logger/util.h"
 #include "logger/version.h"
 
-static const char *logger_now_utc_or_null(const logger_app_t *app) {
-  return app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL;
-}
-
 static bool logger_parse_u8(const char *text, uint8_t *value_out) {
   if (text == NULL || value_out == NULL || text[0] == '\0') {
     return false;
@@ -897,12 +893,12 @@ static bool logger_cli_is_logging_mode(const logger_app_t *app) {
 static bool logger_cli_require_service(const logger_app_t *app,
                                        const char *command) {
   if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "busy_logging", "not permitted while logging");
     return false;
   }
   if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode",
                             "only allowed in service mode");
     return false;
@@ -918,7 +914,7 @@ static bool logger_cli_require_service_unlocked(const logger_service_cli_t *cli,
   }
   if (!logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "service_locked", "service unlock is required");
     return false;
   }
@@ -929,13 +925,13 @@ static bool logger_debug_require_service_unlocked(
     const logger_service_cli_t *cli, const logger_app_t *app,
     const char *command, const char *mode_message) {
   if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode", mode_message);
     return false;
   }
   if (!logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "service_locked", "service unlock is required");
     return false;
   }
@@ -958,20 +954,20 @@ logger_require_config_import_context(const logger_service_cli_t *cli,
                                      const logger_app_t *app,
                                      const char *command, bool require_unlock) {
   if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "busy_logging",
                             "config import is not permitted while logging");
     return false;
   }
   if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode",
                             "config import is only allowed in service mode");
     return false;
   }
   if (require_unlock && !logger_service_cli_is_unlocked(
                             cli, to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "service_locked",
                             "service unlock is required before config import");
     return false;
@@ -1044,7 +1040,8 @@ static void logger_write_status_payload(const logger_app_t *app) {
   logger_upload_queue_init(&queue);
   logger_upload_queue_summary_init(&queue_summary);
   if (logger_upload_queue_load(&queue) ||
-      logger_upload_queue_scan(&queue, NULL, logger_now_utc_or_null(app))) {
+      logger_upload_queue_scan(&queue, NULL,
+                               logger_clock_now_utc_or_null(&app->clock))) {
     logger_upload_queue_compute_summary(&queue, &queue_summary);
   }
   const bool have_study_day =
@@ -1227,13 +1224,15 @@ static void logger_write_status_payload(const logger_app_t *app) {
 }
 
 static void logger_handle_status_json(const logger_app_t *app) {
-  logger_json_begin_success("status", logger_now_utc_or_null(app));
+  logger_json_begin_success("status",
+                            logger_clock_now_utc_or_null(&app->clock));
   logger_write_status_payload(app);
   logger_json_end_success();
 }
 
 static void logger_handle_provisioning_status_json(logger_app_t *app) {
-  logger_json_begin_success("provisioning-status", logger_now_utc_or_null(app));
+  logger_json_begin_success("provisioning-status",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"normal_logging_ready\":", stdout);
   fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true"
                                                                    : "false",
@@ -1254,10 +1253,11 @@ static void logger_handle_queue_json(logger_app_t *app) {
   logger_upload_queue_t queue;
   logger_upload_queue_init(&queue);
   if (!logger_upload_queue_load(&queue)) {
-    (void)logger_upload_queue_scan(&queue, NULL, logger_now_utc_or_null(app));
+    (void)logger_upload_queue_scan(&queue, NULL,
+                                   logger_clock_now_utc_or_null(&app->clock));
   }
 
-  logger_json_begin_success("queue", logger_now_utc_or_null(app));
+  logger_json_begin_success("queue", logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"schema_source\":\"upload_queue.json\",\"updated_at_utc\":", stdout);
   logger_json_write_string_or_null(logger_string_present(queue.updated_at_utc)
                                        ? queue.updated_at_utc
@@ -1312,9 +1312,10 @@ static void logger_handle_queue_json(logger_app_t *app) {
 }
 
 static void logger_handle_system_log_export_json(logger_app_t *app) {
-  logger_json_begin_success("system-log export", logger_now_utc_or_null(app));
+  logger_json_begin_success("system-log export",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"schema_version\":1,\"exported_at_utc\":", stdout);
-  logger_json_write_string_or_null(logger_now_utc_or_null(app));
+  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
   fputs(",\"events\":[", stdout);
 
   for (uint32_t i = 0u; i < logger_system_log_count(&app->system_log); ++i) {
@@ -1398,9 +1399,10 @@ static void logger_write_upload_tls_json(const logger_config_t *config) {
 }
 
 static void logger_handle_config_export_json(logger_app_t *app) {
-  logger_json_begin_success("config export", logger_now_utc_or_null(app));
+  logger_json_begin_success("config export",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"schema_version\":1,\"exported_at_utc\":", stdout);
-  logger_json_write_string_or_null(logger_now_utc_or_null(app));
+  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
   fputs(",\"hardware_id\":", stdout);
   logger_json_write_string_or_null(app->hardware_id);
   fputs(",\"secrets_included\":false,\"identity\":{\"logger_id\":", stdout);
@@ -1458,7 +1460,8 @@ static void logger_handle_config_export_json(logger_app_t *app) {
 }
 
 static void logger_handle_clock_status_json(logger_app_t *app) {
-  logger_json_begin_success("clock status", logger_now_utc_or_null(app));
+  logger_json_begin_success("clock status",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"rtc_present\":", stdout);
   fputs(app->clock.rtc_present ? "true" : "false", stdout);
   fputs(",\"valid\":", stdout);
@@ -1470,7 +1473,7 @@ static void logger_handle_clock_status_json(logger_app_t *app) {
   fputs(",\"state\":", stdout);
   logger_json_write_string_or_null(logger_clock_state_name(&app->clock));
   fputs(",\"now_utc\":", stdout);
-  logger_json_write_string_or_null(logger_now_utc_or_null(app));
+  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
   fputs(",\"timezone\":", stdout);
   logger_json_write_string_or_null(app->persisted.config.timezone);
   fputs("}", stdout);
@@ -1479,15 +1482,15 @@ static void logger_handle_clock_status_json(logger_app_t *app) {
 
 static void logger_handle_preflight_json(logger_app_t *app) {
   if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error("preflight", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "preflight is not permitted while logging");
+    logger_json_begin_error(
+        "preflight", logger_clock_now_utc_or_null(&app->clock), "busy_logging",
+        "preflight is not permitted while logging");
     return;
   }
   if (logger_cli_is_upload_mode(app)) {
-    logger_json_begin_error("preflight", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "preflight is not permitted during upload");
+    logger_json_begin_error(
+        "preflight", logger_clock_now_utc_or_null(&app->clock),
+        "not_permitted_in_mode", "preflight is not permitted during upload");
     return;
   }
 
@@ -1513,7 +1516,8 @@ static void logger_handle_preflight_json(logger_app_t *app) {
     overall = "warn";
   }
 
-  logger_json_begin_success("preflight", logger_now_utc_or_null(app));
+  logger_json_begin_success("preflight",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"overall_result\":", stdout);
   logger_json_write_string_or_null(overall);
   fputs(",\"checks\":[", stdout);
@@ -1577,7 +1581,8 @@ static void logger_handle_net_test_json(logger_app_t *app) {
   logger_upload_net_test_result_t result;
   const bool ok = logger_upload_net_test(&app->persisted.config, &result);
 
-  logger_json_begin_success("net-test", logger_now_utc_or_null(app));
+  logger_json_begin_success("net-test",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"wifi_join\":{\"result\":", stdout);
   logger_json_write_string_or_null(result.wifi_join_result);
   fputs(",\"details\":{\"message\":", stdout);
@@ -1608,20 +1613,22 @@ static void logger_handle_service_unlock(logger_service_cli_t *cli,
 
   cli->unlocked = true;
   cli->unlock_deadline_mono_ms = now_ms + 60000u;
-  (void)logger_system_log_append(&app->system_log, logger_now_utc_or_null(app),
-                                 "service_unlock",
-                                 LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
+  (void)logger_system_log_append(
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+      "service_unlock", LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
 
-  logger_json_begin_success("service unlock", logger_now_utc_or_null(app));
+  logger_json_begin_success("service unlock",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"unlocked\":true,\"expires_at_utc\":", stdout);
-  logger_json_write_string_or_null(logger_now_utc_or_null(app));
+  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
   fputs(",\"ttl_seconds\":60}", stdout);
   logger_json_end_success();
 }
 
 static void logger_handle_service_enter(logger_app_t *app, uint32_t now_ms) {
   if (logger_cli_is_upload_mode(app)) {
-    logger_json_begin_error("service enter", logger_now_utc_or_null(app),
+    logger_json_begin_error("service enter",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode",
                             "service enter is not permitted during upload");
     return;
@@ -1631,19 +1638,21 @@ static void logger_handle_service_enter(logger_app_t *app, uint32_t now_ms) {
   bool will_stop_logging = false;
   if (!logger_app_request_service_mode(app, now_ms, &will_stop_logging)) {
     logger_json_begin_error(
-        "service enter", logger_now_utc_or_null(app), "not_permitted_in_mode",
+        "service enter", logger_clock_now_utc_or_null(&app->clock),
+        "not_permitted_in_mode",
         "service enter is not permitted in the current mode");
     return;
   }
 
   (void)logger_system_log_append(
-      &app->system_log, logger_now_utc_or_null(app), "service_request",
-      LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+      "service_request", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
       already_in_service
           ? "{\"source\":\"host\",\"already_in_service\":true}"
           : "{\"source\":\"host\",\"already_in_service\":false}");
 
-  logger_json_begin_success("service enter", logger_now_utc_or_null(app));
+  logger_json_begin_success("service enter",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"requested\":true,\"already_in_service\":", stdout);
   fputs(already_in_service ? "true" : "false", stdout);
   fputs(",\"will_stop_logging\":", stdout);
@@ -1659,40 +1668,42 @@ static void logger_handle_service_enter(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_handle_fault_clear(logger_app_t *app) {
   if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error("fault clear", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "fault clear is not permitted while logging");
+    logger_json_begin_error(
+        "fault clear", logger_clock_now_utc_or_null(&app->clock),
+        "busy_logging", "fault clear is not permitted while logging");
     return;
   }
   if (logger_cli_is_upload_mode(app)) {
-    logger_json_begin_error("fault clear", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "fault clear is not permitted during upload");
+    logger_json_begin_error(
+        "fault clear", logger_clock_now_utc_or_null(&app->clock),
+        "not_permitted_in_mode", "fault clear is not permitted during upload");
     return;
   }
 
   const logger_fault_code_t previous = app->persisted.current_fault_code;
   if (previous == LOGGER_FAULT_NONE) {
-    logger_json_begin_success("fault clear", logger_now_utc_or_null(app));
+    logger_json_begin_success("fault clear",
+                              logger_clock_now_utc_or_null(&app->clock));
     fputs("{\"cleared\":false,\"previous_code\":null}", stdout);
     logger_json_end_success();
     return;
   }
   if (logger_cli_fault_condition_still_present(app)) {
-    logger_json_begin_error("fault clear", logger_now_utc_or_null(app),
-                            "condition_still_present",
-                            "fault condition is still present");
+    logger_json_begin_error(
+        "fault clear", logger_clock_now_utc_or_null(&app->clock),
+        "condition_still_present", "fault condition is still present");
     return;
   }
 
   app->persisted.last_cleared_fault_code = previous;
   app->persisted.current_fault_code = LOGGER_FAULT_NONE;
   (void)logger_config_store_save(&app->persisted);
-  (void)logger_system_log_append(&app->system_log, logger_now_utc_or_null(app),
-                                 "fault_cleared",
-                                 LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
+  (void)logger_system_log_append(
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+      "fault_cleared", LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
 
-  logger_json_begin_success("fault clear", logger_now_utc_or_null(app));
+  logger_json_begin_success("fault clear",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"cleared\":true,\"previous_code\":", stdout);
   logger_json_write_string_or_null(logger_fault_code_name(previous));
   fputs("}", stdout);
@@ -1706,13 +1717,15 @@ static void logger_handle_factory_reset(logger_service_cli_t *cli,
   }
 
   (void)logger_system_log_append(
-      &app->system_log, logger_now_utc_or_null(app), "factory_reset",
-      LOGGER_SYSTEM_LOG_SEVERITY_WARN, "{\"source\":\"service_cli\"}");
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+      "factory_reset", LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+      "{\"source\":\"service_cli\"}");
   (void)logger_config_store_factory_reset(&app->persisted);
   cli->unlocked = false;
   app->reboot_pending = true;
 
-  logger_json_begin_success("factory-reset", logger_now_utc_or_null(app));
+  logger_json_begin_success("factory-reset",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"factory_reset\":true,\"will_reboot\":true}", stdout);
   logger_json_end_success();
 }
@@ -1724,7 +1737,8 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
   }
   if (app->session.active) {
     logger_json_begin_error(
-        "sd format", logger_now_utc_or_null(app), "not_permitted_in_mode",
+        "sd format", logger_clock_now_utc_or_null(&app->clock),
+        "not_permitted_in_mode",
         "sd format is not permitted while a session is active");
     return;
   }
@@ -1733,17 +1747,20 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
   if (!logger_storage_format(&formatted)) {
     (void)logger_storage_refresh(&app->storage);
     logger_json_begin_error(
-        "sd format", logger_now_utc_or_null(app), "storage_unavailable",
+        "sd format", logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable",
         "failed to format and remount the SD card as FAT32");
     return;
   }
 
   logger_upload_queue_summary_t queue_summary;
   if (!logger_upload_queue_refresh_file(
-          &app->system_log, logger_now_utc_or_null(app), &queue_summary)) {
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+          &queue_summary)) {
     (void)logger_storage_refresh(&app->storage);
     logger_json_begin_error(
-        "sd format", logger_now_utc_or_null(app), "storage_unavailable",
+        "sd format", logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable",
         "formatted SD card but failed to initialize logger queue state");
     return;
   }
@@ -1751,13 +1768,14 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
   (void)logger_storage_refresh(&app->storage);
   (void)queue_summary;
   (void)logger_system_log_append(
-      &app->system_log, logger_now_utc_or_null(app), "sd_formatted",
-      LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+      "sd_formatted", LOGGER_SYSTEM_LOG_SEVERITY_WARN,
       "{\"filesystem\":\"fat32\",\"logger_root_created\":true}");
 
   cli->unlocked = false;
 
-  logger_json_begin_success("sd format", logger_now_utc_or_null(app));
+  logger_json_begin_success("sd format",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"formatted\":true,\"filesystem\":\"fat32\",\"logger_root_created\":"
         "true}",
         stdout);
@@ -1770,18 +1788,20 @@ static void logger_handle_clock_set(const logger_service_cli_t *cli,
     return;
   }
   if (!logger_clock_set_utc(value, &app->clock)) {
-    logger_json_begin_error("clock set", logger_now_utc_or_null(app),
+    logger_json_begin_error("clock set",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "invalid_config", "invalid RFC3339 UTC timestamp");
     return;
   }
   logger_app_note_wall_clock_changed(app);
-  (void)logger_system_log_append(&app->system_log, logger_now_utc_or_null(app),
-                                 "clock_set", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-                                 "{}");
+  (void)logger_system_log_append(
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock), "clock_set",
+      LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
 
-  logger_json_begin_success("clock set", logger_now_utc_or_null(app));
+  logger_json_begin_success("clock set",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"applied\":true,\"now_utc\":", stdout);
-  logger_json_write_string_or_null(logger_now_utc_or_null(app));
+  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
   fputs("}", stdout);
   logger_json_end_success();
 }
@@ -1795,7 +1815,8 @@ static void logger_handle_clock_sync(logger_service_cli_t *cli,
   logger_clock_ntp_sync_result_t result;
   const bool ok = logger_app_clock_sync_ntp(app, &result);
 
-  logger_json_begin_success("clock sync", logger_now_utc_or_null(app));
+  logger_json_begin_success("clock sync",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"attempted\":", stdout);
   fputs(result.attempted ? "true" : "false", stdout);
   fputs(",\"applied\":", stdout);
@@ -1822,7 +1843,7 @@ static void logger_handle_clock_sync(logger_service_cli_t *cli,
   logger_json_write_string_or_null(
       result.previous_utc[0] != '\0' ? result.previous_utc : NULL);
   fputs(",\"now_utc\":", stdout);
-  logger_json_write_string_or_null(logger_now_utc_or_null(app));
+  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
   fputs(",\"message\":", stdout);
   logger_json_write_string_or_null(result.message[0] != '\0' ? result.message
                                                              : NULL);
@@ -1840,12 +1861,12 @@ static void logger_apply_config_import_json(logger_service_cli_t *cli,
   const char *error_message = "config import failed";
   if (!logger_parse_config_import_document(app, json, &imported, &bond_cleared,
                                            &error_message)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "invalid_config", error_message);
     return;
   }
   if (!logger_config_store_save(&imported)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "storage_unavailable",
                             "failed to persist imported config");
     return;
@@ -1872,8 +1893,8 @@ static void logger_apply_config_import_json(logger_service_cli_t *cli,
                                            bond_cleared) &&
       logger_json_object_writer_finish(&writer)) {
     (void)logger_system_log_append(
-        &app->system_log, logger_now_utc_or_null(app), "config_changed",
-        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+        "config_changed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
         logger_json_object_writer_data(&writer));
   }
 
@@ -1882,7 +1903,7 @@ static void logger_apply_config_import_json(logger_service_cli_t *cli,
   }
   cli->unlocked = false;
 
-  logger_json_begin_success(command, logger_now_utc_or_null(app));
+  logger_json_begin_success(command, logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"applied\":true,\"normal_logging_ready\":", stdout);
   fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true"
                                                                    : "false",
@@ -1899,7 +1920,8 @@ static void logger_handle_config_import(logger_service_cli_t *cli,
     return;
   }
   if (!logger_string_present(json)) {
-    logger_json_begin_error("config import", logger_now_utc_or_null(app),
+    logger_json_begin_error("config import",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "invalid_config",
                             "expected: config import <json>\nor use: config "
                             "import begin <bytes> / chunk / commit");
@@ -1920,9 +1942,9 @@ static void logger_handle_config_import_begin(logger_service_cli_t *cli,
   char extra[8] = {0};
   const int matched = sscanf(args, "%23s %7s", size_text, extra);
   if (matched != 1) {
-    logger_json_begin_error("config import begin", logger_now_utc_or_null(app),
-                            "invalid_config",
-                            "expected: config import begin <total_bytes>");
+    logger_json_begin_error(
+        "config import begin", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "expected: config import begin <total_bytes>");
     return;
   }
 
@@ -1930,14 +1952,14 @@ static void logger_handle_config_import_begin(logger_service_cli_t *cli,
   if (!logger_parse_size_t_strict(size_text, &expected_len) ||
       expected_len == 0u) {
     logger_json_begin_error(
-        "config import begin", logger_now_utc_or_null(app), "invalid_config",
-        "config import begin requires a positive byte count");
+        "config import begin", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "config import begin requires a positive byte count");
     return;
   }
   if (expected_len > LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX) {
-    logger_json_begin_error("config import begin", logger_now_utc_or_null(app),
-                            "invalid_config",
-                            "config import size exceeds transport buffer");
+    logger_json_begin_error(
+        "config import begin", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "config import size exceeds transport buffer");
     return;
   }
 
@@ -1946,7 +1968,8 @@ static void logger_handle_config_import_begin(logger_service_cli_t *cli,
   cli->config_import_active = true;
   cli->config_import_expected_len = expected_len;
 
-  logger_json_begin_success("config import begin", logger_now_utc_or_null(app));
+  logger_json_begin_success("config import begin",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"started\":true,\"expected_bytes\":", stdout);
   printf("%llu", (unsigned long long)cli->config_import_expected_len);
   fputs(",\"received_bytes\":0,\"remaining_bytes\":", stdout);
@@ -1968,7 +1991,8 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
   }
   if (!cli->config_import_active) {
     logger_json_begin_error(
-        "config import chunk", logger_now_utc_or_null(app), "invalid_config",
+        "config import chunk", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config",
         "no config import transfer is active; use config import begin first");
     return;
   }
@@ -1976,7 +2000,8 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
   const size_t chunk_len = strlen(chunk);
   if (chunk_len == 0u) {
     logger_json_begin_error(
-        "config import chunk", logger_now_utc_or_null(app), "invalid_config",
+        "config import chunk", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config",
         "config import chunk requires a non-empty payload fragment");
     return;
   }
@@ -1986,7 +2011,8 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
       (cli->config_import_received_len + chunk_len) >
           LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX) {
     logger_config_import_transfer_reset(cli);
-    logger_json_begin_error("config import chunk", logger_now_utc_or_null(app),
+    logger_json_begin_error("config import chunk",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "invalid_config",
                             "config import chunk exceeds announced transfer "
                             "size; transfer aborted");
@@ -1999,7 +2025,8 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
   cli->config_import_buf[cli->config_import_received_len] = '\0';
   cli->config_import_chunk_count += 1u;
 
-  logger_json_begin_success("config import chunk", logger_now_utc_or_null(app));
+  logger_json_begin_success("config import chunk",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"accepted\":true,\"chunk_bytes\":", stdout);
   printf("%llu", (unsigned long long)chunk_len);
   fputs(",\"received_bytes\":", stdout);
@@ -2028,7 +2055,7 @@ static void logger_handle_config_import_status(logger_service_cli_t *cli,
   }
 
   logger_json_begin_success("config import status",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"active\":", stdout);
   fputs(cli->config_import_active ? "true" : "false", stdout);
   fputs(",\"expected_bytes\":", stdout);
@@ -2070,7 +2097,7 @@ static void logger_handle_config_import_cancel(logger_service_cli_t *cli,
   logger_config_import_transfer_reset(cli);
 
   logger_json_begin_success("config import cancel",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"cleared\":true,\"had_transfer\":", stdout);
   fputs(had_transfer ? "true" : "false", stdout);
   fputs("}", stdout);
@@ -2085,14 +2112,15 @@ static void logger_handle_config_import_commit(logger_service_cli_t *cli,
   }
   if (!cli->config_import_active) {
     logger_json_begin_error(
-        "config import commit", logger_now_utc_or_null(app), "invalid_config",
+        "config import commit", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config",
         "no config import transfer is active; use config import begin first");
     return;
   }
   if (cli->config_import_received_len != cli->config_import_expected_len) {
-    logger_json_begin_error("config import commit", logger_now_utc_or_null(app),
-                            "invalid_config",
-                            "config import transfer is incomplete");
+    logger_json_begin_error(
+        "config import commit", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "config import transfer is incomplete");
     return;
   }
 
@@ -2112,7 +2140,8 @@ logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli,
   bool had_anchor = false;
   if (!logger_config_clear_provisioned_anchor(&app->persisted, &had_anchor)) {
     logger_json_begin_error("upload tls clear-provisioned-anchor",
-                            logger_now_utc_or_null(app), "storage_unavailable",
+                            logger_clock_now_utc_or_null(&app->clock),
+                            "storage_unavailable",
                             "failed to clear provisioned upload TLS anchor");
     return;
   }
@@ -2125,15 +2154,15 @@ logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli,
       logger_json_object_writer_bool_field(&writer, "had_anchor", had_anchor) &&
       logger_json_object_writer_finish(&writer)) {
     (void)logger_system_log_append(
-        &app->system_log, logger_now_utc_or_null(app), "config_changed",
-        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+        "config_changed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
         logger_json_object_writer_data(&writer));
   }
 
   cli->unlocked = false;
 
   logger_json_begin_success("upload tls clear-provisioned-anchor",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"cleared\":true,\"had_anchor\":", stdout);
   fputs(had_anchor ? "true" : "false", stdout);
   fputs(",\"current_tls_mode\":", stdout);
@@ -2155,9 +2184,9 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
   value[0] = '\0';
   const int matched = sscanf(args, "%47s %255[^\n]", field, value);
   if (matched < 2) {
-    logger_json_begin_error("debug config set", logger_now_utc_or_null(app),
-                            "invalid_config",
-                            "expected: debug config set <field> <value>");
+    logger_json_begin_error(
+        "debug config set", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "expected: debug config set <field> <value>");
     return;
   }
 
@@ -2171,13 +2200,14 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
 
   if (logger_cli_is_logging_mode(app) && !allow_in_log_wait_h10) {
-    logger_json_begin_error("debug config set", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "config mutation is not permitted while logging");
+    logger_json_begin_error(
+        "debug config set", logger_clock_now_utc_or_null(&app->clock),
+        "busy_logging", "config mutation is not permitted while logging");
     return;
   }
   if (!logger_cli_is_service_mode(app) && !allow_in_log_wait_h10) {
-    logger_json_begin_error("debug config set", logger_now_utc_or_null(app),
+    logger_json_begin_error("debug config set",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode",
                             "debug config set is only allowed in service mode");
     return;
@@ -2186,8 +2216,8 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
     logger_json_begin_error(
-        "debug config set", logger_now_utc_or_null(app), "service_locked",
-        "service unlock is required before debug config set");
+        "debug config set", logger_clock_now_utc_or_null(&app->clock),
+        "service_locked", "service unlock is required before debug config set");
     return;
   }
 
@@ -2213,15 +2243,16 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
   } else if (strcmp(field, "upload_token") == 0) {
     ok = logger_config_set_upload_token(&app->persisted, value);
   } else {
-    logger_json_begin_error("debug config set", logger_now_utc_or_null(app),
+    logger_json_begin_error("debug config set",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "invalid_config", "unknown debug config field");
     return;
   }
 
   if (!ok) {
-    logger_json_begin_error("debug config set", logger_now_utc_or_null(app),
-                            "invalid_config",
-                            "failed to apply debug config field");
+    logger_json_begin_error(
+        "debug config set", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "failed to apply debug config field");
     return;
   }
 
@@ -2231,12 +2262,13 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
   if (logger_json_object_writer_string_field(&writer, "field", field) &&
       logger_json_object_writer_finish(&writer)) {
     (void)logger_system_log_append(
-        &app->system_log, logger_now_utc_or_null(app), "config_changed",
-        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+        "config_changed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
         logger_json_object_writer_data(&writer));
   }
 
-  logger_json_begin_success("debug config set", logger_now_utc_or_null(app));
+  logger_json_begin_success("debug config set",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"applied\":true,\"field\":", stdout);
   logger_json_write_string_or_null(field);
   fputs(",\"normal_logging_ready\":", stdout);
@@ -2258,17 +2290,19 @@ static void logger_handle_debug_config_clear(const logger_service_cli_t *cli,
     return;
   }
   if (strcmp(args, "upload") != 0) {
-    logger_json_begin_error("debug config clear", logger_now_utc_or_null(app),
-                            "invalid_config",
-                            "only 'debug config clear upload' is supported");
+    logger_json_begin_error(
+        "debug config clear", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "only 'debug config clear upload' is supported");
     return;
   }
 
   (void)logger_config_clear_upload(&app->persisted);
   (void)logger_system_log_append(
-      &app->system_log, logger_now_utc_or_null(app), "config_changed",
-      LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{\"field\":\"upload\"}");
-  logger_json_begin_success("debug config clear", logger_now_utc_or_null(app));
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+      "config_changed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+      "{\"field\":\"upload\"}");
+  logger_json_begin_success("debug config clear",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"applied\":true,\"field\":\"upload\"}", stdout);
   logger_json_end_success();
 }
@@ -2289,13 +2323,15 @@ static void logger_handle_debug_session_start(const logger_service_cli_t *cli,
           &app->clock, &app->battery, &app->storage,
           app->persisted.current_fault_code, app->persisted.boot_counter,
           now_ms, &error_code, &error_message)) {
-    logger_json_begin_error("debug session start", logger_now_utc_or_null(app),
+    logger_json_begin_error("debug session start",
+                            logger_clock_now_utc_or_null(&app->clock),
                             error_code, error_message);
     return;
   }
   app->last_session_snapshot_mono_ms = now_ms;
 
-  logger_json_begin_success("debug session start", logger_now_utc_or_null(app));
+  logger_json_begin_success("debug session start",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"active\":true,\"session_id\":", stdout);
   logger_json_write_string_or_null(app->session.session_id);
   fputs(",\"study_day_local\":", stdout);
@@ -2308,7 +2344,7 @@ static void logger_handle_debug_session_snapshot(logger_app_t *app,
                                                  uint32_t now_ms) {
   if (!app->session.active) {
     logger_json_begin_error(
-        "debug session snapshot", logger_now_utc_or_null(app),
+        "debug session snapshot", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode", "no debug session is active");
     return;
   }
@@ -2316,15 +2352,15 @@ static void logger_handle_debug_session_snapshot(logger_app_t *app,
           &app->session, &app->clock, &app->battery, &app->storage,
           app->persisted.current_fault_code, app->persisted.boot_counter,
           now_ms)) {
-    logger_json_begin_error("debug session snapshot",
-                            logger_now_utc_or_null(app), "storage_unavailable",
-                            "failed to append status snapshot");
+    logger_json_begin_error(
+        "debug session snapshot", logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable", "failed to append status snapshot");
     return;
   }
   app->last_session_snapshot_mono_ms = now_ms;
 
   logger_json_begin_success("debug session snapshot",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"written\":true,\"journal_size_bytes\":", stdout);
   printf("%llu", (unsigned long long)app->session.journal_size_bytes);
   fputs("}", stdout);
@@ -2335,7 +2371,7 @@ static void logger_handle_debug_session_stop(logger_app_t *app,
                                              uint32_t now_ms) {
   if (!app->session.active) {
     logger_json_begin_success("debug session stop",
-                              logger_now_utc_or_null(app));
+                              logger_clock_now_utc_or_null(&app->clock));
     fputs("{\"active\":false}", stdout);
     logger_json_end_success();
     return;
@@ -2343,12 +2379,13 @@ static void logger_handle_debug_session_stop(logger_app_t *app,
   if (!logger_session_stop_debug(
           &app->session, &app->system_log, app->hardware_id, &app->persisted,
           &app->clock, &app->storage, app->persisted.boot_counter, now_ms)) {
-    logger_json_begin_error("debug session stop", logger_now_utc_or_null(app),
-                            "storage_unavailable",
-                            "failed to close debug session");
+    logger_json_begin_error(
+        "debug session stop", logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable", "failed to close debug session");
     return;
   }
-  logger_json_begin_success("debug session stop", logger_now_utc_or_null(app));
+  logger_json_begin_success("debug session stop",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"active\":false}", stdout);
   logger_json_end_success();
 }
@@ -2362,17 +2399,17 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
     return;
   }
   if (!app->session.active) {
-    logger_json_begin_error("debug synth ecg", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "no debug session is active");
+    logger_json_begin_error(
+        "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
+        "not_permitted_in_mode", "no debug session is active");
     return;
   }
 
   uint8_t count = 1u;
   if (args != NULL && args[0] != '\0' && !logger_parse_u8(args, &count)) {
-    logger_json_begin_error("debug synth ecg", logger_now_utc_or_null(app),
-                            "invalid_config",
-                            "expected: debug synth ecg [count]");
+    logger_json_begin_error(
+        "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "expected: debug synth ecg [count]");
     return;
   }
   if (count == 0u) {
@@ -2388,7 +2425,7 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
             app->persisted.config.bound_h10_address, false, false, false,
             app->persisted.boot_counter, now_ms, &error_code, &error_message)) {
       logger_json_begin_error(
-          "debug synth ecg", logger_now_utc_or_null(app),
+          "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
           error_code != NULL ? error_code : "storage_unavailable",
           error_message != NULL ? error_message : "failed to reopen span");
       return;
@@ -2414,15 +2451,16 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
                                           ((uint64_t)now_ms * 1000ull) +
                                               ((uint64_t)i * 1000ull),
                                           packet, sizeof(packet))) {
-      logger_json_begin_error("debug synth ecg", logger_now_utc_or_null(app),
-                              "storage_unavailable",
-                              "failed to append synthetic ECG packet");
+      logger_json_begin_error(
+          "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
+          "storage_unavailable", "failed to append synthetic ECG packet");
       return;
     }
     appended += 1u;
   }
 
-  logger_json_begin_success("debug synth ecg", logger_now_utc_or_null(app));
+  logger_json_begin_success("debug synth ecg",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"appended_packets\":", stdout);
   printf("%lu", (unsigned long)appended);
   fputs(",\"session_id\":", stdout);
@@ -2446,20 +2484,20 @@ logger_handle_debug_synth_disconnect(const logger_service_cli_t *cli,
   }
   if (!app->session.active || !app->session.span_active) {
     logger_json_begin_error("debug synth disconnect",
-                            logger_now_utc_or_null(app),
+                            logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode", "no active span is open");
     return;
   }
   if (!logger_session_handle_disconnect(&app->session, &app->clock,
                                         app->persisted.boot_counter, now_ms,
                                         "disconnect")) {
-    logger_json_begin_error("debug synth disconnect",
-                            logger_now_utc_or_null(app), "storage_unavailable",
-                            "failed to append synthetic disconnect gap");
+    logger_json_begin_error(
+        "debug synth disconnect", logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable", "failed to append synthetic disconnect gap");
     return;
   }
   logger_json_begin_success("debug synth disconnect",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"span_active\":false,\"session_id\":", stdout);
   logger_json_write_string_or_null(app->session.session_id);
   fputs("}", stdout);
@@ -2477,7 +2515,7 @@ logger_handle_debug_synth_h10_battery(const logger_service_cli_t *cli,
   }
   if (!app->session.active) {
     logger_json_begin_error(
-        "debug synth h10-battery", logger_now_utc_or_null(app),
+        "debug synth h10-battery", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode", "no debug session is active");
     return;
   }
@@ -2486,7 +2524,7 @@ logger_handle_debug_synth_h10_battery(const logger_service_cli_t *cli,
   char reason[16] = {0};
   if (args == NULL || sscanf(args, "%15s %15s", percent_text, reason) != 2) {
     logger_json_begin_error(
-        "debug synth h10-battery", logger_now_utc_or_null(app),
+        "debug synth h10-battery", logger_clock_now_utc_or_null(&app->clock),
         "invalid_config",
         "expected: debug synth h10-battery <percent> <connect|periodic>");
     return;
@@ -2494,24 +2532,24 @@ logger_handle_debug_synth_h10_battery(const logger_service_cli_t *cli,
   uint8_t percent = 0u;
   if (!logger_parse_u8(percent_text, &percent) || percent > 100u ||
       (strcmp(reason, "connect") != 0 && strcmp(reason, "periodic") != 0)) {
-    logger_json_begin_error("debug synth h10-battery",
-                            logger_now_utc_or_null(app), "invalid_config",
-                            "invalid battery percent or read reason");
+    logger_json_begin_error(
+        "debug synth h10-battery", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config", "invalid battery percent or read reason");
     return;
   }
 
   if (!logger_session_append_h10_battery(&app->session, &app->clock,
                                          app->persisted.boot_counter, now_ms,
                                          percent, reason)) {
-    logger_json_begin_error("debug synth h10-battery",
-                            logger_now_utc_or_null(app), "storage_unavailable",
-                            "failed to append synthetic h10_battery record");
+    logger_json_begin_error(
+        "debug synth h10-battery", logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable", "failed to append synthetic h10_battery record");
     return;
   }
   app->h10.battery_percent = percent;
 
   logger_json_begin_success("debug synth h10-battery",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"written\":true,\"battery_percent\":", stdout);
   printf("%u", (unsigned)percent);
   fputs(",\"read_reason\":", stdout);
@@ -2551,7 +2589,7 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
   }
   if (app->session.active) {
     logger_json_begin_error(
-        "debug synth no-session-day", logger_now_utc_or_null(app),
+        "debug synth no-session-day", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode",
         "debug synth no-session-day requires no active session");
     return;
@@ -2567,7 +2605,8 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
                                    seen_text, connected_text, start_text);
   if (matched < 1) {
     logger_json_begin_error("debug synth no-session-day",
-                            logger_now_utc_or_null(app), "invalid_config",
+                            logger_clock_now_utc_or_null(&app->clock),
+                            "invalid_config",
                             "expected: debug synth no-session-day "
                             "<reason>|auto [seen connected ecg_started]");
     return;
@@ -2584,7 +2623,8 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
           !logger_parse_bool01(connected_text, &ble_connected) ||
           !logger_parse_bool01(start_text, &ecg_start_attempted)) {
         logger_json_begin_error("debug synth no-session-day",
-                                logger_now_utc_or_null(app), "invalid_config",
+                                logger_clock_now_utc_or_null(&app->clock),
+                                "invalid_config",
                                 "auto mode flags must be 0 or 1");
         return;
       }
@@ -2593,8 +2633,8 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
         seen_bound_device, ble_connected, ecg_start_attempted);
   } else if (!logger_no_session_reason_valid(reason)) {
     logger_json_begin_error("debug synth no-session-day",
-                            logger_now_utc_or_null(app), "invalid_config",
-                            "invalid no-session-day reason");
+                            logger_clock_now_utc_or_null(&app->clock),
+                            "invalid_config", "invalid no-session-day reason");
     return;
   }
 
@@ -2602,7 +2642,7 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
   if (!logger_clock_derive_study_day_local_observed(
           &app->clock, app->persisted.config.timezone, study_day_local)) {
     logger_json_begin_error(
-        "debug synth no-session-day", logger_now_utc_or_null(app),
+        "debug synth no-session-day", logger_clock_now_utc_or_null(&app->clock),
         "invalid_config",
         "cannot derive study_day_local from current clock/timezone");
     return;
@@ -2622,17 +2662,17 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
                                             ecg_start_attempted) ||
       !logger_json_object_writer_finish(&writer)) {
     logger_json_begin_error(
-        "debug synth no-session-day", logger_now_utc_or_null(app),
+        "debug synth no-session-day", logger_clock_now_utc_or_null(&app->clock),
         "storage_unavailable",
         "failed to build synthetic no_session_day_summary details");
     return;
   }
-  if (!logger_system_log_append(&app->system_log, logger_now_utc_or_null(app),
-                                "no_session_day_summary",
-                                LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-                                logger_json_object_writer_data(&writer))) {
+  if (!logger_system_log_append(
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+          "no_session_day_summary", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+          logger_json_object_writer_data(&writer))) {
     logger_json_begin_error(
-        "debug synth no-session-day", logger_now_utc_or_null(app),
+        "debug synth no-session-day", logger_clock_now_utc_or_null(&app->clock),
         "storage_unavailable",
         "failed to append synthetic no_session_day_summary");
     return;
@@ -2640,7 +2680,7 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
   logger_app_set_last_day_outcome(app, study_day_local, "no_session", reason);
 
   logger_json_begin_success("debug synth no-session-day",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"study_day_local\":", stdout);
   logger_json_write_string_or_null(study_day_local);
   fputs(",\"reason\":", stdout);
@@ -2690,9 +2730,9 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
     return;
   }
   if (!app->session.active) {
-    logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "no debug session is active");
+    logger_json_begin_error(
+        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
+        "not_permitted_in_mode", "no debug session is active");
     return;
   }
 
@@ -2704,7 +2744,8 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
                      app->session.study_day_local);
 
   if (!logger_update_clock_from_rfc3339(app, rfc3339, now_ms, NULL, NULL)) {
-    logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app),
+    logger_json_begin_error("debug synth rollover",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "invalid_config", "invalid RFC3339 UTC timestamp");
     return;
   }
@@ -2713,13 +2754,15 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
   if (!logger_clock_derive_study_day_local_observed(
           &app->clock, app->persisted.config.timezone, new_study_day_local)) {
     logger_json_begin_error(
-        "debug synth rollover", logger_now_utc_or_null(app), "invalid_config",
+        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config",
         "cannot derive study_day_local from current clock/timezone");
     return;
   }
   if (strcmp(old_study_day_local, new_study_day_local) == 0) {
     logger_json_begin_error(
-        "debug synth rollover", logger_now_utc_or_null(app), "invalid_config",
+        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
+        "invalid_config",
         "new timestamp does not cross the study-day boundary");
     return;
   }
@@ -2728,9 +2771,9 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
                                app->hardware_id, &app->persisted, &app->clock,
                                &app->storage, "rollover",
                                app->persisted.boot_counter, now_ms)) {
-    logger_json_begin_error("debug synth rollover", logger_now_utc_or_null(app),
-                            "storage_unavailable",
-                            "failed to finalize pre-rollover session");
+    logger_json_begin_error(
+        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable", "failed to finalize pre-rollover session");
     return;
   }
   const char *error_code = NULL;
@@ -2741,7 +2784,7 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
           app->persisted.config.bound_h10_address, false, false, false,
           app->persisted.boot_counter, now_ms, &error_code, &error_message)) {
     logger_json_begin_error(
-        "debug synth rollover", logger_now_utc_or_null(app),
+        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
         error_code != NULL ? error_code : "storage_unavailable",
         error_message != NULL ? error_message
                               : "failed to open post-rollover session");
@@ -2753,7 +2796,7 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
   app->last_session_snapshot_mono_ms = now_ms;
 
   logger_json_begin_success("debug synth rollover",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"old_study_day_local\":", stdout);
   logger_json_write_string_or_null(old_study_day_local);
   fputs(",\"new_study_day_local\":", stdout);
@@ -2777,7 +2820,7 @@ static void logger_handle_debug_synth_clock_boundary(
     return;
   }
   if (!app->session.active) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode",
                             "no debug session is active");
     return;
@@ -2794,7 +2837,7 @@ static void logger_handle_debug_synth_clock_boundary(
   int64_t new_utc_ns = 0ll;
   if (!logger_update_clock_from_rfc3339(app, rfc3339, now_ms, &old_utc_ns,
                                         &new_utc_ns)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
+    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
                             "invalid_config", "invalid RFC3339 UTC timestamp");
     return;
   }
@@ -2803,7 +2846,7 @@ static void logger_handle_debug_synth_clock_boundary(
   if (!logger_clock_derive_study_day_local_observed(
           &app->clock, app->persisted.config.timezone, new_study_day_local)) {
     logger_json_begin_error(
-        command, logger_now_utc_or_null(app), "invalid_config",
+        command, logger_clock_now_utc_or_null(&app->clock), "invalid_config",
         "cannot derive study_day_local from current clock/timezone");
     return;
   }
@@ -2815,7 +2858,8 @@ static void logger_handle_debug_synth_clock_boundary(
           event_kind, span_end_reason, new_utc_ns - old_utc_ns, old_utc_ns,
           new_utc_ns, true)) {
     logger_json_begin_error(
-        command, logger_now_utc_or_null(app), "storage_unavailable",
+        command, logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable",
         "failed to append synthetic clock boundary records");
     return;
   }
@@ -2825,9 +2869,9 @@ static void logger_handle_debug_synth_clock_boundary(
                                  app->hardware_id, &app->persisted, &app->clock,
                                  &app->storage, span_end_reason,
                                  app->persisted.boot_counter, now_ms)) {
-      logger_json_begin_error(command, logger_now_utc_or_null(app),
-                              "storage_unavailable",
-                              "failed to finalize pre-boundary session");
+      logger_json_begin_error(
+          command, logger_clock_now_utc_or_null(&app->clock),
+          "storage_unavailable", "failed to finalize pre-boundary session");
       return;
     }
     logger_app_set_last_day_outcome(app, old_study_day_local, "session",
@@ -2843,7 +2887,7 @@ static void logger_handle_debug_synth_clock_boundary(
           jump_at_session_start && crossed_study_day,
           app->persisted.boot_counter, now_ms, &error_code, &error_message)) {
     logger_json_begin_error(
-        command, logger_now_utc_or_null(app),
+        command, logger_clock_now_utc_or_null(&app->clock),
         error_code != NULL ? error_code : "storage_unavailable",
         error_message != NULL ? error_message
                               : "failed to open post-boundary span/session");
@@ -2853,7 +2897,7 @@ static void logger_handle_debug_synth_clock_boundary(
   app->last_session_live_flush_mono_ms = now_ms;
   app->last_session_snapshot_mono_ms = now_ms;
 
-  logger_json_begin_success(command, logger_now_utc_or_null(app));
+  logger_json_begin_success(command, logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"crossed_study_day\":", stdout);
   fputs(crossed_study_day ? "true" : "false", stdout);
   fputs(",\"old_study_day_local\":", stdout);
@@ -2877,14 +2921,14 @@ static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli,
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
   if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
     logger_json_begin_error(
-        "debug queue rebuild", logger_now_utc_or_null(app),
+        "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode",
         "debug queue rebuild is only allowed in service mode or log_wait_h10");
     return;
   }
   if (app->session.active) {
     logger_json_begin_error(
-        "debug queue rebuild", logger_now_utc_or_null(app),
+        "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode",
         "debug queue rebuild is not permitted while a session is active");
     return;
@@ -2893,22 +2937,25 @@ static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli,
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
     logger_json_begin_error(
-        "debug queue rebuild", logger_now_utc_or_null(app), "service_locked",
+        "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
+        "service_locked",
         "service unlock is required before debug queue rebuild");
     return;
   }
 
   logger_upload_queue_summary_t summary;
   if (!logger_upload_queue_rebuild_file(
-          &app->system_log, logger_now_utc_or_null(app), &summary)) {
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+          &summary)) {
     logger_json_begin_error(
-        "debug queue rebuild", logger_now_utc_or_null(app),
+        "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
         "storage_unavailable",
         "failed to rebuild upload_queue.json from local sessions");
     return;
   }
 
-  logger_json_begin_success("debug queue rebuild", logger_now_utc_or_null(app));
+  logger_json_begin_success("debug queue rebuild",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"rebuilt\":true,\"updated_at_utc\":", stdout);
   logger_json_write_string_or_null(
       summary.updated_at_utc[0] != '\0' ? summary.updated_at_utc : NULL);
@@ -2928,7 +2975,7 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
   if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
     logger_json_begin_error("debug queue requeue-blocked",
-                            logger_now_utc_or_null(app),
+                            logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode",
                             "debug queue requeue-blocked is only allowed in "
                             "service mode or log_wait_h10");
@@ -2936,7 +2983,7 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
   }
   if (app->session.active) {
     logger_json_begin_error("debug queue requeue-blocked",
-                            logger_now_utc_or_null(app),
+                            logger_clock_now_utc_or_null(&app->clock),
                             "not_permitted_in_mode",
                             "debug queue requeue-blocked is not permitted "
                             "while a session is active");
@@ -2946,8 +2993,8 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
     logger_json_begin_error(
-        "debug queue requeue-blocked", logger_now_utc_or_null(app),
-        "service_locked",
+        "debug queue requeue-blocked",
+        logger_clock_now_utc_or_null(&app->clock), "service_locked",
         "service unlock is required before debug queue requeue-blocked");
     return;
   }
@@ -2955,17 +3002,17 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
   size_t requeued_count = 0u;
   logger_upload_queue_summary_t summary;
   if (!logger_upload_queue_requeue_blocked_file(
-          &app->system_log, logger_now_utc_or_null(app),
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           "manual_requeue_blocked", &requeued_count, &summary)) {
     logger_json_begin_error(
-        "debug queue requeue-blocked", logger_now_utc_or_null(app),
-        "storage_unavailable",
+        "debug queue requeue-blocked",
+        logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
         "failed to rewrite blocked upload_queue.json entries as pending");
     return;
   }
 
   logger_json_begin_success("debug queue requeue-blocked",
-                            logger_now_utc_or_null(app));
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"requeued_count\":", stdout);
   printf("%lu", (unsigned long)requeued_count);
   fputs(",\"updated_at_utc\":", stdout);
@@ -2987,14 +3034,14 @@ static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
   if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
     logger_json_begin_error(
-        "debug prune once", logger_now_utc_or_null(app),
+        "debug prune once", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode",
         "debug prune once is only allowed in service mode or log_wait_h10");
     return;
   }
   if (app->session.active) {
     logger_json_begin_error(
-        "debug prune once", logger_now_utc_or_null(app),
+        "debug prune once", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode",
         "debug prune once is not permitted while a session is active");
     return;
@@ -3003,8 +3050,8 @@ static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
     logger_json_begin_error(
-        "debug prune once", logger_now_utc_or_null(app), "service_locked",
-        "service unlock is required before debug prune once");
+        "debug prune once", logger_clock_now_utc_or_null(&app->clock),
+        "service_locked", "service unlock is required before debug prune once");
     return;
   }
 
@@ -3013,16 +3060,17 @@ static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
   bool reserve_met = false;
   logger_upload_queue_summary_t summary;
   if (!logger_upload_queue_prune_file(
-          &app->system_log, logger_now_utc_or_null(app),
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           LOGGER_SD_MIN_FREE_RESERVE_BYTES, &retention_pruned_count,
           &reserve_pruned_count, &reserve_met, &summary)) {
-    logger_json_begin_error("debug prune once", logger_now_utc_or_null(app),
-                            "storage_unavailable",
-                            "failed to apply upload retention/prune policy");
+    logger_json_begin_error(
+        "debug prune once", logger_clock_now_utc_or_null(&app->clock),
+        "storage_unavailable", "failed to apply upload retention/prune policy");
     return;
   }
 
-  logger_json_begin_success("debug prune once", logger_now_utc_or_null(app));
+  logger_json_begin_success("debug prune once",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"retention_pruned_count\":", stdout);
   printf("%lu", (unsigned long)retention_pruned_count);
   fputs(",\"reserve_pruned_count\":", stdout);
@@ -3048,7 +3096,7 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
   if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
     logger_json_begin_error(
-        "debug upload once", logger_now_utc_or_null(app),
+        "debug upload once", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode",
         "debug upload once is only allowed in service mode or log_wait_h10");
     return;
@@ -3057,7 +3105,8 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
     logger_json_begin_error(
-        "debug upload once", logger_now_utc_or_null(app), "service_locked",
+        "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+        "service_locked",
         "service unlock is required before debug upload once");
     return;
   }
@@ -3065,28 +3114,31 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
   logger_upload_process_result_t result;
   const bool ok = logger_upload_process_one(
       &app->system_log, &app->persisted.config, app->hardware_id,
-      logger_now_utc_or_null(app), &result);
+      logger_clock_now_utc_or_null(&app->clock), &result);
 
   if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
-    logger_json_begin_error("debug upload once", logger_now_utc_or_null(app),
+    logger_json_begin_error("debug upload once",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "invalid_config", result.message);
     return;
   }
   if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_FAILED) {
-    logger_json_begin_error("debug upload once", logger_now_utc_or_null(app),
-                            logger_string_present(result.failure_class)
-                                ? result.failure_class
-                                : "upload_failed",
-                            result.message);
+    logger_json_begin_error(
+        "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+        logger_string_present(result.failure_class) ? result.failure_class
+                                                    : "upload_failed",
+        result.message);
     return;
   }
   if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
-    logger_json_begin_error("debug upload once", logger_now_utc_or_null(app),
+    logger_json_begin_error("debug upload once",
+                            logger_clock_now_utc_or_null(&app->clock),
                             "min_firmware_rejected", result.message);
     return;
   }
 
-  logger_json_begin_success("debug upload once", logger_now_utc_or_null(app));
+  logger_json_begin_success("debug upload once",
+                            logger_clock_now_utc_or_null(&app->clock));
   fputs("{\"attempted\":", stdout);
   fputs(result.attempted ? "true" : "false", stdout);
   fputs(",\"result\":", stdout);
@@ -3308,7 +3360,8 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strcmp(line, "debug reboot") == 0) {
     app->reboot_pending = true;
-    logger_json_begin_success("debug reboot", logger_now_utc_or_null(app));
+    logger_json_begin_success("debug reboot",
+                              logger_clock_now_utc_or_null(&app->clock));
     fputs("{\"will_reboot\":true}", stdout);
     logger_json_end_success();
     return;
@@ -3318,8 +3371,8 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
     return;
   }
 
-  logger_json_begin_error(line, logger_now_utc_or_null(app), "internal_error",
-                          "unknown command");
+  logger_json_begin_error(line, logger_clock_now_utc_or_null(&app->clock),
+                          "internal_error", "unknown command");
 }
 
 void logger_service_cli_poll(logger_service_cli_t *cli, logger_app_t *app,
@@ -3342,7 +3395,8 @@ void logger_service_cli_poll(logger_service_cli_t *cli, logger_app_t *app,
     }
     if (cli->line_len + 1u >= sizeof(cli->line_buf)) {
       cli->line_len = 0u;
-      logger_json_begin_error("input", logger_now_utc_or_null(app),
+      logger_json_begin_error("input",
+                              logger_clock_now_utc_or_null(&app->clock),
                               "internal_error", "input line too long");
       break;
     }
