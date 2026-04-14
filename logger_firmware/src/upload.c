@@ -110,10 +110,6 @@ static bool logger_upload_auth_configured(const logger_config_t *config) {
          logger_string_present(config->upload_token);
 }
 
-static void logger_set_literal(char *dst, size_t dst_len, const char *value) {
-  logger_copy_string(dst, dst_len, value);
-}
-
 static void
 logger_upload_net_test_result_fail_all(logger_upload_net_test_result_t *result,
                                        const char *message) {
@@ -121,11 +117,11 @@ logger_upload_net_test_result_fail_all(logger_upload_net_test_result_t *result,
   result->dns_result = "fail";
   result->tls_result = "fail";
   result->upload_endpoint_reachable_result = "fail";
-  logger_set_literal(result->wifi_join_details,
+  logger_copy_string(result->wifi_join_details,
                      sizeof(result->wifi_join_details), message);
-  logger_set_literal(result->dns_details, sizeof(result->dns_details), message);
-  logger_set_literal(result->tls_details, sizeof(result->tls_details), message);
-  logger_set_literal(result->upload_endpoint_reachable_details,
+  logger_copy_string(result->dns_details, sizeof(result->dns_details), message);
+  logger_copy_string(result->tls_details, sizeof(result->tls_details), message);
+  logger_copy_string(result->upload_endpoint_reachable_details,
                      sizeof(result->upload_endpoint_reachable_details),
                      message);
 }
