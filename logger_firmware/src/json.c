@@ -204,20 +204,19 @@ void logger_json_string_literal(char *dst, size_t dst_len, const char *src) {
     return;
   }
 
-  char escaped[512];
-  logger_json_escape_into(escaped, sizeof(escaped), src);
   if (dst_len < 3u) {
     dst[0] = '\0';
     return;
   }
 
-  const size_t escaped_len = strlen(escaped);
-  const size_t copy_len =
-      escaped_len < (dst_len - 3u) ? escaped_len : (dst_len - 3u);
   dst[0] = '"';
-  memcpy(dst + 1u, escaped, copy_len);
-  dst[1u + copy_len] = '"';
-  dst[2u + copy_len] = '\0';
+  /* Reserve 2 bytes: closing quote + NUL. escape_into writes up to
+     (dst_len - 2) - 1 chars plus its own NUL, which we overwrite. */
+  logger_json_escape_into(dst + 1u, dst_len - 2u, src);
+
+  const size_t escaped_len = strlen(dst + 1u);
+  dst[1u + escaped_len] = '"';
+  dst[2u + escaped_len] = '\0';
 }
 
 void logger_json_fwrite_escaped(FILE *stream, const char *value) {
