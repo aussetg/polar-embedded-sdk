@@ -123,21 +123,33 @@ static bool logger_json_object_writer_begin_field(logger_json_object_writer_t *w
     return true;
 }
 
-static bool logger_json_object_writer_number_field(
+static bool logger_json_object_writer_unsigned_field(
     logger_json_object_writer_t *writer,
     const char *key,
-    const char *fmt,
-    unsigned long long unsigned_value,
-    long long signed_value,
-    bool use_signed) {
+    unsigned long long value) {
     if (!logger_json_object_writer_begin_field(writer, key)) {
         return false;
     }
 
     char number[32];
-    const int n = use_signed
-        ? snprintf(number, sizeof(number), fmt, signed_value)
-        : snprintf(number, sizeof(number), fmt, unsigned_value);
+    const int n = snprintf(number, sizeof(number), "%llu", value);
+    if (n <= 0 || (size_t)n >= sizeof(number)) {
+        writer->ok = false;
+        return false;
+    }
+    return logger_json_writer_append_text(writer, number);
+}
+
+static bool logger_json_object_writer_signed_field(
+    logger_json_object_writer_t *writer,
+    const char *key,
+    long long value) {
+    if (!logger_json_object_writer_begin_field(writer, key)) {
+        return false;
+    }
+
+    char number[32];
+    const int n = snprintf(number, sizeof(number), "%lld", value);
     if (n <= 0 || (size_t)n >= sizeof(number)) {
         writer->ok = false;
         return false;
@@ -207,48 +219,28 @@ bool logger_json_object_writer_uint32_field(
     logger_json_object_writer_t *writer,
     const char *key,
     uint32_t value) {
-    return logger_json_object_writer_number_field(writer,
-                                                  key,
-                                                  "%llu",
-                                                  (unsigned long long)value,
-                                                  0ll,
-                                                  false);
+    return logger_json_object_writer_unsigned_field(writer, key, (unsigned long long)value);
 }
 
 bool logger_json_object_writer_uint64_field(
     logger_json_object_writer_t *writer,
     const char *key,
     uint64_t value) {
-    return logger_json_object_writer_number_field(writer,
-                                                  key,
-                                                  "%llu",
-                                                  (unsigned long long)value,
-                                                  0ll,
-                                                  false);
+    return logger_json_object_writer_unsigned_field(writer, key, (unsigned long long)value);
 }
 
 bool logger_json_object_writer_size_field(
     logger_json_object_writer_t *writer,
     const char *key,
     size_t value) {
-    return logger_json_object_writer_number_field(writer,
-                                                  key,
-                                                  "%llu",
-                                                  (unsigned long long)value,
-                                                  0ll,
-                                                  false);
+    return logger_json_object_writer_unsigned_field(writer, key, (unsigned long long)value);
 }
 
 bool logger_json_object_writer_int64_field(
     logger_json_object_writer_t *writer,
     const char *key,
     int64_t value) {
-    return logger_json_object_writer_number_field(writer,
-                                                  key,
-                                                  "%lld",
-                                                  0ull,
-                                                  (long long)value,
-                                                  true);
+    return logger_json_object_writer_signed_field(writer, key, (long long)value);
 }
 
 bool logger_json_object_writer_finish(logger_json_object_writer_t *writer) {
