@@ -324,6 +324,18 @@ static void logger_store_cache_reset(void) {
   g_store.metadata_slot = -1;
 }
 
+/*
+ * The RP2040/2350 XIP base is always word-aligned, and flash sector offsets
+ * (FLASH_SECTOR_SIZE = 4096) are multiples of _Alignof(uint32_t).  So the
+ * cast from uint8_t* to a struct whose first member is uint32_t is safe,
+ * but -Wcast-align=strict cannot see that.  Validate at compile time and
+ * use an intermediate uintptr_t cast to suppress the warning.
+ */
+_Static_assert(LOGGER_FLASH_CONFIG_SLOT_SIZE % _Alignof(logger_flash_config_record_t) == 0,
+               "config slot size must be aligned for logger_flash_config_record_t");
+_Static_assert(LOGGER_FLASH_METADATA_SLOT_SIZE % _Alignof(logger_flash_metadata_record_t) == 0,
+               "metadata slot size must be aligned for logger_flash_metadata_record_t");
+
 static bool
 logger_flash_config_slot_load(unsigned slot,
                               logger_flash_config_slot_state_t *out) {
@@ -333,7 +345,7 @@ logger_flash_config_slot_load(unsigned slot,
   const uint8_t *raw =
       (const uint8_t *)(XIP_BASE + logger_flash_config_slot_offset(slot));
   const logger_flash_config_record_t *record =
-      (const logger_flash_config_record_t *)raw;
+      (const logger_flash_config_record_t *)(uintptr_t)raw;
   if (!logger_flash_config_record_valid(record)) {
     return false;
   }
@@ -353,7 +365,7 @@ logger_flash_metadata_slot_load(unsigned slot,
   const uint8_t *raw =
       (const uint8_t *)(XIP_BASE + logger_flash_metadata_slot_offset(slot));
   const logger_flash_metadata_record_t *record =
-      (const logger_flash_metadata_record_t *)raw;
+      (const logger_flash_metadata_record_t *)(uintptr_t)raw;
   if (!logger_flash_metadata_record_valid(record)) {
     return false;
   }
