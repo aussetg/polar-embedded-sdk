@@ -9,18 +9,6 @@
 
 #define LOGGER_UPLOAD_BUNDLE_NAME_MAX 100u
 
-static bool logger_path_join2(char *dst, size_t dst_len, const char *a,
-                              const char *b) {
-  const size_t a_len = strlen(a);
-  const size_t b_len = strlen(b);
-  if ((a_len + b_len + 1u) > dst_len) {
-    return false;
-  }
-  memcpy(dst, a, a_len);
-  memcpy(dst + a_len, b, b_len + 1u);
-  return true;
-}
-
 static bool
 logger_upload_bundle_copy_name(char dst[LOGGER_UPLOAD_BUNDLE_NAME_MAX],
                                const char *src) {

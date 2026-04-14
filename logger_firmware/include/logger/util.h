@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /*
  * Copy src into dst with truncation and guaranteed NUL termination.
@@ -80,6 +81,40 @@ static inline bool logger_timezone_is_utc_like(const char *timezone) {
  */
 static inline bool logger_string_present(const char *value) {
   return value != NULL && value[0] != '\0';
+}
+
+/*
+ * Concatenate two strings into dst.  No separator is inserted.
+ * Returns false if the result (including NUL) would exceed dst_len.
+ */
+static inline bool logger_path_join2(char *dst, size_t dst_len, const char *a,
+                                     const char *b) {
+  const size_t a_len = strlen(a);
+  const size_t b_len = strlen(b);
+  if ((a_len + b_len + 1u) > dst_len) {
+    return false;
+  }
+  memcpy(dst, a, a_len);
+  memcpy(dst + a_len, b, b_len + 1u);
+  return true;
+}
+
+/*
+ * Concatenate three strings into dst.  No separator is inserted.
+ * Returns false if the result (including NUL) would exceed dst_len.
+ */
+static inline bool logger_path_join3(char *dst, size_t dst_len, const char *a,
+                                     const char *b, const char *c) {
+  const size_t a_len = strlen(a);
+  const size_t b_len = strlen(b);
+  const size_t c_len = strlen(c);
+  if ((a_len + b_len + c_len + 1u) > dst_len) {
+    return false;
+  }
+  memcpy(dst, a, a_len);
+  memcpy(dst + a_len, b, b_len);
+  memcpy(dst + a_len + b_len, c, c_len + 1u);
+  return true;
 }
 
 #endif /* LOGGER_UTIL_H */

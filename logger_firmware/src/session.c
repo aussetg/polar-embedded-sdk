@@ -101,32 +101,6 @@ static void logger_put_u64le(uint8_t *dst, uint64_t value) {
 
 static size_t logger_align4(size_t n) { return (n + 3u) & ~((size_t)3u); }
 
-static bool logger_path_join2(char *dst, size_t dst_len, const char *a,
-                              const char *b) {
-  const size_t a_len = strlen(a);
-  const size_t b_len = strlen(b);
-  if ((a_len + b_len + 1u) > dst_len) {
-    return false;
-  }
-  memcpy(dst, a, a_len);
-  memcpy(dst + a_len, b, b_len + 1u);
-  return true;
-}
-
-static bool logger_path_join3(char *dst, size_t dst_len, const char *a,
-                              const char *b, const char *c) {
-  const size_t a_len = strlen(a);
-  const size_t b_len = strlen(b);
-  const size_t c_len = strlen(c);
-  if ((a_len + b_len + c_len + 1u) > dst_len) {
-    return false;
-  }
-  memcpy(dst, a, a_len);
-  memcpy(dst + a_len, b, b_len);
-  memcpy(dst + a_len + b_len, c, c_len + 1u);
-  return true;
-}
-
 static int64_t
 logger_session_observed_utc_ns_or_zero(const logger_clock_status_t *clock) {
   int64_t utc_ns = 0ll;
