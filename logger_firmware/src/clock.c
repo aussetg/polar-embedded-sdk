@@ -691,8 +691,8 @@ bool logger_clock_ntp_sync(
             continue;
         }
 
-        int64_t applied_unix_seconds = (int64_t)(ntp_utc_ns / 1000000000ull);
-        if ((ntp_utc_ns % 1000000000ull) >= 500000000ull) {
+        int64_t applied_unix_seconds = ntp_utc_ns / 1000000000ll;
+        if ((ntp_utc_ns % 1000000000ll) >= 500000000ll) {
             applied_unix_seconds += 1ll;
         }
         if (!logger_clock_format_unix_seconds_rfc3339(applied_unix_seconds, result->applied_utc)) {
