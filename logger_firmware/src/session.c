@@ -14,14 +14,7 @@
 #include "logger/queue.h"
 #include "logger/sha256.h"
 #include "logger/util.h"
-
-#ifndef LOGGER_FIRMWARE_VERSION
-#define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
-#endif
-
-#ifndef LOGGER_BUILD_ID
-#define LOGGER_BUILD_ID "logger-fw-dev"
-#endif
+#include "logger/version.h"
 
 #define LOGGER_SESSION_JSON_MAX 1024
 #define LOGGER_SESSION_MANIFEST_MAX 8192

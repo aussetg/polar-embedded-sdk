@@ -25,15 +25,8 @@
 #include "logger/upload_bundle.h"
 #include "logger/util.h"
 
+#include "logger/version.h"
 #include "upload_tls_roots.h"
-
-#ifndef LOGGER_FIRMWARE_VERSION
-#define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
-#endif
-
-#ifndef LOGGER_BUILD_ID
-#define LOGGER_BUILD_ID "logger-fw-dev"
-#endif
 
 #define LOGGER_UPLOAD_HTTP_REQUEST_MAX 1536u
 #define LOGGER_UPLOAD_HTTP_RESPONSE_MAX 2048u

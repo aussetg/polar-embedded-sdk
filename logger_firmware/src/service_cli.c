@@ -18,14 +18,7 @@
 #include "logger/sha256.h"
 #include "logger/upload.h"
 #include "logger/util.h"
-
-#ifndef LOGGER_FIRMWARE_VERSION
-#define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
-#endif
-
-#ifndef LOGGER_BUILD_ID
-#define LOGGER_BUILD_ID "logger-fw-dev"
-#endif
+#include "logger/version.h"
 
 static const char *logger_now_utc_or_null(const logger_app_t *app) {
   return app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL;

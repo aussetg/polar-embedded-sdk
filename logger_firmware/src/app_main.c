@@ -14,14 +14,7 @@
 #include "logger/queue.h"
 #include "logger/upload.h"
 #include "logger/util.h"
-
-#ifndef LOGGER_FIRMWARE_VERSION
-#define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
-#endif
-
-#ifndef LOGGER_BUILD_ID
-#define LOGGER_BUILD_ID "logger-fw-dev"
-#endif
+#include "logger/version.h"
 
 #define LOGGER_QUEUE_MAINTENANCE_INTERVAL_MS 300000u
 
