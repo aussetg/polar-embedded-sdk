@@ -1,6 +1,7 @@
 #include "logger/upload.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -392,7 +393,11 @@ static void logger_upload_http_parse_response_progress(
       const char *cl = strstr(request->response, "\r\nContent-Length: ");
       if (cl != NULL && cl < headers_end) {
         cl += strlen("\r\nContent-Length: ");
-        request->content_length = atoi(cl);
+        char *end = NULL;
+        long val = strtol(cl, &end, 10);
+        if (end != cl && val >= 0 && val <= (long)INT_MAX) {
+          request->content_length = (int)val;
+        }
       }
     }
   }
