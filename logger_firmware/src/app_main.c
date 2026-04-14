@@ -48,7 +48,7 @@ static void logger_app_copy_string(char *dst, size_t dst_len, const char *src) {
 }
 
 static int64_t logger_app_i64_abs(int64_t value) {
-  return value < 0 ? -value : value;
+  return value < 0 ? -(value + 1) + 1 : value;
 }
 
 static bool logger_app_boot_identity_matches_persisted(
