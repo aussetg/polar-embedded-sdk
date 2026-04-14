@@ -13,6 +13,8 @@ proto/*.pb
 build/
 .cache
 docs/book/
+compile_commands.json
+build-strict
 
 # IDE
 .idea/
@@ -33,9 +35,3 @@ __pycache__/
 # Debug
 *.gdb
 captures/
-
-# Agent Stuff
-.pi
-AGENTS.md
-.agent
-compile_commands.json
