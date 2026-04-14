@@ -20,7 +20,8 @@
 
 #define LOGGER_QUEUE_MAINTENANCE_INTERVAL_MS 300000u
 
-static bool logger_app_finalize_no_session_before_stop(logger_app_t *app);
+static bool logger_app_try_finalize_no_session_day(logger_app_t *app,
+                                                   uint32_t now_ms);
 
 static int64_t logger_app_i64_abs(int64_t value) {
   return value < 0 ? -(value + 1) + 1 : value;
@@ -483,11 +484,7 @@ bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,
   }
 
   if (!app->session.active) {
-    if (!app->current_day_has_session &&
-        !logger_app_finalize_no_session_before_stop(app)) {
-      logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-      logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                  "no_session_day_summary_failed", now_ms);
+    if (!logger_app_try_finalize_no_session_day(app, now_ms)) {
       return true;
     }
     logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
@@ -610,6 +607,23 @@ static bool logger_app_finalize_no_session_day(logger_app_t *app,
 
 static bool logger_app_finalize_no_session_before_stop(logger_app_t *app) {
   return logger_app_finalize_no_session_day(app, "stopped_before_first_span");
+}
+
+/* Try to finalize a no-session day.  Returns true if the caller may continue
+   (either nothing to finalize, or finalize succeeded).  Returns false after
+   transitioning to SERVICE on failure — the caller must return immediately. */
+static bool logger_app_try_finalize_no_session_day(logger_app_t *app,
+                                                   uint32_t now_ms) {
+  if (app->session.active || app->current_day_has_session) {
+    return true;
+  }
+  if (logger_app_finalize_no_session_before_stop(app)) {
+    return true;
+  }
+  logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+  logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
+                              "no_session_day_summary_failed", now_ms);
+  return false;
 }
 
 static logger_runtime_state_t
@@ -850,13 +864,8 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
       return false;
     }
 
-    if (!app->current_day_has_session) {
-      if (!logger_app_finalize_no_session_day(app, NULL)) {
-        logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                    "no_session_day_summary_failed", now_ms);
-        return false;
-      }
+    if (!logger_app_try_finalize_no_session_day(app, now_ms)) {
+      return false;
     }
     logger_app_reset_day_tracking(app, observed_study_day_local);
   }
@@ -1164,11 +1173,7 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
   const logger_fault_code_t storage_fault =
       logger_fault_from_storage(&app->storage);
   if (storage_fault != LOGGER_FAULT_NONE) {
-    if (!app->session.active && !app->current_day_has_session &&
-        !logger_app_finalize_no_session_before_stop(app)) {
-      logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-      logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                  "no_session_day_summary_failed", now_ms);
+    if (!logger_app_try_finalize_no_session_day(app, now_ms)) {
       return;
     }
     logger_app_maybe_latch_new_fault(app, storage_fault);
@@ -1178,11 +1183,7 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
   }
 
   if (logger_app_should_enter_overnight_idle(app)) {
-    if (!app->session.active && !app->current_day_has_session &&
-        !logger_app_finalize_no_session_before_stop(app)) {
-      logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-      logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                  "no_session_day_summary_failed", now_ms);
+    if (!logger_app_try_finalize_no_session_day(app, now_ms)) {
       return;
     }
     logger_app_begin_upload_after_stop(app, false, "charger_overnight_window",
@@ -1191,11 +1192,7 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
   }
 
   if (logger_battery_low_start_blocked(&app->battery)) {
-    if (!app->session.active && !app->current_day_has_session &&
-        !logger_app_finalize_no_session_before_stop(app)) {
-      logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-      logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                  "no_session_day_summary_failed", now_ms);
+    if (!logger_app_try_finalize_no_session_day(app, now_ms)) {
       return;
     }
     logger_app_maybe_latch_new_fault(app,
@@ -1236,11 +1233,7 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
       printf("[logger] marker ignored: no active session/span\n");
     }
   } else if (event == LOGGER_BUTTON_EVENT_LONG_PRESS) {
-    if (!app->session.active && !app->current_day_has_session &&
-        !logger_app_finalize_no_session_before_stop(app)) {
-      logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-      logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                  "no_session_day_summary_failed", now_ms);
+    if (!logger_app_try_finalize_no_session_day(app, now_ms)) {
       return;
     }
     if (app->battery.vbus_present ||
