@@ -894,6 +894,54 @@ static bool logger_cli_is_logging_mode(const logger_app_t *app) {
   return logger_runtime_state_is_logging(app->runtime.current_state);
 }
 
+static bool logger_cli_require_service(const logger_app_t *app,
+                                       const char *command) {
+  if (logger_cli_is_logging_mode(app)) {
+    logger_json_begin_error(command, logger_now_utc_or_null(app),
+                            "busy_logging", "not permitted while logging");
+    return false;
+  }
+  if (!logger_cli_is_service_mode(app)) {
+    logger_json_begin_error(command, logger_now_utc_or_null(app),
+                            "not_permitted_in_mode",
+                            "only allowed in service mode");
+    return false;
+  }
+  return true;
+}
+
+static bool logger_cli_require_service_unlocked(const logger_service_cli_t *cli,
+                                                const logger_app_t *app,
+                                                const char *command) {
+  if (!logger_cli_require_service(app, command)) {
+    return false;
+  }
+  if (!logger_service_cli_is_unlocked(cli,
+                                      to_ms_since_boot(get_absolute_time()))) {
+    logger_json_begin_error(command, logger_now_utc_or_null(app),
+                            "service_locked", "service unlock is required");
+    return false;
+  }
+  return true;
+}
+
+static bool logger_debug_require_service_unlocked(
+    const logger_service_cli_t *cli, const logger_app_t *app,
+    const char *command, const char *mode_message) {
+  if (!logger_cli_is_service_mode(app)) {
+    logger_json_begin_error(command, logger_now_utc_or_null(app),
+                            "not_permitted_in_mode", mode_message);
+    return false;
+  }
+  if (!logger_service_cli_is_unlocked(cli,
+                                      to_ms_since_boot(get_absolute_time()))) {
+    logger_json_begin_error(command, logger_now_utc_or_null(app),
+                            "service_locked", "service unlock is required");
+    return false;
+  }
+  return true;
+}
+
 static void logger_config_import_transfer_reset(logger_service_cli_t *cli) {
   if (cli == NULL) {
     return;
@@ -1522,16 +1570,7 @@ static void logger_handle_preflight_json(logger_app_t *app) {
 }
 
 static void logger_handle_net_test_json(logger_app_t *app) {
-  if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error("net-test", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "net-test is not permitted while logging");
-    return;
-  }
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error("net-test", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "net-test is only allowed in service mode");
+  if (!logger_cli_require_service(app, "net-test")) {
     return;
   }
 
@@ -1563,16 +1602,7 @@ static void logger_handle_net_test_json(logger_app_t *app) {
 
 static void logger_handle_service_unlock(logger_service_cli_t *cli,
                                          logger_app_t *app, uint32_t now_ms) {
-  if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error("service unlock", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "service unlock is not permitted while logging");
-    return;
-  }
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error("service unlock", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "service unlock is only allowed in service mode");
+  if (!logger_cli_require_service(app, "service unlock")) {
     return;
   }
 
@@ -1671,23 +1701,7 @@ static void logger_handle_fault_clear(logger_app_t *app) {
 
 static void logger_handle_factory_reset(logger_service_cli_t *cli,
                                         logger_app_t *app) {
-  if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error("factory-reset", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "factory reset is not permitted while logging");
-    return;
-  }
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error("factory-reset", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "factory reset is only allowed in service mode");
-    return;
-  }
-  if (!logger_service_cli_is_unlocked(cli,
-                                      to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error("factory-reset", logger_now_utc_or_null(app),
-                            "service_locked",
-                            "service unlock is required before factory reset");
+  if (!logger_cli_require_service_unlocked(cli, app, "factory-reset")) {
     return;
   }
 
@@ -1705,29 +1719,13 @@ static void logger_handle_factory_reset(logger_service_cli_t *cli,
 
 static void logger_handle_sd_format(logger_service_cli_t *cli,
                                     logger_app_t *app) {
-  if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error("sd format", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "sd format is not permitted while logging");
-    return;
-  }
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error("sd format", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "sd format is only allowed in service mode");
+  if (!logger_cli_require_service_unlocked(cli, app, "sd format")) {
     return;
   }
   if (app->session.active) {
     logger_json_begin_error(
         "sd format", logger_now_utc_or_null(app), "not_permitted_in_mode",
         "sd format is not permitted while a session is active");
-    return;
-  }
-  if (!logger_service_cli_is_unlocked(cli,
-                                      to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error("sd format", logger_now_utc_or_null(app),
-                            "service_locked",
-                            "service unlock is required before sd format");
     return;
   }
 
@@ -1768,23 +1766,7 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
 
 static void logger_handle_clock_set(const logger_service_cli_t *cli,
                                     logger_app_t *app, const char *value) {
-  if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error("clock set", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "clock set is not permitted while logging");
-    return;
-  }
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error("clock set", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "clock set is only allowed in service mode");
-    return;
-  }
-  if (!logger_service_cli_is_unlocked(cli,
-                                      to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error("clock set", logger_now_utc_or_null(app),
-                            "service_locked",
-                            "service unlock is required before clock set");
+  if (!logger_cli_require_service_unlocked(cli, app, "clock set")) {
     return;
   }
   if (!logger_clock_set_utc(value, &app->clock)) {
@@ -1806,23 +1788,7 @@ static void logger_handle_clock_set(const logger_service_cli_t *cli,
 
 static void logger_handle_clock_sync(logger_service_cli_t *cli,
                                      logger_app_t *app) {
-  if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error("clock sync", logger_now_utc_or_null(app),
-                            "busy_logging",
-                            "clock sync is not permitted while logging");
-    return;
-  }
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error("clock sync", logger_now_utc_or_null(app),
-                            "not_permitted_in_mode",
-                            "clock sync is only allowed in service mode");
-    return;
-  }
-  if (!logger_service_cli_is_unlocked(cli,
-                                      to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error("clock sync", logger_now_utc_or_null(app),
-                            "service_locked",
-                            "service unlock is required before clock sync");
+  if (!logger_cli_require_service_unlocked(cli, app, "clock sync")) {
     return;
   }
 
@@ -2138,26 +2104,8 @@ static void logger_handle_config_import_commit(logger_service_cli_t *cli,
 static void
 logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli,
                                                   logger_app_t *app) {
-  if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error(
-        "upload tls clear-provisioned-anchor", logger_now_utc_or_null(app),
-        "busy_logging",
-        "upload tls clear-provisioned-anchor is not permitted while logging");
-    return;
-  }
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(
-        "upload tls clear-provisioned-anchor", logger_now_utc_or_null(app),
-        "not_permitted_in_mode",
-        "upload tls clear-provisioned-anchor is only allowed in service mode");
-    return;
-  }
-  if (!logger_service_cli_is_unlocked(cli,
-                                      to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error("upload tls clear-provisioned-anchor",
-                            logger_now_utc_or_null(app), "service_locked",
-                            "service unlock is required before upload tls "
-                            "clear-provisioned-anchor");
+  if (!logger_cli_require_service_unlocked(
+          cli, app, "upload tls clear-provisioned-anchor")) {
     return;
   }
 
@@ -2304,18 +2252,9 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
 static void logger_handle_debug_config_clear(const logger_service_cli_t *cli,
                                              logger_app_t *app,
                                              const char *args) {
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(
-        "debug config clear", logger_now_utc_or_null(app),
-        "not_permitted_in_mode",
-        "debug config clear is only allowed in service mode");
-    return;
-  }
-  if (!logger_service_cli_is_unlocked(cli,
-                                      to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(
-        "debug config clear", logger_now_utc_or_null(app), "service_locked",
-        "service unlock is required before debug config clear");
+  if (!logger_debug_require_service_unlocked(
+          cli, app, "debug config clear",
+          "debug config clear is only allowed in service mode")) {
     return;
   }
   if (strcmp(args, "upload") != 0) {
@@ -2337,17 +2276,9 @@ static void logger_handle_debug_config_clear(const logger_service_cli_t *cli,
 static void logger_handle_debug_session_start(const logger_service_cli_t *cli,
                                               logger_app_t *app,
                                               uint32_t now_ms) {
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(
-        "debug session start", logger_now_utc_or_null(app),
-        "not_permitted_in_mode",
-        "debug session start is only allowed in service mode");
-    return;
-  }
-  if (!logger_service_cli_is_unlocked(cli, now_ms)) {
-    logger_json_begin_error(
-        "debug session start", logger_now_utc_or_null(app), "service_locked",
-        "service unlock is required before debug session start");
+  if (!logger_debug_require_service_unlocked(
+          cli, app, "debug session start",
+          "debug session start is only allowed in service mode")) {
     return;
   }
 
@@ -2420,23 +2351,6 @@ static void logger_handle_debug_session_stop(logger_app_t *app,
   logger_json_begin_success("debug session stop", logger_now_utc_or_null(app));
   fputs("{\"active\":false}", stdout);
   logger_json_end_success();
-}
-
-static bool logger_debug_require_service_unlocked(
-    const logger_service_cli_t *cli, const logger_app_t *app,
-    const char *command, const char *mode_message) {
-  if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
-                            "not_permitted_in_mode", mode_message);
-    return false;
-  }
-  if (!logger_service_cli_is_unlocked(cli,
-                                      to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(command, logger_now_utc_or_null(app),
-                            "service_locked", "service unlock is required");
-    return false;
-  }
-  return true;
 }
 
 static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
