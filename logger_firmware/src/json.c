@@ -140,7 +140,6 @@ void logger_json_escape_into(char *dst, size_t dst_len, const char *src) {
   for (const unsigned char *p = (const unsigned char *)src;
        *p != '\0' && (out + 1u) < dst_len; ++p) {
     const char *replacement = NULL;
-    char unicode_buf[7];
     switch (*p) {
     case '\\':
       replacement = "\\\\";
@@ -176,6 +175,7 @@ void logger_json_escape_into(char *dst, size_t dst_len, const char *src) {
       continue;
     }
     if (*p < 0x20u) {
+      char unicode_buf[7];
       const int n = snprintf(unicode_buf, sizeof(unicode_buf), "\\u%04x", *p);
       if (n != 6 || (out + 6u) >= dst_len) {
         break;
