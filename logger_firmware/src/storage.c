@@ -324,7 +324,7 @@ static bool logger_sd_initialize_card(void) {
   sd->sector_count = logger_sd_parse_sector_count(sd->csd);
   sd->high_capacity = high_capacity;
   sd->card_initialized = sd->sector_count != 0u;
-  sd->dstatus = sd->card_initialized ? 0u : STA_NOINIT;
+  sd->dstatus = sd->card_initialized ? 0u : (DSTATUS)STA_NOINIT;
   if (sd->card_initialized) {
     spi_set_baudrate(logger_sd_spi_bus(), LOGGER_SD_SPI_RUN_BAUD_HZ);
   }
@@ -337,7 +337,7 @@ void logger_storage_init(void) {
   }
 
   memset(&g_sd, 0, sizeof(g_sd));
-  g_sd.dstatus = STA_NOINIT;
+  g_sd.dstatus = (DSTATUS)STA_NOINIT;
 
   spi_init(logger_sd_spi_bus(), LOGGER_SD_SPI_INIT_BAUD_HZ);
   spi_set_format(logger_sd_spi_bus(), 8u, SPI_CPOL_0, SPI_CPHA_0,
@@ -443,7 +443,7 @@ bool logger_storage_refresh(logger_storage_status_t *status) {
 
 #if !LOGGER_SD_DETECT_OPTIONAL
   if (!status->detect_pin_asserted) {
-    g_sd.dstatus = STA_NOINIT | STA_NODISK;
+    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
     return false;
   }
 #endif
@@ -504,7 +504,7 @@ bool logger_storage_format(logger_storage_status_t *status) {
       status->detect_pin_configured = true;
       status->detect_pin_asserted = false;
     }
-    g_sd.dstatus = STA_NOINIT | STA_NODISK;
+    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
     logger_storage_reset_mount_state();
     return false;
   }
@@ -730,14 +730,14 @@ DSTATUS disk_initialize(BYTE pdrv) {
   }
 #if !LOGGER_SD_DETECT_OPTIONAL
   if (!logger_sd_detect_pin_active()) {
-    g_sd.dstatus = STA_NOINIT | STA_NODISK;
+    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
     return g_sd.dstatus;
   }
 #endif
   if (logger_sd_initialize_card()) {
     g_sd.dstatus = 0u;
   } else {
-    g_sd.dstatus = STA_NOINIT;
+    g_sd.dstatus = (DSTATUS)STA_NOINIT;
   }
   return g_sd.dstatus;
 }
@@ -749,7 +749,7 @@ DSTATUS disk_status(BYTE pdrv) {
   logger_storage_init();
 #if !LOGGER_SD_DETECT_OPTIONAL
   if (!logger_sd_detect_pin_active()) {
-    g_sd.dstatus = STA_NOINIT | STA_NODISK;
+    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
   }
 #endif
   return g_sd.dstatus;

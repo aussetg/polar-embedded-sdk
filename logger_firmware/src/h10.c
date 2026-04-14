@@ -285,6 +285,7 @@ static bool logger_h10_queue_push_packet(logger_h10_state_t *state,
   slot->mono_us = mono_us;
   slot->value_len = value_len;
   memcpy(slot->value, value, value_len);
+  /* Index wraps in [0, QUEUE_DEPTH); fits uint8_t (QUEUE_DEPTH ≤ 255). */
   state->packet_write_index = (uint8_t)((state->packet_write_index + 1u) %
                                         LOGGER_H10_PACKET_QUEUE_DEPTH);
   state->packet_count += 1u;
@@ -299,6 +300,7 @@ bool logger_h10_pop_packet(logger_h10_state_t *state,
   *out = state->packets[state->packet_read_index];
   memset(&state->packets[state->packet_read_index], 0,
          sizeof(state->packets[state->packet_read_index]));
+  /* Index wraps in [0, QUEUE_DEPTH); fits uint8_t (QUEUE_DEPTH ≤ 255). */
   state->packet_read_index = (uint8_t)((state->packet_read_index + 1u) %
                                        LOGGER_H10_PACKET_QUEUE_DEPTH);
   state->packet_count -= 1u;

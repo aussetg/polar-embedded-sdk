@@ -16,6 +16,12 @@
 
 extern char __flash_binary_end;
 
+/* Packed deliberately: this struct is a direct flash-sector image.
+ * It must be exactly 2 * FLASH_PAGE_SIZE (512 B) so it can be passed
+ * verbatim to flash_range_program().  The natural alignment of the
+ * uint32_t / char[] members would leave internal padding, so we pack
+ * and let the static_assert below guard the exact size.  Compilers may
+ * emit -Wpacked warnings — that is expected and benign here. */
 typedef struct __attribute__((packed)) {
   uint32_t magic;
   uint16_t schema_version;
