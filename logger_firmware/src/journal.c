@@ -392,18 +392,18 @@ bool logger_journal_scan(const char *path,
   UINT read_bytes = 0u;
   if (f_read(&file, header, sizeof(header), &read_bytes) != FR_OK ||
       read_bytes != sizeof(header)) {
-    (void)f_close(&file);
+    f_close(&file);
     return false;
   }
   if (memcmp(header + 0, "NOF1JNL1", 8u) != 0 ||
       logger_u16le(header + 8) != LOGGER_JOURNAL_FILE_HEADER_BYTES ||
       logger_u16le(header + 10) != 1u) {
-    (void)f_close(&file);
+    f_close(&file);
     return false;
   }
   const uint32_t expect_header_crc = logger_crc32_ieee(header, 56u);
   if (logger_u32le(header + 56) != expect_header_crc) {
-    (void)f_close(&file);
+    f_close(&file);
     return false;
   }
 
@@ -507,8 +507,7 @@ bool logger_journal_scan(const char *path,
     }
   }
 
-  (void)f_close(&file);
-  return true;
+  return f_close(&file) == FR_OK;
 }
 
 bool logger_journal_truncate_to_valid(const char *path,

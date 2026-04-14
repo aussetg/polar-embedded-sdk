@@ -520,7 +520,7 @@ logger_session_compute_file_sha256(const char *path,
   UINT read_bytes = 0u;
   do {
     if (f_read(&file, chunk, sizeof(chunk), &read_bytes) != FR_OK) {
-      (void)f_close(&file);
+      f_close(&file);
       return false;
     }
     if (read_bytes > 0u) {
@@ -895,8 +895,7 @@ static bool logger_session_find_live_paths(
     break;
   }
 
-  (void)f_closedir(&dir);
-  return found;
+  return f_closedir(&dir) == FR_OK && found;
 }
 
 static bool logger_session_load_live_session_id(
