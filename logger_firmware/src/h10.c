@@ -303,7 +303,7 @@ bool logger_h10_pop_packet(logger_h10_state_t *state,
   /* Index wraps in [0, QUEUE_DEPTH); fits uint8_t (QUEUE_DEPTH ≤ 255). */
   state->packet_read_index = (uint8_t)((state->packet_read_index + 1u) %
                                        LOGGER_H10_PACKET_QUEUE_DEPTH);
-  state->packet_count -= 1u;
+  state->packet_count = (uint8_t)(state->packet_count - 1u);
   return true;
 }
 
