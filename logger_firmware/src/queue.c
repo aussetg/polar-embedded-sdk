@@ -35,6 +35,20 @@ typedef struct {
   bool quarantined;
 } logger_manifest_summary_t;
 
+/* Scratch arena for JSON parsing — queue-load and manifest-scan paths
+ * are mutually exclusive in the call graph, so they share via union.
+ * Frees ~44 KB vs. separate static locals. */
+static union {
+  struct {
+    char json[LOGGER_QUEUE_READ_MAX + 1u];
+    jsmntok_t tokens[LOGGER_QUEUE_JSON_TOKEN_MAX];
+  } load;
+  struct {
+    char json[LOGGER_MANIFEST_READ_MAX + 1u];
+    jsmntok_t tokens[LOGGER_MANIFEST_JSON_TOKEN_MAX];
+  } manifest;
+} queue_scratch;
+
 static bool logger_path_join2(char *dst, size_t dst_len, const char *a,
                               const char *b) {
   const size_t a_len = strlen(a);
@@ -65,9 +79,9 @@ static bool logger_parse_manifest_summary(const char *json,
                                           logger_manifest_summary_t *summary) {
   memset(summary, 0, sizeof(*summary));
 
-  static jsmntok_t tokens[LOGGER_MANIFEST_JSON_TOKEN_MAX];
   logger_json_doc_t doc;
-  if (!logger_json_parse(&doc, json, strlen(json), tokens,
+  if (!logger_json_parse(&doc, json, strlen(json),
+                         queue_scratch.manifest.tokens,
                          LOGGER_MANIFEST_JSON_TOKEN_MAX)) {
     return false;
   }
@@ -574,17 +588,16 @@ bool logger_upload_queue_load(logger_upload_queue_t *queue) {
     return true;
   }
 
-  static char queue_json[LOGGER_QUEUE_READ_MAX + 1u];
   size_t len = 0u;
-  if (!logger_storage_read_file(LOGGER_QUEUE_PATH, queue_json,
+  if (!logger_storage_read_file(LOGGER_QUEUE_PATH, queue_scratch.load.json,
                                 LOGGER_QUEUE_READ_MAX, &len)) {
     return false;
   }
-  queue_json[len] = '\0';
+  queue_scratch.load.json[len] = '\0';
 
-  static jsmntok_t tokens[LOGGER_QUEUE_JSON_TOKEN_MAX];
   logger_json_doc_t doc;
-  if (!logger_json_parse(&doc, queue_json, len, tokens,
+  if (!logger_json_parse(&doc, queue_scratch.load.json, len,
+                         queue_scratch.load.tokens,
                          LOGGER_QUEUE_JSON_TOKEN_MAX)) {
     return false;
   }
@@ -697,18 +710,18 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
       break;
     }
 
-    static char manifest_buf[LOGGER_MANIFEST_READ_MAX + 1u];
     size_t manifest_len = 0u;
-    if (!logger_storage_read_file(manifest_path, manifest_buf,
+    if (!logger_storage_read_file(manifest_path, queue_scratch.manifest.json,
                                   LOGGER_MANIFEST_READ_MAX, &manifest_len)) {
       logger_log_local_corrupt(system_log, updated_at_utc_or_null, info.fname,
                                "manifest_read_failed");
       continue;
     }
-    manifest_buf[manifest_len] = '\0';
+    queue_scratch.manifest.json[manifest_len] = '\0';
 
     logger_manifest_summary_t manifest;
-    if (!logger_parse_manifest_summary(manifest_buf, &manifest)) {
+    if (!logger_parse_manifest_summary(queue_scratch.manifest.json,
+                                       &manifest)) {
       logger_log_local_corrupt(system_log, updated_at_utc_or_null, info.fname,
                                "manifest_parse_failed");
       continue;
