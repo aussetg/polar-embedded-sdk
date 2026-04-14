@@ -817,59 +817,29 @@ static void logger_json_end_success(void) {
   fflush(stdout);
 }
 
-static void logger_write_required_missing_array(const logger_app_t *app) {
+/*
+ * Write a comma-delimited JSON array of required config field names,
+ * selecting fields whose value is present (present=true) or absent
+ * (present=false).
+ */
+static void logger_write_required_field_array(const logger_app_t *app,
+                                              bool present) {
+  static const char *names[] = {"bound_h10_address", "logger_id", "subject_id",
+                                "timezone"};
+  const char *values[] = {
+      app->persisted.config.bound_h10_address,
+      app->persisted.config.logger_id,
+      app->persisted.config.subject_id,
+      app->persisted.config.timezone,
+  };
   bool first = true;
-  if (!logger_string_present(app->persisted.config.bound_h10_address)) {
-    logger_json_write_string_or_null(first ? "bound_h10_address" : NULL);
-    first = false;
-  }
-  if (!logger_string_present(app->persisted.config.logger_id)) {
-    if (!first) {
-      fputs(",", stdout);
+  for (size_t i = 0; i < 4; i++) {
+    if (logger_string_present(values[i]) == present) {
+      if (!first)
+        fputs(",", stdout);
+      logger_json_write_string_or_null(names[i]);
+      first = false;
     }
-    logger_json_write_string_or_null("logger_id");
-    first = false;
-  }
-  if (!logger_string_present(app->persisted.config.subject_id)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("subject_id");
-    first = false;
-  }
-  if (!logger_string_present(app->persisted.config.timezone)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("timezone");
-  }
-}
-
-static void logger_write_required_present_array(const logger_app_t *app) {
-  bool first = true;
-  if (logger_string_present(app->persisted.config.bound_h10_address)) {
-    logger_json_write_string_or_null(first ? "bound_h10_address" : NULL);
-    first = false;
-  }
-  if (logger_string_present(app->persisted.config.logger_id)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("logger_id");
-    first = false;
-  }
-  if (logger_string_present(app->persisted.config.subject_id)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("subject_id");
-    first = false;
-  }
-  if (logger_string_present(app->persisted.config.timezone)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("timezone");
   }
 }
 
@@ -1055,7 +1025,7 @@ static void logger_write_status_payload(const logger_app_t *app) {
                                                                    : "false",
         stdout);
   fputs(",\"required_missing\":[", stdout);
-  logger_write_required_missing_array(app);
+  logger_write_required_field_array(app, false);
   fputs("],\"warnings\":[", stdout);
   logger_write_warnings_array(app);
   fputs("]}", stdout);
@@ -1221,9 +1191,9 @@ static void logger_handle_provisioning_status_json(logger_app_t *app) {
                                                                    : "false",
         stdout);
   fputs(",\"required_present\":[", stdout);
-  logger_write_required_present_array(app);
+  logger_write_required_field_array(app, true);
   fputs("],\"required_missing\":[", stdout);
-  logger_write_required_missing_array(app);
+  logger_write_required_field_array(app, false);
   fputs("],\"optional_present\":[", stdout);
   logger_write_optional_present_array(app);
   fputs("],\"warnings\":[", stdout);
