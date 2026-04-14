@@ -13,7 +13,7 @@ Features:
 - persists accepted uploads under a local data directory,
 - deduplicates by ``(session_id, sha256)`` as required by the spec,
 - rejects same-session different-hash replays as ``validation_failed``,
-- optionally enforces a bearer token and a minimum firmware version,
+- optionally enforces ``x-api-key``, bearer token, and a minimum firmware version,
 - exposes small inspection endpoints for local testing.
 
 Useful endpoints:
@@ -81,6 +81,7 @@ class ServerConfig:
     path: str
     data_dir: Path
     max_body_bytes: int
+    api_key: str | None
     bearer_token: str | None
     min_firmware: str | None
 
@@ -308,6 +309,11 @@ def parse_args() -> ServerConfig:
         help="maximum accepted Content-Length before 413",
     )
     parser.add_argument(
+        "--api-key",
+        default=None,
+        help="if set, require x-api-key: <key>",
+    )
+    parser.add_argument(
         "--bearer-token",
         default=None,
         help="if set, require Authorization: Bearer <token>",
@@ -326,6 +332,7 @@ def parse_args() -> ServerConfig:
         path=path,
         data_dir=args.data_dir,
         max_body_bytes=args.max_body_bytes,
+        api_key=args.api_key,
         bearer_token=args.bearer_token,
         min_firmware=args.min_firmware,
     )
@@ -930,6 +937,7 @@ def make_handler(config: ServerConfig, store: UploadStore, request_tracker: Requ
                         "upload_path": config.path,
                         "data_dir": str(config.data_dir),
                         "stored_upload_count": store.count(),
+                        "require_api_key": config.api_key is not None,
                         "require_bearer": config.bearer_token is not None,
                         "min_firmware": config.min_firmware,
                         **tracker,
@@ -989,6 +997,14 @@ def make_handler(config: ServerConfig, store: UploadStore, request_tracker: Requ
                         HTTPStatus.BAD_REQUEST,
                         "malformed_request",
                         "Content-Type must be application/x-tar",
+                        retryable=False,
+                    )
+
+                if config.api_key is not None and self.headers.get("x-api-key") != config.api_key:
+                    raise UploadError(
+                        HTTPStatus.UNAUTHORIZED,
+                        "unauthorized",
+                        "missing or invalid x-api-key",
                         retryable=False,
                     )
 
@@ -1099,6 +1115,7 @@ def main() -> int:
     print(f"[logger-ref-server] bind={config.host}:{config.port}")
     print(f"[logger-ref-server] upload_path={config.path}")
     print(f"[logger-ref-server] data_dir={config.data_dir}")
+    print(f"[logger-ref-server] api_key_required={config.api_key is not None}")
     print(f"[logger-ref-server] bearer_required={config.bearer_token is not None}")
     print(f"[logger-ref-server] min_firmware={config.min_firmware}")
 

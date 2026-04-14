@@ -33,7 +33,7 @@
 #define LOGGER_BUILD_ID "logger-fw-dev"
 #endif
 
-#define LOGGER_UPLOAD_HTTP_REQUEST_MAX 1024u
+#define LOGGER_UPLOAD_HTTP_REQUEST_MAX 1536u
 #define LOGGER_UPLOAD_HTTP_RESPONSE_MAX 2048u
 #define LOGGER_UPLOAD_TCP_POLL_INTERVAL 2u
 #define LOGGER_UPLOAD_DNS_TIMEOUT_MS 10000u
@@ -112,6 +112,12 @@ typedef struct {
 
 static bool logger_string_present(const char *value) {
     return value != NULL && value[0] != '\0';
+}
+
+static bool logger_upload_auth_configured(const logger_config_t *config) {
+    return config != NULL &&
+           logger_string_present(config->upload_api_key) &&
+           logger_string_present(config->upload_token);
 }
 
 static void logger_copy_string(char *dst, size_t dst_len, const char *src) {
@@ -1074,6 +1080,11 @@ static bool logger_upload_process_selected(
         logger_copy_string(result->message, sizeof(result->message), "upload TLS trust is not ready");
         return false;
     }
+    if (!logger_upload_auth_configured(config)) {
+        result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
+        logger_copy_string(result->message, sizeof(result->message), "upload auth requires both api key and bearer token");
+        return false;
+    }
 
     logger_upload_url_t url;
     if (!logger_upload_parse_url(config->upload_url, &url)) {
@@ -1165,10 +1176,11 @@ static bool logger_upload_process_selected(
     }
 
     char auth_header[LOGGER_CONFIG_UPLOAD_TOKEN_MAX + 32];
+    char api_key_header[LOGGER_CONFIG_UPLOAD_API_KEY_MAX + 24];
     auth_header[0] = '\0';
-    if (logger_string_present(config->upload_token)) {
-        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s\r\n", config->upload_token);
-    }
+    api_key_header[0] = '\0';
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s\r\n", config->upload_token);
+    snprintf(api_key_header, sizeof(api_key_header), "x-api-key: %s\r\n", config->upload_api_key);
 
     char request_text[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
     char host_header[LOGGER_UPLOAD_URL_HOST_MAX + 8];
@@ -1196,6 +1208,7 @@ static bool logger_upload_process_selected(
         "X-Logger-Tar-Canonicalization-Version: 1\r\n"
         "X-Logger-Manifest-Schema-Version: 1\r\n"
         "%s"
+        "%s"
         "Connection: close\r\n"
         "\r\n",
         url.path,
@@ -1207,7 +1220,8 @@ static bool logger_upload_process_selected(
         config->subject_id,
         entry->study_day_local,
         entry->bundle_sha256,
-        auth_header);
+        auth_header,
+        api_key_header);
     if (request_n <= 0 || (size_t)request_n >= sizeof(request_text)) {
         logger_net_wifi_leave();
         result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;

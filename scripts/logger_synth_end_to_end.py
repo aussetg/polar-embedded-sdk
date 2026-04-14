@@ -92,6 +92,7 @@ class Step:
 class RefServerConfig:
     upload_url: str
     data_dir: Path
+    api_key: str | None
     bearer_token: str | None
     min_firmware: str | None
     origin_upload_url: str | None = None
@@ -254,6 +255,8 @@ class RefServerProcess:
             "--data-dir",
             str(self.config.data_dir),
         ]
+        if self.config.api_key is not None:
+            cmd.extend(["--api-key", self.config.api_key])
         if self.config.bearer_token is not None:
             cmd.extend(["--bearer-token", self.config.bearer_token])
         if self.config.min_firmware is not None:
@@ -448,18 +451,20 @@ def build_config_import_document(
     wifi_ssid: str,
     wifi_psk: str,
     upload_url: str,
+    upload_api_key: str | None,
     upload_token: str | None,
     secrets_included: bool,
     upload_tls: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     upload_enabled = True
+    if upload_api_key is None or upload_token is None:
+        raise ValueError("upload-enabled config import requires both upload_api_key and upload_token")
+
     upload_auth: dict[str, Any]
-    if upload_token is None:
-        upload_auth = {"type": "none"}
-    elif secrets_included:
-        upload_auth = {"type": "bearer", "token": upload_token}
+    if secrets_included:
+        upload_auth = {"type": "api_key_and_bearer", "api_key": upload_api_key, "token": upload_token}
     else:
-        upload_auth = {"type": "bearer", "token_present": True}
+        upload_auth = {"type": "api_key_and_bearer", "api_key_present": True, "token_present": True}
 
     wifi_network: dict[str, Any] = {"ssid": wifi_ssid}
     if secrets_included:
@@ -539,6 +544,7 @@ def validate_config_export_payload(
     wifi_ssid: str,
     upload_url: str,
     expect_wifi_psk_present: bool,
+    expect_upload_api_key_present: bool,
     expect_upload_token_present: bool,
     expected_auth_type: str,
     expected_tls_mode: str | None = None,
@@ -592,6 +598,11 @@ def validate_config_export_payload(
     if auth.get("type") != expected_auth_type:
         raise RuntimeError(
             f"config export upload.auth.type mismatch: expected {expected_auth_type!r}, got {auth.get('type')!r}"
+        )
+    if auth.get("api_key_present") is not expect_upload_api_key_present:
+        raise RuntimeError(
+            "config export upload.auth.api_key_present mismatch: "
+            f"expected {expect_upload_api_key_present!r}, got {auth.get('api_key_present')!r}"
         )
     if auth.get("token_present") is not expect_upload_token_present:
         raise RuntimeError(
@@ -932,6 +943,10 @@ def default_wifi_args_required(scenario: str) -> bool:
     }
 
 
+def default_upload_auth_args_required(scenario: str) -> bool:
+    return default_wifi_args_required(scenario)
+
+
 def build_scenario(
     name: str,
     start_utc: datetime,
@@ -939,6 +954,7 @@ def build_scenario(
     upload_url: str | None = None,
     wifi_ssid: str | None = None,
     wifi_psk: str | None = None,
+    upload_api_key: str | None = None,
     upload_token: str | None = None,
 ) -> list[Step]:
     if name == "smoke":
@@ -1012,8 +1028,8 @@ def build_scenario(
             Step("system_log", "system-log export --json", "system-log export"),
         ]
     if name in {"upload-verified", "upload-failed", "upload-blocked-min-firmware"}:
-        if upload_url is None or wifi_ssid is None or wifi_psk is None:
-            raise ValueError(f"scenario {name!r} requires upload_url, wifi_ssid, and wifi_psk")
+        if upload_url is None or wifi_ssid is None or wifi_psk is None or upload_api_key is None or upload_token is None:
+            raise ValueError(f"scenario {name!r} requires upload_url, wifi_ssid, wifi_psk, upload_api_key, and upload_token")
 
         steps = [
             Step("status_before", "status --json", "status"),
@@ -1028,9 +1044,9 @@ def build_scenario(
             Step("set_wifi_ssid", f"debug config set wifi_ssid {wifi_ssid}", "debug config set"),
             Step("set_wifi_psk", f"debug config set wifi_psk {wifi_psk}", "debug config set"),
             Step("set_upload_url", f"debug config set upload_url {upload_url}", "debug config set"),
+            Step("set_upload_api_key", f"debug config set upload_api_key {upload_api_key}", "debug config set"),
+            Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set"),
         ]
-        if upload_token is not None:
-            steps.append(Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set"))
         steps.extend(
             [
                 Step("unlock_3", "service unlock", "service unlock"),
@@ -1048,8 +1064,8 @@ def build_scenario(
         )
         return steps
     if name == "upload-interrupted-reboot":
-        if upload_url is None or wifi_ssid is None or wifi_psk is None:
-            raise ValueError(f"scenario {name!r} requires upload_url, wifi_ssid, and wifi_psk")
+        if upload_url is None or wifi_ssid is None or wifi_psk is None or upload_api_key is None or upload_token is None:
+            raise ValueError(f"scenario {name!r} requires upload_url, wifi_ssid, wifi_psk, upload_api_key, and upload_token")
 
         steps = [
             Step("status_before", "status --json", "status"),
@@ -1064,9 +1080,9 @@ def build_scenario(
             Step("set_wifi_ssid", f"debug config set wifi_ssid {wifi_ssid}", "debug config set"),
             Step("set_wifi_psk", f"debug config set wifi_psk {wifi_psk}", "debug config set"),
             Step("set_upload_url", f"debug config set upload_url {upload_url}", "debug config set"),
+            Step("set_upload_api_key", f"debug config set upload_api_key {upload_api_key}", "debug config set"),
+            Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set"),
         ]
-        if upload_token is not None:
-            steps.append(Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set"))
         return steps
     raise ValueError(f"unsupported scenario {name!r}")
 
@@ -1385,6 +1401,7 @@ def run_config_import_scenario(
     upload_url: str,
     wifi_ssid: str,
     wifi_psk: str,
+    upload_api_key: str,
     upload_token: str | None,
 ) -> dict[str, Any]:
     with SerialJsonClient(port) as client:
@@ -1427,6 +1444,7 @@ def run_config_import_scenario(
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
             upload_url=upload_url,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
             secrets_included=True,
         )
@@ -1440,6 +1458,7 @@ def run_config_import_scenario(
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
             upload_url=upload_url,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
             secrets_included=False,
         )
@@ -1453,6 +1472,7 @@ def run_config_import_scenario(
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
             upload_url=upload_url,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
             secrets_included=True,
         )
@@ -1512,8 +1532,9 @@ def run_config_import_scenario(
         wifi_ssid=wifi_ssid,
         upload_url=upload_url,
         expect_wifi_psk_present=True,
+        expect_upload_api_key_present=upload_api_key is not None,
         expect_upload_token_present=upload_token is not None,
-        expected_auth_type="bearer" if upload_token is not None else "none",
+        expected_auth_type="api_key_and_bearer",
     )
 
     import_clear_payload = payload_from_response(response_by_label(responses, "import_clear"))
@@ -1531,8 +1552,9 @@ def run_config_import_scenario(
         wifi_ssid=wifi_ssid,
         upload_url=upload_url,
         expect_wifi_psk_present=False,
+        expect_upload_api_key_present=False,
         expect_upload_token_present=False,
-        expected_auth_type="none",
+        expected_auth_type="api_key_and_bearer",
     )
 
     import_restore_payload = payload_from_response(response_by_label(responses, "import_restore"))
@@ -1550,8 +1572,9 @@ def run_config_import_scenario(
         wifi_ssid=wifi_ssid,
         upload_url=upload_url,
         expect_wifi_psk_present=True,
+        expect_upload_api_key_present=upload_api_key is not None,
         expect_upload_token_present=upload_token is not None,
-        expected_auth_type="bearer" if upload_token is not None else "none",
+        expected_auth_type="api_key_and_bearer",
     )
 
     status_after_reboot = payload_from_response(response_by_label(responses, "status_after_reboot"))
@@ -1569,8 +1592,9 @@ def run_config_import_scenario(
         wifi_ssid=wifi_ssid,
         upload_url=upload_url,
         expect_wifi_psk_present=True,
+        expect_upload_api_key_present=upload_api_key is not None,
         expect_upload_token_present=upload_token is not None,
-        expected_auth_type="bearer" if upload_token is not None else "none",
+        expected_auth_type="api_key_and_bearer",
     )
 
     system_log_before = response_by_label(responses, "system_log_before")
@@ -1617,6 +1641,7 @@ def run_https_trust_scenario(
     upload_url: str,
     wifi_ssid: str,
     wifi_psk: str,
+    upload_api_key: str,
     upload_token: str | None,
     trust_mode: str,
     spawn_ref_server: bool,
@@ -1649,6 +1674,7 @@ def run_https_trust_scenario(
                     RefServerConfig(
                         upload_url=upload_url,
                         data_dir=ref_server_data_dir,
+                        api_key=upload_api_key,
                         bearer_token=upload_token,
                         min_firmware=None,
                         origin_upload_url=ref_server_origin_url,
@@ -1712,6 +1738,7 @@ def run_https_trust_scenario(
                 wifi_ssid=wifi_ssid,
                 wifi_psk=wifi_psk,
                 upload_url=upload_url,
+                upload_api_key=upload_api_key,
                 upload_token=upload_token,
                 secrets_included=True,
                 upload_tls=build_upload_tls_document(upload_url=upload_url, trust_plan=trust_plan),
@@ -1788,8 +1815,9 @@ def run_https_trust_scenario(
             wifi_ssid=wifi_ssid,
             upload_url=upload_url,
             expect_wifi_psk_present=True,
+            expect_upload_api_key_present=upload_api_key is not None,
             expect_upload_token_present=upload_token is not None,
-            expected_auth_type="bearer" if upload_token is not None else "none",
+            expected_auth_type="api_key_and_bearer",
             expected_tls_mode=trust_plan.mode,
             expected_tls_root_profile=trust_plan.root_profile,
             expected_anchor_sha256=expected_anchor_sha256,
@@ -1850,8 +1878,9 @@ def run_https_trust_scenario(
                 wifi_ssid=wifi_ssid,
                 upload_url=upload_url,
                 expect_wifi_psk_present=True,
+                expect_upload_api_key_present=upload_api_key is not None,
                 expect_upload_token_present=upload_token is not None,
-                expected_auth_type="bearer" if upload_token is not None else "none",
+                expected_auth_type="api_key_and_bearer",
                 expected_tls_mode=LOGGER_TLS_MODE_PUBLIC_ROOTS,
                 expected_tls_root_profile=LOGGER_PUBLIC_ROOT_PROFILE,
                 expected_anchor_sha256=None,
@@ -1886,8 +1915,9 @@ def run_https_trust_scenario(
             wifi_ssid=wifi_ssid,
             upload_url=upload_url,
             expect_wifi_psk_present=True,
+            expect_upload_api_key_present=upload_api_key is not None,
             expect_upload_token_present=upload_token is not None,
-            expected_auth_type="bearer" if upload_token is not None else "none",
+            expected_auth_type="api_key_and_bearer",
             expected_tls_mode=LOGGER_TLS_MODE_PUBLIC_ROOTS,
             expected_tls_root_profile=LOGGER_PUBLIC_ROOT_PROFILE,
             expected_anchor_sha256=None,
@@ -1930,6 +1960,7 @@ def run_firmware_change_requeue_scenario(
     upload_url: str,
     wifi_ssid: str,
     wifi_psk: str,
+    upload_api_key: str,
     upload_token: str | None,
     spawn_ref_server: bool,
     ref_server_data_dir: Path | None,
@@ -1950,6 +1981,7 @@ def run_firmware_change_requeue_scenario(
                     RefServerConfig(
                         upload_url=upload_url,
                         data_dir=ref_server_data_dir,
+                        api_key=upload_api_key,
                         bearer_token=upload_token,
                         min_firmware=None,
                     )
@@ -1976,11 +2008,8 @@ def run_firmware_change_requeue_scenario(
                     Step("set_wifi_ssid", f"debug config set wifi_ssid {wifi_ssid}", "debug config set"),
                     Step("set_wifi_psk", f"debug config set wifi_psk {wifi_psk}", "debug config set"),
                     Step("set_upload_url", f"debug config set upload_url {blocked_upload_url}", "debug config set"),
-                    *(
-                        [Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set")]
-                        if upload_token is not None
-                        else []
-                    ),
+                    Step("set_upload_api_key", f"debug config set upload_api_key {upload_api_key}", "debug config set"),
+                    Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set"),
                     Step("unlock_3", "service unlock", "service unlock"),
                     Step("upload_once", "debug upload once", "debug upload once", timeout_s=90.0, allow_error=True),
                     Step("queue_after", "queue --json", "queue"),
@@ -2160,6 +2189,7 @@ def run_retention_prune_scenario(
     upload_url: str,
     wifi_ssid: str,
     wifi_psk: str,
+    upload_api_key: str,
     upload_token: str | None,
     spawn_ref_server: bool,
     ref_server_data_dir: Path | None,
@@ -2177,6 +2207,7 @@ def run_retention_prune_scenario(
                     RefServerConfig(
                         upload_url=effective_upload_url,
                         data_dir=ref_server_data_dir,
+                        api_key=upload_api_key,
                         bearer_token=upload_token,
                         min_firmware=None,
                     )
@@ -2206,11 +2237,8 @@ def run_retention_prune_scenario(
                     Step("set_wifi_ssid", f"debug config set wifi_ssid {wifi_ssid}", "debug config set"),
                     Step("set_wifi_psk", f"debug config set wifi_psk {wifi_psk}", "debug config set"),
                     Step("set_upload_url", f"debug config set upload_url {effective_upload_url}", "debug config set"),
-                    *(
-                        [Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set")]
-                        if upload_token is not None
-                        else []
-                    ),
+                    Step("set_upload_api_key", f"debug config set upload_api_key {upload_api_key}", "debug config set"),
+                    Step("set_upload_token", f"debug config set upload_token {upload_token}", "debug config set"),
                     Step("unlock_3", "service unlock", "service unlock"),
                     Step("upload_once", "debug upload once", "debug upload once", timeout_s=90.0),
                     Step("queue_after_upload", "queue --json", "queue"),
@@ -2344,6 +2372,7 @@ def run_scenario(
     upload_url: str | None = None,
     wifi_ssid: str | None = None,
     wifi_psk: str | None = None,
+    upload_api_key: str | None = None,
     upload_token: str | None = None,
     spawn_ref_server: bool = False,
     ref_server_data_dir: Path | None = None,
@@ -2363,6 +2392,7 @@ def run_scenario(
             upload_url=upload_url,
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
         )
     if scenario == "https-public-roots":
@@ -2375,6 +2405,7 @@ def run_scenario(
             upload_url=upload_url,
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
             trust_mode=LOGGER_TLS_MODE_PUBLIC_ROOTS,
             spawn_ref_server=spawn_ref_server,
@@ -2392,6 +2423,7 @@ def run_scenario(
             upload_url=upload_url,
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
             trust_mode=LOGGER_TLS_MODE_PROVISIONED_ANCHOR,
             spawn_ref_server=spawn_ref_server,
@@ -2408,6 +2440,7 @@ def run_scenario(
             upload_url=upload_url,
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
             spawn_ref_server=spawn_ref_server,
             ref_server_data_dir=ref_server_data_dir,
@@ -2424,6 +2457,7 @@ def run_scenario(
             upload_url=upload_url,
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
             spawn_ref_server=spawn_ref_server,
             ref_server_data_dir=ref_server_data_dir,
@@ -2436,6 +2470,7 @@ def run_scenario(
             upload_url=upload_url,
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
             spawn_ref_server=spawn_ref_server,
             ref_server_data_dir=ref_server_data_dir,
@@ -2458,6 +2493,7 @@ def run_scenario(
                     RefServerConfig(
                         upload_url=effective_upload_url,
                         data_dir=ref_server_data_dir,
+                        api_key=upload_api_key,
                         bearer_token=upload_token,
                         min_firmware=ref_server_min_firmware,
                     )
@@ -2473,6 +2509,7 @@ def run_scenario(
             upload_url=effective_upload_url,
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
         )
 
@@ -2505,6 +2542,7 @@ def run_interrupted_upload_reboot_scenario(
     upload_url: str | None,
     wifi_ssid: str | None,
     wifi_psk: str | None,
+    upload_api_key: str | None,
     upload_token: str | None,
     spawn_ref_server: bool,
     ref_server_data_dir: Path | None,
@@ -2527,6 +2565,7 @@ def run_interrupted_upload_reboot_scenario(
                     RefServerConfig(
                         upload_url=effective_upload_url,
                         data_dir=ref_server_data_dir,
+                        api_key=upload_api_key,
                         bearer_token=upload_token,
                         min_firmware=ref_server_min_firmware,
                     )
@@ -2541,6 +2580,7 @@ def run_interrupted_upload_reboot_scenario(
             upload_url=effective_upload_url,
             wifi_ssid=wifi_ssid,
             wifi_psk=wifi_psk,
+            upload_api_key=upload_api_key,
             upload_token=upload_token,
         )
 
@@ -2665,7 +2705,8 @@ def main() -> int:
     parser.add_argument("--wifi-ssid", default=None, help="Wi-Fi SSID for upload scenarios")
     parser.add_argument("--wifi-psk", default=None, help="Wi-Fi PSK for upload scenarios")
     parser.add_argument("--upload-url", default=None, help="HTTP or HTTPS upload URL for upload scenarios")
-    parser.add_argument("--upload-token", default=None, help="optional bearer token for upload scenarios")
+    parser.add_argument("--upload-api-key", default=None, help="upload API key for upload scenarios")
+    parser.add_argument("--upload-token", default=None, help="upload bearer token for upload scenarios")
     parser.add_argument(
         "--spawn-ref-server",
         action="store_true",
@@ -2724,6 +2765,15 @@ def main() -> int:
         if missing_args:
             parser.error(f"scenario {args.scenario!r} requires {' '.join(missing_args)}")
 
+    if default_upload_auth_args_required(args.scenario):
+        missing_args = [
+            name
+            for name, value in (("--upload-api-key", args.upload_api_key), ("--upload-token", args.upload_token))
+            if value is None
+        ]
+        if missing_args:
+            parser.error(f"scenario {args.scenario!r} requires {' '.join(missing_args)}")
+
     errors: list[str] = []
     try:
         summary = run_scenario(
@@ -2733,6 +2783,7 @@ def main() -> int:
             upload_url=args.upload_url,
             wifi_ssid=args.wifi_ssid,
             wifi_psk=args.wifi_psk,
+            upload_api_key=args.upload_api_key,
             upload_token=args.upload_token,
             spawn_ref_server=args.spawn_ref_server,
             ref_server_data_dir=args.ref_server_data_dir,

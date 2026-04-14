@@ -24,6 +24,8 @@
 
 #define LOGGER_QUEUE_MAINTENANCE_INTERVAL_MS 300000u
 
+static bool logger_app_finalize_no_session_before_stop(logger_app_t *app);
+
 static bool logger_timezone_is_utc_like(const char *timezone) {
     return timezone != NULL &&
            (strcmp(timezone, "UTC") == 0 || strcmp(timezone, "Etc/UTC") == 0);
@@ -447,6 +449,62 @@ bool logger_app_clock_sync_ntp(logger_app_t *app, logger_clock_ntp_sync_result_t
 
     logger_app_log_ntp_sync_result(app, "ntp_sync_failed", LOGGER_SYSTEM_LOG_SEVERITY_WARN, result);
     return false;
+}
+
+bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms, bool *will_stop_logging_out) {
+    if (will_stop_logging_out != NULL) {
+        *will_stop_logging_out = false;
+    }
+    if (app == NULL) {
+        return false;
+    }
+
+    switch (app->runtime.current_state) {
+        case LOGGER_RUNTIME_SERVICE:
+            return true;
+
+        case LOGGER_RUNTIME_UPLOAD_PREP:
+        case LOGGER_RUNTIME_UPLOAD_RUNNING:
+        case LOGGER_RUNTIME_BOOT:
+            return false;
+
+        case LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER:
+        case LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE:
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "host_service_request", now_ms);
+            return true;
+
+        case LOGGER_RUNTIME_LOG_STOPPING:
+            app->runtime.planned_next_state = LOGGER_RUNTIME_SERVICE;
+            logger_app_copy_string(app->stopping_end_reason, sizeof(app->stopping_end_reason), "service_entry");
+            if (will_stop_logging_out != NULL) {
+                *will_stop_logging_out = true;
+            }
+            return true;
+
+        default:
+            break;
+    }
+
+    if (!logger_runtime_state_is_logging(app->runtime.current_state)) {
+        return false;
+    }
+
+    if (!app->session.active) {
+        if (!app->current_day_has_session && !logger_app_finalize_no_session_before_stop(app)) {
+            logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+            logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "no_session_day_summary_failed", now_ms);
+            return true;
+        }
+        logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE, "host_service_request", now_ms);
+        return true;
+    }
+
+    logger_app_copy_string(app->stopping_end_reason, sizeof(app->stopping_end_reason), "service_entry");
+    logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE, "host_service_request", now_ms);
+    if (will_stop_logging_out != NULL) {
+        *will_stop_logging_out = true;
+    }
+    return true;
 }
 
 static bool logger_app_current_day_seen_bound_device(const logger_app_t *app) {
@@ -1026,6 +1084,7 @@ static void logger_step_service(logger_app_t *app, uint32_t now_ms) {
 }
 
 static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
+    const logger_runtime_state_t step_entry_state = app->runtime.current_state;
     logger_app_refresh_observations(app, now_ms);
     if (!logger_app_run_queue_maintenance(app, now_ms, !app->storage.reserve_ok)) {
         logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
@@ -1035,6 +1094,9 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
     logger_h10_set_enabled(&app->h10, true);
     logger_h10_poll(&app->h10, now_ms);
     logger_service_cli_poll(&app->cli, app, now_ms);
+    if (app->runtime.current_state != step_entry_state) {
+        return;
+    }
 
     if (!logger_app_handle_day_and_clock_boundaries(app, now_ms)) {
         return;

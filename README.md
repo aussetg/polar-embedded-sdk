@@ -62,6 +62,30 @@ The `docs/` directory is an `mdBook`.
 - `scripts/check_full.sh` — aggregate gate (`check_fast` + `check_c`)
 - `patches/align_btstack_trees.sh` — align BTstack trees to pinned commit and apply local patch stacks (auto-run by firmware/probe configure, can be disabled via CMake cache vars)
 
+### `loggerctl` upload provisioning
+
+The current upload contract uses both:
+
+- `x-api-key: <api key>`
+- `Authorization: Bearer <token>`
+
+`scripts/loggerctl.py upload configure` can generate or apply a matching v1 config document:
+
+```sh
+export LOGGER_UPLOAD_API_KEY='replace-me'
+export LOGGER_UPLOAD_BEARER_TOKEN='replace-me'
+export LOGGER_WIFI_PSK='replace-me'
+
+python scripts/loggerctl.py upload configure https://example.invalid/upload \
+  --api-key-env LOGGER_UPLOAD_API_KEY \
+  --bearer-token-env LOGGER_UPLOAD_BEARER_TOKEN \
+  --wifi-ssid my-wifi \
+  --wifi-psk-env LOGGER_WIFI_PSK \
+  --apply --verify-net-test
+```
+
+For the stable schema and import/export details, see `docs/specs/logger_host_interfaces_v1.md`.
+
 ## Vendor deps
 
 Third party sources live under `vendors/` (MicroPython, nanopb, ...).

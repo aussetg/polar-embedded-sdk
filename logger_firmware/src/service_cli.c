@@ -663,15 +663,22 @@ static bool logger_parse_config_import_document(
         return false;
     }
 
-    char auth_type[16];
+    char auth_type[24];
+    char auth_api_key[LOGGER_CONFIG_UPLOAD_API_KEY_MAX] = {0};
     char auth_token[LOGGER_CONFIG_UPLOAD_TOKEN_MAX] = {0};
+    bool api_key_present_marker = false;
     bool token_present_marker = false;
     if (!logger_json_object_copy_string(&doc, auth_tok, "type", auth_type, sizeof(auth_type))) {
         *error_message_out = "config import upload.auth.type is invalid";
         return false;
     }
-    if (strcmp(auth_type, "none") != 0 && strcmp(auth_type, "bearer") != 0) {
-        *error_message_out = "config import upload.auth.type must be none or bearer";
+    if (strcmp(auth_type, "none") != 0 && strcmp(auth_type, "api_key_and_bearer") != 0) {
+        *error_message_out = "config import upload.auth.type must be none or api_key_and_bearer";
+        return false;
+    }
+    if (logger_json_object_has_key(&doc, auth_tok, "api_key") &&
+        !logger_json_object_copy_string_or_empty_required(&doc, auth_tok, "api_key", auth_api_key, sizeof(auth_api_key))) {
+        *error_message_out = "config import upload.auth.api_key is invalid";
         return false;
     }
     if (logger_json_object_has_key(&doc, auth_tok, "token") &&
@@ -679,11 +686,17 @@ static bool logger_parse_config_import_document(
         *error_message_out = "config import upload.auth.token is invalid";
         return false;
     }
+    if (logger_json_object_has_key(&doc, auth_tok, "api_key_present") &&
+        !logger_json_object_get_bool(&doc, auth_tok, "api_key_present", &api_key_present_marker)) {
+        *error_message_out = "config import upload.auth.api_key_present is invalid";
+        return false;
+    }
     if (logger_json_object_has_key(&doc, auth_tok, "token_present") &&
         !logger_json_object_get_bool(&doc, auth_tok, "token_present", &token_present_marker)) {
         *error_message_out = "config import upload.auth.token_present is invalid";
         return false;
     }
+    (void)api_key_present_marker;
     (void)token_present_marker;
 
     if (upload_enabled) {
@@ -700,25 +713,37 @@ static bool logger_parse_config_import_document(
                                                    error_message_out)) {
             return false;
         }
-        if (strcmp(auth_type, "bearer") == 0) {
+        if (strcmp(auth_type, "api_key_and_bearer") == 0) {
             if (secrets_included) {
-                if (!logger_string_present(auth_token)) {
-                    *error_message_out = "config import bearer auth requires token when secrets_included is true";
+                if (!logger_string_present(auth_api_key)) {
+                    *error_message_out = "config import api_key_and_bearer auth requires api_key when secrets_included is true";
                     return false;
                 }
+                if (!logger_string_present(auth_token)) {
+                    *error_message_out = "config import api_key_and_bearer auth requires token when secrets_included is true";
+                    return false;
+                }
+                logger_copy_string(imported.config.upload_api_key, sizeof(imported.config.upload_api_key), auth_api_key);
                 logger_copy_string(imported.config.upload_token, sizeof(imported.config.upload_token), auth_token);
             } else {
-                if (!logger_json_object_has_key(&doc, auth_tok, "token_present")) {
-                    *error_message_out = "config import bearer auth requires token_present when secrets_included is false";
+                if (!logger_json_object_has_key(&doc, auth_tok, "api_key_present")) {
+                    *error_message_out = "config import api_key_and_bearer auth requires api_key_present when secrets_included is false";
                     return false;
                 }
+                if (!logger_json_object_has_key(&doc, auth_tok, "token_present")) {
+                    *error_message_out = "config import api_key_and_bearer auth requires token_present when secrets_included is false";
+                    return false;
+                }
+                imported.config.upload_api_key[0] = '\0';
                 imported.config.upload_token[0] = '\0';
             }
         } else {
-            imported.config.upload_token[0] = '\0';
+            *error_message_out = "config import enabled upload requires api_key_and_bearer auth";
+            return false;
         }
     } else {
         imported.config.upload_url[0] = '\0';
+        imported.config.upload_api_key[0] = '\0';
         imported.config.upload_token[0] = '\0';
         if (!logger_parse_config_import_upload_tls(&doc,
                                                    upload_tok,
@@ -827,7 +852,8 @@ static void logger_write_required_present_array(const logger_app_t *app) {
 
 static void logger_write_optional_present_array(const logger_app_t *app) {
     bool first = true;
-    if (logger_string_present(app->persisted.config.upload_token)) {
+    if (logger_string_present(app->persisted.config.upload_api_key) &&
+        logger_string_present(app->persisted.config.upload_token)) {
         logger_json_write_string_or_null(first ? "upload_auth" : NULL);
         first = false;
     }
@@ -1313,7 +1339,9 @@ static void logger_handle_config_export_json(logger_app_t *app) {
     fputs(",\"url\":", stdout);
     logger_json_write_string_or_null(app->persisted.config.upload_url);
     fputs(",\"auth\":{\"type\":", stdout);
-    logger_json_write_string_or_null(logger_string_present(app->persisted.config.upload_token) ? "bearer" : "none");
+    logger_json_write_string_or_null(logger_string_present(app->persisted.config.upload_url) ? "api_key_and_bearer" : "none");
+    fputs(",\"api_key_present\":", stdout);
+    fputs(logger_string_present(app->persisted.config.upload_api_key) ? "true" : "false", stdout);
     fputs(",\"token_present\":", stdout);
     fputs(logger_string_present(app->persisted.config.upload_token) ? "true" : "false", stdout);
     fputs("},\"tls\":", stdout);
@@ -1479,6 +1507,39 @@ static void logger_handle_service_unlock(logger_service_cli_t *cli, logger_app_t
     fputs("{\"unlocked\":true,\"expires_at_utc\":", stdout);
     logger_json_write_string_or_null(logger_now_utc_or_null(app));
     fputs(",\"ttl_seconds\":60}", stdout);
+    logger_json_end_success();
+}
+
+static void logger_handle_service_enter(logger_app_t *app, uint32_t now_ms) {
+    if (logger_cli_is_upload_mode(app)) {
+        logger_json_begin_error("service enter", logger_now_utc_or_null(app), "not_permitted_in_mode", "service enter is not permitted during upload");
+        return;
+    }
+
+    const bool already_in_service = logger_cli_is_service_mode(app);
+    bool will_stop_logging = false;
+    if (!logger_app_request_service_mode(app, now_ms, &will_stop_logging)) {
+        logger_json_begin_error("service enter", logger_now_utc_or_null(app), "not_permitted_in_mode", "service enter is not permitted in the current mode");
+        return;
+    }
+
+    (void)logger_system_log_append(
+        &app->system_log,
+        logger_now_utc_or_null(app),
+        "service_request",
+        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        already_in_service ? "{\"source\":\"host\",\"already_in_service\":true}" : "{\"source\":\"host\",\"already_in_service\":false}");
+
+    logger_json_begin_success("service enter", logger_now_utc_or_null(app));
+    fputs("{\"requested\":true,\"already_in_service\":", stdout);
+    fputs(already_in_service ? "true" : "false", stdout);
+    fputs(",\"will_stop_logging\":", stdout);
+    fputs(will_stop_logging ? "true" : "false", stdout);
+    fputs(",\"mode\":", stdout);
+    logger_json_write_string_or_null(logger_mode_name(&app->runtime));
+    fputs(",\"runtime_state\":", stdout);
+    logger_json_write_string_or_null(logger_runtime_state_name(app->runtime.current_state));
+    fputs(",\"target_mode\":\"service\"}", stdout);
     logger_json_end_success();
 }
 
@@ -2008,6 +2069,7 @@ static void logger_handle_debug_config_set(logger_service_cli_t *cli, logger_app
     const bool upload_debug_field = strcmp(field, "wifi_ssid") == 0 ||
                                     strcmp(field, "wifi_psk") == 0 ||
                                     strcmp(field, "upload_url") == 0 ||
+                                    strcmp(field, "upload_api_key") == 0 ||
                                     strcmp(field, "upload_token") == 0;
     const bool allow_in_log_wait_h10 = upload_debug_field && app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
 
@@ -2040,6 +2102,8 @@ static void logger_handle_debug_config_set(logger_service_cli_t *cli, logger_app
         ok = logger_config_set_wifi_psk(&app->persisted, value);
     } else if (strcmp(field, "upload_url") == 0) {
         ok = logger_config_set_upload_url(&app->persisted, value);
+    } else if (strcmp(field, "upload_api_key") == 0) {
+        ok = logger_config_set_upload_api_key(&app->persisted, value);
     } else if (strcmp(field, "upload_token") == 0) {
         ok = logger_config_set_upload_token(&app->persisted, value);
     } else {
@@ -2923,6 +2987,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli, logger_app_t *
     }
     if (strcmp(line, "clock sync --json") == 0) {
         logger_handle_clock_sync(cli, app);
+        return;
+    }
+    if (strcmp(line, "service enter") == 0) {
+        logger_handle_service_enter(app, now_ms);
         return;
     }
     if (strcmp(line, "service unlock") == 0) {

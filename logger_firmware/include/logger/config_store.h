@@ -12,6 +12,7 @@
 #define LOGGER_CONFIG_BOUND_H10_ADDR_MAX 18
 #define LOGGER_CONFIG_TIMEZONE_MAX 64
 #define LOGGER_CONFIG_UPLOAD_URL_MAX 192
+#define LOGGER_CONFIG_UPLOAD_API_KEY_MAX 160
 #define LOGGER_CONFIG_UPLOAD_TOKEN_MAX 160
 #define LOGGER_CONFIG_WIFI_SSID_MAX 33
 #define LOGGER_CONFIG_WIFI_PSK_MAX 65
@@ -34,6 +35,7 @@ typedef struct {
     char bound_h10_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
     char timezone[LOGGER_CONFIG_TIMEZONE_MAX];
     char upload_url[LOGGER_CONFIG_UPLOAD_URL_MAX];
+    char upload_api_key[LOGGER_CONFIG_UPLOAD_API_KEY_MAX];
     char upload_token[LOGGER_CONFIG_UPLOAD_TOKEN_MAX];
     char wifi_ssid[LOGGER_CONFIG_WIFI_SSID_MAX];
     char wifi_psk[LOGGER_CONFIG_WIFI_PSK_MAX];
@@ -89,6 +91,7 @@ bool logger_config_set_timezone(logger_persisted_state_t *state, const char *val
 bool logger_config_set_wifi_ssid(logger_persisted_state_t *state, const char *value);
 bool logger_config_set_wifi_psk(logger_persisted_state_t *state, const char *value);
 bool logger_config_set_upload_url(logger_persisted_state_t *state, const char *value);
+bool logger_config_set_upload_api_key(logger_persisted_state_t *state, const char *value);
 bool logger_config_set_upload_token(logger_persisted_state_t *state, const char *value);
 bool logger_config_clear_upload(logger_persisted_state_t *state);
 bool logger_config_clear_provisioned_anchor(logger_persisted_state_t *state, bool *had_anchor_out);

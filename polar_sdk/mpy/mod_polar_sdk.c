@@ -4168,7 +4168,7 @@ static mp_obj_t polar_h10_capabilities(mp_obj_t self_in) {
     polar_require_ready(self);
 
     mp_obj_t root = mp_obj_new_dict(6);
-    mp_obj_dict_store(root, mp_obj_new_str("schema_version", 14), mp_obj_new_int(0));
+    mp_obj_dict_store(root, mp_obj_new_str("schema_version", 14), mp_obj_new_int(1));
 
     mp_obj_t device = mp_obj_new_dict(5);
     if (self->addr == mp_const_none) {

@@ -186,9 +186,8 @@ Main class: `polar_sdk.Device`
 `capabilities()` must include `schema_version`.
 
 Schema-version policy:
-- pre-beta: `schema_version = 0` and schema shape may change without compatibility guarantees,
-- first beta/stable release: schema is frozen at `schema_version = 1`,
-- after freeze: breaking schema changes require a version bump.
+- current firmware uses `schema_version = 1`,
+- breaking schema changes require an intentional version bump.
 
 `capabilities()` required top-level keys:
 - `schema_version`, `device`, `streams`, `recording`, `psftp`, `security`

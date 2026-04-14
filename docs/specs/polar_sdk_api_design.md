@@ -775,8 +775,8 @@ Top-level keys:
 - `security: dict`
 
 Versioning policy:
-- `schema_version == 0` while the API remains pre-beta breakable.
-- The first beta/stable freeze sets `schema_version == 1`.
+- Current firmware uses `schema_version == 1`.
+- Breaking schema changes require an intentional version bump.
 
 #### `device`
 

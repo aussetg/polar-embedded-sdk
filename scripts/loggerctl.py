@@ -4,8 +4,14 @@
 This tool speaks the private USB serial framing used by the current firmware but
 keeps the stable v1 command names and JSON-first behavior exposed to users.
 
-It also provides host-assisted HTTPS endpoint provisioning so the device can be
-configured for either:
+`upload configure` is a host-side helper that prepares a full config document
+for the current upload contract:
+
+- `upload.auth.type = "api_key_and_bearer"`
+- `x-api-key: <api key>`
+- `Authorization: Bearer <token>`
+
+For HTTPS endpoints it can also plan device TLS trust using either:
 
 - built-in curated public roots, or
 - one provisioned CA anchor.
@@ -72,6 +78,47 @@ TRUST_MODE_ALIASES = {
     "provisioned-anchor": LOGGER_TLS_MODE_PROVISIONED_ANCHOR,
     "provisioned_anchor": LOGGER_TLS_MODE_PROVISIONED_ANCHOR,
 }
+
+ROOT_HELP_EPILOG = """Examples:
+  loggerctl status --json
+  loggerctl config export --output build/logger-config.json
+  loggerctl upload configure https://example.invalid/upload \\
+    --api-key-env LOGGER_UPLOAD_API_KEY \\
+    --bearer-token-env LOGGER_UPLOAD_BEARER_TOKEN \\
+    --wifi-ssid my-wifi \\
+    --wifi-psk-env LOGGER_WIFI_PSK \\
+    --output build/logger-config.json
+  loggerctl upload configure https://example.invalid/upload \\
+    --config build/logger-config.json \\
+    --api-key-env LOGGER_UPLOAD_API_KEY \\
+    --bearer-token-env LOGGER_UPLOAD_BEARER_TOKEN \\
+    --apply --verify-net-test
+"""
+
+
+UPLOAD_CONFIGURE_HELP_EPILOG = """Notes:
+  - Enabled upload uses auth.type=api_key_and_bearer.
+  - New upload provisioning normally needs both --api-key and --bearer-token.
+  - If --config is omitted, loggerctl starts from a live config export.
+  - Exported configs omit secrets. Re-applying one requires providing any
+    missing secrets explicitly before --apply.
+
+Examples:
+  loggerctl upload configure http://192.0.2.10:8787/upload \\
+    --api-key test-api-key \\
+    --bearer-token test-bearer-token \\
+    --wifi-ssid lab-wifi \\
+    --wifi-psk-env LOGGER_WIFI_PSK \\
+    --apply
+
+  loggerctl upload configure https://example.invalid/upload \\
+    --trust-mode auto \\
+    --api-key-env LOGGER_UPLOAD_API_KEY \\
+    --bearer-token-env LOGGER_UPLOAD_BEARER_TOKEN \\
+    --wifi-ssid lab-wifi \\
+    --wifi-psk-env LOGGER_WIFI_PSK \\
+    --output build/logger-config.json
+"""
 
 
 @dataclass(frozen=True)
@@ -154,6 +201,7 @@ def sanitize_export_summary(config: dict[str, Any]) -> dict[str, Any]:
             if isinstance(network.get("psk"), str) or network.get("psk_present") is True:
                 psk_present = True
 
+    api_key_present = isinstance(auth.get("api_key"), str) or auth.get("api_key_present") is True
     token_present = isinstance(auth.get("token"), str) or auth.get("token_present") is True
     return {
         "schema_version": config.get("schema_version"),
@@ -172,6 +220,7 @@ def sanitize_export_summary(config: dict[str, Any]) -> dict[str, Any]:
             "url": upload.get("url"),
             "auth": {
                 "type": auth.get("type"),
+                "api_key_present": api_key_present,
                 "token_present": token_present,
             },
             "tls": tls,
@@ -219,6 +268,8 @@ def find_hidden_secret_markers(config: dict[str, Any]) -> list[str]:
 
     upload = require_mapping(config, "upload")
     auth = require_mapping(upload, "auth")
+    if auth.get("api_key_present") is True and "api_key" not in auth:
+        markers.append("upload.auth.api_key")
     if auth.get("token_present") is True and "token" not in auth:
         markers.append("upload.auth.token")
 
@@ -269,26 +320,58 @@ def apply_wifi_settings(config: dict[str, Any], *, ssid: str | None, psk: str | 
 def apply_upload_auth_settings(
     config: dict[str, Any],
     *,
+    api_key: str | None,
     bearer_token: str | None,
-    clear_bearer_token: bool,
 ) -> dict[str, Any]:
     upload = require_mapping(config, "upload")
     auth = require_mapping(upload, "auth")
 
-    if clear_bearer_token and bearer_token is not None:
-        raise ValueError("--clear-bearer-token cannot be combined with --bearer-token")
-    if clear_bearer_token:
-        upload["auth"] = {"type": "none"}
-    elif bearer_token is not None:
-        upload["auth"] = {"type": "bearer", "token": bearer_token}
+    if api_key is not None or bearer_token is not None:
+        next_auth = dict(auth) if auth.get("type") == "api_key_and_bearer" else {"type": "api_key_and_bearer"}
+        if api_key is not None:
+            next_auth["api_key"] = api_key
+            next_auth.pop("api_key_present", None)
+        if bearer_token is not None:
+            next_auth["token"] = bearer_token
+            next_auth.pop("token_present", None)
+        upload["auth"] = next_auth
     else:
         upload["auth"] = dict(auth)
 
     final_auth = require_mapping(upload, "auth")
     return {
         "type": final_auth.get("type"),
+        "api_key_present": isinstance(final_auth.get("api_key"), str) or final_auth.get("api_key_present") is True,
         "token_present": isinstance(final_auth.get("token"), str) or final_auth.get("token_present") is True,
     }
+
+
+def validate_upload_auth_config(config: dict[str, Any]) -> None:
+    upload = require_mapping(config, "upload")
+    if upload.get("enabled") is not True:
+        return
+
+    auth = require_mapping(upload, "auth")
+    if auth.get("type") != "api_key_and_bearer":
+        raise ValueError(
+            "enabled upload requires auth.type=api_key_and_bearer; provide --api-key and --bearer-token "
+            "or start from a config export that already has auth markers"
+        )
+
+    has_api_key = isinstance(auth.get("api_key"), str)
+    has_token = isinstance(auth.get("token"), str)
+    has_api_key_marker = auth.get("api_key_present") is True
+    has_token_marker = auth.get("token_present") is True
+
+    if has_api_key != has_token:
+        raise ValueError("enabled upload auth must include both api_key and bearer token secrets together")
+    if not has_api_key and (has_api_key_marker != has_token_marker):
+        raise ValueError("enabled upload auth must include both api_key_present and token_present markers together")
+    if not has_api_key and not has_api_key_marker:
+        raise ValueError(
+            "enabled upload auth must include both secrets or both *_present markers; "
+            "provide --api-key and --bearer-token or start from a config export with auth markers"
+        )
 
 
 def apply_upload_endpoint_settings(
@@ -328,8 +411,9 @@ def finalize_secrets_flag(config: dict[str, Any]) -> bool:
     upload = require_mapping(config, "upload")
     auth = require_mapping(upload, "auth")
     has_wifi_secret = any(isinstance(network, dict) and isinstance(network.get("psk"), str) for network in networks or [])
+    has_api_key_secret = isinstance(auth.get("api_key"), str)
     has_token_secret = isinstance(auth.get("token"), str)
-    config["secrets_included"] = has_wifi_secret or has_token_secret
+    config["secrets_included"] = has_wifi_secret or has_api_key_secret or has_token_secret
     return bool(config["secrets_included"])
 
 
@@ -422,6 +506,7 @@ def load_base_config(device: LoggerDevice | None, path: Path | None) -> tuple[di
 
 def handle_upload_configure(args: argparse.Namespace) -> int:
     wifi_psk = resolve_secret_argument(args.wifi_psk, args.wifi_psk_env)
+    api_key = resolve_secret_argument(args.api_key, args.api_key_env)
     bearer_token = resolve_secret_argument(args.bearer_token, args.bearer_token_env)
 
     parsed = urlparse(args.url)
@@ -449,8 +534,9 @@ def handle_upload_configure(args: argparse.Namespace) -> int:
 
         config["exported_at_utc"] = now_rfc3339_utc()
         wifi_summary = apply_wifi_settings(config, ssid=args.wifi_ssid, psk=wifi_psk)
-        auth_summary = apply_upload_auth_settings(config, bearer_token=bearer_token, clear_bearer_token=args.clear_bearer_token)
+        auth_summary = apply_upload_auth_settings(config, api_key=api_key, bearer_token=bearer_token)
         upload_summary = apply_upload_endpoint_settings(config, url=args.url, trust_plan=trust_plan)
+        validate_upload_auth_config(config)
         secrets_included = finalize_secrets_flag(config)
         hidden_markers = find_hidden_secret_markers(config)
 
@@ -507,7 +593,7 @@ def handle_upload_configure(args: argparse.Namespace) -> int:
 
 
 def add_json_flag(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--json", action="store_true", help="accepted for compatibility; JSON is always printed")
+    parser.add_argument("--json", action="store_true", help="JSON is always printed")
 
 
 def add_device_command_parser(
@@ -524,7 +610,11 @@ def add_device_command_parser(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=ROOT_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--port", type=Path, help="logger USB serial device (auto-detect if omitted)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -600,6 +690,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     service_subparsers = service_parser.add_subparsers(dest="service_command", required=True)
     add_device_command_parser(
         service_subparsers,
+        "enter",
+        help_text="request transition into service mode",
+        spec=DeviceCommandSpec("service enter", "service enter", timeout_s=15.0),
+    )
+    add_device_command_parser(
+        service_subparsers,
         "unlock",
         help_text="arm the dangerous-operation window",
         spec=DeviceCommandSpec("service unlock", "service unlock"),
@@ -639,6 +735,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     configure_parser = upload_subparsers.add_parser(
         "configure",
         help="host-assisted upload endpoint provisioning and optional config apply",
+        description=(
+            "Prepare a full config document for an upload endpoint and optionally apply it.\n\n"
+            "Enabled upload requires both an API key and a bearer token."
+        ),
+        epilog=UPLOAD_CONFIGURE_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     configure_parser.add_argument("url", help="absolute http:// or https:// upload URL")
     configure_parser.add_argument("--config", type=Path, help="base config JSON file; default is live config export")
@@ -658,14 +760,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     wifi_psk_group = configure_parser.add_mutually_exclusive_group()
     wifi_psk_group.add_argument("--wifi-psk", help="set the Wi-Fi PSK directly")
     wifi_psk_group.add_argument("--wifi-psk-env", help="read the Wi-Fi PSK from an environment variable")
+    api_key_group = configure_parser.add_mutually_exclusive_group()
+    api_key_group.add_argument("--api-key", help="set the upload API key directly (for x-api-key)")
+    api_key_group.add_argument("--api-key-env", help="read the upload API key from an environment variable")
     token_group = configure_parser.add_mutually_exclusive_group()
-    token_group.add_argument("--bearer-token", help="set the upload bearer token directly")
+    token_group.add_argument("--bearer-token", help="set the upload bearer token directly (for Authorization: Bearer ...)")
     token_group.add_argument("--bearer-token-env", help="read the bearer token from an environment variable")
-    configure_parser.add_argument(
-        "--clear-bearer-token",
-        action="store_true",
-        help="replace bearer auth with auth.type=none",
-    )
     add_json_flag(configure_parser)
     configure_parser.set_defaults(handler=handle_upload_configure)
 
