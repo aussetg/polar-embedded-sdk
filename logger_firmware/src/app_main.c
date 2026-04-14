@@ -13,6 +13,7 @@
 #include "logger/net.h"
 #include "logger/queue.h"
 #include "logger/upload.h"
+#include "logger/util.h"
 
 #ifndef LOGGER_FIRMWARE_VERSION
 #define LOGGER_FIRMWARE_VERSION "0.1.0-dev"
@@ -25,27 +26,6 @@
 #define LOGGER_QUEUE_MAINTENANCE_INTERVAL_MS 300000u
 
 static bool logger_app_finalize_no_session_before_stop(logger_app_t *app);
-
-static bool logger_timezone_is_utc_like(const char *timezone) {
-  return timezone != NULL &&
-         (strcmp(timezone, "UTC") == 0 || strcmp(timezone, "Etc/UTC") == 0);
-}
-
-static void logger_app_copy_string(char *dst, size_t dst_len, const char *src) {
-  if (dst_len == 0u) {
-    return;
-  }
-  if (src == NULL) {
-    dst[0] = '\0';
-    return;
-  }
-  size_t i = 0u;
-  while (src[i] != '\0' && (i + 1u) < dst_len) {
-    dst[i] = src[i];
-    ++i;
-  }
-  dst[i] = '\0';
-}
 
 static int64_t logger_app_i64_abs(int64_t value) {
   return value < 0 ? -(value + 1) + 1 : value;
@@ -60,11 +40,11 @@ static bool logger_app_boot_identity_matches_persisted(
 
 static void
 logger_app_set_persisted_boot_identity(logger_persisted_state_t *state) {
-  logger_app_copy_string(state->last_boot_firmware_version,
-                         sizeof(state->last_boot_firmware_version),
-                         LOGGER_FIRMWARE_VERSION);
-  logger_app_copy_string(state->last_boot_build_id,
-                         sizeof(state->last_boot_build_id), LOGGER_BUILD_ID);
+  logger_copy_string(state->last_boot_firmware_version,
+                     sizeof(state->last_boot_firmware_version),
+                     LOGGER_FIRMWARE_VERSION);
+  logger_copy_string(state->last_boot_build_id,
+                     sizeof(state->last_boot_build_id), LOGGER_BUILD_ID);
 }
 
 static void logger_print_boot_banner(const logger_app_t *app) {
@@ -360,9 +340,8 @@ static bool logger_app_observed_study_day(const logger_app_t *app,
 
 static void logger_app_reset_day_tracking(logger_app_t *app,
                                           const char *study_day_local) {
-  logger_app_copy_string(app->current_day_study_day_local,
-                         sizeof(app->current_day_study_day_local),
-                         study_day_local);
+  logger_copy_string(app->current_day_study_day_local,
+                     sizeof(app->current_day_study_day_local), study_day_local);
   app->day_seen_baseline = app->h10.seen_count;
   app->day_connect_baseline = app->h10.connect_count;
   app->day_ecg_start_baseline = app->h10.ecg_start_attempt_count;
@@ -445,8 +424,8 @@ bool logger_app_clock_sync_ntp(logger_app_t *app,
 
   logger_clock_ntp_sync_result_init(result);
   if (app->persisted.config.wifi_ssid[0] == '\0') {
-    logger_app_copy_string(result->message, sizeof(result->message),
-                           "wifi network is not configured");
+    logger_copy_string(result->message, sizeof(result->message),
+                       "wifi network is not configured");
     return false;
   }
 
@@ -500,8 +479,8 @@ bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,
 
   case LOGGER_RUNTIME_LOG_STOPPING:
     app->runtime.planned_next_state = LOGGER_RUNTIME_SERVICE;
-    logger_app_copy_string(app->stopping_end_reason,
-                           sizeof(app->stopping_end_reason), "service_entry");
+    logger_copy_string(app->stopping_end_reason,
+                       sizeof(app->stopping_end_reason), "service_entry");
     if (will_stop_logging_out != NULL) {
       *will_stop_logging_out = true;
     }
@@ -534,8 +513,8 @@ bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,
     return true;
   }
 
-  logger_app_copy_string(app->stopping_end_reason,
-                         sizeof(app->stopping_end_reason), "service_entry");
+  logger_copy_string(app->stopping_end_reason, sizeof(app->stopping_end_reason),
+                     "service_entry");
   logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE,
                                      "host_service_request", now_ms);
   if (will_stop_logging_out != NULL) {
@@ -561,13 +540,13 @@ static void logger_app_set_last_day_outcome(logger_app_t *app,
                                             const char *study_day_local,
                                             const char *kind,
                                             const char *reason) {
-  logger_app_copy_string(app->last_day_outcome_study_day_local,
-                         sizeof(app->last_day_outcome_study_day_local),
-                         study_day_local);
-  logger_app_copy_string(app->last_day_outcome_kind,
-                         sizeof(app->last_day_outcome_kind), kind);
-  logger_app_copy_string(app->last_day_outcome_reason,
-                         sizeof(app->last_day_outcome_reason), reason);
+  logger_copy_string(app->last_day_outcome_study_day_local,
+                     sizeof(app->last_day_outcome_study_day_local),
+                     study_day_local);
+  logger_copy_string(app->last_day_outcome_kind,
+                     sizeof(app->last_day_outcome_kind), kind);
+  logger_copy_string(app->last_day_outcome_reason,
+                     sizeof(app->last_day_outcome_reason), reason);
   app->last_day_outcome_valid =
       study_day_local != NULL && study_day_local[0] != '\0' && kind != NULL &&
       kind[0] != '\0' && reason != NULL && reason[0] != '\0';
@@ -575,8 +554,8 @@ static void logger_app_set_last_day_outcome(logger_app_t *app,
 
 static void logger_app_set_next_span_start_reason(logger_app_t *app,
                                                   const char *reason) {
-  logger_app_copy_string(app->next_span_start_reason,
-                         sizeof(app->next_span_start_reason), reason);
+  logger_copy_string(app->next_span_start_reason,
+                     sizeof(app->next_span_start_reason), reason);
 }
 
 static const char *logger_app_take_next_span_start_reason(logger_app_t *app,
@@ -586,15 +565,15 @@ static const char *logger_app_take_next_span_start_reason(logger_app_t *app,
   if (app->next_span_start_reason[0] == '\0') {
     return fallback;
   }
-  logger_app_copy_string(buf, buf_size, app->next_span_start_reason);
+  logger_copy_string(buf, buf_size, app->next_span_start_reason);
   app->next_span_start_reason[0] = '\0';
   return buf;
 }
 
 static void logger_app_set_stopping_end_reason(logger_app_t *app,
                                                const char *reason) {
-  logger_app_copy_string(app->stopping_end_reason,
-                         sizeof(app->stopping_end_reason), reason);
+  logger_copy_string(app->stopping_end_reason, sizeof(app->stopping_end_reason),
+                     reason);
 }
 
 static bool logger_app_finalize_no_session_day(logger_app_t *app,
@@ -826,9 +805,9 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
       logger_app_set_next_span_start_reason(app, "clock_fix_continue");
       if (crosses_day) {
         logger_app_set_stopping_end_reason(app, "clock_fix");
-        logger_app_copy_string(app->pending_day_study_day_local,
-                               sizeof(app->pending_day_study_day_local),
-                               observed_study_day_local);
+        logger_copy_string(app->pending_day_study_day_local,
+                           sizeof(app->pending_day_study_day_local),
+                           observed_study_day_local);
         app->pending_next_session_clock_jump = false;
         logger_app_transition_via_stopping(app, LOGGER_RUNTIME_LOG_WAIT_H10,
                                            "clock_fix_new_day", now_ms);
@@ -865,9 +844,9 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
       logger_app_set_next_span_start_reason(app, "clock_jump_continue");
       if (crosses_day) {
         logger_app_set_stopping_end_reason(app, "clock_jump");
-        logger_app_copy_string(app->pending_day_study_day_local,
-                               sizeof(app->pending_day_study_day_local),
-                               observed_study_day_local);
+        logger_copy_string(app->pending_day_study_day_local,
+                           sizeof(app->pending_day_study_day_local),
+                           observed_study_day_local);
         app->pending_next_session_clock_jump = true;
         logger_app_transition_via_stopping(app, LOGGER_RUNTIME_LOG_WAIT_H10,
                                            "clock_jump_new_day", now_ms);
@@ -881,9 +860,9 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
     if (app->session.active) {
       logger_app_set_stopping_end_reason(app, "rollover");
       logger_app_set_next_span_start_reason(app, "rollover_continue");
-      logger_app_copy_string(app->pending_day_study_day_local,
-                             sizeof(app->pending_day_study_day_local),
-                             observed_study_day_local);
+      logger_copy_string(app->pending_day_study_day_local,
+                         sizeof(app->pending_day_study_day_local),
+                         observed_study_day_local);
       app->pending_next_session_clock_jump = false;
       logger_app_transition_via_stopping(app, LOGGER_RUNTIME_LOG_WAIT_H10,
                                          "study_day_rollover", now_ms);
@@ -1309,9 +1288,8 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
   }
   if (app->session.active) {
     char closed_study_day_local[11];
-    logger_app_copy_string(closed_study_day_local,
-                           sizeof(closed_study_day_local),
-                           app->session.study_day_local);
+    logger_copy_string(closed_study_day_local, sizeof(closed_study_day_local),
+                       app->session.study_day_local);
     if (!logger_session_finalize(
             &app->session, &app->system_log, app->hardware_id, &app->persisted,
             &app->clock, &app->storage, logger_app_session_stop_reason(app),

@@ -68,6 +68,14 @@ static inline uint32_t logger_crc32_ieee(const uint8_t *data, size_t len) {
 }
 
 /*
+ * True when timezone is "UTC" or "Etc/UTC".
+ */
+static inline bool logger_timezone_is_utc_like(const char *timezone) {
+  return timezone != NULL &&
+         (strcmp(timezone, "UTC") == 0 || strcmp(timezone, "Etc/UTC") == 0);
+}
+
+/*
  * True when value is non-NULL and not the empty string.
  */
 static inline bool logger_string_present(const char *value) {

@@ -417,13 +417,6 @@ logger_clock_datetime_reasonable(const logger_clock_status_t *status) {
                                                 status->minute, status->second);
 }
 
-static bool logger_timezone_is_utc_like(const char *timezone) {
-  if (timezone == NULL) {
-    return false;
-  }
-  return strcmp(timezone, "UTC") == 0 || strcmp(timezone, "Etc/UTC") == 0;
-}
-
 static bool logger_timezone_present(const char *timezone) {
   return timezone != NULL && timezone[0] != '\0';
 }
