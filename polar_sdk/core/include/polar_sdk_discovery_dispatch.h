@@ -11,10 +11,10 @@ extern "C" {
 #endif
 
 typedef struct {
-    void *ctx;
-    uint8_t (*discover_hr_chars)(void *ctx);
-    uint8_t (*discover_pmd_chars)(void *ctx);
-    uint8_t (*discover_psftp_chars)(void *ctx);
+  void *ctx;
+  uint8_t (*discover_hr_chars)(void *ctx);
+  uint8_t (*discover_pmd_chars)(void *ctx);
+  uint8_t (*discover_psftp_chars)(void *ctx);
 } polar_sdk_discovery_dispatch_ops_t;
 
 uint8_t polar_sdk_discovery_dispatch_command(

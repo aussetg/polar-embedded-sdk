@@ -11,17 +11,15 @@ extern "C" {
 #endif
 
 typedef struct {
-    bool *pending;
-    bool *done;
-    uint8_t *att_status;
-    bool update_last_att_status;
+  bool *pending;
+  bool *done;
+  uint8_t *att_status;
+  bool update_last_att_status;
 } polar_sdk_gatt_query_slot_t;
 
 bool polar_sdk_gatt_apply_query_complete(
-    uint8_t query_complete_att_status,
-    const polar_sdk_gatt_query_slot_t *slots,
-    size_t slot_count,
-    uint8_t *last_att_status);
+    uint8_t query_complete_att_status, const polar_sdk_gatt_query_slot_t *slots,
+    size_t slot_count, uint8_t *last_att_status);
 
 #ifdef __cplusplus
 }

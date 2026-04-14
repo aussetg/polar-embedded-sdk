@@ -1,10 +1,12 @@
 #ifndef POLAR_SDK_MPY_BTSTACK_CONFIG_H
 #define POLAR_SDK_MPY_BTSTACK_CONFIG_H
 
-// Project-local BTstack configuration overlay for the MicroPython firmware build.
+// Project-local BTstack configuration overlay for the MicroPython firmware
+// build.
 //
 // Why this exists:
-// - The rp2 MicroPython port normally injects its own btstack_inc/btstack_config.h.
+// - The rp2 MicroPython port normally injects its own
+// btstack_inc/btstack_config.h.
 // - That default config is intentionally minimal and differs from the dedicated
 //   pico-sdk probe builds used in this repository.
 // - Our H10 PSFTP paths depend on the same security/crypto behavior that the

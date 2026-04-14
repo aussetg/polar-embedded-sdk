@@ -11,10 +11,8 @@
 extern "C" {
 #endif
 
-bool polar_sdk_btstack_decode_link_event(
-    uint8_t packet_type,
-    uint8_t *packet,
-    polar_sdk_link_event_t *out_event);
+bool polar_sdk_btstack_decode_link_event(uint8_t packet_type, uint8_t *packet,
+                                         polar_sdk_link_event_t *out_event);
 
 #ifdef __cplusplus
 }
