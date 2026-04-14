@@ -69,6 +69,9 @@ typedef struct logger_app {
 
 void logger_app_init(logger_app_t *app, uint32_t now_ms,
                      logger_boot_gesture_t boot_gesture);
+void logger_app_set_last_day_outcome(logger_app_t *app,
+                                     const char *study_day_local,
+                                     const char *kind, const char *reason);
 void logger_app_note_wall_clock_changed(logger_app_t *app);
 bool logger_app_clock_sync_ntp(logger_app_t *app,
                                logger_clock_ntp_sync_result_t *result);

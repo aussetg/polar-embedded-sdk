@@ -12,6 +12,7 @@
 
 #include "board_config.h"
 #include "logger/app_main.h"
+#include "logger/faults.h"
 #include "logger/json.h"
 #include "logger/json_writer.h"
 #include "logger/queue.h"
@@ -22,21 +23,6 @@
 
 static const char *logger_now_utc_or_null(const logger_app_t *app) {
   return app->clock.now_utc[0] != '\0' ? app->clock.now_utc : NULL;
-}
-
-static void logger_set_last_day_outcome(logger_app_t *app,
-                                        const char *study_day_local,
-                                        const char *kind, const char *reason) {
-  logger_copy_string(app->last_day_outcome_study_day_local,
-                     sizeof(app->last_day_outcome_study_day_local),
-                     study_day_local);
-  logger_copy_string(app->last_day_outcome_kind,
-                     sizeof(app->last_day_outcome_kind), kind);
-  logger_copy_string(app->last_day_outcome_reason,
-                     sizeof(app->last_day_outcome_reason), reason);
-  app->last_day_outcome_valid =
-      study_day_local != NULL && study_day_local[0] != '\0' && kind != NULL &&
-      kind[0] != '\0' && reason != NULL && reason[0] != '\0';
 }
 
 static bool logger_parse_u8(const char *text, uint8_t *value_out) {
@@ -991,19 +977,6 @@ static bool logger_cli_upload_blocked_fault_present(void) {
   return summary.blocked_count > 0u;
 }
 
-static logger_fault_code_t
-logger_cli_storage_fault_code(const logger_app_t *app) {
-  if (!app->storage.card_present || !app->storage.mounted ||
-      !app->storage.writable || !app->storage.logger_root_ready ||
-      strcmp(app->storage.filesystem, "fat32") != 0) {
-    return LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE;
-  }
-  if (!app->storage.reserve_ok) {
-    return LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET;
-  }
-  return LOGGER_FAULT_NONE;
-}
-
 static bool logger_cli_fault_condition_still_present(const logger_app_t *app) {
   switch (app->persisted.current_fault_code) {
   case LOGGER_FAULT_CONFIG_INCOMPLETE:
@@ -1016,10 +989,10 @@ static bool logger_cli_fault_condition_still_present(const logger_app_t *app) {
     return logger_battery_is_critical(&app->battery);
   case LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE:
   case LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET:
-    return logger_cli_storage_fault_code(app) ==
+    return logger_fault_from_storage(&app->storage) ==
            app->persisted.current_fault_code;
   case LOGGER_FAULT_SD_WRITE_FAILED:
-    return logger_cli_storage_fault_code(app) != LOGGER_FAULT_NONE;
+    return logger_fault_from_storage(&app->storage) != LOGGER_FAULT_NONE;
   case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
     return logger_cli_upload_blocked_fault_present();
   case LOGGER_FAULT_NONE:
@@ -2780,7 +2753,7 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
         "failed to append synthetic no_session_day_summary");
     return;
   }
-  logger_set_last_day_outcome(app, study_day_local, "no_session", reason);
+  logger_app_set_last_day_outcome(app, study_day_local, "no_session", reason);
 
   logger_json_begin_success("debug synth no-session-day",
                             logger_now_utc_or_null(app));
@@ -2890,8 +2863,8 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
                               : "failed to open post-rollover session");
     return;
   }
-  logger_set_last_day_outcome(app, old_study_day_local, "session",
-                              "session_closed");
+  logger_app_set_last_day_outcome(app, old_study_day_local, "session",
+                                  "session_closed");
   app->last_session_live_flush_mono_ms = now_ms;
   app->last_session_snapshot_mono_ms = now_ms;
 
@@ -2973,8 +2946,8 @@ static void logger_handle_debug_synth_clock_boundary(
                               "failed to finalize pre-boundary session");
       return;
     }
-    logger_set_last_day_outcome(app, old_study_day_local, "session",
-                                "session_closed");
+    logger_app_set_last_day_outcome(app, old_study_day_local, "session",
+                                    "session_closed");
   }
 
   const char *error_code = NULL;

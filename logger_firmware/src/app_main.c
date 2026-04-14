@@ -1,5 +1,7 @@
 #include "logger/app_main.h"
 
+#include "logger/faults.h"
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -67,19 +69,6 @@ static void logger_print_boot_banner(const logger_app_t *app) {
          (unsigned)LOGGER_BATTERY_CRITICAL_STOP_MV,
          (unsigned)LOGGER_BATTERY_LOW_START_BLOCK_MV,
          (unsigned)LOGGER_BATTERY_OFF_CHARGER_UPLOAD_MIN_MV);
-}
-
-static logger_fault_code_t
-logger_app_storage_fault_code(const logger_storage_status_t *storage) {
-  if (!storage->card_present || !storage->mounted || !storage->writable ||
-      !storage->logger_root_ready ||
-      strcmp(storage->filesystem, "fat32") != 0) {
-    return LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE;
-  }
-  if (!storage->reserve_ok) {
-    return LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET;
-  }
-  return LOGGER_FAULT_NONE;
 }
 
 static const char *logger_app_boot_gesture_name(logger_boot_gesture_t gesture) {
@@ -529,10 +518,9 @@ logger_app_current_day_ecg_start_attempted(const logger_app_t *app) {
   return app->h10.ecg_start_attempt_count > app->day_ecg_start_baseline;
 }
 
-static void logger_app_set_last_day_outcome(logger_app_t *app,
-                                            const char *study_day_local,
-                                            const char *kind,
-                                            const char *reason) {
+void logger_app_set_last_day_outcome(logger_app_t *app,
+                                     const char *study_day_local,
+                                     const char *kind, const char *reason) {
   logger_copy_string(app->last_day_outcome_study_day_local,
                      sizeof(app->last_day_outcome_study_day_local),
                      study_day_local);
@@ -1065,7 +1053,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
   }
 
   const logger_fault_code_t storage_fault =
-      logger_app_storage_fault_code(&app->storage);
+      logger_fault_from_storage(&app->storage);
   if (storage_fault != LOGGER_FAULT_NONE) {
     logger_app_maybe_latch_new_fault(app, storage_fault);
     logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
@@ -1174,7 +1162,7 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
   }
 
   const logger_fault_code_t storage_fault =
-      logger_app_storage_fault_code(&app->storage);
+      logger_fault_from_storage(&app->storage);
   if (storage_fault != LOGGER_FAULT_NONE) {
     if (!app->session.active && !app->current_day_has_session &&
         !logger_app_finalize_no_session_before_stop(app)) {
@@ -1319,7 +1307,7 @@ static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
   logger_service_cli_poll(&app->cli, app, now_ms);
 
   const logger_fault_code_t storage_fault =
-      logger_app_storage_fault_code(&app->storage);
+      logger_fault_from_storage(&app->storage);
   if (storage_fault != LOGGER_FAULT_NONE) {
     logger_app_maybe_latch_new_fault(app, storage_fault);
     logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
@@ -1379,7 +1367,7 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
   logger_service_cli_poll(&app->cli, app, now_ms);
 
   const logger_fault_code_t storage_fault =
-      logger_app_storage_fault_code(&app->storage);
+      logger_fault_from_storage(&app->storage);
   if (storage_fault != LOGGER_FAULT_NONE) {
     logger_app_maybe_latch_new_fault(app, storage_fault);
     logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,

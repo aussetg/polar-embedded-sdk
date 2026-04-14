@@ -1,6 +1,7 @@
 #ifndef LOGGER_FIRMWARE_FAULTS_H
 #define LOGGER_FIRMWARE_FAULTS_H
 
+#include "logger/storage.h"
 #include <stdint.h>
 
 typedef enum {
@@ -17,5 +18,7 @@ typedef enum {
 
 const char *logger_fault_code_name(logger_fault_code_t code);
 uint8_t logger_fault_blink_count(logger_fault_code_t code);
+logger_fault_code_t
+logger_fault_from_storage(const logger_storage_status_t *storage);
 
 #endif
