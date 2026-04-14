@@ -981,6 +981,27 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
   }
 }
 
+typedef enum {
+  LOGGER_STEP_CONTINUE,
+  LOGGER_STEP_ABORTED,
+} logger_step_result_t;
+
+static logger_step_result_t logger_step_common_prologue(logger_app_t *app,
+                                                        uint32_t now_ms,
+                                                        bool h10_enabled) {
+  logger_app_refresh_observations(app, now_ms);
+  if (!logger_app_run_queue_maintenance(app, now_ms,
+                                        !app->storage.reserve_ok)) {
+    logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
+                                "queue_prune_failed", now_ms);
+    return LOGGER_STEP_ABORTED;
+  }
+  logger_h10_set_enabled(&app->h10, h10_enabled);
+  logger_service_cli_poll(&app->cli, app, now_ms);
+  return LOGGER_STEP_CONTINUE;
+}
+
 static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
   logger_app_refresh_observations(app, now_ms);
 
@@ -1105,32 +1126,18 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
 }
 
 static void logger_step_service(logger_app_t *app, uint32_t now_ms) {
-  logger_app_refresh_observations(app, now_ms);
-  if (!logger_app_run_queue_maintenance(app, now_ms,
-                                        !app->storage.reserve_ok)) {
-    logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                "queue_prune_failed", now_ms);
+  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
     return;
   }
-  logger_h10_set_enabled(&app->h10, false);
-  logger_service_cli_poll(&app->cli, app, now_ms);
   (void)logger_button_poll(&app->button, now_ms);
 }
 
 static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
   const logger_runtime_state_t step_entry_state = app->runtime.current_state;
-  logger_app_refresh_observations(app, now_ms);
-  if (!logger_app_run_queue_maintenance(app, now_ms,
-                                        !app->storage.reserve_ok)) {
-    logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-    logger_app_transition_via_stopping(app, LOGGER_RUNTIME_SERVICE,
-                                       "queue_prune_failed", now_ms);
+  if (logger_step_common_prologue(app, now_ms, true) == LOGGER_STEP_ABORTED) {
     return;
   }
-  logger_h10_set_enabled(&app->h10, true);
   logger_h10_poll(&app->h10, now_ms);
-  logger_service_cli_poll(&app->cli, app, now_ms);
   if (app->runtime.current_state != step_entry_state) {
     return;
   }
@@ -1280,16 +1287,9 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
 }
 
 static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
-  logger_app_refresh_observations(app, now_ms);
-  if (!logger_app_run_queue_maintenance(app, now_ms,
-                                        !app->storage.reserve_ok)) {
-    logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                "queue_prune_failed", now_ms);
+  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
     return;
   }
-  logger_h10_set_enabled(&app->h10, false);
-  logger_service_cli_poll(&app->cli, app, now_ms);
 
   const logger_fault_code_t storage_fault =
       logger_fault_from_storage(&app->storage);
@@ -1340,16 +1340,9 @@ static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
 }
 
 static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
-  logger_app_refresh_observations(app, now_ms);
-  if (!logger_app_run_queue_maintenance(app, now_ms,
-                                        !app->storage.reserve_ok)) {
-    logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                "queue_prune_failed", now_ms);
+  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
     return;
   }
-  logger_h10_set_enabled(&app->h10, false);
-  logger_service_cli_poll(&app->cli, app, now_ms);
 
   const logger_fault_code_t storage_fault =
       logger_fault_from_storage(&app->storage);
@@ -1444,16 +1437,9 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_idle_waiting_for_charger(logger_app_t *app,
                                                  uint32_t now_ms) {
-  logger_app_refresh_observations(app, now_ms);
-  if (!logger_app_run_queue_maintenance(app, now_ms,
-                                        !app->storage.reserve_ok)) {
-    logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                "queue_prune_failed", now_ms);
+  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
     return;
   }
-  logger_h10_set_enabled(&app->h10, false);
-  logger_service_cli_poll(&app->cli, app, now_ms);
   (void)logger_button_poll(&app->button, now_ms);
 
   if (app->battery.vbus_present) {
@@ -1465,16 +1451,9 @@ static void logger_step_idle_waiting_for_charger(logger_app_t *app,
 
 static void logger_step_idle_upload_complete(logger_app_t *app,
                                              uint32_t now_ms) {
-  logger_app_refresh_observations(app, now_ms);
-  if (!logger_app_run_queue_maintenance(app, now_ms,
-                                        !app->storage.reserve_ok)) {
-    logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
-    logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_SERVICE,
-                                "queue_prune_failed", now_ms);
+  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
     return;
   }
-  logger_h10_set_enabled(&app->h10, false);
-  logger_service_cli_poll(&app->cli, app, now_ms);
   (void)logger_button_poll(&app->button, now_ms);
 
   if (!app->idle_resume_on_unplug && app->battery.vbus_present) {
