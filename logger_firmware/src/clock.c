@@ -116,11 +116,13 @@ static void logger_clock_ntp_recv_cb(void *arg, struct udp_pcb *pcb,
   response->source_address = *addr;
   response->source_port = port;
   response->len = p->tot_len;
+  u16_t copy_len = p->tot_len;
   if (response->len > sizeof(response->data)) {
-    response->len = sizeof(response->data);
+    copy_len = (u16_t)sizeof(response->data);
+    response->len = copy_len;
     response->truncated = true;
   }
-  (void)pbuf_copy_partial(p, response->data, response->len, 0u);
+  (void)pbuf_copy_partial(p, response->data, copy_len, 0u);
   pbuf_free(p);
 }
 

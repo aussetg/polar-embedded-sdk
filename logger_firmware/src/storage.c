@@ -324,7 +324,7 @@ static bool logger_sd_initialize_card(void) {
   sd->sector_count = logger_sd_parse_sector_count(sd->csd);
   sd->high_capacity = high_capacity;
   sd->card_initialized = sd->sector_count != 0u;
-  sd->dstatus = sd->card_initialized ? 0u : (DSTATUS)STA_NOINIT;
+  sd->dstatus = (DSTATUS)(sd->card_initialized ? 0u : STA_NOINIT);
   if (sd->card_initialized) {
     spi_set_baudrate(logger_sd_spi_bus(), LOGGER_SD_SPI_RUN_BAUD_HZ);
   }
