@@ -150,8 +150,8 @@ logger_upload_net_test_result_fail_all(logger_upload_net_test_result_t *result,
                      message);
 }
 
-void logger_upload_net_test_result_init(
-    logger_upload_net_test_result_t *result) {
+static void
+logger_upload_net_test_result_init(logger_upload_net_test_result_t *result) {
   memset(result, 0, sizeof(*result));
   result->wifi_join_result = "fail";
   result->dns_result = "fail";
@@ -159,7 +159,8 @@ void logger_upload_net_test_result_init(
   result->upload_endpoint_reachable_result = "fail";
 }
 
-void logger_upload_process_result_init(logger_upload_process_result_t *result) {
+static void
+logger_upload_process_result_init(logger_upload_process_result_t *result) {
   memset(result, 0, sizeof(*result));
   result->code = LOGGER_UPLOAD_PROCESS_RESULT_NONE;
   result->http_status = -1;

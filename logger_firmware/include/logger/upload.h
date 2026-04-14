@@ -45,10 +45,6 @@ typedef struct {
   char message[LOGGER_UPLOAD_MESSAGE_MAX + 1];
 } logger_upload_process_result_t;
 
-void logger_upload_net_test_result_init(
-    logger_upload_net_test_result_t *result);
-void logger_upload_process_result_init(logger_upload_process_result_t *result);
-
 bool logger_upload_net_test(const logger_config_t *config,
                             logger_upload_net_test_result_t *result);
 

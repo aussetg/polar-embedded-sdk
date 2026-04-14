@@ -209,7 +209,8 @@ logger_upload_bundle_fill_emit(logger_upload_bundle_stream_t *stream) {
   }
 }
 
-void logger_upload_bundle_stream_init(logger_upload_bundle_stream_t *stream) {
+static void
+logger_upload_bundle_stream_init(logger_upload_bundle_stream_t *stream) {
   memset(stream, 0, sizeof(*stream));
   stream->state = LOGGER_UPLOAD_BUNDLE_STATE_DONE;
 }

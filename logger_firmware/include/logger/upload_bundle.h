@@ -43,7 +43,6 @@ typedef struct {
   uint8_t io_buf[512];
 } logger_upload_bundle_stream_t;
 
-void logger_upload_bundle_stream_init(logger_upload_bundle_stream_t *stream);
 bool logger_upload_bundle_stream_open(logger_upload_bundle_stream_t *stream,
                                       const char *dir_name,
                                       const char *manifest_path,

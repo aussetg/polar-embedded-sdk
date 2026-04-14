@@ -437,9 +437,11 @@ static bool logger_validate_fixed_policy_string(const char *value,
   return value != NULL && expected != NULL && strcmp(value, expected) == 0;
 }
 
-static bool logger_parse_config_import_document(
-    logger_app_t *app, const char *json, logger_persisted_state_t *state_out,
-    bool *bond_cleared_out, const char **error_message_out) {
+static bool
+logger_parse_config_import_document(const logger_app_t *app, const char *json,
+                                    logger_persisted_state_t *state_out,
+                                    bool *bond_cleared_out,
+                                    const char **error_message_out) {
   static jsmntok_t tokens[LOGGER_CONFIG_IMPORT_JSON_TOKEN_MAX];
   logger_json_doc_t doc;
   if (!logger_json_parse(&doc, json, strlen(json), tokens,
@@ -954,10 +956,10 @@ static void logger_config_import_transfer_reset(logger_service_cli_t *cli) {
   cli->config_import_buf[0] = '\0';
 }
 
-static bool logger_require_config_import_context(logger_service_cli_t *cli,
-                                                 logger_app_t *app,
-                                                 const char *command,
-                                                 bool require_unlock) {
+static bool
+logger_require_config_import_context(const logger_service_cli_t *cli,
+                                     const logger_app_t *app,
+                                     const char *command, bool require_unlock) {
   if (logger_cli_is_logging_mode(app)) {
     logger_json_begin_error(command, logger_now_utc_or_null(app),
                             "busy_logging",
@@ -1240,7 +1242,7 @@ static void logger_write_status_payload(const logger_app_t *app) {
   fputs("}}", stdout);
 }
 
-static void logger_handle_status_json(logger_app_t *app) {
+static void logger_handle_status_json(const logger_app_t *app) {
   logger_json_begin_success("status", logger_now_utc_or_null(app));
   logger_write_status_payload(app);
   logger_json_end_success();
@@ -1828,7 +1830,7 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
   logger_json_end_success();
 }
 
-static void logger_handle_clock_set(logger_service_cli_t *cli,
+static void logger_handle_clock_set(const logger_service_cli_t *cli,
                                     logger_app_t *app, const char *value) {
   if (logger_cli_is_logging_mode(app)) {
     logger_json_begin_error("clock set", logger_now_utc_or_null(app),
@@ -2005,7 +2007,7 @@ static void logger_handle_config_import(logger_service_cli_t *cli,
 }
 
 static void logger_handle_config_import_begin(logger_service_cli_t *cli,
-                                              logger_app_t *app,
+                                              const logger_app_t *app,
                                               const char *args) {
   if (!logger_require_config_import_context(cli, app, "config import begin",
                                             true)) {
@@ -2056,7 +2058,7 @@ static void logger_handle_config_import_begin(logger_service_cli_t *cli,
 }
 
 static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
-                                              logger_app_t *app,
+                                              const logger_app_t *app,
                                               const char *chunk) {
   if (!logger_require_config_import_context(cli, app, "config import chunk",
                                             true)) {
@@ -2117,7 +2119,7 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
 }
 
 static void logger_handle_config_import_status(logger_service_cli_t *cli,
-                                               logger_app_t *app) {
+                                               const logger_app_t *app) {
   if (!logger_require_config_import_context(cli, app, "config import status",
                                             false)) {
     return;
@@ -2153,7 +2155,7 @@ static void logger_handle_config_import_status(logger_service_cli_t *cli,
 }
 
 static void logger_handle_config_import_cancel(logger_service_cli_t *cli,
-                                               logger_app_t *app) {
+                                               const logger_app_t *app) {
   if (!logger_require_config_import_context(cli, app, "config import cancel",
                                             false)) {
     return;
@@ -2260,7 +2262,7 @@ logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli,
   logger_json_end_success();
 }
 
-static void logger_handle_debug_config_set(logger_service_cli_t *cli,
+static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
                                            logger_app_t *app,
                                            const char *args) {
   char field[48];
@@ -2363,7 +2365,7 @@ static void logger_handle_debug_config_set(logger_service_cli_t *cli,
   logger_json_end_success();
 }
 
-static void logger_handle_debug_config_clear(logger_service_cli_t *cli,
+static void logger_handle_debug_config_clear(const logger_service_cli_t *cli,
                                              logger_app_t *app,
                                              const char *args) {
   if (!logger_cli_is_service_mode(app)) {
@@ -2396,7 +2398,7 @@ static void logger_handle_debug_config_clear(logger_service_cli_t *cli,
   logger_json_end_success();
 }
 
-static void logger_handle_debug_session_start(logger_service_cli_t *cli,
+static void logger_handle_debug_session_start(const logger_service_cli_t *cli,
                                               logger_app_t *app,
                                               uint32_t now_ms) {
   if (!logger_cli_is_service_mode(app)) {
@@ -2484,10 +2486,9 @@ static void logger_handle_debug_session_stop(logger_app_t *app,
   logger_json_end_success();
 }
 
-static bool logger_debug_require_service_unlocked(logger_service_cli_t *cli,
-                                                  logger_app_t *app,
-                                                  const char *command,
-                                                  const char *mode_message) {
+static bool logger_debug_require_service_unlocked(
+    const logger_service_cli_t *cli, const logger_app_t *app,
+    const char *command, const char *mode_message) {
   if (!logger_cli_is_service_mode(app)) {
     logger_json_begin_error(command, logger_now_utc_or_null(app),
                             "not_permitted_in_mode", mode_message);
@@ -2585,9 +2586,9 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
   logger_json_end_success();
 }
 
-static void logger_handle_debug_synth_disconnect(logger_service_cli_t *cli,
-                                                 logger_app_t *app,
-                                                 uint32_t now_ms) {
+static void
+logger_handle_debug_synth_disconnect(const logger_service_cli_t *cli,
+                                     logger_app_t *app, uint32_t now_ms) {
   if (!logger_debug_require_service_unlocked(
           cli, app, "debug synth disconnect",
           "debug synth disconnect is only allowed in service mode")) {
@@ -2615,10 +2616,10 @@ static void logger_handle_debug_synth_disconnect(logger_service_cli_t *cli,
   logger_json_end_success();
 }
 
-static void logger_handle_debug_synth_h10_battery(logger_service_cli_t *cli,
-                                                  logger_app_t *app,
-                                                  const char *args,
-                                                  uint32_t now_ms) {
+static void
+logger_handle_debug_synth_h10_battery(const logger_service_cli_t *cli,
+                                      logger_app_t *app, const char *args,
+                                      uint32_t now_ms) {
   if (!logger_debug_require_service_unlocked(
           cli, app, "debug synth h10-battery",
           "debug synth h10-battery is only allowed in service mode")) {
@@ -2690,9 +2691,9 @@ static bool logger_no_session_reason_valid(const char *reason) {
          strcmp(reason, "stopped_before_first_span") == 0;
 }
 
-static void logger_handle_debug_synth_no_session_day(logger_service_cli_t *cli,
-                                                     logger_app_t *app,
-                                                     const char *args) {
+static void
+logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
+                                         logger_app_t *app, const char *args) {
   if (!logger_debug_require_service_unlocked(
           cli, app, "debug synth no-session-day",
           "debug synth no-session-day is only allowed in service mode")) {
@@ -2829,7 +2830,7 @@ static bool logger_update_clock_from_rfc3339(logger_app_t *app,
   return true;
 }
 
-static void logger_handle_debug_synth_rollover(logger_service_cli_t *cli,
+static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
                                                logger_app_t *app,
                                                const char *rfc3339,
                                                uint32_t now_ms) {

@@ -331,10 +331,14 @@ static void logger_store_cache_reset(void) {
  * but -Wcast-align=strict cannot see that.  Validate at compile time and
  * use an intermediate uintptr_t cast to suppress the warning.
  */
-_Static_assert(LOGGER_FLASH_CONFIG_SLOT_SIZE % _Alignof(logger_flash_config_record_t) == 0,
-               "config slot size must be aligned for logger_flash_config_record_t");
-_Static_assert(LOGGER_FLASH_METADATA_SLOT_SIZE % _Alignof(logger_flash_metadata_record_t) == 0,
-               "metadata slot size must be aligned for logger_flash_metadata_record_t");
+_Static_assert(
+    LOGGER_FLASH_CONFIG_SLOT_SIZE % _Alignof(logger_flash_config_record_t) == 0,
+    "config slot size must be aligned for logger_flash_config_record_t");
+_Static_assert(
+    LOGGER_FLASH_METADATA_SLOT_SIZE %
+            _Alignof(logger_flash_metadata_record_t) ==
+        0,
+    "metadata slot size must be aligned for logger_flash_metadata_record_t");
 
 static bool
 logger_flash_config_slot_load(unsigned slot,
