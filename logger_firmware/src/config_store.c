@@ -556,28 +556,31 @@ bool logger_config_store_save(logger_persisted_state_t *state) {
     return false;
   }
 
-  logger_config_t normalized_config;
-  logger_persisted_metadata_t normalized_metadata;
-  logger_config_normalize(&state->config, &normalized_config);
-  logger_metadata_from_state(state, &normalized_metadata);
+  /*
+   * Normalize in-place.  All writers maintain the zero-padding invariant;
+   * the only stateful normalization is TLS mode consistency.
+   */
+  logger_config_sanitize_upload_tls(&state->config);
 
-  const bool config_changed = memcmp(&normalized_config, &g_store.config,
-                                     sizeof(normalized_config)) != 0;
-  const bool metadata_changed = memcmp(&normalized_metadata, &g_store.metadata,
-                                       sizeof(normalized_metadata)) != 0;
+  logger_persisted_metadata_t meta;
+  logger_metadata_from_state(state, &meta);
+
+  const bool config_changed =
+      memcmp(&state->config, &g_store.config, sizeof(state->config)) != 0;
+  const bool metadata_changed =
+      memcmp(&meta, &g_store.metadata, sizeof(meta)) != 0;
   const bool write_metadata = metadata_changed || !g_store.metadata_valid;
   const bool write_config = config_changed || !g_store.config_valid;
 
-  if (write_metadata &&
-      !logger_config_store_write_metadata(&normalized_metadata)) {
+  if (write_metadata && !logger_config_store_write_metadata(&meta)) {
     return false;
   }
-  if (write_config && !logger_config_store_write_config(&normalized_config)) {
+  if (write_config && !logger_config_store_write_config(&state->config)) {
     return false;
   }
 
-  state->config = normalized_config;
-  logger_state_apply_metadata(state, &normalized_metadata);
+  g_store.config = state->config;
+  logger_state_apply_metadata(state, &meta);
   return true;
 }
 
@@ -616,16 +619,12 @@ bool logger_config_wifi_configured(const logger_config_t *config) {
 
 static bool logger_write_if_changed(char *dst, size_t dst_len,
                                     const char *value) {
-  char tmp[LOGGER_CONFIG_UPLOAD_URL_MAX];
-  if (dst_len > sizeof(tmp)) {
-    return false;
-  }
-  memset(tmp, 0, sizeof(tmp));
-  logger_copy_string(tmp, dst_len, value);
-  if (strncmp(dst, tmp, dst_len) == 0) {
+  const char *cmp = (value != NULL) ? value : "";
+  if (strncmp(dst, cmp, dst_len) == 0) {
     return true;
   }
-  memcpy(dst, tmp, dst_len);
+  memset(dst, 0, dst_len);
+  logger_copy_string(dst, dst_len, value);
   return true;
 }
 
@@ -717,15 +716,14 @@ bool logger_config_set_wifi_psk(logger_persisted_state_t *state,
 
 bool logger_config_set_upload_url(logger_persisted_state_t *state,
                                   const char *value) {
-  char previous_url[LOGGER_CONFIG_UPLOAD_URL_MAX];
-  logger_copy_string(previous_url, sizeof(previous_url),
-                     state->config.upload_url);
+  const char *cmp = (value != NULL) ? value : "";
+  const bool url_changed = strncmp(state->config.upload_url, cmp,
+                                   sizeof(state->config.upload_url)) != 0;
   if (!logger_write_if_changed(state->config.upload_url,
                                sizeof(state->config.upload_url), value)) {
     return false;
   }
-  if (strncmp(previous_url, state->config.upload_url, sizeof(previous_url)) !=
-      0) {
+  if (url_changed) {
     if (logger_upload_url_uses_https(state->config.upload_url)) {
       logger_config_set_upload_tls_public_roots_in_memory(&state->config);
     } else {
