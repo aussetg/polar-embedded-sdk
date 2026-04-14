@@ -43,6 +43,13 @@ bool logger_runtime_state_is_logging(logger_runtime_state_t state) {
   case LOGGER_RUNTIME_LOG_STREAMING:
   case LOGGER_RUNTIME_LOG_STOPPING:
     return true;
+  case LOGGER_RUNTIME_BOOT:
+  case LOGGER_RUNTIME_SERVICE:
+  case LOGGER_RUNTIME_UPLOAD_PREP:
+  case LOGGER_RUNTIME_UPLOAD_RUNNING:
+  case LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER:
+  case LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE:
+    return false;
   default:
     return false;
   }

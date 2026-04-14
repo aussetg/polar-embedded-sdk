@@ -507,6 +507,12 @@ bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,
     }
     return true;
 
+  case LOGGER_RUNTIME_LOG_WAIT_H10:
+  case LOGGER_RUNTIME_LOG_CONNECTING:
+  case LOGGER_RUNTIME_LOG_SECURING:
+  case LOGGER_RUNTIME_LOG_STARTING_STREAM:
+  case LOGGER_RUNTIME_LOG_STREAMING:
+    break;
   default:
     break;
   }
@@ -660,6 +666,7 @@ logger_app_h10_target_runtime_state(const logger_app_t *app) {
   case LOGGER_H10_PHASE_OFF:
   case LOGGER_H10_PHASE_WAITING:
   case LOGGER_H10_PHASE_SCANNING:
+    return LOGGER_RUNTIME_LOG_WAIT_H10;
   default:
     return LOGGER_RUNTIME_LOG_WAIT_H10;
   }

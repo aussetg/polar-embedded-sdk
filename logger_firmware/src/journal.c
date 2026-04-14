@@ -239,7 +239,11 @@ logger_journal_apply_json_record(logger_journal_scan_result_t *result,
     }
     break;
   }
-  default:
+  case LOGGER_JOURNAL_RECORD_DATA_CHUNK:
+  case LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT:
+  case LOGGER_JOURNAL_RECORD_MARKER:
+  case LOGGER_JOURNAL_RECORD_GAP:
+  case LOGGER_JOURNAL_RECORD_H10_BATTERY:
     break;
   }
 }
