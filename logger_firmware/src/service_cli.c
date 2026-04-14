@@ -14,6 +14,7 @@
 #include "logger/app_main.h"
 #include "logger/faults.h"
 #include "logger/json.h"
+#include "logger/json_stream_writer.h"
 #include "logger/json_writer.h"
 #include "logger/queue.h"
 #include "logger/sha256.h"
@@ -781,44 +782,51 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
   return true;
 }
 
-#define logger_json_write_string_or_null(value)                                \
-  logger_json_fwrite_string_or_null(stdout, (value))
+/* ------------------------------------------------------------------ */
+/*  CLI response envelope (streaming JSON writer)                     */
+/* ------------------------------------------------------------------ */
 
-static void logger_json_begin_success(const char *command,
-                                      const char *generated_at_utc) {
-  fputs("{\"schema_version\":1,\"command\":", stdout);
-  logger_json_write_string_or_null(command);
-  fputs(",\"ok\":true,\"generated_at_utc\":", stdout);
-  logger_json_write_string_or_null(generated_at_utc);
-  fputs(",\"payload\":", stdout);
+typedef logger_json_stream_writer_t jsw;
+
+static void jsw_ok(jsw *w, const char *command, const char *utc) {
+  logger_json_stream_writer_init(w, stdout);
+  logger_json_stream_writer_object_begin(w);
+  logger_json_stream_writer_field_uint32(w, "schema_version", 1u);
+  logger_json_stream_writer_field_string_or_null(w, "command", command);
+  logger_json_stream_writer_field_bool(w, "ok", true);
+  logger_json_stream_writer_field_string_or_null(w, "generated_at_utc", utc);
+  logger_json_stream_writer_field_object_begin(w, "payload");
 }
 
-static void logger_json_begin_error(const char *command,
-                                    const char *generated_at_utc,
-                                    const char *code, const char *message) {
-  fputs("{\"schema_version\":1,\"command\":", stdout);
-  logger_json_write_string_or_null(command);
-  fputs(",\"ok\":false,\"generated_at_utc\":", stdout);
-  logger_json_write_string_or_null(generated_at_utc);
-  fputs(",\"error\":{\"code\":", stdout);
-  logger_json_write_string_or_null(code);
-  fputs(",\"message\":", stdout);
-  logger_json_write_string_or_null(message);
-  fputs("}}\n", stdout);
-  fflush(stdout);
+static void jsw_end(jsw *w) {
+  logger_json_stream_writer_object_end(w);
+  logger_json_stream_writer_object_end(w);
+  fputc('\n', w->stream);
+  fflush(w->stream);
 }
 
-static void logger_json_end_success(void) {
-  fputs("}\n", stdout);
-  fflush(stdout);
+static void jsw_err(jsw *w, const char *command, const char *utc,
+                    const char *code, const char *message) {
+  logger_json_stream_writer_init(w, stdout);
+  logger_json_stream_writer_object_begin(w);
+  logger_json_stream_writer_field_uint32(w, "schema_version", 1u);
+  logger_json_stream_writer_field_string_or_null(w, "command", command);
+  logger_json_stream_writer_field_bool(w, "ok", false);
+  logger_json_stream_writer_field_string_or_null(w, "generated_at_utc", utc);
+  logger_json_stream_writer_field_object_begin(w, "error");
+  logger_json_stream_writer_field_string_or_null(w, "code", code);
+  logger_json_stream_writer_field_string_or_null(w, "message", message);
+  logger_json_stream_writer_object_end(w);
+  logger_json_stream_writer_object_end(w);
+  fputc('\n', w->stream);
+  fflush(w->stream);
 }
 
-/*
- * Write a comma-delimited JSON array of required config field names,
- * selecting fields whose value is present (present=true) or absent
- * (present=false).
- */
-static void logger_write_required_field_array(const logger_app_t *app,
+/* ------------------------------------------------------------------ */
+/*  Array element helpers                                             */
+/* ------------------------------------------------------------------ */
+
+static void logger_write_required_field_array(jsw *w, const logger_app_t *app,
                                               bool present) {
   static const char *names[] = {"bound_h10_address", "logger_id", "subject_id",
                                 "timezone"};
@@ -828,59 +836,42 @@ static void logger_write_required_field_array(const logger_app_t *app,
       app->persisted.config.subject_id,
       app->persisted.config.timezone,
   };
-  bool first = true;
-  for (size_t i = 0; i < 4; i++) {
+  for (size_t i = 0u; i < 4u; i++) {
     if (logger_string_present(values[i]) == present) {
-      if (!first)
-        fputs(",", stdout);
-      logger_json_write_string_or_null(names[i]);
-      first = false;
+      logger_json_stream_writer_elem_string_or_null(w, names[i]);
     }
   }
 }
 
-static void logger_write_optional_present_array(const logger_app_t *app) {
-  bool first = true;
+static void logger_write_optional_present_array(jsw *w,
+                                                const logger_app_t *app) {
   if (logger_string_present(app->persisted.config.upload_api_key) &&
       logger_string_present(app->persisted.config.upload_token)) {
-    logger_json_write_string_or_null(first ? "upload_auth" : NULL);
-    first = false;
+    logger_json_stream_writer_elem_string_or_null(w, "upload_auth");
   }
   if (logger_string_present(app->persisted.config.upload_url)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("upload_url");
-    first = false;
+    logger_json_stream_writer_elem_string_or_null(w, "upload_url");
   }
   if (logger_config_wifi_configured(&app->persisted.config)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("wifi_networks");
+    logger_json_stream_writer_elem_string_or_null(w, "wifi_networks");
   }
 }
 
-static void logger_write_warnings_array(const logger_app_t *app) {
-  bool first = true;
+static void logger_write_warnings_array(jsw *w, const logger_app_t *app) {
   if (!app->clock.valid) {
-    logger_json_write_string_or_null(first ? "clock_invalid" : NULL);
-    first = false;
+    logger_json_stream_writer_elem_string_or_null(w, "clock_invalid");
   }
   if (!logger_config_upload_configured(&app->persisted.config)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("upload_not_configured");
-    first = false;
+    logger_json_stream_writer_elem_string_or_null(w, "upload_not_configured");
   }
   if (!logger_config_wifi_configured(&app->persisted.config)) {
-    if (!first) {
-      fputs(",", stdout);
-    }
-    logger_json_write_string_or_null("wifi_not_configured");
+    logger_json_stream_writer_elem_string_or_null(w, "wifi_not_configured");
   }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Mode / guard helpers                                              */
+/* ------------------------------------------------------------------ */
 
 static bool logger_cli_is_service_mode(const logger_app_t *app) {
   return app->runtime.current_state == LOGGER_RUNTIME_SERVICE;
@@ -893,14 +884,15 @@ static bool logger_cli_is_logging_mode(const logger_app_t *app) {
 static bool logger_cli_require_service(const logger_app_t *app,
                                        const char *command) {
   if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "busy_logging", "not permitted while logging");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "busy_logging", "not permitted while logging");
     return false;
   }
   if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode",
-                            "only allowed in service mode");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode", "only allowed in service mode");
     return false;
   }
   return true;
@@ -914,8 +906,9 @@ static bool logger_cli_require_service_unlocked(const logger_service_cli_t *cli,
   }
   if (!logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "service_locked", "service unlock is required");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "service_locked", "service unlock is required");
     return false;
   }
   return true;
@@ -925,14 +918,16 @@ static bool logger_debug_require_service_unlocked(
     const logger_service_cli_t *cli, const logger_app_t *app,
     const char *command, const char *mode_message) {
   if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode", mode_message);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode", mode_message);
     return false;
   }
   if (!logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "service_locked", "service unlock is required");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "service_locked", "service unlock is required");
     return false;
   }
   return true;
@@ -954,22 +949,24 @@ logger_require_config_import_context(const logger_service_cli_t *cli,
                                      const logger_app_t *app,
                                      const char *command, bool require_unlock) {
   if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "busy_logging",
-                            "config import is not permitted while logging");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "busy_logging", "config import is not permitted while logging");
     return false;
   }
   if (!logger_cli_is_service_mode(app)) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode",
-                            "config import is only allowed in service mode");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "config import is only allowed in service mode");
     return false;
   }
   if (require_unlock && !logger_service_cli_is_unlocked(
                             cli, to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "service_locked",
-                            "service unlock is required before config import");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "service_locked",
+            "service unlock is required before config import");
     return false;
   }
   return true;
@@ -1015,25 +1012,32 @@ static bool logger_cli_fault_condition_still_present(const logger_app_t *app) {
   }
 }
 
-static void logger_write_storage_card_identity(const logger_app_t *app) {
+/* ------------------------------------------------------------------ */
+/*  JSON payload writers                                              */
+/* ------------------------------------------------------------------ */
+
+static void logger_write_storage_card_identity(jsw *w,
+                                               const logger_app_t *app) {
   if (!logger_string_present(app->storage.manufacturer_id)) {
-    fputs("null", stdout);
+    fputs("null", w->stream);
+    w->needs_comma = true;
     return;
   }
-  fputs("{\"manufacturer_id\":", stdout);
-  logger_json_write_string_or_null(app->storage.manufacturer_id);
-  fputs(",\"oem_id\":", stdout);
-  logger_json_write_string_or_null(app->storage.oem_id);
-  fputs(",\"product_name\":", stdout);
-  logger_json_write_string_or_null(app->storage.product_name);
-  fputs(",\"revision\":", stdout);
-  logger_json_write_string_or_null(app->storage.revision);
-  fputs(",\"serial_number\":", stdout);
-  logger_json_write_string_or_null(app->storage.serial_number);
-  fputs("}", stdout);
+  logger_json_stream_writer_object_begin(w);
+  logger_json_stream_writer_field_string_or_null(w, "manufacturer_id",
+                                                 app->storage.manufacturer_id);
+  logger_json_stream_writer_field_string_or_null(w, "oem_id",
+                                                 app->storage.oem_id);
+  logger_json_stream_writer_field_string_or_null(w, "product_name",
+                                                 app->storage.product_name);
+  logger_json_stream_writer_field_string_or_null(w, "revision",
+                                                 app->storage.revision);
+  logger_json_stream_writer_field_string_or_null(w, "serial_number",
+                                                 app->storage.serial_number);
+  logger_json_stream_writer_object_end(w);
 }
 
-static void logger_write_status_payload(const logger_app_t *app) {
+static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   char study_day_local[11] = {0};
   logger_upload_queue_t queue;
   logger_upload_queue_summary_t queue_summary;
@@ -1051,202 +1055,209 @@ static void logger_write_status_payload(const logger_app_t *app) {
              logger_clock_derive_study_day_local_observed(
                  &app->clock, app->persisted.config.timezone, study_day_local));
 
-  fputs("{\"mode\":", stdout);
-  logger_json_write_string_or_null(logger_mode_name(&app->runtime));
-  fputs(",\"runtime_state\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      w, "mode", logger_mode_name(&app->runtime));
+  logger_json_stream_writer_field_string_or_null(
+      w, "runtime_state",
       logger_runtime_state_name(app->runtime.current_state));
 
-  fputs(",\"identity\":{\"hardware_id\":", stdout);
-  logger_json_write_string_or_null(app->hardware_id);
-  fputs(",\"logger_id\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.logger_id);
-  fputs(",\"subject_id\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.subject_id);
-  fputs("}", stdout);
+  logger_json_stream_writer_field_object_begin(w, "identity");
+  logger_json_stream_writer_field_string_or_null(w, "hardware_id",
+                                                 app->hardware_id);
+  logger_json_stream_writer_field_string_or_null(
+      w, "logger_id", app->persisted.config.logger_id);
+  logger_json_stream_writer_field_string_or_null(
+      w, "subject_id", app->persisted.config.subject_id);
+  logger_json_stream_writer_object_end(w);
 
-  fputs(",\"provisioning\":{\"normal_logging_ready\":", stdout);
-  fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true"
-                                                                   : "false",
-        stdout);
-  fputs(",\"required_missing\":[", stdout);
-  logger_write_required_field_array(app, false);
-  fputs("],\"warnings\":[", stdout);
-  logger_write_warnings_array(app);
-  fputs("]}", stdout);
+  logger_json_stream_writer_field_object_begin(w, "provisioning");
+  logger_json_stream_writer_field_bool(
+      w, "normal_logging_ready",
+      logger_config_normal_logging_ready(&app->persisted.config));
+  logger_json_stream_writer_field_array_begin(w, "required_missing");
+  logger_write_required_field_array(w, app, false);
+  logger_json_stream_writer_array_end(w);
+  logger_json_stream_writer_field_array_begin(w, "warnings");
+  logger_write_warnings_array(w, app);
+  logger_json_stream_writer_array_end(w);
+  logger_json_stream_writer_object_end(w);
 
-  fputs(",\"fault\":{\"latched\":", stdout);
-  fputs(app->persisted.current_fault_code != LOGGER_FAULT_NONE ? "true"
-                                                               : "false",
-        stdout);
-  fputs(",\"current_code\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_object_begin(w, "fault");
+  logger_json_stream_writer_field_bool(
+      w, "latched", app->persisted.current_fault_code != LOGGER_FAULT_NONE);
+  logger_json_stream_writer_field_string_or_null(
+      w, "current_code",
       logger_fault_code_name(app->persisted.current_fault_code));
-  fputs(",\"last_cleared_code\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      w, "last_cleared_code",
       logger_fault_code_name(app->persisted.last_cleared_fault_code));
-  fputs("}", stdout);
+  logger_json_stream_writer_object_end(w);
 
-  fputs(",\"battery\":{\"voltage_mv\":", stdout);
-  printf("%u", (unsigned)app->battery.voltage_mv);
-  fputs(",\"estimate_pct\":", stdout);
-  printf("%d", app->battery.estimate_pct);
-  fputs(",\"vbus_present\":", stdout);
-  fputs(app->battery.vbus_present ? "true" : "false", stdout);
-  fputs(",\"critical_stop_mv\":", stdout);
-  printf("%u", (unsigned)LOGGER_BATTERY_CRITICAL_STOP_MV);
-  fputs(",\"low_start_mv\":", stdout);
-  printf("%u", (unsigned)LOGGER_BATTERY_LOW_START_BLOCK_MV);
-  fputs(",\"off_charger_upload_mv\":", stdout);
-  printf("%u", (unsigned)LOGGER_BATTERY_OFF_CHARGER_UPLOAD_MIN_MV);
-  fputs("}", stdout);
+  logger_json_stream_writer_field_object_begin(w, "battery");
+  logger_json_stream_writer_field_uint32(w, "voltage_mv",
+                                         app->battery.voltage_mv);
+  logger_json_stream_writer_field_int32(w, "estimate_pct",
+                                        app->battery.estimate_pct);
+  logger_json_stream_writer_field_bool(w, "vbus_present",
+                                       app->battery.vbus_present);
+  logger_json_stream_writer_field_uint32(w, "critical_stop_mv",
+                                         LOGGER_BATTERY_CRITICAL_STOP_MV);
+  logger_json_stream_writer_field_uint32(w, "low_start_mv",
+                                         LOGGER_BATTERY_LOW_START_BLOCK_MV);
+  logger_json_stream_writer_field_uint32(
+      w, "off_charger_upload_mv", LOGGER_BATTERY_OFF_CHARGER_UPLOAD_MIN_MV);
+  logger_json_stream_writer_object_end(w);
 
-  fputs(",\"storage\":{\"sd_present\":", stdout);
-  fputs(app->storage.card_present ? "true" : "false", stdout);
-  fputs(",\"filesystem\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_object_begin(w, "storage");
+  logger_json_stream_writer_field_bool(w, "sd_present",
+                                       app->storage.card_present);
+  logger_json_stream_writer_field_string_or_null(
+      w, "filesystem",
       logger_string_present(app->storage.filesystem) ? app->storage.filesystem
                                                      : NULL);
-  fputs(",\"free_bytes\":", stdout);
   if (app->storage.mounted) {
-    printf("%llu", (unsigned long long)app->storage.free_bytes);
+    logger_json_stream_writer_field_uint64(w, "free_bytes",
+                                           app->storage.free_bytes);
   } else {
-    fputs("null", stdout);
+    logger_json_stream_writer_field_null(w, "free_bytes");
   }
-  fputs(",\"reserve_bytes\":", stdout);
-  printf("%lu", (unsigned long)LOGGER_SD_MIN_FREE_RESERVE_BYTES);
-  fputs(",\"card_identity\":", stdout);
-  logger_write_storage_card_identity(app);
-  fputs("}", stdout);
+  logger_json_stream_writer_field_uint32(w, "reserve_bytes",
+                                         LOGGER_SD_MIN_FREE_RESERVE_BYTES);
+  logger_json_stream_writer_field_object_begin(w, "card_identity");
+  logger_write_storage_card_identity(w, app);
+  logger_json_stream_writer_object_end(w);
+  logger_json_stream_writer_object_end(w);
 
-  fputs(",\"h10\":{\"bound_address\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.bound_h10_address);
-  fputs(",\"connected\":", stdout);
-  fputs(app->h10.connected ? "true" : "false", stdout);
-  fputs(",\"encrypted\":", stdout);
-  fputs(app->h10.encrypted ? "true" : "false", stdout);
-  fputs(",\"bonded\":", stdout);
-  fputs(app->h10.bonded ? "true" : "false", stdout);
-  fputs(",\"last_seen_address\":", stdout);
-  logger_json_write_string_or_null(app->h10.last_seen_address[0] != '\0'
-                                       ? app->h10.last_seen_address
-                                       : NULL);
-  fputs(",\"battery_percent\":", stdout);
+  logger_json_stream_writer_field_object_begin(w, "h10");
+  logger_json_stream_writer_field_string_or_null(
+      w, "bound_address", app->persisted.config.bound_h10_address);
+  logger_json_stream_writer_field_bool(w, "connected", app->h10.connected);
+  logger_json_stream_writer_field_bool(w, "encrypted", app->h10.encrypted);
+  logger_json_stream_writer_field_bool(w, "bonded", app->h10.bonded);
+  logger_json_stream_writer_field_string_or_null(
+      w, "last_seen_address",
+      app->h10.last_seen_address[0] != '\0' ? app->h10.last_seen_address
+                                            : NULL);
   if (app->h10.battery_percent >= 0) {
-    printf("%d", app->h10.battery_percent);
+    logger_json_stream_writer_field_int32(w, "battery_percent",
+                                          app->h10.battery_percent);
   } else {
-    fputs("null", stdout);
+    logger_json_stream_writer_field_null(w, "battery_percent");
   }
-  fputs(",\"phase\":", stdout);
-  logger_json_write_string_or_null(logger_h10_phase_name(app->h10.phase));
-  fputs(",\"att_mtu\":", stdout);
-  printf("%u", (unsigned)app->h10.att_mtu);
-  fputs(",\"encryption_key_size\":", stdout);
-  printf("%u", (unsigned)app->h10.encryption_key_size);
-  fputs(",\"ecg_start_attempts\":", stdout);
-  printf("%lu", (unsigned long)app->h10.ecg_start_attempt_count);
-  fputs(",\"ecg_start_successes\":", stdout);
-  printf("%lu", (unsigned long)app->h10.ecg_start_success_count);
-  fputs(",\"ecg_packets\":", stdout);
-  printf("%lu", (unsigned long)app->h10.ecg_packet_count);
-  fputs(",\"ecg_packet_drops\":", stdout);
-  printf("%lu", (unsigned long)app->h10.ecg_packet_drop_count);
-  fputs(",\"acc_start_attempts\":", stdout);
-  printf("%lu", (unsigned long)app->h10.acc_start_attempt_count);
-  fputs(",\"acc_start_successes\":", stdout);
-  printf("%lu", (unsigned long)app->h10.acc_start_success_count);
-  fputs(",\"acc_packets\":", stdout);
-  printf("%lu", (unsigned long)app->h10.acc_packet_count);
-  fputs(",\"acc_packet_drops\":", stdout);
-  printf("%lu", (unsigned long)app->h10.acc_packet_drop_count);
-  fputs("}", stdout);
+  logger_json_stream_writer_field_string_or_null(
+      w, "phase", logger_h10_phase_name(app->h10.phase));
+  logger_json_stream_writer_field_uint32(w, "att_mtu", app->h10.att_mtu);
+  logger_json_stream_writer_field_uint32(w, "encryption_key_size",
+                                         app->h10.encryption_key_size);
+  logger_json_stream_writer_field_uint32(
+      w, "ecg_start_attempts", (uint32_t)app->h10.ecg_start_attempt_count);
+  logger_json_stream_writer_field_uint32(
+      w, "ecg_start_successes", (uint32_t)app->h10.ecg_start_success_count);
+  logger_json_stream_writer_field_uint32(w, "ecg_packets",
+                                         (uint32_t)app->h10.ecg_packet_count);
+  logger_json_stream_writer_field_uint32(
+      w, "ecg_packet_drops", (uint32_t)app->h10.ecg_packet_drop_count);
+  logger_json_stream_writer_field_uint32(
+      w, "acc_start_attempts", (uint32_t)app->h10.acc_start_attempt_count);
+  logger_json_stream_writer_field_uint32(
+      w, "acc_start_successes", (uint32_t)app->h10.acc_start_success_count);
+  logger_json_stream_writer_field_uint32(w, "acc_packets",
+                                         (uint32_t)app->h10.acc_packet_count);
+  logger_json_stream_writer_field_uint32(
+      w, "acc_packet_drops", (uint32_t)app->h10.acc_packet_drop_count);
+  logger_json_stream_writer_object_end(w);
 
-  fputs(",\"session\":{\"active\":", stdout);
-  fputs(app->session.active ? "true" : "false", stdout);
-  fputs(",\"session_id\":", stdout);
-  logger_json_write_string_or_null(app->session.active ? app->session.session_id
-                                                       : NULL);
-  fputs(",\"study_day_local\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_object_begin(w, "session");
+  logger_json_stream_writer_field_bool(w, "active", app->session.active);
+  logger_json_stream_writer_field_string_or_null(
+      w, "session_id", app->session.active ? app->session.session_id : NULL);
+  logger_json_stream_writer_field_string_or_null(
+      w, "study_day_local",
       app->session.active ? app->session.study_day_local
                           : (have_study_day ? study_day_local : NULL));
-  fputs(",\"span_id\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      w, "span_id",
       (app->session.active && app->session.span_active)
           ? app->session.current_span_id
           : NULL);
-  fputs(",\"quarantined\":", stdout);
-  fputs(app->session.active && app->session.quarantined ? "true" : "false",
-        stdout);
-  fputs(",\"clock_state\":", stdout);
-  logger_json_write_string_or_null(app->session.active
-                                       ? app->session.clock_state
-                                       : logger_clock_state_name(&app->clock));
-  fputs(",\"journal_size_bytes\":", stdout);
+  logger_json_stream_writer_field_bool(
+      w, "quarantined", app->session.active && app->session.quarantined);
+  logger_json_stream_writer_field_string_or_null(
+      w, "clock_state",
+      app->session.active ? app->session.clock_state
+                          : logger_clock_state_name(&app->clock));
   if (app->session.active) {
-    printf("%llu", (unsigned long long)app->session.journal_size_bytes);
+    logger_json_stream_writer_field_uint64(w, "journal_size_bytes",
+                                           app->session.journal_size_bytes);
   } else {
-    fputs("null", stdout);
+    logger_json_stream_writer_field_null(w, "journal_size_bytes");
   }
-  fputs("}", stdout);
+  logger_json_stream_writer_object_end(w);
 
-  fputs(",\"upload_queue\":{\"pending_count\":", stdout);
-  printf("%lu", (unsigned long)queue_summary.pending_count);
-  fputs(",\"blocked_count\":", stdout);
-  printf("%lu", (unsigned long)queue_summary.blocked_count);
-  fputs(",\"oldest_pending_study_day\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_object_begin(w, "upload_queue");
+  logger_json_stream_writer_field_uint32(w, "pending_count",
+                                         queue_summary.pending_count);
+  logger_json_stream_writer_field_uint32(w, "blocked_count",
+                                         queue_summary.blocked_count);
+  logger_json_stream_writer_field_string_or_null(
+      w, "oldest_pending_study_day",
       logger_string_present(queue_summary.oldest_pending_study_day)
           ? queue_summary.oldest_pending_study_day
           : NULL);
-  fputs(",\"last_failure_class\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      w, "last_failure_class",
       logger_string_present(queue_summary.last_failure_class)
           ? queue_summary.last_failure_class
           : NULL);
-  fputs("}", stdout);
-  fputs(",\"last_day_outcome\":{\"study_day_local\":", stdout);
-  logger_json_write_string_or_null(app->last_day_outcome_valid
-                                       ? app->last_day_outcome_study_day_local
-                                       : NULL);
-  fputs(",\"kind\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_object_end(w);
+
+  logger_json_stream_writer_field_object_begin(w, "last_day_outcome");
+  logger_json_stream_writer_field_string_or_null(
+      w, "study_day_local",
+      app->last_day_outcome_valid ? app->last_day_outcome_study_day_local
+                                  : NULL);
+  logger_json_stream_writer_field_string_or_null(
+      w, "kind",
       app->last_day_outcome_valid ? app->last_day_outcome_kind : NULL);
-  fputs(",\"reason\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      w, "reason",
       app->last_day_outcome_valid ? app->last_day_outcome_reason : NULL);
-  fputs("}", stdout);
-  fputs(",\"firmware\":{\"version\":", stdout);
-  logger_json_write_string_or_null(LOGGER_FIRMWARE_VERSION);
-  fputs(",\"build_id\":", stdout);
-  logger_json_write_string_or_null(LOGGER_BUILD_ID);
-  fputs("}}", stdout);
+  logger_json_stream_writer_object_end(w);
+
+  logger_json_stream_writer_field_object_begin(w, "firmware");
+  logger_json_stream_writer_field_string_or_null(w, "version",
+                                                 LOGGER_FIRMWARE_VERSION);
+  logger_json_stream_writer_field_string_or_null(w, "build_id",
+                                                 LOGGER_BUILD_ID);
+  logger_json_stream_writer_object_end(w);
 }
 
 static void logger_handle_status_json(const logger_app_t *app) {
-  logger_json_begin_success("status",
-                            logger_clock_now_utc_or_null(&app->clock));
-  logger_write_status_payload(app);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "status", logger_clock_now_utc_or_null(&app->clock));
+  logger_write_status_payload(&w, app);
+  jsw_end(&w);
 }
 
 static void logger_handle_provisioning_status_json(logger_app_t *app) {
-  logger_json_begin_success("provisioning-status",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"normal_logging_ready\":", stdout);
-  fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true"
-                                                                   : "false",
-        stdout);
-  fputs(",\"required_present\":[", stdout);
-  logger_write_required_field_array(app, true);
-  fputs("],\"required_missing\":[", stdout);
-  logger_write_required_field_array(app, false);
-  fputs("],\"optional_present\":[", stdout);
-  logger_write_optional_present_array(app);
-  fputs("],\"warnings\":[", stdout);
-  logger_write_warnings_array(app);
-  fputs("]}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "provisioning-status", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(
+      &w, "normal_logging_ready",
+      logger_config_normal_logging_ready(&app->persisted.config));
+  logger_json_stream_writer_field_array_begin(&w, "required_present");
+  logger_write_required_field_array(&w, app, true);
+  logger_json_stream_writer_array_end(&w);
+  logger_json_stream_writer_field_array_begin(&w, "required_missing");
+  logger_write_required_field_array(&w, app, false);
+  logger_json_stream_writer_array_end(&w);
+  logger_json_stream_writer_field_array_begin(&w, "optional_present");
+  logger_write_optional_present_array(&w, app);
+  logger_json_stream_writer_array_end(&w);
+  logger_json_stream_writer_field_array_begin(&w, "warnings");
+  logger_write_warnings_array(&w, app);
+  logger_json_stream_writer_array_end(&w);
+  jsw_end(&w);
 }
 
 static void logger_handle_queue_json(logger_app_t *app) {
@@ -1257,115 +1268,109 @@ static void logger_handle_queue_json(logger_app_t *app) {
                                    logger_clock_now_utc_or_null(&app->clock));
   }
 
-  logger_json_begin_success("queue", logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"schema_source\":\"upload_queue.json\",\"updated_at_utc\":", stdout);
-  logger_json_write_string_or_null(logger_string_present(queue.updated_at_utc)
-                                       ? queue.updated_at_utc
-                                       : NULL);
-  fputs(",\"sessions\":[", stdout);
+  jsw w;
+  jsw_ok(&w, "queue", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "schema_source",
+                                                 "upload_queue.json");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "updated_at_utc",
+      logger_string_present(queue.updated_at_utc) ? queue.updated_at_utc
+                                                  : NULL);
+  logger_json_stream_writer_field_array_begin(&w, "sessions");
   for (size_t i = 0u; i < queue.session_count; ++i) {
     const logger_upload_queue_entry_t *entry = &queue.sessions[i];
-    if (i != 0u) {
-      fputs(",", stdout);
-    }
-    fputs("{\"session_id\":", stdout);
-    logger_json_write_string_or_null(entry->session_id);
-    fputs(",\"study_day_local\":", stdout);
-    logger_json_write_string_or_null(entry->study_day_local);
-    fputs(",\"dir_name\":", stdout);
-    logger_json_write_string_or_null(entry->dir_name);
-    fputs(",\"session_start_utc\":", stdout);
-    logger_json_write_string_or_null(entry->session_start_utc);
-    fputs(",\"session_end_utc\":", stdout);
-    logger_json_write_string_or_null(entry->session_end_utc);
-    fputs(",\"bundle_sha256\":", stdout);
-    logger_json_write_string_or_null(entry->bundle_sha256);
-    fputs(",\"bundle_size_bytes\":", stdout);
-    printf("%llu", (unsigned long long)entry->bundle_size_bytes);
-    fputs(",\"status\":", stdout);
-    logger_json_write_string_or_null(entry->status);
-    fputs(",\"quarantined\":", stdout);
-    fputs(entry->quarantined ? "true" : "false", stdout);
-    fputs(",\"attempt_count\":", stdout);
-    printf("%lu", (unsigned long)entry->attempt_count);
-    fputs(",\"last_attempt_utc\":", stdout);
-    logger_json_write_string_or_null(
+    logger_json_stream_writer_elem_object_begin(&w);
+    logger_json_stream_writer_field_string_or_null(&w, "session_id",
+                                                   entry->session_id);
+    logger_json_stream_writer_field_string_or_null(&w, "study_day_local",
+                                                   entry->study_day_local);
+    logger_json_stream_writer_field_string_or_null(&w, "dir_name",
+                                                   entry->dir_name);
+    logger_json_stream_writer_field_string_or_null(&w, "session_start_utc",
+                                                   entry->session_start_utc);
+    logger_json_stream_writer_field_string_or_null(&w, "session_end_utc",
+                                                   entry->session_end_utc);
+    logger_json_stream_writer_field_string_or_null(&w, "bundle_sha256",
+                                                   entry->bundle_sha256);
+    logger_json_stream_writer_field_uint64(&w, "bundle_size_bytes",
+                                           entry->bundle_size_bytes);
+    logger_json_stream_writer_field_string_or_null(&w, "status", entry->status);
+    logger_json_stream_writer_field_bool(&w, "quarantined", entry->quarantined);
+    logger_json_stream_writer_field_uint32(&w, "attempt_count",
+                                           (uint32_t)entry->attempt_count);
+    logger_json_stream_writer_field_string_or_null(
+        &w, "last_attempt_utc",
         logger_string_present(entry->last_attempt_utc) ? entry->last_attempt_utc
                                                        : NULL);
-    fputs(",\"last_failure_class\":", stdout);
-    logger_json_write_string_or_null(
+    logger_json_stream_writer_field_string_or_null(
+        &w, "last_failure_class",
         logger_string_present(entry->last_failure_class)
             ? entry->last_failure_class
             : NULL);
-    fputs(",\"verified_upload_utc\":", stdout);
-    logger_json_write_string_or_null(
+    logger_json_stream_writer_field_string_or_null(
+        &w, "verified_upload_utc",
         logger_string_present(entry->verified_upload_utc)
             ? entry->verified_upload_utc
             : NULL);
-    fputs(",\"receipt_id\":", stdout);
-    logger_json_write_string_or_null(
+    logger_json_stream_writer_field_string_or_null(
+        &w, "receipt_id",
         logger_string_present(entry->receipt_id) ? entry->receipt_id : NULL);
-    fputs("}", stdout);
+    logger_json_stream_writer_object_end(&w);
   }
-  fputs("]}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_array_end(&w);
+  jsw_end(&w);
 }
 
 static void logger_handle_system_log_export_json(logger_app_t *app) {
-  logger_json_begin_success("system-log export",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"schema_version\":1,\"exported_at_utc\":", stdout);
-  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
-  fputs(",\"events\":[", stdout);
+  jsw w;
+  jsw_ok(&w, "system-log export", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_uint32(&w, "schema_version", 1u);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "exported_at_utc", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_array_begin(&w, "events");
 
   for (uint32_t i = 0u; i < logger_system_log_count(&app->system_log); ++i) {
     logger_system_log_event_t event;
     if (!logger_system_log_read_event(i, &event)) {
       continue;
     }
-    if (i != 0u) {
-      fputs(",", stdout);
-    }
-    fputs("{\"event_seq\":", stdout);
-    printf("%lu", (unsigned long)event.event_seq);
-    fputs(",\"utc\":", stdout);
-    logger_json_write_string_or_null(
-        logger_string_present(event.utc) ? event.utc : NULL);
-    fputs(",\"boot_counter\":", stdout);
-    printf("%lu", (unsigned long)event.boot_counter);
-    fputs(",\"kind\":", stdout);
-    logger_json_write_string_or_null(event.kind);
-    fputs(",\"severity\":", stdout);
-    logger_json_write_string_or_null(
-        logger_system_log_severity_name(event.severity));
-    fputs(",\"details\":", stdout);
-    fputs(logger_string_present(event.details_json) ? event.details_json : "{}",
-          stdout);
-    fputs("}", stdout);
+    logger_json_stream_writer_elem_object_begin(&w);
+    logger_json_stream_writer_field_uint32(&w, "event_seq", event.event_seq);
+    logger_json_stream_writer_field_string_or_null(
+        &w, "utc", logger_string_present(event.utc) ? event.utc : NULL);
+    logger_json_stream_writer_field_uint32(&w, "boot_counter",
+                                           event.boot_counter);
+    logger_json_stream_writer_field_string_or_null(&w, "kind", event.kind);
+    logger_json_stream_writer_field_string_or_null(
+        &w, "severity", logger_system_log_severity_name(event.severity));
+    logger_json_stream_writer_field_raw(
+        &w, "details",
+        logger_string_present(event.details_json) ? event.details_json : "{}");
+    logger_json_stream_writer_object_end(&w);
   }
 
-  fputs("]}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_array_end(&w);
+  jsw_end(&w);
 }
 
-static void logger_write_upload_tls_json(const logger_config_t *config) {
+static void logger_write_upload_tls_json(jsw *w,
+                                         const logger_config_t *config) {
   const char *tls_mode = logger_config_upload_tls_mode(config);
 
-  fputs("{\"mode\":", stdout);
-  logger_json_write_string_or_null(tls_mode);
-  fputs(",\"root_profile\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_object_begin(w, "tls");
+  logger_json_stream_writer_field_string_or_null(w, "mode", tls_mode);
+  logger_json_stream_writer_field_string_or_null(
+      w, "root_profile",
       tls_mode != NULL &&
               strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PUBLIC_ROOTS) == 0
           ? LOGGER_UPLOAD_TLS_PUBLIC_ROOT_PROFILE
           : NULL);
-  fputs(",\"anchor\":", stdout);
 
   if (tls_mode == NULL ||
       strcmp(tls_mode, LOGGER_UPLOAD_TLS_MODE_PROVISIONED_ANCHOR) != 0 ||
       !logger_config_upload_has_provisioned_anchor(config)) {
-    fputs("null", stdout);
-    fputs("}", stdout);
+    logger_json_stream_writer_field_null(w, "anchor");
+    logger_json_stream_writer_object_end(w);
     return;
   }
 
@@ -1375,122 +1380,144 @@ static void logger_write_upload_tls_json(const logger_config_t *config) {
                             &der_base64_len, config->upload_tls_anchor_der,
                             config->upload_tls_anchor_der_len) != 0 ||
       der_base64_len >= sizeof(der_base64)) {
-    fputs("null}", stdout);
+    logger_json_stream_writer_field_null(w, "anchor");
+    logger_json_stream_writer_object_end(w);
     return;
   }
   der_base64[der_base64_len] = '\0';
 
-  fputs("{\"format\":", stdout);
-  logger_json_write_string_or_null(
-      LOGGER_UPLOAD_TLS_ANCHOR_FORMAT_X509_DER_BASE64);
-  fputs(",\"der_base64\":", stdout);
-  logger_json_write_string_or_null(der_base64);
-  fputs(",\"sha256\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_object_begin(w, "anchor");
+  logger_json_stream_writer_field_string_or_null(
+      w, "format", LOGGER_UPLOAD_TLS_ANCHOR_FORMAT_X509_DER_BASE64);
+  logger_json_stream_writer_field_string_or_null(w, "der_base64", der_base64);
+  logger_json_stream_writer_field_string_or_null(
+      w, "sha256",
       logger_string_present(config->upload_tls_anchor_sha256)
           ? config->upload_tls_anchor_sha256
           : NULL);
-  fputs(",\"subject\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      w, "subject",
       logger_string_present(config->upload_tls_anchor_subject)
           ? config->upload_tls_anchor_subject
           : NULL);
-  fputs("}}", stdout);
+  logger_json_stream_writer_object_end(w);
+  logger_json_stream_writer_object_end(w);
 }
 
 static void logger_handle_config_export_json(logger_app_t *app) {
-  logger_json_begin_success("config export",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"schema_version\":1,\"exported_at_utc\":", stdout);
-  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
-  fputs(",\"hardware_id\":", stdout);
-  logger_json_write_string_or_null(app->hardware_id);
-  fputs(",\"secrets_included\":false,\"identity\":{\"logger_id\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.logger_id);
-  fputs(",\"subject_id\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.subject_id);
-  fputs("},\"recording\":{\"bound_h10_address\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.bound_h10_address);
-  fputs(",\"study_day_rollover_local\":\"04:00:00\",\"overnight_upload_window_"
-        "start_local\":\"22:00:00\",\"overnight_upload_window_end_local\":\"06:"
-        "00:00\"}",
-        stdout);
-  fputs(",\"time\":{\"timezone\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.timezone);
-  fputs("},\"battery_policy\":{\"critical_stop_voltage_v\":3.5,\"low_start_"
-        "voltage_v\":3.65,\"off_charger_upload_voltage_v\":3.85}",
-        stdout);
-  fputs(",\"wifi\":{\"allowed_ssids\":[", stdout);
+  jsw w;
+  jsw_ok(&w, "config export", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_uint32(&w, "schema_version", 1u);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "exported_at_utc", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "hardware_id",
+                                                 app->hardware_id);
+  logger_json_stream_writer_field_bool(&w, "secrets_included", false);
+
+  logger_json_stream_writer_field_object_begin(&w, "identity");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "logger_id", app->persisted.config.logger_id);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "subject_id", app->persisted.config.subject_id);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "recording");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "bound_h10_address", app->persisted.config.bound_h10_address);
+  logger_json_stream_writer_field_string_or_null(&w, "study_day_rollover_local",
+                                                 "04:00:00");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "overnight_upload_window_start_local", "22:00:00");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "overnight_upload_window_end_local", "06:00:00");
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "time");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "timezone", app->persisted.config.timezone);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "battery_policy");
+  logger_json_stream_writer_field_raw(&w, "critical_stop_voltage_v", "3.5");
+  logger_json_stream_writer_field_raw(&w, "low_start_voltage_v", "3.65");
+  logger_json_stream_writer_field_raw(&w, "off_charger_upload_voltage_v",
+                                      "3.85");
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "wifi");
+  logger_json_stream_writer_field_array_begin(&w, "allowed_ssids");
   if (logger_string_present(app->persisted.config.wifi_ssid)) {
-    logger_json_write_string_or_null(app->persisted.config.wifi_ssid);
+    logger_json_stream_writer_elem_string_or_null(
+        &w, app->persisted.config.wifi_ssid);
   }
-  fputs("],\"networks\":[", stdout);
+  logger_json_stream_writer_array_end(&w);
+  logger_json_stream_writer_field_array_begin(&w, "networks");
   if (logger_string_present(app->persisted.config.wifi_ssid)) {
-    fputs("{\"ssid\":", stdout);
-    logger_json_write_string_or_null(app->persisted.config.wifi_ssid);
-    fputs(",\"psk_present\":", stdout);
-    fputs(logger_string_present(app->persisted.config.wifi_psk) ? "true"
-                                                                : "false",
-          stdout);
-    fputs("}", stdout);
+    logger_json_stream_writer_elem_object_begin(&w);
+    logger_json_stream_writer_field_string_or_null(
+        &w, "ssid", app->persisted.config.wifi_ssid);
+    logger_json_stream_writer_field_bool(
+        &w, "psk_present",
+        logger_string_present(app->persisted.config.wifi_psk));
+    logger_json_stream_writer_object_end(&w);
   }
-  fputs("]},\"upload\":{\"enabled\":", stdout);
-  fputs(logger_string_present(app->persisted.config.upload_url) ? "true"
-                                                                : "false",
-        stdout);
-  fputs(",\"url\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.upload_url);
-  fputs(",\"auth\":{\"type\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_array_end(&w);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "upload");
+  logger_json_stream_writer_field_bool(
+      &w, "enabled", logger_string_present(app->persisted.config.upload_url));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "url", app->persisted.config.upload_url);
+  logger_json_stream_writer_field_object_begin(&w, "auth");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "type",
       logger_string_present(app->persisted.config.upload_url)
           ? "api_key_and_bearer"
           : "none");
-  fputs(",\"api_key_present\":", stdout);
-  fputs(logger_string_present(app->persisted.config.upload_api_key) ? "true"
-                                                                    : "false",
-        stdout);
-  fputs(",\"token_present\":", stdout);
-  fputs(logger_string_present(app->persisted.config.upload_token) ? "true"
-                                                                  : "false",
-        stdout);
-  fputs("},\"tls\":", stdout);
-  logger_write_upload_tls_json(&app->persisted.config);
-  fputs("}}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_bool(
+      &w, "api_key_present",
+      logger_string_present(app->persisted.config.upload_api_key));
+  logger_json_stream_writer_field_bool(
+      &w, "token_present",
+      logger_string_present(app->persisted.config.upload_token));
+  logger_json_stream_writer_object_end(&w);
+  logger_write_upload_tls_json(&w, &app->persisted.config);
+  logger_json_stream_writer_object_end(&w);
+
+  jsw_end(&w);
 }
 
 static void logger_handle_clock_status_json(logger_app_t *app) {
-  logger_json_begin_success("clock status",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"rtc_present\":", stdout);
-  fputs(app->clock.rtc_present ? "true" : "false", stdout);
-  fputs(",\"valid\":", stdout);
-  fputs(app->clock.valid ? "true" : "false", stdout);
-  fputs(",\"lost_power\":", stdout);
-  fputs(app->clock.lost_power ? "true" : "false", stdout);
-  fputs(",\"battery_low\":", stdout);
-  fputs(app->clock.battery_low ? "true" : "false", stdout);
-  fputs(",\"state\":", stdout);
-  logger_json_write_string_or_null(logger_clock_state_name(&app->clock));
-  fputs(",\"now_utc\":", stdout);
-  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
-  fputs(",\"timezone\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.timezone);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "clock status", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "rtc_present",
+                                       app->clock.rtc_present);
+  logger_json_stream_writer_field_bool(&w, "valid", app->clock.valid);
+  logger_json_stream_writer_field_bool(&w, "lost_power", app->clock.lost_power);
+  logger_json_stream_writer_field_bool(&w, "battery_low",
+                                       app->clock.battery_low);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "state", logger_clock_state_name(&app->clock));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "now_utc", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "timezone", app->persisted.config.timezone);
+  jsw_end(&w);
 }
 
 static void logger_handle_preflight_json(logger_app_t *app) {
   if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error(
-        "preflight", logger_clock_now_utc_or_null(&app->clock), "busy_logging",
-        "preflight is not permitted while logging");
+    jsw w;
+    jsw_err(&w, "preflight", logger_clock_now_utc_or_null(&app->clock),
+            "busy_logging", "preflight is not permitted while logging");
     return;
   }
   if (logger_cli_is_upload_mode(app)) {
-    logger_json_begin_error(
-        "preflight", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode", "preflight is not permitted during upload");
+    jsw w;
+    jsw_err(&w, "preflight", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "preflight is not permitted during upload");
     return;
   }
 
@@ -1516,61 +1543,80 @@ static void logger_handle_preflight_json(logger_app_t *app) {
     overall = "warn";
   }
 
-  logger_json_begin_success("preflight",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"overall_result\":", stdout);
-  logger_json_write_string_or_null(overall);
-  fputs(",\"checks\":[", stdout);
-  fputs("{\"name\":\"rtc\",\"result\":", stdout);
-  logger_json_write_string_or_null(rtc_result);
-  fputs(",\"details\":{\"rtc_present\":", stdout);
-  fputs(app->clock.rtc_present ? "true" : "false", stdout);
-  fputs(",\"valid\":", stdout);
-  fputs(app->clock.valid ? "true" : "false", stdout);
-  fputs(",\"lost_power\":", stdout);
-  fputs(app->clock.lost_power ? "true" : "false", stdout);
-  fputs("}}", stdout);
+  jsw w;
+  jsw_ok(&w, "preflight", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "overall_result", overall);
+  logger_json_stream_writer_field_array_begin(&w, "checks");
 
-  fputs(",{\"name\":\"storage\",\"result\":", stdout);
-  logger_json_write_string_or_null(storage_result);
-  fputs(",\"details\":{\"mounted\":", stdout);
-  fputs(app->storage.mounted ? "true" : "false", stdout);
-  fputs(",\"filesystem\":", stdout);
-  logger_json_write_string_or_null(
+  /* rtc */
+  logger_json_stream_writer_elem_object_begin(&w);
+  logger_json_stream_writer_field_string_or_null(&w, "name", "rtc");
+  logger_json_stream_writer_field_string_or_null(&w, "result", rtc_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_bool(&w, "rtc_present",
+                                       app->clock.rtc_present);
+  logger_json_stream_writer_field_bool(&w, "valid", app->clock.valid);
+  logger_json_stream_writer_field_bool(&w, "lost_power", app->clock.lost_power);
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
+
+  /* storage */
+  logger_json_stream_writer_elem_object_begin(&w);
+  logger_json_stream_writer_field_string_or_null(&w, "name", "storage");
+  logger_json_stream_writer_field_string_or_null(&w, "result", storage_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_bool(&w, "mounted", app->storage.mounted);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "filesystem",
       logger_string_present(app->storage.filesystem) ? app->storage.filesystem
                                                      : NULL);
-  fputs(",\"free_bytes\":", stdout);
   if (app->storage.mounted) {
-    printf("%llu", (unsigned long long)app->storage.free_bytes);
+    logger_json_stream_writer_field_uint64(&w, "free_bytes",
+                                           app->storage.free_bytes);
   } else {
-    fputs("null", stdout);
+    logger_json_stream_writer_field_null(&w, "free_bytes");
   }
-  fputs(",\"reserve_ok\":", stdout);
-  fputs(app->storage.reserve_ok ? "true" : "false", stdout);
-  fputs("}}", stdout);
+  logger_json_stream_writer_field_bool(&w, "reserve_ok",
+                                       app->storage.reserve_ok);
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
 
-  fputs(",{\"name\":\"battery_sense\",\"result\":", stdout);
-  logger_json_write_string_or_null(battery_result);
-  fputs(",\"details\":{\"voltage_mv\":", stdout);
-  printf("%u", (unsigned)app->battery.voltage_mv);
-  fputs(",\"vbus_present\":", stdout);
-  fputs(app->battery.vbus_present ? "true" : "false", stdout);
-  fputs("}}", stdout);
+  /* battery_sense */
+  logger_json_stream_writer_elem_object_begin(&w);
+  logger_json_stream_writer_field_string_or_null(&w, "name", "battery_sense");
+  logger_json_stream_writer_field_string_or_null(&w, "result", battery_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_uint32(&w, "voltage_mv",
+                                         app->battery.voltage_mv);
+  logger_json_stream_writer_field_bool(&w, "vbus_present",
+                                       app->battery.vbus_present);
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
 
-  fputs(",{\"name\":\"provisioning\",\"result\":", stdout);
-  logger_json_write_string_or_null(prov_result);
-  fputs(",\"details\":{\"normal_logging_ready\":", stdout);
-  fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true"
-                                                                   : "false",
-        stdout);
-  fputs("}}", stdout);
+  /* provisioning */
+  logger_json_stream_writer_elem_object_begin(&w);
+  logger_json_stream_writer_field_string_or_null(&w, "name", "provisioning");
+  logger_json_stream_writer_field_string_or_null(&w, "result", prov_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_bool(
+      &w, "normal_logging_ready",
+      logger_config_normal_logging_ready(&app->persisted.config));
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
 
-  fputs(",{\"name\":\"bound_h10_scan\",\"result\":", stdout);
-  logger_json_write_string_or_null(h10_scan_result);
-  fputs(",\"details\":{\"implemented\":false,\"bound_address\":", stdout);
-  logger_json_write_string_or_null(app->persisted.config.bound_h10_address);
-  fputs("}}]}", stdout);
-  logger_json_end_success();
+  /* bound_h10_scan */
+  logger_json_stream_writer_elem_object_begin(&w);
+  logger_json_stream_writer_field_string_or_null(&w, "name", "bound_h10_scan");
+  logger_json_stream_writer_field_string_or_null(&w, "result", h10_scan_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_bool(&w, "implemented", false);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "bound_address", app->persisted.config.bound_h10_address);
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_array_end(&w);
+  jsw_end(&w);
 }
 
 static void logger_handle_net_test_json(logger_app_t *app) {
@@ -1581,28 +1627,47 @@ static void logger_handle_net_test_json(logger_app_t *app) {
   logger_upload_net_test_result_t result;
   const bool ok = logger_upload_net_test(&app->persisted.config, &result);
 
-  logger_json_begin_success("net-test",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"wifi_join\":{\"result\":", stdout);
-  logger_json_write_string_or_null(result.wifi_join_result);
-  fputs(",\"details\":{\"message\":", stdout);
-  logger_json_write_string_or_null(result.wifi_join_details);
-  fputs("}},\"dns\":{\"result\":", stdout);
-  logger_json_write_string_or_null(result.dns_result);
-  fputs(",\"details\":{\"message\":", stdout);
-  logger_json_write_string_or_null(result.dns_details);
-  fputs("}},\"tls\":{\"result\":", stdout);
-  logger_json_write_string_or_null(result.tls_result);
-  fputs(",\"details\":{\"message\":", stdout);
-  logger_json_write_string_or_null(result.tls_details);
-  fputs("}},\"upload_endpoint_reachable\":{\"result\":", stdout);
-  logger_json_write_string_or_null(result.upload_endpoint_reachable_result);
-  fputs(",\"details\":{\"message\":", stdout);
-  logger_json_write_string_or_null(result.upload_endpoint_reachable_details);
-  fputs(",\"ok\":", stdout);
-  fputs(ok ? "true" : "false", stdout);
-  fputs("}}}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "net-test", logger_clock_now_utc_or_null(&app->clock));
+
+  logger_json_stream_writer_field_object_begin(&w, "wifi_join");
+  logger_json_stream_writer_field_string_or_null(&w, "result",
+                                                 result.wifi_join_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_string_or_null(&w, "message",
+                                                 result.wifi_join_details);
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "dns");
+  logger_json_stream_writer_field_string_or_null(&w, "result",
+                                                 result.dns_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_string_or_null(&w, "message",
+                                                 result.dns_details);
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "tls");
+  logger_json_stream_writer_field_string_or_null(&w, "result",
+                                                 result.tls_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_string_or_null(&w, "message",
+                                                 result.tls_details);
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "upload_endpoint_reachable");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "result", result.upload_endpoint_reachable_result);
+  logger_json_stream_writer_field_object_begin(&w, "details");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "message", result.upload_endpoint_reachable_details);
+  logger_json_stream_writer_field_bool(&w, "ok", ok);
+  logger_json_stream_writer_object_end(&w);
+  logger_json_stream_writer_object_end(&w);
+
+  jsw_end(&w);
 }
 
 static void logger_handle_service_unlock(logger_service_cli_t *cli,
@@ -1617,30 +1682,31 @@ static void logger_handle_service_unlock(logger_service_cli_t *cli,
       &app->system_log, logger_clock_now_utc_or_null(&app->clock),
       "service_unlock", LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
 
-  logger_json_begin_success("service unlock",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"unlocked\":true,\"expires_at_utc\":", stdout);
-  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
-  fputs(",\"ttl_seconds\":60}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "service unlock", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "unlocked", true);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "expires_at_utc", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_uint32(&w, "ttl_seconds", 60u);
+  jsw_end(&w);
 }
 
 static void logger_handle_service_enter(logger_app_t *app, uint32_t now_ms) {
   if (logger_cli_is_upload_mode(app)) {
-    logger_json_begin_error("service enter",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode",
-                            "service enter is not permitted during upload");
+    jsw w;
+    jsw_err(&w, "service enter", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "service enter is not permitted during upload");
     return;
   }
 
   const bool already_in_service = logger_cli_is_service_mode(app);
   bool will_stop_logging = false;
   if (!logger_app_request_service_mode(app, now_ms, &will_stop_logging)) {
-    logger_json_begin_error(
-        "service enter", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode",
-        "service enter is not permitted in the current mode");
+    jsw w;
+    jsw_err(&w, "service enter", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "service enter is not permitted in the current mode");
     return;
   }
 
@@ -1651,47 +1717,50 @@ static void logger_handle_service_enter(logger_app_t *app, uint32_t now_ms) {
           ? "{\"source\":\"host\",\"already_in_service\":true}"
           : "{\"source\":\"host\",\"already_in_service\":false}");
 
-  logger_json_begin_success("service enter",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"requested\":true,\"already_in_service\":", stdout);
-  fputs(already_in_service ? "true" : "false", stdout);
-  fputs(",\"will_stop_logging\":", stdout);
-  fputs(will_stop_logging ? "true" : "false", stdout);
-  fputs(",\"mode\":", stdout);
-  logger_json_write_string_or_null(logger_mode_name(&app->runtime));
-  fputs(",\"runtime_state\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, "service enter", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "requested", true);
+  logger_json_stream_writer_field_bool(&w, "already_in_service",
+                                       already_in_service);
+  logger_json_stream_writer_field_bool(&w, "will_stop_logging",
+                                       will_stop_logging);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "mode", logger_mode_name(&app->runtime));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "runtime_state",
       logger_runtime_state_name(app->runtime.current_state));
-  fputs(",\"target_mode\":\"service\"}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_string_or_null(&w, "target_mode", "service");
+  jsw_end(&w);
 }
 
 static void logger_handle_fault_clear(logger_app_t *app) {
   if (logger_cli_is_logging_mode(app)) {
-    logger_json_begin_error(
-        "fault clear", logger_clock_now_utc_or_null(&app->clock),
-        "busy_logging", "fault clear is not permitted while logging");
+    jsw w;
+    jsw_err(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock),
+            "busy_logging", "fault clear is not permitted while logging");
     return;
   }
   if (logger_cli_is_upload_mode(app)) {
-    logger_json_begin_error(
-        "fault clear", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode", "fault clear is not permitted during upload");
+    jsw w;
+    jsw_err(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "fault clear is not permitted during upload");
     return;
   }
 
   const logger_fault_code_t previous = app->persisted.current_fault_code;
   if (previous == LOGGER_FAULT_NONE) {
-    logger_json_begin_success("fault clear",
-                              logger_clock_now_utc_or_null(&app->clock));
-    fputs("{\"cleared\":false,\"previous_code\":null}", stdout);
-    logger_json_end_success();
+    jsw w;
+    jsw_ok(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock));
+    logger_json_stream_writer_field_bool(&w, "cleared", false);
+    logger_json_stream_writer_field_null(&w, "previous_code");
+    jsw_end(&w);
     return;
   }
   if (logger_cli_fault_condition_still_present(app)) {
-    logger_json_begin_error(
-        "fault clear", logger_clock_now_utc_or_null(&app->clock),
-        "condition_still_present", "fault condition is still present");
+    jsw w;
+    jsw_err(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock),
+            "condition_still_present", "fault condition is still present");
     return;
   }
 
@@ -1702,12 +1771,12 @@ static void logger_handle_fault_clear(logger_app_t *app) {
       &app->system_log, logger_clock_now_utc_or_null(&app->clock),
       "fault_cleared", LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
 
-  logger_json_begin_success("fault clear",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"cleared\":true,\"previous_code\":", stdout);
-  logger_json_write_string_or_null(logger_fault_code_name(previous));
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "cleared", true);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "previous_code", logger_fault_code_name(previous));
+  jsw_end(&w);
 }
 
 static void logger_handle_factory_reset(logger_service_cli_t *cli,
@@ -1724,10 +1793,11 @@ static void logger_handle_factory_reset(logger_service_cli_t *cli,
   cli->unlocked = false;
   app->reboot_pending = true;
 
-  logger_json_begin_success("factory-reset",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"factory_reset\":true,\"will_reboot\":true}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "factory-reset", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "factory_reset", true);
+  logger_json_stream_writer_field_bool(&w, "will_reboot", true);
+  jsw_end(&w);
 }
 
 static void logger_handle_sd_format(logger_service_cli_t *cli,
@@ -1736,20 +1806,20 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
     return;
   }
   if (app->session.active) {
-    logger_json_begin_error(
-        "sd format", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode",
-        "sd format is not permitted while a session is active");
+    jsw w;
+    jsw_err(&w, "sd format", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "sd format is not permitted while a session is active");
     return;
   }
 
   logger_storage_status_t formatted;
   if (!logger_storage_format(&formatted)) {
     (void)logger_storage_refresh(&app->storage);
-    logger_json_begin_error(
-        "sd format", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable",
-        "failed to format and remount the SD card as FAT32");
+    jsw w;
+    jsw_err(&w, "sd format", logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable",
+            "failed to format and remount the SD card as FAT32");
     return;
   }
 
@@ -1758,10 +1828,10 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           &queue_summary)) {
     (void)logger_storage_refresh(&app->storage);
-    logger_json_begin_error(
-        "sd format", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable",
-        "formatted SD card but failed to initialize logger queue state");
+    jsw w;
+    jsw_err(&w, "sd format", logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable",
+            "formatted SD card but failed to initialize logger queue state");
     return;
   }
 
@@ -1774,12 +1844,12 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
 
   cli->unlocked = false;
 
-  logger_json_begin_success("sd format",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"formatted\":true,\"filesystem\":\"fat32\",\"logger_root_created\":"
-        "true}",
-        stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "sd format", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "formatted", true);
+  logger_json_stream_writer_field_string_or_null(&w, "filesystem", "fat32");
+  logger_json_stream_writer_field_bool(&w, "logger_root_created", true);
+  jsw_end(&w);
 }
 
 static void logger_handle_clock_set(const logger_service_cli_t *cli,
@@ -1788,9 +1858,9 @@ static void logger_handle_clock_set(const logger_service_cli_t *cli,
     return;
   }
   if (!logger_clock_set_utc(value, &app->clock)) {
-    logger_json_begin_error("clock set",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config", "invalid RFC3339 UTC timestamp");
+    jsw w;
+    jsw_err(&w, "clock set", logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", "invalid RFC3339 UTC timestamp");
     return;
   }
   logger_app_note_wall_clock_changed(app);
@@ -1798,12 +1868,12 @@ static void logger_handle_clock_set(const logger_service_cli_t *cli,
       &app->system_log, logger_clock_now_utc_or_null(&app->clock), "clock_set",
       LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
 
-  logger_json_begin_success("clock set",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"applied\":true,\"now_utc\":", stdout);
-  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "clock set", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "applied", true);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "now_utc", logger_clock_now_utc_or_null(&app->clock));
+  jsw_end(&w);
 }
 
 static void logger_handle_clock_sync(logger_service_cli_t *cli,
@@ -1815,40 +1885,34 @@ static void logger_handle_clock_sync(logger_service_cli_t *cli,
   logger_clock_ntp_sync_result_t result;
   const bool ok = logger_app_clock_sync_ntp(app, &result);
 
-  logger_json_begin_success("clock sync",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"attempted\":", stdout);
-  fputs(result.attempted ? "true" : "false", stdout);
-  fputs(",\"applied\":", stdout);
-  fputs(ok ? "true" : "false", stdout);
-  fputs(",\"previous_valid\":", stdout);
-  fputs(result.previous_valid ? "true" : "false", stdout);
-  fputs(",\"large_correction\":", stdout);
-  fputs(result.large_correction ? "true" : "false", stdout);
-  fputs(",\"correction_seconds\":", stdout);
-  printf("%lld", (long long)result.correction_seconds);
-  fputs(",\"server\":", stdout);
-  logger_json_write_string_or_null(result.server[0] != '\0' ? result.server
-                                                            : NULL);
-  fputs(",\"remote_address\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, "clock sync", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "attempted", result.attempted);
+  logger_json_stream_writer_field_bool(&w, "applied", ok);
+  logger_json_stream_writer_field_bool(&w, "previous_valid",
+                                       result.previous_valid);
+  logger_json_stream_writer_field_bool(&w, "large_correction",
+                                       result.large_correction);
+  logger_json_stream_writer_field_int64(&w, "correction_seconds",
+                                        result.correction_seconds);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "server", result.server[0] != '\0' ? result.server : NULL);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "remote_address",
       result.remote_address[0] != '\0' ? result.remote_address : NULL);
-  fputs(",\"stratum\":", stdout);
   if (result.stratum != 0u) {
-    printf("%u", (unsigned)result.stratum);
+    logger_json_stream_writer_field_uint32(&w, "stratum", result.stratum);
   } else {
-    fputs("null", stdout);
+    logger_json_stream_writer_field_null(&w, "stratum");
   }
-  fputs(",\"previous_utc\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      &w, "previous_utc",
       result.previous_utc[0] != '\0' ? result.previous_utc : NULL);
-  fputs(",\"now_utc\":", stdout);
-  logger_json_write_string_or_null(logger_clock_now_utc_or_null(&app->clock));
-  fputs(",\"message\":", stdout);
-  logger_json_write_string_or_null(result.message[0] != '\0' ? result.message
-                                                             : NULL);
-  fputs("}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_string_or_null(
+      &w, "now_utc", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "message", result.message[0] != '\0' ? result.message : NULL);
+  jsw_end(&w);
 }
 
 static void logger_apply_config_import_json(logger_service_cli_t *cli,
@@ -1861,14 +1925,15 @@ static void logger_apply_config_import_json(logger_service_cli_t *cli,
   const char *error_message = "config import failed";
   if (!logger_parse_config_import_document(app, json, &imported, &bond_cleared,
                                            &error_message)) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config", error_message);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", error_message);
     return;
   }
   if (!logger_config_store_save(&imported)) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "storage_unavailable",
-                            "failed to persist imported config");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to persist imported config");
     return;
   }
 
@@ -1903,15 +1968,14 @@ static void logger_apply_config_import_json(logger_service_cli_t *cli,
   }
   cli->unlocked = false;
 
-  logger_json_begin_success(command, logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"applied\":true,\"normal_logging_ready\":", stdout);
-  fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true"
-                                                                   : "false",
-        stdout);
-  fputs(",\"bond_cleared\":", stdout);
-  fputs(bond_cleared ? "true" : "false", stdout);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "applied", true);
+  logger_json_stream_writer_field_bool(
+      &w, "normal_logging_ready",
+      logger_config_normal_logging_ready(&app->persisted.config));
+  logger_json_stream_writer_field_bool(&w, "bond_cleared", bond_cleared);
+  jsw_end(&w);
 }
 
 static void logger_handle_config_import(logger_service_cli_t *cli,
@@ -1920,11 +1984,11 @@ static void logger_handle_config_import(logger_service_cli_t *cli,
     return;
   }
   if (!logger_string_present(json)) {
-    logger_json_begin_error("config import",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config",
-                            "expected: config import <json>\nor use: config "
-                            "import begin <bytes> / chunk / commit");
+    jsw w;
+    jsw_err(&w, "config import", logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config",
+            "expected: config import <json>\nor use: config "
+            "import begin <bytes> / chunk / commit");
     return;
   }
   logger_apply_config_import_json(cli, app, "config import", json, true);
@@ -1942,24 +2006,27 @@ static void logger_handle_config_import_begin(logger_service_cli_t *cli,
   char extra[8] = {0};
   const int matched = sscanf(args, "%23s %7s", size_text, extra);
   if (matched != 1) {
-    logger_json_begin_error(
-        "config import begin", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "expected: config import begin <total_bytes>");
+    jsw w;
+    jsw_err(&w, "config import begin",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "expected: config import begin <total_bytes>");
     return;
   }
 
   size_t expected_len = 0u;
   if (!logger_parse_size_t_strict(size_text, &expected_len) ||
       expected_len == 0u) {
-    logger_json_begin_error(
-        "config import begin", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "config import begin requires a positive byte count");
+    jsw w;
+    jsw_err(&w, "config import begin",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "config import begin requires a positive byte count");
     return;
   }
   if (expected_len > LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX) {
-    logger_json_begin_error(
-        "config import begin", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "config import size exceeds transport buffer");
+    jsw w;
+    jsw_err(&w, "config import begin",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "config import size exceeds transport buffer");
     return;
   }
 
@@ -1968,18 +2035,19 @@ static void logger_handle_config_import_begin(logger_service_cli_t *cli,
   cli->config_import_active = true;
   cli->config_import_expected_len = expected_len;
 
-  logger_json_begin_success("config import begin",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"started\":true,\"expected_bytes\":", stdout);
-  printf("%llu", (unsigned long long)cli->config_import_expected_len);
-  fputs(",\"received_bytes\":0,\"remaining_bytes\":", stdout);
-  printf("%llu", (unsigned long long)cli->config_import_expected_len);
-  fputs(",\"max_bytes\":", stdout);
-  printf("%u", (unsigned)LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX);
-  fputs(",\"replaced_existing\":", stdout);
-  fputs(replaced_existing ? "true" : "false", stdout);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "config import begin", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "started", true);
+  logger_json_stream_writer_field_uint64(&w, "expected_bytes",
+                                         cli->config_import_expected_len);
+  logger_json_stream_writer_field_uint64(&w, "received_bytes", 0u);
+  logger_json_stream_writer_field_uint64(&w, "remaining_bytes",
+                                         cli->config_import_expected_len);
+  logger_json_stream_writer_field_uint32(
+      &w, "max_bytes", LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX);
+  logger_json_stream_writer_field_bool(&w, "replaced_existing",
+                                       replaced_existing);
+  jsw_end(&w);
 }
 
 static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
@@ -1990,8 +2058,9 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
     return;
   }
   if (!cli->config_import_active) {
-    logger_json_begin_error(
-        "config import chunk", logger_clock_now_utc_or_null(&app->clock),
+    jsw w;
+    jsw_err(
+        &w, "config import chunk", logger_clock_now_utc_or_null(&app->clock),
         "invalid_config",
         "no config import transfer is active; use config import begin first");
     return;
@@ -1999,10 +2068,10 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
 
   const size_t chunk_len = strlen(chunk);
   if (chunk_len == 0u) {
-    logger_json_begin_error(
-        "config import chunk", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config",
-        "config import chunk requires a non-empty payload fragment");
+    jsw w;
+    jsw_err(&w, "config import chunk",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "config import chunk requires a non-empty payload fragment");
     return;
   }
 
@@ -2011,11 +2080,11 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
       (cli->config_import_received_len + chunk_len) >
           LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX) {
     logger_config_import_transfer_reset(cli);
-    logger_json_begin_error("config import chunk",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config",
-                            "config import chunk exceeds announced transfer "
-                            "size; transfer aborted");
+    jsw w;
+    jsw_err(&w, "config import chunk",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "config import chunk exceeds announced transfer "
+            "size; transfer aborted");
     return;
   }
 
@@ -2025,26 +2094,25 @@ static void logger_handle_config_import_chunk(logger_service_cli_t *cli,
   cli->config_import_buf[cli->config_import_received_len] = '\0';
   cli->config_import_chunk_count += 1u;
 
-  logger_json_begin_success("config import chunk",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"accepted\":true,\"chunk_bytes\":", stdout);
-  printf("%llu", (unsigned long long)chunk_len);
-  fputs(",\"received_bytes\":", stdout);
-  printf("%llu", (unsigned long long)cli->config_import_received_len);
-  fputs(",\"expected_bytes\":", stdout);
-  printf("%llu", (unsigned long long)cli->config_import_expected_len);
-  fputs(",\"remaining_bytes\":", stdout);
-  printf("%llu", (unsigned long long)(cli->config_import_expected_len -
-                                      cli->config_import_received_len));
-  fputs(",\"chunk_count\":", stdout);
-  printf("%lu", (unsigned long)cli->config_import_chunk_count);
-  fputs(",\"complete\":", stdout);
-  fputs(cli->config_import_received_len == cli->config_import_expected_len
-            ? "true"
-            : "false",
-        stdout);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "config import chunk", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "accepted", true);
+  logger_json_stream_writer_field_uint64(&w, "chunk_bytes",
+                                         (uint64_t)chunk_len);
+  logger_json_stream_writer_field_uint64(
+      &w, "received_bytes", (uint64_t)cli->config_import_received_len);
+  logger_json_stream_writer_field_uint64(
+      &w, "expected_bytes", (uint64_t)cli->config_import_expected_len);
+  logger_json_stream_writer_field_uint64(
+      &w, "remaining_bytes",
+      (uint64_t)(cli->config_import_expected_len -
+                 cli->config_import_received_len));
+  logger_json_stream_writer_field_uint32(
+      &w, "chunk_count", (uint32_t)cli->config_import_chunk_count);
+  logger_json_stream_writer_field_bool(&w, "complete",
+                                       cli->config_import_received_len ==
+                                           cli->config_import_expected_len);
+  jsw_end(&w);
 }
 
 static void logger_handle_config_import_status(logger_service_cli_t *cli,
@@ -2054,33 +2122,30 @@ static void logger_handle_config_import_status(logger_service_cli_t *cli,
     return;
   }
 
-  logger_json_begin_success("config import status",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"active\":", stdout);
-  fputs(cli->config_import_active ? "true" : "false", stdout);
-  fputs(",\"expected_bytes\":", stdout);
-  printf("%llu", (unsigned long long)cli->config_import_expected_len);
-  fputs(",\"received_bytes\":", stdout);
-  printf("%llu", (unsigned long long)cli->config_import_received_len);
-  fputs(",\"remaining_bytes\":", stdout);
+  jsw w;
+  jsw_ok(&w, "config import status", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "active", cli->config_import_active);
+  logger_json_stream_writer_field_uint64(
+      &w, "expected_bytes", (uint64_t)cli->config_import_expected_len);
+  logger_json_stream_writer_field_uint64(
+      &w, "received_bytes", (uint64_t)cli->config_import_received_len);
   if (cli->config_import_received_len <= cli->config_import_expected_len) {
-    printf("%llu", (unsigned long long)(cli->config_import_expected_len -
-                                        cli->config_import_received_len));
+    logger_json_stream_writer_field_uint64(
+        &w, "remaining_bytes",
+        (uint64_t)(cli->config_import_expected_len -
+                   cli->config_import_received_len));
   } else {
-    fputs("0", stdout);
+    logger_json_stream_writer_field_uint64(&w, "remaining_bytes", 0u);
   }
-  fputs(",\"chunk_count\":", stdout);
-  printf("%lu", (unsigned long)cli->config_import_chunk_count);
-  fputs(",\"max_bytes\":", stdout);
-  printf("%u", (unsigned)LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX);
-  fputs(",\"ready_to_commit\":", stdout);
-  fputs(cli->config_import_active && cli->config_import_received_len ==
-                                         cli->config_import_expected_len
-            ? "true"
-            : "false",
-        stdout);
-  fputs("}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_uint32(
+      &w, "chunk_count", (uint32_t)cli->config_import_chunk_count);
+  logger_json_stream_writer_field_uint32(
+      &w, "max_bytes", LOGGER_SERVICE_CLI_CONFIG_IMPORT_JSON_MAX);
+  logger_json_stream_writer_field_bool(&w, "ready_to_commit",
+                                       cli->config_import_active &&
+                                           cli->config_import_received_len ==
+                                               cli->config_import_expected_len);
+  jsw_end(&w);
 }
 
 static void logger_handle_config_import_cancel(logger_service_cli_t *cli,
@@ -2096,12 +2161,11 @@ static void logger_handle_config_import_cancel(logger_service_cli_t *cli,
                             cli->config_import_chunk_count != 0u;
   logger_config_import_transfer_reset(cli);
 
-  logger_json_begin_success("config import cancel",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"cleared\":true,\"had_transfer\":", stdout);
-  fputs(had_transfer ? "true" : "false", stdout);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "config import cancel", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "cleared", true);
+  logger_json_stream_writer_field_bool(&w, "had_transfer", had_transfer);
+  jsw_end(&w);
 }
 
 static void logger_handle_config_import_commit(logger_service_cli_t *cli,
@@ -2111,16 +2175,18 @@ static void logger_handle_config_import_commit(logger_service_cli_t *cli,
     return;
   }
   if (!cli->config_import_active) {
-    logger_json_begin_error(
-        "config import commit", logger_clock_now_utc_or_null(&app->clock),
+    jsw w;
+    jsw_err(
+        &w, "config import commit", logger_clock_now_utc_or_null(&app->clock),
         "invalid_config",
         "no config import transfer is active; use config import begin first");
     return;
   }
   if (cli->config_import_received_len != cli->config_import_expected_len) {
-    logger_json_begin_error(
-        "config import commit", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "config import transfer is incomplete");
+    jsw w;
+    jsw_err(&w, "config import commit",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "config import transfer is incomplete");
     return;
   }
 
@@ -2139,10 +2205,10 @@ logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli,
 
   bool had_anchor = false;
   if (!logger_config_clear_provisioned_anchor(&app->persisted, &had_anchor)) {
-    logger_json_begin_error("upload tls clear-provisioned-anchor",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "storage_unavailable",
-                            "failed to clear provisioned upload TLS anchor");
+    jsw w;
+    jsw_err(&w, "upload tls clear-provisioned-anchor",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to clear provisioned upload TLS anchor");
     return;
   }
 
@@ -2161,18 +2227,17 @@ logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli,
 
   cli->unlocked = false;
 
-  logger_json_begin_success("upload tls clear-provisioned-anchor",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"cleared\":true,\"had_anchor\":", stdout);
-  fputs(had_anchor ? "true" : "false", stdout);
-  fputs(",\"current_tls_mode\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, "upload tls clear-provisioned-anchor",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "cleared", true);
+  logger_json_stream_writer_field_bool(&w, "had_anchor", had_anchor);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "current_tls_mode",
       logger_config_upload_tls_mode(&app->persisted.config));
-  fputs(",\"upload_ready\":", stdout);
-  fputs(logger_config_upload_ready(&app->persisted.config) ? "true" : "false",
-        stdout);
-  fputs("}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_bool(
+      &w, "upload_ready", logger_config_upload_ready(&app->persisted.config));
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
@@ -2184,9 +2249,9 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
   value[0] = '\0';
   const int matched = sscanf(args, "%47s %255[^\n]", field, value);
   if (matched < 2) {
-    logger_json_begin_error(
-        "debug config set", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "expected: debug config set <field> <value>");
+    jsw w;
+    jsw_err(&w, "debug config set", logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", "expected: debug config set <field> <value>");
     return;
   }
 
@@ -2200,24 +2265,25 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
 
   if (logger_cli_is_logging_mode(app) && !allow_in_log_wait_h10) {
-    logger_json_begin_error(
-        "debug config set", logger_clock_now_utc_or_null(&app->clock),
-        "busy_logging", "config mutation is not permitted while logging");
+    jsw w;
+    jsw_err(&w, "debug config set", logger_clock_now_utc_or_null(&app->clock),
+            "busy_logging", "config mutation is not permitted while logging");
     return;
   }
   if (!logger_cli_is_service_mode(app) && !allow_in_log_wait_h10) {
-    logger_json_begin_error("debug config set",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode",
-                            "debug config set is only allowed in service mode");
+    jsw w;
+    jsw_err(&w, "debug config set", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "debug config set is only allowed in service mode");
     return;
   }
   if (logger_cli_is_service_mode(app) &&
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(
-        "debug config set", logger_clock_now_utc_or_null(&app->clock),
-        "service_locked", "service unlock is required before debug config set");
+    jsw w;
+    jsw_err(&w, "debug config set", logger_clock_now_utc_or_null(&app->clock),
+            "service_locked",
+            "service unlock is required before debug config set");
     return;
   }
 
@@ -2243,16 +2309,16 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
   } else if (strcmp(field, "upload_token") == 0) {
     ok = logger_config_set_upload_token(&app->persisted, value);
   } else {
-    logger_json_begin_error("debug config set",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config", "unknown debug config field");
+    jsw w;
+    jsw_err(&w, "debug config set", logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", "unknown debug config field");
     return;
   }
 
   if (!ok) {
-    logger_json_begin_error(
-        "debug config set", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "failed to apply debug config field");
+    jsw w;
+    jsw_err(&w, "debug config set", logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", "failed to apply debug config field");
     return;
   }
 
@@ -2267,18 +2333,15 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
         logger_json_object_writer_data(&writer));
   }
 
-  logger_json_begin_success("debug config set",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"applied\":true,\"field\":", stdout);
-  logger_json_write_string_or_null(field);
-  fputs(",\"normal_logging_ready\":", stdout);
-  fputs(logger_config_normal_logging_ready(&app->persisted.config) ? "true"
-                                                                   : "false",
-        stdout);
-  fputs(",\"bond_cleared\":", stdout);
-  fputs(bond_cleared ? "true" : "false", stdout);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug config set", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "applied", true);
+  logger_json_stream_writer_field_string_or_null(&w, "field", field);
+  logger_json_stream_writer_field_bool(
+      &w, "normal_logging_ready",
+      logger_config_normal_logging_ready(&app->persisted.config));
+  logger_json_stream_writer_field_bool(&w, "bond_cleared", bond_cleared);
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_config_clear(const logger_service_cli_t *cli,
@@ -2290,9 +2353,9 @@ static void logger_handle_debug_config_clear(const logger_service_cli_t *cli,
     return;
   }
   if (strcmp(args, "upload") != 0) {
-    logger_json_begin_error(
-        "debug config clear", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "only 'debug config clear upload' is supported");
+    jsw w;
+    jsw_err(&w, "debug config clear", logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", "only 'debug config clear upload' is supported");
     return;
   }
 
@@ -2301,10 +2364,11 @@ static void logger_handle_debug_config_clear(const logger_service_cli_t *cli,
       &app->system_log, logger_clock_now_utc_or_null(&app->clock),
       "config_changed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
       "{\"field\":\"upload\"}");
-  logger_json_begin_success("debug config clear",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"applied\":true,\"field\":\"upload\"}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug config clear", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "applied", true);
+  logger_json_stream_writer_field_string_or_null(&w, "field", "upload");
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_session_start(const logger_service_cli_t *cli,
@@ -2323,71 +2387,75 @@ static void logger_handle_debug_session_start(const logger_service_cli_t *cli,
           &app->clock, &app->battery, &app->storage,
           app->persisted.current_fault_code, app->persisted.boot_counter,
           now_ms, &error_code, &error_message)) {
-    logger_json_begin_error("debug session start",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            error_code, error_message);
+    jsw w;
+    jsw_err(&w, "debug session start",
+            logger_clock_now_utc_or_null(&app->clock), error_code,
+            error_message);
     return;
   }
   app->last_session_snapshot_mono_ms = now_ms;
 
-  logger_json_begin_success("debug session start",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"active\":true,\"session_id\":", stdout);
-  logger_json_write_string_or_null(app->session.session_id);
-  fputs(",\"study_day_local\":", stdout);
-  logger_json_write_string_or_null(app->session.study_day_local);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug session start", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "active", true);
+  logger_json_stream_writer_field_string_or_null(&w, "session_id",
+                                                 app->session.session_id);
+  logger_json_stream_writer_field_string_or_null(&w, "study_day_local",
+                                                 app->session.study_day_local);
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_session_snapshot(logger_app_t *app,
                                                  uint32_t now_ms) {
   if (!app->session.active) {
-    logger_json_begin_error(
-        "debug session snapshot", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode", "no debug session is active");
+    jsw w;
+    jsw_err(&w, "debug session snapshot",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "no debug session is active");
     return;
   }
   if (!logger_session_write_status_snapshot(
           &app->session, &app->clock, &app->battery, &app->storage,
           app->persisted.current_fault_code, app->persisted.boot_counter,
           now_ms)) {
-    logger_json_begin_error(
-        "debug session snapshot", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable", "failed to append status snapshot");
+    jsw w;
+    jsw_err(&w, "debug session snapshot",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to append status snapshot");
     return;
   }
   app->last_session_snapshot_mono_ms = now_ms;
 
-  logger_json_begin_success("debug session snapshot",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"written\":true,\"journal_size_bytes\":", stdout);
-  printf("%llu", (unsigned long long)app->session.journal_size_bytes);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug session snapshot",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "written", true);
+  logger_json_stream_writer_field_uint64(&w, "journal_size_bytes",
+                                         app->session.journal_size_bytes);
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_session_stop(logger_app_t *app,
                                              uint32_t now_ms) {
   if (!app->session.active) {
-    logger_json_begin_success("debug session stop",
-                              logger_clock_now_utc_or_null(&app->clock));
-    fputs("{\"active\":false}", stdout);
-    logger_json_end_success();
+    jsw w;
+    jsw_ok(&w, "debug session stop", logger_clock_now_utc_or_null(&app->clock));
+    logger_json_stream_writer_field_bool(&w, "active", false);
+    jsw_end(&w);
     return;
   }
   if (!logger_session_stop_debug(
           &app->session, &app->system_log, app->hardware_id, &app->persisted,
           &app->clock, &app->storage, app->persisted.boot_counter, now_ms)) {
-    logger_json_begin_error(
-        "debug session stop", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable", "failed to close debug session");
+    jsw w;
+    jsw_err(&w, "debug session stop", logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to close debug session");
     return;
   }
-  logger_json_begin_success("debug session stop",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"active\":false}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug session stop", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "active", false);
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
@@ -2398,18 +2466,19 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
           "debug synth ecg is only allowed in service mode")) {
     return;
   }
+
   if (!app->session.active) {
-    logger_json_begin_error(
-        "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode", "no debug session is active");
+    jsw w;
+    jsw_err(&w, "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode", "no debug session is active");
     return;
   }
 
   uint8_t count = 1u;
   if (args != NULL && args[0] != '\0' && !logger_parse_u8(args, &count)) {
-    logger_json_begin_error(
-        "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "expected: debug synth ecg [count]");
+    jsw w;
+    jsw_err(&w, "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", "expected: debug synth ecg [count]");
     return;
   }
   if (count == 0u) {
@@ -2424,10 +2493,10 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
             &app->clock, &app->storage, "reconnect",
             app->persisted.config.bound_h10_address, false, false, false,
             app->persisted.boot_counter, now_ms, &error_code, &error_message)) {
-      logger_json_begin_error(
-          "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
-          error_code != NULL ? error_code : "storage_unavailable",
-          error_message != NULL ? error_message : "failed to reopen span");
+      jsw w;
+      jsw_err(&w, "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
+              error_code != NULL ? error_code : "storage_unavailable",
+              error_message != NULL ? error_message : "failed to reopen span");
       return;
     }
   }
@@ -2451,27 +2520,25 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
                                           ((uint64_t)now_ms * 1000ull) +
                                               ((uint64_t)i * 1000ull),
                                           packet, sizeof(packet))) {
-      logger_json_begin_error(
-          "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
-          "storage_unavailable", "failed to append synthetic ECG packet");
+      jsw w;
+      jsw_err(&w, "debug synth ecg", logger_clock_now_utc_or_null(&app->clock),
+              "storage_unavailable", "failed to append synthetic ECG packet");
       return;
     }
     appended += 1u;
   }
 
-  logger_json_begin_success("debug synth ecg",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"appended_packets\":", stdout);
-  printf("%lu", (unsigned long)appended);
-  fputs(",\"session_id\":", stdout);
-  logger_json_write_string_or_null(app->session.session_id);
-  fputs(",\"span_id\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, "debug synth ecg", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_uint32(&w, "appended_packets", appended);
+  logger_json_stream_writer_field_string_or_null(&w, "session_id",
+                                                 app->session.session_id);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "span_id",
       app->session.span_active ? app->session.current_span_id : NULL);
-  fputs(",\"journal_size_bytes\":", stdout);
-  printf("%llu", (unsigned long long)app->session.journal_size_bytes);
-  fputs("}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_uint64(&w, "journal_size_bytes",
+                                         app->session.journal_size_bytes);
+  jsw_end(&w);
 }
 
 static void
@@ -2483,25 +2550,28 @@ logger_handle_debug_synth_disconnect(const logger_service_cli_t *cli,
     return;
   }
   if (!app->session.active || !app->session.span_active) {
-    logger_json_begin_error("debug synth disconnect",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode", "no active span is open");
+    jsw w;
+    jsw_err(&w, "debug synth disconnect",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "no active span is open");
     return;
   }
   if (!logger_session_handle_disconnect(&app->session, &app->clock,
                                         app->persisted.boot_counter, now_ms,
                                         "disconnect")) {
-    logger_json_begin_error(
-        "debug synth disconnect", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable", "failed to append synthetic disconnect gap");
+    jsw w;
+    jsw_err(&w, "debug synth disconnect",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to append synthetic disconnect gap");
     return;
   }
-  logger_json_begin_success("debug synth disconnect",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"span_active\":false,\"session_id\":", stdout);
-  logger_json_write_string_or_null(app->session.session_id);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug synth disconnect",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "span_active", false);
+  logger_json_stream_writer_field_string_or_null(&w, "session_id",
+                                                 app->session.session_id);
+  jsw_end(&w);
 }
 
 static void
@@ -2514,48 +2584,51 @@ logger_handle_debug_synth_h10_battery(const logger_service_cli_t *cli,
     return;
   }
   if (!app->session.active) {
-    logger_json_begin_error(
-        "debug synth h10-battery", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode", "no debug session is active");
+    jsw w;
+    jsw_err(&w, "debug synth h10-battery",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "no debug session is active");
     return;
   }
 
   char percent_text[16] = {0};
   char reason[16] = {0};
   if (args == NULL || sscanf(args, "%15s %15s", percent_text, reason) != 2) {
-    logger_json_begin_error(
-        "debug synth h10-battery", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config",
-        "expected: debug synth h10-battery <percent> <connect|periodic>");
+    jsw w;
+    jsw_err(&w, "debug synth h10-battery",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "expected: debug synth h10-battery <percent> <connect|periodic>");
     return;
   }
   uint8_t percent = 0u;
   if (!logger_parse_u8(percent_text, &percent) || percent > 100u ||
       (strcmp(reason, "connect") != 0 && strcmp(reason, "periodic") != 0)) {
-    logger_json_begin_error(
-        "debug synth h10-battery", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config", "invalid battery percent or read reason");
+    jsw w;
+    jsw_err(&w, "debug synth h10-battery",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "invalid battery percent or read reason");
     return;
   }
 
   if (!logger_session_append_h10_battery(&app->session, &app->clock,
                                          app->persisted.boot_counter, now_ms,
                                          percent, reason)) {
-    logger_json_begin_error(
-        "debug synth h10-battery", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable", "failed to append synthetic h10_battery record");
+    jsw w;
+    jsw_err(&w, "debug synth h10-battery",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to append synthetic h10_battery record");
     return;
   }
   app->h10.battery_percent = percent;
 
-  logger_json_begin_success("debug synth h10-battery",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"written\":true,\"battery_percent\":", stdout);
-  printf("%u", (unsigned)percent);
-  fputs(",\"read_reason\":", stdout);
-  logger_json_write_string_or_null(reason);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug synth h10-battery",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "written", true);
+  logger_json_stream_writer_field_uint32(&w, "battery_percent",
+                                         (uint32_t)percent);
+  logger_json_stream_writer_field_string_or_null(&w, "read_reason", reason);
+  jsw_end(&w);
 }
 
 static const char *logger_classify_no_session_day_reason(
@@ -2588,10 +2661,10 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
     return;
   }
   if (app->session.active) {
-    logger_json_begin_error(
-        "debug synth no-session-day", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode",
-        "debug synth no-session-day requires no active session");
+    jsw w;
+    jsw_err(&w, "debug synth no-session-day",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "debug synth no-session-day requires no active session");
     return;
   }
 
@@ -2604,11 +2677,11 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
                           : sscanf(args, "%31s %7s %7s %7s", mode_or_reason,
                                    seen_text, connected_text, start_text);
   if (matched < 1) {
-    logger_json_begin_error("debug synth no-session-day",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config",
-                            "expected: debug synth no-session-day "
-                            "<reason>|auto [seen connected ecg_started]");
+    jsw w;
+    jsw_err(&w, "debug synth no-session-day",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "expected: debug synth no-session-day "
+            "<reason>|auto [seen connected ecg_started]");
     return;
   }
 
@@ -2622,29 +2695,30 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
       if (!logger_parse_bool01(seen_text, &seen_bound_device) ||
           !logger_parse_bool01(connected_text, &ble_connected) ||
           !logger_parse_bool01(start_text, &ecg_start_attempted)) {
-        logger_json_begin_error("debug synth no-session-day",
-                                logger_clock_now_utc_or_null(&app->clock),
-                                "invalid_config",
-                                "auto mode flags must be 0 or 1");
+        jsw w;
+        jsw_err(&w, "debug synth no-session-day",
+                logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+                "auto mode flags must be 0 or 1");
         return;
       }
     }
     reason = logger_classify_no_session_day_reason(
         seen_bound_device, ble_connected, ecg_start_attempted);
   } else if (!logger_no_session_reason_valid(reason)) {
-    logger_json_begin_error("debug synth no-session-day",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config", "invalid no-session-day reason");
+    jsw w;
+    jsw_err(&w, "debug synth no-session-day",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "invalid no-session-day reason");
     return;
   }
 
   char study_day_local[11] = {0};
   if (!logger_clock_derive_study_day_local_observed(
           &app->clock, app->persisted.config.timezone, study_day_local)) {
-    logger_json_begin_error(
-        "debug synth no-session-day", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config",
-        "cannot derive study_day_local from current clock/timezone");
+    jsw w;
+    jsw_err(&w, "debug synth no-session-day",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "cannot derive study_day_local from current clock/timezone");
     return;
   }
 
@@ -2661,38 +2735,36 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
       !logger_json_object_writer_bool_field(&writer, "ecg_start_attempted",
                                             ecg_start_attempted) ||
       !logger_json_object_writer_finish(&writer)) {
-    logger_json_begin_error(
-        "debug synth no-session-day", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable",
-        "failed to build synthetic no_session_day_summary details");
+    jsw w;
+    jsw_err(&w, "debug synth no-session-day",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to build synthetic no_session_day_summary details");
     return;
   }
   if (!logger_system_log_append(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           "no_session_day_summary", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
           logger_json_object_writer_data(&writer))) {
-    logger_json_begin_error(
-        "debug synth no-session-day", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable",
-        "failed to append synthetic no_session_day_summary");
+    jsw w;
+    jsw_err(&w, "debug synth no-session-day",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to append synthetic no_session_day_summary");
     return;
   }
   logger_app_set_last_day_outcome(app, study_day_local, "no_session", reason);
 
-  logger_json_begin_success("debug synth no-session-day",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"study_day_local\":", stdout);
-  logger_json_write_string_or_null(study_day_local);
-  fputs(",\"reason\":", stdout);
-  logger_json_write_string_or_null(reason);
-  fputs(",\"seen_bound_device\":", stdout);
-  fputs(seen_bound_device ? "true" : "false", stdout);
-  fputs(",\"ble_connected\":", stdout);
-  fputs(ble_connected ? "true" : "false", stdout);
-  fputs(",\"ecg_start_attempted\":", stdout);
-  fputs(ecg_start_attempted ? "true" : "false", stdout);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug synth no-session-day",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "study_day_local",
+                                                 study_day_local);
+  logger_json_stream_writer_field_string_or_null(&w, "reason", reason);
+  logger_json_stream_writer_field_bool(&w, "seen_bound_device",
+                                       seen_bound_device);
+  logger_json_stream_writer_field_bool(&w, "ble_connected", ble_connected);
+  logger_json_stream_writer_field_bool(&w, "ecg_start_attempted",
+                                       ecg_start_attempted);
+  jsw_end(&w);
 }
 
 static bool logger_update_clock_from_rfc3339(logger_app_t *app,
@@ -2730,9 +2802,10 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
     return;
   }
   if (!app->session.active) {
-    logger_json_begin_error(
-        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode", "no debug session is active");
+    jsw w;
+    jsw_err(&w, "debug synth rollover",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "no debug session is active");
     return;
   }
 
@@ -2744,26 +2817,27 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
                      app->session.study_day_local);
 
   if (!logger_update_clock_from_rfc3339(app, rfc3339, now_ms, NULL, NULL)) {
-    logger_json_begin_error("debug synth rollover",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config", "invalid RFC3339 UTC timestamp");
+    jsw w;
+    jsw_err(&w, "debug synth rollover",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "invalid RFC3339 UTC timestamp");
     return;
   }
 
   char new_study_day_local[11] = {0};
   if (!logger_clock_derive_study_day_local_observed(
           &app->clock, app->persisted.config.timezone, new_study_day_local)) {
-    logger_json_begin_error(
-        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config",
-        "cannot derive study_day_local from current clock/timezone");
+    jsw w;
+    jsw_err(&w, "debug synth rollover",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "cannot derive study_day_local from current clock/timezone");
     return;
   }
   if (strcmp(old_study_day_local, new_study_day_local) == 0) {
-    logger_json_begin_error(
-        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
-        "invalid_config",
-        "new timestamp does not cross the study-day boundary");
+    jsw w;
+    jsw_err(&w, "debug synth rollover",
+            logger_clock_now_utc_or_null(&app->clock), "invalid_config",
+            "new timestamp does not cross the study-day boundary");
     return;
   }
 
@@ -2771,9 +2845,10 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
                                app->hardware_id, &app->persisted, &app->clock,
                                &app->storage, "rollover",
                                app->persisted.boot_counter, now_ms)) {
-    logger_json_begin_error(
-        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable", "failed to finalize pre-rollover session");
+    jsw w;
+    jsw_err(&w, "debug synth rollover",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to finalize pre-rollover session");
     return;
   }
   const char *error_code = NULL;
@@ -2783,11 +2858,12 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
           &app->clock, &app->storage, "rollover_continue",
           app->persisted.config.bound_h10_address, false, false, false,
           app->persisted.boot_counter, now_ms, &error_code, &error_message)) {
-    logger_json_begin_error(
-        "debug synth rollover", logger_clock_now_utc_or_null(&app->clock),
-        error_code != NULL ? error_code : "storage_unavailable",
-        error_message != NULL ? error_message
-                              : "failed to open post-rollover session");
+    jsw w;
+    jsw_err(&w, "debug synth rollover",
+            logger_clock_now_utc_or_null(&app->clock),
+            error_code != NULL ? error_code : "storage_unavailable",
+            error_message != NULL ? error_message
+                                  : "failed to open post-rollover session");
     return;
   }
   logger_app_set_last_day_outcome(app, old_study_day_local, "session",
@@ -2795,18 +2871,17 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
   app->last_session_live_flush_mono_ms = now_ms;
   app->last_session_snapshot_mono_ms = now_ms;
 
-  logger_json_begin_success("debug synth rollover",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"old_study_day_local\":", stdout);
-  logger_json_write_string_or_null(old_study_day_local);
-  fputs(",\"new_study_day_local\":", stdout);
-  logger_json_write_string_or_null(new_study_day_local);
-  fputs(",\"old_session_id\":", stdout);
-  logger_json_write_string_or_null(old_session_id);
-  fputs(",\"new_session_id\":", stdout);
-  logger_json_write_string_or_null(app->session.session_id);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw w;
+  jsw_ok(&w, "debug synth rollover", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "old_study_day_local",
+                                                 old_study_day_local);
+  logger_json_stream_writer_field_string_or_null(&w, "new_study_day_local",
+                                                 new_study_day_local);
+  logger_json_stream_writer_field_string_or_null(&w, "old_session_id",
+                                                 old_session_id);
+  logger_json_stream_writer_field_string_or_null(&w, "new_session_id",
+                                                 app->session.session_id);
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_synth_clock_boundary(
@@ -2820,9 +2895,9 @@ static void logger_handle_debug_synth_clock_boundary(
     return;
   }
   if (!app->session.active) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode",
-                            "no debug session is active");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode", "no debug session is active");
     return;
   }
 
@@ -2837,17 +2912,19 @@ static void logger_handle_debug_synth_clock_boundary(
   int64_t new_utc_ns = 0ll;
   if (!logger_update_clock_from_rfc3339(app, rfc3339, now_ms, &old_utc_ns,
                                         &new_utc_ns)) {
-    logger_json_begin_error(command, logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config", "invalid RFC3339 UTC timestamp");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", "invalid RFC3339 UTC timestamp");
     return;
   }
 
   char new_study_day_local[11] = {0};
   if (!logger_clock_derive_study_day_local_observed(
           &app->clock, app->persisted.config.timezone, new_study_day_local)) {
-    logger_json_begin_error(
-        command, logger_clock_now_utc_or_null(&app->clock), "invalid_config",
-        "cannot derive study_day_local from current clock/timezone");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config",
+            "cannot derive study_day_local from current clock/timezone");
     return;
   }
   const bool crossed_study_day =
@@ -2857,10 +2934,10 @@ static void logger_handle_debug_synth_clock_boundary(
           &app->session, &app->clock, app->persisted.boot_counter, now_ms,
           event_kind, span_end_reason, new_utc_ns - old_utc_ns, old_utc_ns,
           new_utc_ns, true)) {
-    logger_json_begin_error(
-        command, logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable",
-        "failed to append synthetic clock boundary records");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable",
+            "failed to append synthetic clock boundary records");
     return;
   }
 
@@ -2869,9 +2946,9 @@ static void logger_handle_debug_synth_clock_boundary(
                                  app->hardware_id, &app->persisted, &app->clock,
                                  &app->storage, span_end_reason,
                                  app->persisted.boot_counter, now_ms)) {
-      logger_json_begin_error(
-          command, logger_clock_now_utc_or_null(&app->clock),
-          "storage_unavailable", "failed to finalize pre-boundary session");
+      jsw w;
+      jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+              "storage_unavailable", "failed to finalize pre-boundary session");
       return;
     }
     logger_app_set_last_day_outcome(app, old_study_day_local, "session",
@@ -2886,33 +2963,34 @@ static void logger_handle_debug_synth_clock_boundary(
           app->persisted.config.bound_h10_address, false, false,
           jump_at_session_start && crossed_study_day,
           app->persisted.boot_counter, now_ms, &error_code, &error_message)) {
-    logger_json_begin_error(
-        command, logger_clock_now_utc_or_null(&app->clock),
-        error_code != NULL ? error_code : "storage_unavailable",
-        error_message != NULL ? error_message
-                              : "failed to open post-boundary span/session");
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            error_code != NULL ? error_code : "storage_unavailable",
+            error_message != NULL
+                ? error_message
+                : "failed to open post-boundary span/session");
     return;
   }
 
   app->last_session_live_flush_mono_ms = now_ms;
   app->last_session_snapshot_mono_ms = now_ms;
 
-  logger_json_begin_success(command, logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"crossed_study_day\":", stdout);
-  fputs(crossed_study_day ? "true" : "false", stdout);
-  fputs(",\"old_study_day_local\":", stdout);
-  logger_json_write_string_or_null(old_study_day_local);
-  fputs(",\"new_study_day_local\":", stdout);
-  logger_json_write_string_or_null(new_study_day_local);
-  fputs(",\"old_session_id\":", stdout);
-  logger_json_write_string_or_null(old_session_id);
-  fputs(",\"new_session_id\":", stdout);
-  logger_json_write_string_or_null(app->session.session_id);
-  fputs(",\"current_span_id\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "crossed_study_day",
+                                       crossed_study_day);
+  logger_json_stream_writer_field_string_or_null(&w, "old_study_day_local",
+                                                 old_study_day_local);
+  logger_json_stream_writer_field_string_or_null(&w, "new_study_day_local",
+                                                 new_study_day_local);
+  logger_json_stream_writer_field_string_or_null(&w, "old_session_id",
+                                                 old_session_id);
+  logger_json_stream_writer_field_string_or_null(&w, "new_session_id",
+                                                 app->session.session_id);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "current_span_id",
       app->session.span_active ? app->session.current_span_id : NULL);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli,
@@ -2920,26 +2998,27 @@ static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli,
   const bool allowed_in_wait_h10 =
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
   if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
-    logger_json_begin_error(
-        "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
+    jsw w;
+    jsw_err(
+        &w, "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode",
         "debug queue rebuild is only allowed in service mode or log_wait_h10");
     return;
   }
   if (app->session.active) {
-    logger_json_begin_error(
-        "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode",
-        "debug queue rebuild is not permitted while a session is active");
+    jsw w;
+    jsw_err(&w, "debug queue rebuild",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "debug queue rebuild is not permitted while a session is active");
     return;
   }
   if (logger_cli_is_service_mode(app) &&
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(
-        "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
-        "service_locked",
-        "service unlock is required before debug queue rebuild");
+    jsw w;
+    jsw_err(&w, "debug queue rebuild",
+            logger_clock_now_utc_or_null(&app->clock), "service_locked",
+            "service unlock is required before debug queue rebuild");
     return;
   }
 
@@ -2947,26 +3026,26 @@ static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli,
   if (!logger_upload_queue_rebuild_file(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           &summary)) {
-    logger_json_begin_error(
-        "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable",
-        "failed to rebuild upload_queue.json from local sessions");
+    jsw w;
+    jsw_err(&w, "debug queue rebuild",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to rebuild upload_queue.json from local sessions");
     return;
   }
 
-  logger_json_begin_success("debug queue rebuild",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"rebuilt\":true,\"updated_at_utc\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, "debug queue rebuild", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "rebuilt", true);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "updated_at_utc",
       summary.updated_at_utc[0] != '\0' ? summary.updated_at_utc : NULL);
-  fputs(",\"session_count\":", stdout);
-  printf("%lu", (unsigned long)summary.session_count);
-  fputs(",\"pending_count\":", stdout);
-  printf("%lu", (unsigned long)summary.pending_count);
-  fputs(",\"blocked_count\":", stdout);
-  printf("%lu", (unsigned long)summary.blocked_count);
-  fputs("}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_uint32(&w, "session_count",
+                                         (uint32_t)summary.session_count);
+  logger_json_stream_writer_field_uint32(&w, "pending_count",
+                                         (uint32_t)summary.pending_count);
+  logger_json_stream_writer_field_uint32(&w, "blocked_count",
+                                         (uint32_t)summary.blocked_count);
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
@@ -2974,28 +3053,28 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
   const bool allowed_in_wait_h10 =
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
   if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
-    logger_json_begin_error("debug queue requeue-blocked",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode",
-                            "debug queue requeue-blocked is only allowed in "
-                            "service mode or log_wait_h10");
+    jsw w;
+    jsw_err(&w, "debug queue requeue-blocked",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "debug queue requeue-blocked is only allowed in "
+            "service mode or log_wait_h10");
     return;
   }
   if (app->session.active) {
-    logger_json_begin_error("debug queue requeue-blocked",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "not_permitted_in_mode",
-                            "debug queue requeue-blocked is not permitted "
-                            "while a session is active");
+    jsw w;
+    jsw_err(&w, "debug queue requeue-blocked",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "debug queue requeue-blocked is not permitted "
+            "while a session is active");
     return;
   }
   if (logger_cli_is_service_mode(app) &&
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(
-        "debug queue requeue-blocked",
-        logger_clock_now_utc_or_null(&app->clock), "service_locked",
-        "service unlock is required before debug queue requeue-blocked");
+    jsw w;
+    jsw_err(&w, "debug queue requeue-blocked",
+            logger_clock_now_utc_or_null(&app->clock), "service_locked",
+            "service unlock is required before debug queue requeue-blocked");
     return;
   }
 
@@ -3004,28 +3083,28 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
   if (!logger_upload_queue_requeue_blocked_file(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           "manual_requeue_blocked", &requeued_count, &summary)) {
-    logger_json_begin_error(
-        "debug queue requeue-blocked",
-        logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
-        "failed to rewrite blocked upload_queue.json entries as pending");
+    jsw w;
+    jsw_err(&w, "debug queue requeue-blocked",
+            logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
+            "failed to rewrite blocked upload_queue.json entries as pending");
     return;
   }
 
-  logger_json_begin_success("debug queue requeue-blocked",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"requeued_count\":", stdout);
-  printf("%lu", (unsigned long)requeued_count);
-  fputs(",\"updated_at_utc\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, "debug queue requeue-blocked",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_uint32(&w, "requeued_count",
+                                         (uint32_t)requeued_count);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "updated_at_utc",
       summary.updated_at_utc[0] != '\0' ? summary.updated_at_utc : NULL);
-  fputs(",\"session_count\":", stdout);
-  printf("%lu", (unsigned long)summary.session_count);
-  fputs(",\"pending_count\":", stdout);
-  printf("%lu", (unsigned long)summary.pending_count);
-  fputs(",\"blocked_count\":", stdout);
-  printf("%lu", (unsigned long)summary.blocked_count);
-  fputs("}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_uint32(&w, "session_count",
+                                         (uint32_t)summary.session_count);
+  logger_json_stream_writer_field_uint32(&w, "pending_count",
+                                         (uint32_t)summary.pending_count);
+  logger_json_stream_writer_field_uint32(&w, "blocked_count",
+                                         (uint32_t)summary.blocked_count);
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
@@ -3033,25 +3112,26 @@ static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
   const bool allowed_in_wait_h10 =
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
   if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
-    logger_json_begin_error(
-        "debug prune once", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode",
-        "debug prune once is only allowed in service mode or log_wait_h10");
+    jsw w;
+    jsw_err(&w, "debug prune once", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "debug prune once is only allowed in service mode or log_wait_h10");
     return;
   }
   if (app->session.active) {
-    logger_json_begin_error(
-        "debug prune once", logger_clock_now_utc_or_null(&app->clock),
-        "not_permitted_in_mode",
-        "debug prune once is not permitted while a session is active");
+    jsw w;
+    jsw_err(&w, "debug prune once", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "debug prune once is not permitted while a session is active");
     return;
   }
   if (logger_cli_is_service_mode(app) &&
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(
-        "debug prune once", logger_clock_now_utc_or_null(&app->clock),
-        "service_locked", "service unlock is required before debug prune once");
+    jsw w;
+    jsw_err(&w, "debug prune once", logger_clock_now_utc_or_null(&app->clock),
+            "service_locked",
+            "service unlock is required before debug prune once");
     return;
   }
 
@@ -3063,31 +3143,30 @@ static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           LOGGER_SD_MIN_FREE_RESERVE_BYTES, &retention_pruned_count,
           &reserve_pruned_count, &reserve_met, &summary)) {
-    logger_json_begin_error(
-        "debug prune once", logger_clock_now_utc_or_null(&app->clock),
-        "storage_unavailable", "failed to apply upload retention/prune policy");
+    jsw w;
+    jsw_err(&w, "debug prune once", logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable",
+            "failed to apply upload retention/prune policy");
     return;
   }
 
-  logger_json_begin_success("debug prune once",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"retention_pruned_count\":", stdout);
-  printf("%lu", (unsigned long)retention_pruned_count);
-  fputs(",\"reserve_pruned_count\":", stdout);
-  printf("%lu", (unsigned long)reserve_pruned_count);
-  fputs(",\"reserve_met\":", stdout);
-  fputs(reserve_met ? "true" : "false", stdout);
-  fputs(",\"updated_at_utc\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, "debug prune once", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_uint32(&w, "retention_pruned_count",
+                                         (uint32_t)retention_pruned_count);
+  logger_json_stream_writer_field_uint32(&w, "reserve_pruned_count",
+                                         (uint32_t)reserve_pruned_count);
+  logger_json_stream_writer_field_bool(&w, "reserve_met", reserve_met);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "updated_at_utc",
       summary.updated_at_utc[0] != '\0' ? summary.updated_at_utc : NULL);
-  fputs(",\"session_count\":", stdout);
-  printf("%lu", (unsigned long)summary.session_count);
-  fputs(",\"pending_count\":", stdout);
-  printf("%lu", (unsigned long)summary.pending_count);
-  fputs(",\"blocked_count\":", stdout);
-  printf("%lu", (unsigned long)summary.blocked_count);
-  fputs("}", stdout);
-  logger_json_end_success();
+  logger_json_stream_writer_field_uint32(&w, "session_count",
+                                         (uint32_t)summary.session_count);
+  logger_json_stream_writer_field_uint32(&w, "pending_count",
+                                         (uint32_t)summary.pending_count);
+  logger_json_stream_writer_field_uint32(&w, "blocked_count",
+                                         (uint32_t)summary.blocked_count);
+  jsw_end(&w);
 }
 
 static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
@@ -3095,8 +3174,9 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
   const bool allowed_in_wait_h10 =
       app->runtime.current_state == LOGGER_RUNTIME_LOG_WAIT_H10;
   if (!logger_cli_is_service_mode(app) && !allowed_in_wait_h10) {
-    logger_json_begin_error(
-        "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+    jsw w;
+    jsw_err(
+        &w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
         "not_permitted_in_mode",
         "debug upload once is only allowed in service mode or log_wait_h10");
     return;
@@ -3104,10 +3184,10 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
   if (logger_cli_is_service_mode(app) &&
       !logger_service_cli_is_unlocked(cli,
                                       to_ms_since_boot(get_absolute_time()))) {
-    logger_json_begin_error(
-        "debug upload once", logger_clock_now_utc_or_null(&app->clock),
-        "service_locked",
-        "service unlock is required before debug upload once");
+    jsw w;
+    jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+            "service_locked",
+            "service unlock is required before debug upload once");
     return;
   }
 
@@ -3117,61 +3197,59 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
       logger_clock_now_utc_or_null(&app->clock), &result);
 
   if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
-    logger_json_begin_error("debug upload once",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "invalid_config", result.message);
+    jsw w;
+    jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+            "invalid_config", result.message);
     return;
   }
   if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_FAILED) {
-    logger_json_begin_error(
-        "debug upload once", logger_clock_now_utc_or_null(&app->clock),
-        logger_string_present(result.failure_class) ? result.failure_class
-                                                    : "upload_failed",
-        result.message);
+    jsw w;
+    jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+            logger_string_present(result.failure_class) ? result.failure_class
+                                                        : "upload_failed",
+            result.message);
     return;
   }
   if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
-    logger_json_begin_error("debug upload once",
-                            logger_clock_now_utc_or_null(&app->clock),
-                            "min_firmware_rejected", result.message);
+    jsw w;
+    jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+            "min_firmware_rejected", result.message);
     return;
   }
 
-  logger_json_begin_success("debug upload once",
-                            logger_clock_now_utc_or_null(&app->clock));
-  fputs("{\"attempted\":", stdout);
-  fputs(result.attempted ? "true" : "false", stdout);
-  fputs(",\"result\":", stdout);
-  logger_json_write_string_or_null(
+  jsw w;
+  jsw_ok(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "attempted", result.attempted);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "result",
       result.code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED ? "verified"
       : result.code == LOGGER_UPLOAD_PROCESS_RESULT_NO_WORK
           ? "no_work"
           : (ok ? "ok" : "unknown"));
-  fputs(",\"session_id\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      &w, "session_id",
       logger_string_present(result.session_id) ? result.session_id : NULL);
-  fputs(",\"final_status\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      &w, "final_status",
       logger_string_present(result.final_status) ? result.final_status : NULL);
-  fputs(",\"receipt_id\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      &w, "receipt_id",
       logger_string_present(result.receipt_id) ? result.receipt_id : NULL);
-  fputs(",\"verified_upload_utc\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      &w, "verified_upload_utc",
       logger_string_present(result.verified_upload_utc)
           ? result.verified_upload_utc
           : NULL);
-  fputs(",\"http_status\":", stdout);
   if (result.http_status >= 0) {
-    printf("%d", result.http_status);
+    logger_json_stream_writer_field_int32(&w, "http_status",
+                                          result.http_status);
   } else {
-    fputs("null", stdout);
+    logger_json_stream_writer_field_null(&w, "http_status");
   }
-  fputs(",\"message\":", stdout);
-  logger_json_write_string_or_null(
+  logger_json_stream_writer_field_string_or_null(
+      &w, "message",
       logger_string_present(result.message) ? result.message : NULL);
-  fputs("}", stdout);
-  logger_json_end_success();
+  jsw_end(&w);
 }
 
 void logger_service_cli_init(logger_service_cli_t *cli) {
@@ -3360,10 +3438,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strcmp(line, "debug reboot") == 0) {
     app->reboot_pending = true;
-    logger_json_begin_success("debug reboot",
-                              logger_clock_now_utc_or_null(&app->clock));
-    fputs("{\"will_reboot\":true}", stdout);
-    logger_json_end_success();
+    jsw w;
+    jsw_ok(&w, "debug reboot", logger_clock_now_utc_or_null(&app->clock));
+    logger_json_stream_writer_field_bool(&w, "will_reboot", true);
+    jsw_end(&w);
     return;
   }
   if (strcmp(line, "sd format") == 0) {
@@ -3371,8 +3449,9 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
     return;
   }
 
-  logger_json_begin_error(line, logger_clock_now_utc_or_null(&app->clock),
-                          "internal_error", "unknown command");
+  jsw w;
+  jsw_err(&w, line, logger_clock_now_utc_or_null(&app->clock), "internal_error",
+          "unknown command");
 }
 
 void logger_service_cli_poll(logger_service_cli_t *cli, logger_app_t *app,
@@ -3395,9 +3474,9 @@ void logger_service_cli_poll(logger_service_cli_t *cli, logger_app_t *app,
     }
     if (cli->line_len + 1u >= sizeof(cli->line_buf)) {
       cli->line_len = 0u;
-      logger_json_begin_error("input",
-                              logger_clock_now_utc_or_null(&app->clock),
-                              "internal_error", "input line too long");
+      jsw w;
+      jsw_err(&w, "input", logger_clock_now_utc_or_null(&app->clock),
+              "internal_error", "input line too long");
       break;
     }
     cli->line_buf[cli->line_len++] = (char)ch;
