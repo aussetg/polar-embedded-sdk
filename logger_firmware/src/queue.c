@@ -1,3 +1,4 @@
+#include "logger/civil_date.h"
 #include "logger/queue.h"
 
 #include <stdio.h>
@@ -395,14 +396,6 @@ static void logger_upload_queue_remove_at(logger_upload_queue_t *queue, size_t i
     }
 }
 
-static int64_t logger_days_from_civil(int year, unsigned month, unsigned day) {
-    year -= month <= 2u;
-    const int era = (year >= 0 ? year : year - 399) / 400;
-    const unsigned yoe = (unsigned)(year - era * 400);
-    const unsigned doy = (153u * (month + (month > 2u ? (unsigned)-3 : 9u)) + 2u) / 5u + day - 1u;
-    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
-    return (int64_t)era * 146097 + (int64_t)doe - 719468;
-}
 
 static bool logger_parse_rfc3339_utc_seconds(const char *text, int64_t *seconds_out) {
     if (text == NULL || seconds_out == NULL || strlen(text) != 20u) {
@@ -430,7 +423,7 @@ static bool logger_parse_rfc3339_utc_seconds(const char *text, int64_t *seconds_
         return false;
     }
 
-    const int64_t days = logger_days_from_civil(year, (unsigned)month, (unsigned)day);
+    const int64_t days = logger_days_from_civil(year, month, day);
     *seconds_out = (days * 86400) + ((int64_t)hour * 3600) + ((int64_t)minute * 60) + (int64_t)second;
     return true;
 }
