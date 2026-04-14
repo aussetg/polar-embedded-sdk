@@ -25,7 +25,7 @@ int main(void) {
     }
   }
 
-  logger_app_t app;
+  static logger_app_t app;
   logger_app_init(&app, to_ms_since_boot(get_absolute_time()), boot_gesture);
 
   while (true) {
