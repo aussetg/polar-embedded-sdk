@@ -142,6 +142,18 @@ target_compile_options(logger_appliance PRIVATE
     -Wextra
     -Wshadow
     -Wdouble-promotion
+    -Wconversion
+    -Wsign-conversion
+    -Wformat=2
+    -Wnull-dereference
+    -Wundef
+    -Wmissing-prototypes
+    -Wstrict-prototypes
+    -Wold-style-definition
+    -Wredundant-decls
+    -Wnested-externs
+    -Wcast-align=strict
+    -Wwrite-strings
 )
 
 pico_enable_stdio_usb(logger_appliance 1)
