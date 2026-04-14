@@ -8,7 +8,8 @@
 #define LOGGER_FIRMWARE_RP2_2_BOARD_CONFIG_H
 
 #define LOGGER_BOARD_PROFILE "RP2-2"
-#define LOGGER_BOARD_NAME "Pimoroni Pico LiPo 2 XL W + Adafruit PiCowbell Adalogger"
+#define LOGGER_BOARD_NAME                                                      \
+  "Pimoroni Pico LiPo 2 XL W + Adafruit PiCowbell Adalogger"
 
 // User I/O
 #define LOGGER_BUTTON_PIN 30

@@ -3,8 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "diskio.h"
 #include "ff.h"
+// ff.h needs to be included before diskio.h
+#include "diskio.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "logger/util.h"
