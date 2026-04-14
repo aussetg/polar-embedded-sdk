@@ -226,7 +226,7 @@ bool logger_upload_bundle_stream_open(
     if (!logger_storage_file_size(stream->journal_path, &stream->journal_size_bytes)) {
         return false;
     }
-    if (stream->manifest_len > UINT_MAX || stream->journal_size_bytes > UINT_MAX) {
+    if ((unsigned)stream->manifest_len != stream->manifest_len || stream->journal_size_bytes > UINT_MAX) {
         return false;
     }
 

@@ -363,7 +363,7 @@ bool logger_journal_append_binary_record(
     const void *payload,
     size_t payload_len,
     uint64_t *size_bytes_out) {
-    if (payload == NULL || payload_len > UINT32_MAX) {
+    if (payload == NULL || (uint32_t)payload_len != payload_len) {
         return false;
     }
 
