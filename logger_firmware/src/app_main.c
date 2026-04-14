@@ -579,16 +579,16 @@ static void logger_app_set_next_span_start_reason(logger_app_t *app,
                          sizeof(app->next_span_start_reason), reason);
 }
 
-static const char *
-logger_app_take_next_span_start_reason(logger_app_t *app,
-                                       const char *fallback) {
-  static char reason[sizeof(app->next_span_start_reason)];
+static const char *logger_app_take_next_span_start_reason(logger_app_t *app,
+                                                          const char *fallback,
+                                                          char *buf,
+                                                          size_t buf_size) {
   if (app->next_span_start_reason[0] == '\0') {
     return fallback;
   }
-  logger_app_copy_string(reason, sizeof(reason), app->next_span_start_reason);
+  logger_app_copy_string(buf, buf_size, app->next_span_start_reason);
   app->next_span_start_reason[0] = '\0';
-  return reason;
+  return buf;
 }
 
 static void logger_app_set_stopping_end_reason(logger_app_t *app,
@@ -701,8 +701,10 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
   logger_h10_packet_t packet;
   bool appended_any = false;
   while (logger_h10_pop_packet(&app->h10, &packet)) {
+    char reason_buf[sizeof(app->next_span_start_reason)];
     const char *span_start_reason = logger_app_take_next_span_start_reason(
-        app, app->session.active ? "reconnect" : "session_start");
+        app, app->session.active ? "reconnect" : "session_start", reason_buf,
+        sizeof(reason_buf));
     if (!app->session.span_active) {
       const char *error_code = NULL;
       const char *error_message = NULL;
