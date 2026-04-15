@@ -1707,7 +1707,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
               "firmware_changed", NULL, NULL)) {
         logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                         LOGGER_RUNTIME_BOOT,
-                                        "queue_requeue_failed", now_ms);
+                                        "queue_rebuild_failed", now_ms);
         return;
       }
     }
@@ -2160,8 +2160,8 @@ static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
   app->upload_pass_had_success = false;
   if (!logger_app_prepare_upload_pass(app, &summary)) {
     logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                    LOGGER_RUNTIME_BOOT,
-                                    "upload_queue_load_failed", now_ms);
+                                    LOGGER_RUNTIME_BOOT, "queue_load_failed",
+                                    now_ms);
     return;
   }
   (void)summary;
@@ -2213,8 +2213,8 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
     logger_upload_queue_summary_t summary;
     if (!logger_app_prepare_upload_pass(app, &summary)) {
       logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                      LOGGER_RUNTIME_BOOT,
-                                      "upload_queue_load_failed", now_ms);
+                                      LOGGER_RUNTIME_BOOT, "queue_load_failed",
+                                      now_ms);
       return;
     }
     (void)summary;
