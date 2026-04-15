@@ -1,11 +1,13 @@
 # Logger host interfaces v1
 
 Status: Draft (implementation target)
-Last updated: 2026-03-29
+Last updated: 2026-04-14
 
 Related:
 - Firmware behavior: [`logger_firmware_v1.md`](./logger_firmware_v1.md)
 - Data/storage/upload contract: [`logger_data_contract_v1.md`](./logger_data_contract_v1.md)
+- Runtime architecture: [`logger_runtime_architecture_v1.md`](./logger_runtime_architecture_v1.md)
+- Recovery architecture: [`logger_recovery_architecture_v1.md`](./logger_recovery_architecture_v1.md)
 
 ---
 
@@ -152,11 +154,11 @@ The device MAY expose additional debug commands, but those are not part of the s
 Mode-availability rules for stable commands:
 
 - `status`, `provisioning-status`, `queue`, `config export`, and `system-log export` are read-only and MUST be allowed in any mode.
-- `preflight` is allowed in `service`, `idle_waiting_for_charger`, and `idle_upload_complete` modes. It MUST fail with `busy_logging` in `logging` mode and with `not_permitted_in_mode` in `upload` mode.
+- `preflight` is allowed in `service`, `recovery_hold`, `idle_waiting_for_charger`, and `idle_upload_complete` modes. It MUST fail with `busy_logging` in `logging` mode and with `not_permitted_in_mode` in `upload` mode.
 - `net-test` is allowed only in `service` mode. It MUST fail with `busy_logging` in `logging` mode and with `not_permitted_in_mode` in any other non-service mode.
-- `service enter` is allowed in `logging`, `service`, `idle_waiting_for_charger`, and `idle_upload_complete` modes. In `logging` mode it MUST cleanly stop logging, close any active session with end reason `service_entry`, and then enter `service`. It MUST fail with `not_permitted_in_mode` in `upload` mode.
+- `service enter` is allowed in `logging`, `service`, `recovery_hold`, `idle_waiting_for_charger`, and `idle_upload_complete` modes. In `logging` mode it MUST cleanly stop logging, close any active session with end reason `service_entry`, and then enter `service`. It MUST fail with `not_permitted_in_mode` in `upload` mode.
 - `service unlock` is allowed only in `service` mode. It MUST fail with `busy_logging` in `logging` mode and with `not_permitted_in_mode` in any other non-service mode.
-- `fault clear` is allowed in `service`, `idle_waiting_for_charger`, and `idle_upload_complete` modes. It MUST fail with `busy_logging` in `logging` mode and with `not_permitted_in_mode` in `upload` mode.
+- `fault clear` is allowed in `service`, `recovery_hold`, `idle_waiting_for_charger`, and `idle_upload_complete` modes. It MUST fail with `busy_logging` in `logging` mode and with `not_permitted_in_mode` in `upload` mode.
 - `config import`, `sd format`, and `factory-reset` are allowed only in `service` mode after unlock. They MUST fail with `busy_logging` in `logging` mode and with `not_permitted_in_mode` in any other non-service mode.
 
 ---
@@ -176,6 +178,7 @@ Mode-availability rules for stable commands:
   "identity": { },
   "provisioning": { },
   "fault": { },
+  "recovery": { },
   "battery": { },
   "storage": { },
   "h10": { },
@@ -193,6 +196,7 @@ Mode-availability rules for stable commands:
 One of:
 
 - `service`
+- `recovery_hold`
 - `logging`
 - `upload`
 - `idle_waiting_for_charger`
@@ -203,6 +207,7 @@ One of:
 One of:
 
 - `service`
+- `recovery_hold`
 - `log_wait_h10`
 - `log_connecting`
 - `log_securing`
@@ -249,6 +254,28 @@ Must include:
 `current_code` and `last_cleared_code` are fault-code strings or `null`.
 
 The canonical v1 fault-code set is defined in the runtime architecture document.
+
+#### `recovery`
+
+Must include:
+
+- `active` (boolean)
+- `reason`
+- `attempt_count`
+- `next_attempt_ms`
+- `resume_mode`
+- `service_pinned_by_user` (boolean)
+- `last_action`
+- `last_result`
+
+`reason`, `next_attempt_ms`, `resume_mode`, `last_action`, and `last_result` are
+either strings/integers as documented by the recovery architecture or `null` when
+not applicable.
+
+If `mode` is `recovery_hold`, `recovery.active` MUST be `true`.
+
+The canonical meanings of these fields are defined in
+`logger_recovery_architecture_v1.md`.
 
 #### `battery`
 
@@ -588,6 +615,8 @@ Config import is a full replacement of the persisted device configuration, not a
 - `logger_id`
 - `subject_id`
 
+`subject_id` remains required in device config as local study metadata and for immutable session artifacts. Upload authentication identity is derived from the configured bearer token, not from `identity.subject_id`.
+
 #### `recording`
 
 - `bound_h10_address`
@@ -765,6 +794,9 @@ Example event kinds include:
 - `no_session_day_summary`
 - `rtc_lost_power`
 - `service_unlock`
+- `service_auto_exit_usb_removed`
+- `bond_auto_cleared`
+- `bond_auto_repaired`
 
 ---
 
@@ -775,6 +807,12 @@ Example event kinds include:
 This command arms a short-lived window in which dangerous operations are accepted.
 
 It is valid only while the device is in `service` mode.
+
+If USB/VBUS is removed while the device is in `service` mode, the device MUST
+automatically leave `service` mode, invalidate any outstanding service unlock,
+discard any uncommitted staged config-import buffer, and reevaluate unattended
+policy. The exact next mode depends on the current live blocking conditions and
+is not encoded in the `service unlock` response itself.
 
 For v1:
 
@@ -828,6 +866,10 @@ On success the payload MUST include at least:
 `fault clear` acknowledges and clears the currently latched fault if policy permits it.
 
 If the underlying fault condition is still present, the command MUST fail with `condition_still_present`.
+
+The device MAY also clear latched faults automatically after validated recovery,
+as defined in `logger_recovery_architecture_v1.md`. Therefore host tooling MUST
+not assume that every clear event was user-initiated.
 
 On success the payload MUST include at least:
 

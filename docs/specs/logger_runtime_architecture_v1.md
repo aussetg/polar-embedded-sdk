@@ -1,12 +1,13 @@
 # Logger runtime architecture v1
 
 Status: Draft (implementation target)
-Last updated: 2026-03-29
+Last updated: 2026-04-14
 
 Related:
 - Firmware behavior spec: [`logger_firmware_v1.md`](./logger_firmware_v1.md)
 - Data/storage/upload contract: [`logger_data_contract_v1.md`](./logger_data_contract_v1.md)
 - Host/CLI interfaces: [`logger_host_interfaces_v1.md`](./logger_host_interfaces_v1.md)
+- Recovery architecture and fault FSMs: [`logger_recovery_architecture_v1.md`](./logger_recovery_architecture_v1.md)
 - Long-term update path: [`logger_update_architecture.md`](./logger_update_architecture.md)
 
 ---
@@ -25,6 +26,10 @@ This document defines:
 - button and boot gestures,
 - fault-code taxonomy,
 - recommended module decomposition.
+
+The detailed fault-recovery and fault-clearing behavior now lives in
+[`logger_recovery_architecture_v1.md`](./logger_recovery_architecture_v1.md).
+If this document conflicts with it on recovery behavior, the recovery document wins.
 
 ---
 
@@ -66,16 +71,17 @@ The top-level FSM uses the following states:
 
 1. `BOOT`
 2. `SERVICE`
-3. `LOG_WAIT_H10`
-4. `LOG_CONNECTING`
-5. `LOG_SECURING`
-6. `LOG_STARTING_STREAM`
-7. `LOG_STREAMING`
-8. `LOG_STOPPING`
-9. `UPLOAD_PREP`
-10. `UPLOAD_RUNNING`
-11. `IDLE_WAITING_FOR_CHARGER`
-12. `IDLE_UPLOAD_COMPLETE`
+3. `RECOVERY_HOLD`
+4. `LOG_WAIT_H10`
+5. `LOG_CONNECTING`
+6. `LOG_SECURING`
+7. `LOG_STARTING_STREAM`
+8. `LOG_STREAMING`
+9. `LOG_STOPPING`
+10. `UPLOAD_PREP`
+11. `UPLOAD_RUNNING`
+12. `IDLE_WAITING_FOR_CHARGER`
+13. `IDLE_UPLOAD_COMPLETE`
 
 Faults are an overlay represented by latched fault metadata, not separate top-level states.
 
@@ -93,7 +99,9 @@ Responsibilities:
 
 Transitions:
 
-- `BOOT -> SERVICE` if provisioning incomplete or service-mode boot hold requested
+- `BOOT -> SERVICE` if service-mode boot hold requested
+- `BOOT -> RECOVERY_HOLD` if provisioning is incomplete and USB/VBUS is absent
+- `BOOT -> SERVICE` if provisioning is incomplete and USB/VBUS is present
 - `BOOT -> UPLOAD_PREP` if charger present and local time is in `22:00–06:00`
 - `BOOT -> LOG_WAIT_H10` otherwise
 
@@ -106,12 +114,35 @@ Responsibilities:
 - expose the USB CLI,
 - allow preflight/tests,
 - allow dangerous operations only after explicit unlock,
-- keep BLE/Wi‑Fi inactive unless an explicit service command requests them.
+- keep BLE/Wi‑Fi inactive unless an explicit service command requests them,
+- represent a human-pinned stop rather than an autonomous recovery state.
 
 Transitions:
 
-- `SERVICE -> LOG_WAIT_H10` when operator exits service mode and logging is permitted
+- `SERVICE -> RECOVERY_HOLD` when USB/VBUS is removed and unattended operation is not currently legal
+- `SERVICE -> LOG_WAIT_H10` when USB/VBUS is removed and unattended logging is legal
 - `SERVICE -> UPLOAD_PREP` for explicit network/upload tests or future update actions
+
+`SERVICE` is no longer the default sink for recoverable failures.
+
+#### `RECOVERY_HOLD`
+
+Responsibilities:
+
+- keep logging stopped,
+- keep BLE logging inactive,
+- keep Wi‑Fi inactive except for bounded recovery probes that explicitly require it,
+- periodically re-evaluate blocking conditions,
+- auto-clear latched faults after validated recovery,
+- resume unattended operation without operator intervention when legal.
+
+Transitions:
+
+- `RECOVERY_HOLD -> SERVICE` when USB/VBUS is present and the active reason is `config_incomplete`
+- `RECOVERY_HOLD -> LOG_WAIT_H10` when recovery succeeds and unattended logging is legal
+- `RECOVERY_HOLD -> UPLOAD_PREP` when recovery succeeds and unattended upload policy is the correct next state
+- `RECOVERY_HOLD -> IDLE_WAITING_FOR_CHARGER` when recovery succeeds but policy still requires waiting for charger
+- `RECOVERY_HOLD -> RECOVERY_HOLD` while the blocking condition remains active
 
 #### `LOG_WAIT_H10`
 
@@ -127,7 +158,8 @@ Transitions:
 - `LOG_WAIT_H10 -> LOG_CONNECTING` when the bound H10 is found
 - `LOG_WAIT_H10 -> LOG_STOPPING` on study-day rollover if a session for the ending day already exists
 - `LOG_WAIT_H10 -> LOG_WAIT_H10` on study-day rollover if no session exists yet and logging should continue for the new day
-- `LOG_WAIT_H10 -> LOG_STOPPING` on manual long press, explicit service request, charger-triggered end-of-day, low battery, or fatal storage condition
+- `LOG_WAIT_H10 -> LOG_STOPPING` on manual long press, explicit service request, or charger-triggered end-of-day
+- `LOG_WAIT_H10 -> RECOVERY_HOLD` on low-start battery block or recoverable storage fault
 
 #### `LOG_CONNECTING`
 
@@ -145,6 +177,9 @@ Transitions:
 - `LOG_CONNECTING -> LOG_STOPPING` on explicit service request
 - `LOG_CONNECTING -> LOG_WAIT_H10` on failure or disconnect
 
+Repeated security-oriented failures remain in the logging acquisition loop and are
+handled by stale-bond recovery, not by a forced transition to `SERVICE`.
+
 #### `LOG_SECURING`
 
 Responsibilities:
@@ -160,6 +195,9 @@ Transitions:
 - `LOG_SECURING -> LOG_WAIT_H10` on study-day rollover if no session exists yet and logging should continue for the new day
 - `LOG_SECURING -> LOG_STOPPING` on explicit service request
 - `LOG_SECURING -> LOG_WAIT_H10` on failure/disconnect
+
+Repeated secure-link failures MUST trigger the stale-bond recovery policy defined
+in `logger_recovery_architecture_v1.md` before any human-facing fallback is considered.
 
 #### `LOG_STARTING_STREAM`
 
@@ -178,6 +216,9 @@ Transitions:
 - `LOG_STARTING_STREAM -> LOG_STOPPING` on explicit service request
 - `LOG_STARTING_STREAM -> LOG_WAIT_H10` on start failure/disconnect
 
+First-packet timeout and PMD-start retry behavior are part of the autonomous
+logging acquisition loop, not a reason to enter `SERVICE`.
+
 #### `LOG_STREAMING`
 
 Responsibilities:
@@ -190,7 +231,7 @@ Responsibilities:
 Transitions:
 
 - `LOG_STREAMING -> LOG_WAIT_H10` on disconnect after explicit span close/gap record
-- `LOG_STREAMING -> LOG_STOPPING` on manual stop, explicit service request, rollover, charger-triggered end-of-day, low battery, storage fault, or reboot recovery boundary
+- `LOG_STREAMING -> LOG_STOPPING` on manual stop, explicit service request, rollover, charger-triggered end-of-day, critical low battery, storage fault, or reboot recovery boundary
 
 #### `LOG_STOPPING`
 
@@ -207,6 +248,7 @@ Transitions:
 - `LOG_STOPPING -> UPLOAD_PREP` if upload work should start now
 - `LOG_STOPPING -> LOG_WAIT_H10` if logging should resume immediately in a new day/mode
 - `LOG_STOPPING -> SERVICE` if an explicit service request is pending
+- `LOG_STOPPING -> RECOVERY_HOLD` if the stop reason is a recoverable blocking fault
 - `LOG_STOPPING -> IDLE_WAITING_FOR_CHARGER` if uploads are queued but USB power is required before they may proceed
 - `LOG_STOPPING -> IDLE_UPLOAD_COMPLETE` if logging is stopped and no upload work remains
 
@@ -278,6 +320,7 @@ The mapping is:
 | Internal state | `mode` | `runtime_state` |
 |---|---|---|
 | `SERVICE` | `service` | `service` |
+| `RECOVERY_HOLD` | `recovery_hold` | `recovery_hold` |
 | `LOG_WAIT_H10` | `logging` | `log_wait_h10` |
 | `LOG_CONNECTING` | `logging` | `log_connecting` |
 | `LOG_SECURING` | `logging` | `log_securing` |
@@ -292,7 +335,9 @@ The mapping is:
 During `LOG_STOPPING`, `mode` MUST be reported as:
 
 - `logging` if the planned next state is `LOG_WAIT_H10`,
-- `upload` otherwise.
+- `upload` if the planned next state is upload-related,
+- `recovery_hold` if the planned next state is `RECOVERY_HOLD`,
+- `service` if the planned next state is `SERVICE`.
 
 ---
 
@@ -355,6 +400,9 @@ The runtime SHOULD implement these periodic jobs during active logging:
 | chunk seal timeout | `60 s` max open time |
 | status snapshot | `5 min` |
 | H10 battery read | `60 min` |
+
+Recovery-mode probe cadence and stability windows are defined in
+`logger_recovery_architecture_v1.md`.
 
 ### 5.2 H10 reconnect backoff
 
@@ -473,15 +521,15 @@ One blink cycle SHOULD repeat every 2 seconds while the fault remains latched.
 
 ### 7.3 Fault latching and clearing
 
-Faults remain latched until one of these occurs:
+Fault latching, precedence, validated auto-clear, and recovery FSM behavior are
+defined by `logger_recovery_architecture_v1.md`.
 
-- the underlying condition is resolved and the operator explicitly clears/acknowledges it,
-- a later fault supersedes it,
-- firmware policy explicitly downgrades it during validated recovery.
+The host CLI `fault clear` command remains a stable operator-facing
+acknowledge/clear path, but it is no longer the only expected path out of a
+recoverable latched fault.
 
-For v1 the stable operator-facing clear/ack path is the host CLI `fault clear` command.
-
-Clearing or acknowledging a fault MUST emit a system-log event.
+Clearing or acknowledging a fault, whether automatic or host-initiated, MUST emit
+a system-log event.
 
 ---
 
@@ -493,6 +541,7 @@ The exact file names are not normative, but a coding agent SHOULD decompose the 
 - `app_state.[ch]` — top-level persistent runtime state struct
 - `button.[ch]` — debouncing and gesture recognition
 - `faults.[ch]` — fault codes, latching, blink policy
+- `recovery.[ch]` — recovery reasons, timers, validation probes, and auto-clear policy
 - `clock.[ch]` — RTC + NTP + clock-validity handling
 - `battery.[ch]` — voltage thresholds and policy decisions
 - `storage.[ch]` — FAT mount, free-space reserve, pruning
@@ -518,7 +567,7 @@ On boot after watchdog reset or any unclean restart, the runtime SHOULD recover 
 3. inspect `live.json` if present,
 4. scan the active `journal.bin` to the last valid record,
 5. append recovery metadata later rather than rewriting durable bytes,
-6. decide whether to resume logging immediately or route into upload/service mode based on charger/time/provisioning rules.
+6. decide whether to resume logging immediately or route into upload/service/recovery-hold mode based on charger/time/provisioning rules.
 
 If a partially active session is recovered successfully and current policy still permits logging for that study day, subsequent data MUST continue in a new span with explicit recovery metadata.
 

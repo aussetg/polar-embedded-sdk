@@ -23,6 +23,19 @@ typedef enum {
   LOGGER_H10_PHASE_STREAMING,
 } logger_h10_phase_t;
 
+typedef enum {
+  LOGGER_H10_SECURITY_FAILURE_NONE = 0,
+  LOGGER_H10_SECURITY_FAILURE_PAIRING_FAILED,
+  LOGGER_H10_SECURITY_FAILURE_SECURE_TIMEOUT,
+  LOGGER_H10_SECURITY_FAILURE_PMD_AUTH,
+} logger_h10_security_failure_t;
+
+typedef enum {
+  LOGGER_H10_RECOVERY_EVENT_NONE = 0,
+  LOGGER_H10_RECOVERY_EVENT_BOND_AUTO_CLEARED,
+  LOGGER_H10_RECOVERY_EVENT_BOND_AUTO_REPAIRED,
+} logger_h10_recovery_event_t;
+
 typedef struct {
   uint16_t stream_kind;
   uint64_t mono_us;
@@ -43,6 +56,7 @@ typedef struct {
   bool scanning;
   bool connect_intent;
   bool connected;
+  bool disconnect_requested;
   bool encrypted;
   bool secure;
   bool bonded;
@@ -52,7 +66,11 @@ typedef struct {
   bool streaming;
   bool packet_overflow;
   bool seen_bound_device;
+  bool bond_repair_in_progress;
+  bool debug_stale_bond_injection_armed;
   logger_h10_phase_t phase;
+  logger_h10_security_failure_t last_security_failure;
+  logger_h10_recovery_event_t recovery_event;
   char bound_address[LOGGER_H10_ADDR_STR_LEN + 1];
   char connected_address[LOGGER_H10_ADDR_STR_LEN + 1];
   char last_seen_address[LOGGER_H10_ADDR_STR_LEN + 1];
@@ -67,11 +85,16 @@ typedef struct {
   uint16_t att_mtu;
   uint32_t last_seen_mono_ms;
   uint32_t next_retry_mono_ms;
+  uint32_t secure_deadline_mono_ms;
   uint32_t start_deadline_mono_ms;
   uint32_t last_battery_read_mono_ms;
+  uint32_t bond_clear_cooldown_until_mono_ms;
   uint32_t seen_count;
   uint32_t connect_count;
   uint32_t disconnect_count;
+  uint32_t security_failure_count;
+  uint32_t bond_auto_clear_count;
+  uint32_t bond_auto_repair_count;
   uint32_t battery_read_count;
   uint32_t ecg_start_attempt_count;
   uint32_t ecg_start_success_count;
@@ -98,7 +121,15 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms);
 bool logger_h10_pop_packet(logger_h10_state_t *state, logger_h10_packet_t *out);
 bool logger_h10_take_battery_event(logger_h10_state_t *state,
                                    logger_h10_battery_event_t *out);
+bool logger_h10_take_recovery_event(logger_h10_state_t *state,
+                                    logger_h10_recovery_event_t *out);
+bool logger_h10_debug_arm_stale_bond_injection(logger_h10_state_t *state,
+                                               uint32_t now_ms,
+                                               bool *restart_requested_out);
 
 const char *logger_h10_phase_name(logger_h10_phase_t phase);
+const char *
+logger_h10_security_failure_name(logger_h10_security_failure_t failure);
+const char *logger_h10_recovery_event_name(logger_h10_recovery_event_t event);
 
 #endif

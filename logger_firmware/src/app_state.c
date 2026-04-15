@@ -7,7 +7,16 @@ const char *logger_mode_name(const logger_app_state_t *state) {
   if (state->current_state == LOGGER_RUNTIME_SERVICE) {
     return "service";
   }
+  if (state->current_state == LOGGER_RUNTIME_RECOVERY_HOLD) {
+    return "recovery_hold";
+  }
   if (state->current_state == LOGGER_RUNTIME_LOG_STOPPING) {
+    if (state->planned_next_state == LOGGER_RUNTIME_SERVICE) {
+      return "service";
+    }
+    if (state->planned_next_state == LOGGER_RUNTIME_RECOVERY_HOLD) {
+      return "recovery_hold";
+    }
     return logger_runtime_state_is_logging(state->planned_next_state)
                ? "logging"
                : "upload";

@@ -14,6 +14,7 @@ Features:
 - deduplicates by ``(session_id, sha256)`` as required by the spec,
 - rejects same-session different-hash replays as ``validation_failed``,
 - optionally enforces ``x-api-key``, bearer token, and a minimum firmware version,
+- can derive the canonical upload ``subject_id`` from the configured bearer-token subject,
 - exposes small inspection endpoints for local testing.
 
 Useful endpoints:
@@ -83,6 +84,7 @@ class ServerConfig:
     max_body_bytes: int
     api_key: str | None
     bearer_token: str | None
+    token_subject_id: str | None
     min_firmware: str | None
 
 
@@ -319,11 +321,21 @@ def parse_args() -> ServerConfig:
         help="if set, require Authorization: Bearer <token>",
     )
     parser.add_argument(
+        "--subject-id",
+        default=None,
+        help="canonical subject_id to derive from the configured bearer token",
+    )
+    parser.add_argument(
         "--min-firmware",
         default=None,
         help="if set, reject firmware older than this version with HTTP 426",
     )
     args = parser.parse_args()
+
+    if args.subject_id is not None and args.bearer_token is None:
+        parser.error("--subject-id requires --bearer-token")
+    if args.bearer_token is not None and args.subject_id is None:
+        parser.error("--bearer-token requires --subject-id so upload subject_id can be derived from auth")
 
     path = args.path if args.path.startswith("/") else f"/{args.path}"
     return ServerConfig(
@@ -334,6 +346,7 @@ def parse_args() -> ServerConfig:
         max_body_bytes=args.max_body_bytes,
         api_key=args.api_key,
         bearer_token=args.bearer_token,
+        token_subject_id=args.subject_id,
         min_firmware=args.min_firmware,
     )
 
@@ -515,7 +528,6 @@ def validate_bundle(body: bytes, headers: Any, config: ServerConfig) -> Validate
     expected_session_id = require_header(headers, "X-Logger-Session-Id")
     expected_hardware_id = require_header(headers, "X-Logger-Hardware-Id")
     expected_logger_id = require_header(headers, "X-Logger-Logger-Id")
-    expected_subject_id = require_header(headers, "X-Logger-Subject-Id")
     expected_study_day = require_header(headers, "X-Logger-Study-Day")
     expected_sha256 = require_header(headers, "X-Logger-SHA256").lower()
     expected_tar_version = require_header(headers, "X-Logger-Tar-Canonicalization-Version")
@@ -788,7 +800,6 @@ def validate_bundle(body: bytes, headers: Any, config: ServerConfig) -> Validate
         "X-Logger-Session-Id": (expected_session_id, session_id),
         "X-Logger-Hardware-Id": (expected_hardware_id, hardware_id),
         "X-Logger-Logger-Id": (expected_logger_id, logger_id),
-        "X-Logger-Subject-Id": (expected_subject_id, subject_id),
         "X-Logger-Study-Day": (expected_study_day, study_day_local),
     }
     for header_name, (declared, actual) in header_checks.items():
@@ -799,6 +810,8 @@ def validate_bundle(body: bytes, headers: Any, config: ServerConfig) -> Validate
                 f"{header_name} does not match manifest.json",
                 retryable=False,
             )
+
+    derived_subject_id = config.token_subject_id if config.token_subject_id is not None else subject_id
 
     if config.min_firmware is not None:
         try:
@@ -821,7 +834,7 @@ def validate_bundle(body: bytes, headers: Any, config: ServerConfig) -> Validate
         session_id=session_id,
         study_day_local=study_day_local,
         logger_id=logger_id,
-        subject_id=subject_id,
+        subject_id=derived_subject_id,
         hardware_id=hardware_id,
         firmware_version=firmware_version,
         build_id=build_id,
@@ -1117,6 +1130,7 @@ def main() -> int:
     print(f"[logger-ref-server] data_dir={config.data_dir}")
     print(f"[logger-ref-server] api_key_required={config.api_key is not None}")
     print(f"[logger-ref-server] bearer_required={config.bearer_token is not None}")
+    print(f"[logger-ref-server] token_subject_id={config.token_subject_id!r}")
     print(f"[logger-ref-server] min_firmware={config.min_firmware}")
 
     try:

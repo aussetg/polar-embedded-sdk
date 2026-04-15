@@ -18,6 +18,7 @@ For the new custom logger firmware work, start here.
 - **Storage/upload/data contract:** [`logger_data_contract_v1.md`](./logger_data_contract_v1.md)
 - **Stable host/CLI JSON interfaces:** [`logger_host_interfaces_v1.md`](./logger_host_interfaces_v1.md)
 - **Runtime architecture and state machine:** [`logger_runtime_architecture_v1.md`](./logger_runtime_architecture_v1.md)
+- **Recovery architecture, fault FSMs, and service/unplug behavior:** [`logger_recovery_architecture_v1.md`](./logger_recovery_architecture_v1.md)
 - **Long-term update path (SD-assisted first, OTA later):** [`logger_update_architecture.md`](./logger_update_architecture.md)
 
 ## Older SDK/MicroPython design notes

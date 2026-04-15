@@ -1,12 +1,13 @@
 # Custom logger firmware v1 specification
 
 Status: Draft (implementation target)
-Last updated: 2026-03-29
+Last updated: 2026-04-14
 
 Related:
 - Data/storage/upload contract: [`logger_data_contract_v1.md`](./logger_data_contract_v1.md)
 - Stable host/CLI interfaces: [`logger_host_interfaces_v1.md`](./logger_host_interfaces_v1.md)
 - Runtime architecture and state machine: [`logger_runtime_architecture_v1.md`](./logger_runtime_architecture_v1.md)
+- Recovery architecture, fault FSMs, and service/unplug behavior: [`logger_recovery_architecture_v1.md`](./logger_recovery_architecture_v1.md)
 - Long-term update path: [`logger_update_architecture.md`](./logger_update_architecture.md)
 - RP2-2 hardware profile: [`../howto/rp2_2_prototype.md`](../howto/rp2_2_prototype.md)
 - BLE stability notes for Pico-class CYW43/RM2 targets: [`../howto/pico2w_ble_stability.md`](../howto/pico2w_ble_stability.md)
@@ -104,13 +105,13 @@ Normal unattended logging is allowed only when all of the following are configur
 
 Upload settings are **not** mandatory for local logging. Missing upload settings MUST be surfaced as a **warning state**, not as a blocker for local capture.
 
-If the device is partially provisioned, it MUST boot into **service/provisioning mode** instead of attempting unattended logging.
+If the device is partially provisioned, it MUST expose **service/provisioning mode** when USB/VBUS is present and MUST otherwise remain out of normal unattended logging until provisioning is complete.
 
 ---
 
 ## 6) Operating modes
 
-The logger has five top-level operating modes and one fault overlay.
+The logger has six top-level operating modes and one fault overlay.
 
 ### 6.1 Service / provisioning mode
 
@@ -136,7 +137,19 @@ Used for:
 - persisting chunked journal data,
 - recording markers, gaps, and status snapshots.
 
-### 6.3 Upload mode
+### 6.3 Recovery-hold mode
+
+Used when:
+
+- logging is intentionally stopped by a recoverable blocking condition,
+- the logger is autonomously waiting for that condition to clear,
+- the logger is periodically validating recovery without assuming a human is present.
+
+Recovery-hold mode is distinct from service/provisioning mode. It is the normal
+destination for recoverable unattended faults such as storage and battery
+blocking conditions.
+
+### 6.4 Upload mode
 
 Used for:
 
@@ -145,7 +158,7 @@ Used for:
 - uploading closed session bundles,
 - retrying pending uploads with backoff.
 
-### 6.4 Idle/waiting-for-charger mode
+### 6.5 Idle/waiting-for-charger mode
 
 Used when:
 
@@ -153,7 +166,7 @@ Used when:
 - uploads are queued,
 - the device is waiting for USB power before uploads may proceed.
 
-### 6.5 Idle/upload-complete mode
+### 6.6 Idle/upload-complete mode
 
 Used when:
 
@@ -161,11 +174,11 @@ Used when:
 - logging is stopped,
 - all pending uploads have completed or no upload can currently proceed.
 
-### 6.6 Fault overlay
+### 6.7 Fault overlay
 
-Faults are an overlay, not a separate top-level mode. A fault MAY coexist with service, idle, upload, or logging behavior depending on severity.
+Faults are an overlay, not a separate top-level mode. A fault MAY coexist with service, recovery-hold, idle, upload, or logging behavior depending on severity.
 
-Visible fault indication MUST be **latched** until cleared or acknowledged.
+Visible fault indication MUST be **latched** until cleared or acknowledged, including automatic validated clear performed by firmware recovery policy.
 
 ---
 
@@ -175,7 +188,7 @@ Visible fault indication MUST be **latched** until cleared or acknowledged.
 
 The device MUST enter service mode when any of the following are true:
 
-- provisioning is incomplete,
+- provisioning is incomplete and USB/VBUS is present,
 - the user forces service mode via button-hold at boot,
 - the device is otherwise directed into service mode by explicit recovery logic.
 
@@ -192,6 +205,11 @@ If the local-time decision cannot be evaluated because the wall clock is invalid
 ### 7.3 Unplug behavior
 
 If the device is in overnight upload/idle mode and USB power is removed, it MUST immediately transition back to normal logging mode, regardless of whether the local time is before 06:00.
+
+If the device is in service mode and USB/VBUS is removed, it MUST automatically
+leave service mode and reevaluate unattended policy. It MUST NOT remain in
+service mode solely because it was previously placed there by a human while USB
+power was present.
 
 ---
 
@@ -533,7 +551,10 @@ Quarantine reasons include, at minimum:
 
 Current fault code MUST survive reboot until cleared or acknowledged.
 
-In v1 the normal explicit clear/acknowledge path is the host CLI `fault clear` command.
+In v1 the normal explicit operator clear/acknowledge path is the host CLI `fault clear` command.
+
+However, recoverable faults MUST also be eligible for automatic validated clear
+by firmware policy as defined in [`logger_recovery_architecture_v1.md`](./logger_recovery_architecture_v1.md).
 
 The canonical latched fault code taxonomy and blink-code mapping are defined in [`logger_runtime_architecture_v1.md`](./logger_runtime_architecture_v1.md).
 
@@ -575,5 +596,7 @@ The firmware is not ready for study use until all of the following are true:
 11. The logger faults visibly on SD/storage conditions that would otherwise cause silent data loss.
 12. The host/CLI JSON interfaces are stable enough for repeatable tooling.
 13. Days with no successful PMD stream still appear in the internal system log as explicit missingness.
+14. Recoverable failed states clear automatically once validated recovery succeeds, without requiring operator babysitting.
+15. Removing USB/VBUS exits service mode automatically and returns the device to unattended policy evaluation.
 
 This document defines the firmware behavior. File formats, manifests, upload tar construction, and upload API details are defined in [`logger_data_contract_v1.md`](./logger_data_contract_v1.md).

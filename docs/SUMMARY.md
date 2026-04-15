@@ -45,6 +45,7 @@
   - [Logger data contract v1](specs/logger_data_contract_v1.md)
   - [Logger host interfaces v1](specs/logger_host_interfaces_v1.md)
   - [Logger runtime architecture v1](specs/logger_runtime_architecture_v1.md)
+  - [Logger recovery architecture v1](specs/logger_recovery_architecture_v1.md)
   - [Logger update architecture](specs/logger_update_architecture.md)
   - [MicroPython Polar SDK driver](specs/micropython_polar_sdk_driver.md)
   - [Polar SDK API design](specs/polar_sdk_api_design.md)

@@ -944,6 +944,15 @@ static void logger_config_import_transfer_reset(logger_service_cli_t *cli) {
   cli->config_import_buf[0] = '\0';
 }
 
+void logger_service_cli_abort_mutable_session(logger_service_cli_t *cli) {
+  if (cli == NULL) {
+    return;
+  }
+  cli->unlocked = false;
+  cli->unlock_deadline_mono_ms = 0u;
+  logger_config_import_transfer_reset(cli);
+}
+
 static bool
 logger_require_config_import_context(const logger_service_cli_t *cli,
                                      const logger_app_t *app,
@@ -1018,12 +1027,6 @@ static bool logger_cli_fault_condition_still_present(const logger_app_t *app) {
 
 static void logger_write_storage_card_identity(jsw *w,
                                                const logger_app_t *app) {
-  if (!logger_string_present(app->storage.manufacturer_id)) {
-    fputs("null", w->stream);
-    w->needs_comma = true;
-    return;
-  }
-  logger_json_stream_writer_object_begin(w);
   logger_json_stream_writer_field_string_or_null(w, "manufacturer_id",
                                                  app->storage.manufacturer_id);
   logger_json_stream_writer_field_string_or_null(w, "oem_id",
@@ -1034,11 +1037,37 @@ static void logger_write_storage_card_identity(jsw *w,
                                                  app->storage.revision);
   logger_json_stream_writer_field_string_or_null(w, "serial_number",
                                                  app->storage.serial_number);
-  logger_json_stream_writer_object_end(w);
+}
+
+static const char *
+logger_recovery_resume_mode_name(logger_runtime_state_t state) {
+  if (state == LOGGER_RUNTIME_BOOT) {
+    return NULL;
+  }
+  if (state == LOGGER_RUNTIME_SERVICE) {
+    return "service";
+  }
+  if (state == LOGGER_RUNTIME_RECOVERY_HOLD) {
+    return "recovery_hold";
+  }
+  if (logger_runtime_state_is_logging(state)) {
+    return "logging";
+  }
+  if (logger_runtime_state_is_upload(state)) {
+    return "upload";
+  }
+  if (state == LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER) {
+    return "idle_waiting_for_charger";
+  }
+  if (state == LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE) {
+    return "idle_upload_complete";
+  }
+  return NULL;
 }
 
 static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   char study_day_local[11] = {0};
+  const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
   logger_upload_queue_t queue;
   logger_upload_queue_summary_t queue_summary;
   logger_upload_queue_init(&queue);
@@ -1093,6 +1122,35 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
       logger_fault_code_name(app->persisted.last_cleared_fault_code));
   logger_json_stream_writer_object_end(w);
 
+  logger_json_stream_writer_field_object_begin(w, "recovery");
+  logger_json_stream_writer_field_bool(
+      w, "active", app->runtime.current_state == LOGGER_RUNTIME_RECOVERY_HOLD);
+  logger_json_stream_writer_field_string_or_null(
+      w, "reason", logger_recovery_reason_name(app->recovery_reason));
+  logger_json_stream_writer_field_uint32(w, "attempt_count",
+                                         app->recovery_attempt_count);
+  if (app->recovery_reason == LOGGER_RECOVERY_NONE) {
+    logger_json_stream_writer_field_null(w, "next_attempt_ms");
+  } else if (app->recovery_next_attempt_mono_ms == 0u ||
+             now_ms >= app->recovery_next_attempt_mono_ms) {
+    logger_json_stream_writer_field_uint32(w, "next_attempt_ms", 0u);
+  } else {
+    logger_json_stream_writer_field_uint32(
+        w, "next_attempt_ms", app->recovery_next_attempt_mono_ms - now_ms);
+  }
+  logger_json_stream_writer_field_string_or_null(
+      w, "resume_mode",
+      logger_recovery_resume_mode_name(app->recovery_resume_state));
+  logger_json_stream_writer_field_bool(w, "service_pinned_by_user",
+                                       app->service_pinned_by_user);
+  logger_json_stream_writer_field_string_or_null(
+      w, "last_action",
+      app->recovery_last_action[0] != '\0' ? app->recovery_last_action : NULL);
+  logger_json_stream_writer_field_string_or_null(
+      w, "last_result",
+      app->recovery_last_result[0] != '\0' ? app->recovery_last_result : NULL);
+  logger_json_stream_writer_object_end(w);
+
   logger_json_stream_writer_field_object_begin(w, "battery");
   logger_json_stream_writer_field_uint32(w, "voltage_mv",
                                          app->battery.voltage_mv);
@@ -1123,9 +1181,13 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   }
   logger_json_stream_writer_field_uint32(w, "reserve_bytes",
                                          LOGGER_SD_MIN_FREE_RESERVE_BYTES);
-  logger_json_stream_writer_field_object_begin(w, "card_identity");
-  logger_write_storage_card_identity(w, app);
-  logger_json_stream_writer_object_end(w);
+  if (!logger_string_present(app->storage.manufacturer_id)) {
+    logger_json_stream_writer_field_null(w, "card_identity");
+  } else {
+    logger_json_stream_writer_field_object_begin(w, "card_identity");
+    logger_write_storage_card_identity(w, app);
+    logger_json_stream_writer_object_end(w);
+  }
   logger_json_stream_writer_object_end(w);
 
   logger_json_stream_writer_field_object_begin(w, "h10");
@@ -1149,6 +1211,21 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   logger_json_stream_writer_field_uint32(w, "att_mtu", app->h10.att_mtu);
   logger_json_stream_writer_field_uint32(w, "encryption_key_size",
                                          app->h10.encryption_key_size);
+  logger_json_stream_writer_field_string_or_null(
+      w, "last_security_failure",
+      logger_h10_security_failure_name(app->h10.last_security_failure));
+  logger_json_stream_writer_field_uint32(w, "security_failures",
+                                         app->h10.security_failure_count);
+  logger_json_stream_writer_field_bool(w, "bond_repair_in_progress",
+                                       app->h10.bond_repair_in_progress);
+  logger_json_stream_writer_field_uint32(w, "bond_auto_clears",
+                                         app->h10.bond_auto_clear_count);
+  logger_json_stream_writer_field_uint32(w, "bond_auto_repairs",
+                                         app->h10.bond_auto_repair_count);
+  logger_json_stream_writer_field_uint32(w, "last_pairing_status",
+                                         app->h10.last_pairing_status);
+  logger_json_stream_writer_field_uint32(w, "last_pairing_reason",
+                                         app->h10.last_pairing_reason);
   logger_json_stream_writer_field_uint32(
       w, "ecg_start_attempts", (uint32_t)app->h10.ecg_start_attempt_count);
   logger_json_stream_writer_field_uint32(
@@ -2574,6 +2651,40 @@ logger_handle_debug_synth_disconnect(const logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+static void logger_handle_debug_h10_inject_stale_bond(logger_service_cli_t *cli,
+                                                      logger_app_t *app,
+                                                      uint32_t now_ms) {
+  (void)cli;
+  if (!logger_cli_is_logging_mode(app) ||
+      app->runtime.current_state == LOGGER_RUNTIME_LOG_STOPPING) {
+    jsw w;
+    jsw_err(&w, "debug h10 inject-stale-bond",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "debug h10 inject-stale-bond is only allowed while logging");
+    return;
+  }
+
+  bool restart_requested = false;
+  if (!logger_h10_debug_arm_stale_bond_injection(&app->h10, now_ms,
+                                                 &restart_requested)) {
+    jsw w;
+    jsw_err(&w, "debug h10 inject-stale-bond",
+            logger_clock_now_utc_or_null(&app->clock), "not_permitted_in_mode",
+            "H10 stale-bond injection requires an active logging target");
+    return;
+  }
+
+  jsw w;
+  jsw_ok(&w, "debug h10 inject-stale-bond",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "armed", true);
+  logger_json_stream_writer_field_bool(&w, "restart_requested",
+                                       restart_requested);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "phase", logger_h10_phase_name(app->h10.phase));
+  jsw_end(&w);
+}
+
 static void
 logger_handle_debug_synth_h10_battery(const logger_service_cli_t *cli,
                                       logger_app_t *app, const char *args,
@@ -3410,6 +3521,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strcmp(line, "debug synth disconnect") == 0) {
     logger_handle_debug_synth_disconnect(cli, app, now_ms);
+    return;
+  }
+  if (strcmp(line, "debug h10 inject-stale-bond") == 0) {
+    logger_handle_debug_h10_inject_stale_bond(cli, app, now_ms);
     return;
   }
   if (strncmp(line, "debug synth h10-battery ", 24) == 0) {

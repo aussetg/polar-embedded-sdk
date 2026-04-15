@@ -94,6 +94,7 @@ class RefServerConfig:
     data_dir: Path
     api_key: str | None
     bearer_token: str | None
+    token_subject_id: str | None
     min_firmware: str | None
     origin_upload_url: str | None = None
     bind_host: str = "0.0.0.0"
@@ -259,6 +260,8 @@ class RefServerProcess:
             cmd.extend(["--api-key", self.config.api_key])
         if self.config.bearer_token is not None:
             cmd.extend(["--bearer-token", self.config.bearer_token])
+        if self.config.token_subject_id is not None:
+            cmd.extend(["--subject-id", self.config.token_subject_id])
         if self.config.min_firmware is not None:
             cmd.extend(["--min-firmware", self.config.min_firmware])
 
@@ -1676,6 +1679,7 @@ def run_https_trust_scenario(
                         data_dir=ref_server_data_dir,
                         api_key=upload_api_key,
                         bearer_token=upload_token,
+                        token_subject_id=subject_id,
                         min_firmware=None,
                         origin_upload_url=ref_server_origin_url,
                     )
@@ -1983,6 +1987,7 @@ def run_firmware_change_requeue_scenario(
                         data_dir=ref_server_data_dir,
                         api_key=upload_api_key,
                         bearer_token=upload_token,
+                        token_subject_id=subject_id,
                         min_firmware=None,
                     )
                 )
@@ -2209,6 +2214,7 @@ def run_retention_prune_scenario(
                         data_dir=ref_server_data_dir,
                         api_key=upload_api_key,
                         bearer_token=upload_token,
+                        token_subject_id=subject_id,
                         min_firmware=None,
                     )
                 )
@@ -2495,6 +2501,7 @@ def run_scenario(
                         data_dir=ref_server_data_dir,
                         api_key=upload_api_key,
                         bearer_token=upload_token,
+                        token_subject_id=subject_id,
                         min_firmware=ref_server_min_firmware,
                     )
                 )
@@ -2567,6 +2574,7 @@ def run_interrupted_upload_reboot_scenario(
                         data_dir=ref_server_data_dir,
                         api_key=upload_api_key,
                         bearer_token=upload_token,
+                        token_subject_id=subject_id,
                         min_firmware=ref_server_min_firmware,
                     )
                 )

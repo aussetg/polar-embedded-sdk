@@ -138,7 +138,7 @@ For v1 the recommended generation rule is UUIDv4-quality randomness or an equiva
 |---|---|
 | `hardware_id` | immutable device-derived identifier |
 | `logger_id` | configured logical logger identifier |
-| `subject_id` | configured subject identifier |
+| `subject_id` | configured subject metadata identifier |
 | `bound_h10_address` | configured H10 BLE address in canonical `AA:BB:CC:DD:EE:FF` form |
 | `study_day_local` | local study-day label in `YYYY-MM-DD` form using the 04:00 rollover rule |
 | `firmware_version` | semantic firmware version string |
@@ -538,6 +538,8 @@ The manifest MUST contain at least:
 - `files`
 - `upload_bundle`
 
+`subject_id` remains part of the immutable session artifact for study metadata and offline analysis. Upload servers MUST treat manifest `subject_id` as metadata only and MUST derive the authenticated upload subject from the bearer token instead.
+
 ### 7.3 Required nested sections
 
 #### `session`
@@ -842,7 +844,6 @@ Required headers:
 - `X-Logger-Session-Id: <session_id>`
 - `X-Logger-Hardware-Id: <hardware_id>`
 - `X-Logger-Logger-Id: <logger_id>`
-- `X-Logger-Subject-Id: <subject_id>`
 - `X-Logger-Study-Day: <study_day_local>`
 - `X-Logger-SHA256: <bundle sha256>`
 - `X-Logger-Tar-Canonicalization-Version: 1`
@@ -852,6 +853,8 @@ If configured, the request also includes:
 
 - `x-api-key: <api_key>`
 - `Authorization: Bearer <token>`
+
+The server MUST derive the canonical upload `subject_id` from the authenticated bearer token. If a client also sends `X-Logger-Subject-Id`, the server MUST treat it as untrusted metadata and MUST NOT use it as an authorization input.
 
 ### 11.2 Success semantics
 

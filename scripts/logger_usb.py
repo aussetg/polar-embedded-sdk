@@ -107,7 +107,17 @@ class SerialJsonClient:
 
     def write_line(self, line: str) -> None:
         assert self.fd is not None
-        os.write(self.fd, (line + "\n").encode("utf-8"))
+        data = (line + "\n").encode("utf-8")
+        offset = 0
+        while offset < len(data):
+            try:
+                written = os.write(self.fd, data[offset:])
+            except BlockingIOError:
+                select.select([], [self.fd], [], 0.1)
+                continue
+            if written <= 0:
+                raise LoggerUsbError("short write to logger USB serial port")
+            offset += written
 
     def read_json(self, expected_command: str, *, timeout_s: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         assert self.fd is not None
@@ -123,7 +133,10 @@ class SerialJsonClient:
             ready, _, _ = select.select([self.fd], [], [], 0.1)
             if not ready:
                 continue
-            data = os.read(self.fd, 4096)
+            try:
+                data = os.read(self.fd, 4096)
+            except BlockingIOError:
+                continue
             if not data:
                 continue
             text = data.decode("utf-8", errors="replace")

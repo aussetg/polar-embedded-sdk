@@ -7,6 +7,7 @@
 typedef enum {
   LOGGER_RUNTIME_BOOT = 0,
   LOGGER_RUNTIME_SERVICE,
+  LOGGER_RUNTIME_RECOVERY_HOLD,
   LOGGER_RUNTIME_LOG_WAIT_H10,
   LOGGER_RUNTIME_LOG_CONNECTING,
   LOGGER_RUNTIME_LOG_SECURING,
@@ -39,6 +40,8 @@ logger_runtime_state_name(logger_runtime_state_t state) {
     return "boot";
   case LOGGER_RUNTIME_SERVICE:
     return "service";
+  case LOGGER_RUNTIME_RECOVERY_HOLD:
+    return "recovery_hold";
   case LOGGER_RUNTIME_LOG_WAIT_H10:
     return "log_wait_h10";
   case LOGGER_RUNTIME_LOG_CONNECTING:
@@ -76,6 +79,7 @@ logger_runtime_state_is_logging(logger_runtime_state_t state) {
     return true;
   case LOGGER_RUNTIME_BOOT:
   case LOGGER_RUNTIME_SERVICE:
+  case LOGGER_RUNTIME_RECOVERY_HOLD:
   case LOGGER_RUNTIME_UPLOAD_PREP:
   case LOGGER_RUNTIME_UPLOAD_RUNNING:
   case LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER:

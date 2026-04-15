@@ -42,6 +42,9 @@
 #define LOGGER_H10_ACC_RESOLUTION 16u
 #define LOGGER_H10_ACC_RANGE 8u
 #define LOGGER_H10_STREAM_START_TIMEOUT_MS 5000u
+#define LOGGER_H10_SECURING_TIMEOUT_MS 12000u
+#define LOGGER_H10_SECURITY_FAILURE_THRESHOLD 3u
+#define LOGGER_H10_BOND_AUTO_CLEAR_COOLDOWN_MS 60000u
 #define LOGGER_H10_BATTERY_PERIOD_MS 3600000u
 
 #define LOGGER_H10_BATTERY_REASON_NONE 0u
@@ -116,6 +119,10 @@ static uint8_t g_battery_pending_reason = LOGGER_H10_BATTERY_REASON_NONE;
 static void logger_h10_gatt_packet_handler(uint8_t packet_type,
                                            uint16_t channel, uint8_t *packet,
                                            uint16_t size);
+static void logger_h10_schedule_retry(logger_h10_state_t *state,
+                                      uint32_t now_ms);
+static void logger_h10_stop_scan(logger_h10_state_t *state);
+static void logger_h10_disconnect_for_restart(logger_h10_state_t *state);
 
 const char *logger_h10_phase_name(logger_h10_phase_t phase) {
   switch (phase) {
@@ -136,6 +143,151 @@ const char *logger_h10_phase_name(logger_h10_phase_t phase) {
   default:
     return "unknown";
   }
+}
+
+const char *
+logger_h10_security_failure_name(logger_h10_security_failure_t failure) {
+  switch (failure) {
+  case LOGGER_H10_SECURITY_FAILURE_PAIRING_FAILED:
+    return "pairing_failed";
+  case LOGGER_H10_SECURITY_FAILURE_SECURE_TIMEOUT:
+    return "secure_timeout";
+  case LOGGER_H10_SECURITY_FAILURE_PMD_AUTH:
+    return "pmd_auth";
+  case LOGGER_H10_SECURITY_FAILURE_NONE:
+  default:
+    return NULL;
+  }
+}
+
+const char *logger_h10_recovery_event_name(logger_h10_recovery_event_t event) {
+  switch (event) {
+  case LOGGER_H10_RECOVERY_EVENT_BOND_AUTO_CLEARED:
+    return "bond_auto_cleared";
+  case LOGGER_H10_RECOVERY_EVENT_BOND_AUTO_REPAIRED:
+    return "bond_auto_repaired";
+  case LOGGER_H10_RECOVERY_EVENT_NONE:
+  default:
+    return NULL;
+  }
+}
+
+static bool logger_h10_deadline_reached(uint32_t now_ms, uint32_t deadline_ms) {
+  return deadline_ms != 0u && (int32_t)(now_ms - deadline_ms) >= 0;
+}
+
+static void logger_h10_emit_recovery_event(logger_h10_state_t *state,
+                                           logger_h10_recovery_event_t event) {
+  if (state == NULL || event == LOGGER_H10_RECOVERY_EVENT_NONE) {
+    return;
+  }
+  state->recovery_event = event;
+}
+
+static void
+logger_h10_reset_security_failure_counters(logger_h10_state_t *state) {
+  if (state == NULL) {
+    return;
+  }
+  state->security_failure_count = 0u;
+  state->secure_deadline_mono_ms = 0u;
+}
+
+static void
+logger_h10_reset_security_recovery_cycle(logger_h10_state_t *state) {
+  if (state == NULL) {
+    return;
+  }
+  logger_h10_reset_security_failure_counters(state);
+  state->last_security_failure = LOGGER_H10_SECURITY_FAILURE_NONE;
+  state->bond_clear_cooldown_until_mono_ms = 0u;
+  state->bond_repair_in_progress = false;
+}
+
+static bool logger_h10_maybe_auto_clear_bond(logger_h10_state_t *state,
+                                             uint32_t now_ms) {
+  if (state == NULL ||
+      state->security_failure_count < LOGGER_H10_SECURITY_FAILURE_THRESHOLD) {
+    return false;
+  }
+  if (state->bond_clear_cooldown_until_mono_ms != 0u &&
+      !logger_h10_deadline_reached(now_ms,
+                                   state->bond_clear_cooldown_until_mono_ms)) {
+    return false;
+  }
+  if (g_peer_addr_type == BD_ADDR_TYPE_UNKNOWN) {
+    return false;
+  }
+
+  gap_delete_bonding(g_peer_addr_type, g_peer_addr);
+  state->bonded = false;
+  state->bond_repair_in_progress = true;
+  state->bond_auto_clear_count += 1u;
+  state->bond_clear_cooldown_until_mono_ms =
+      now_ms + LOGGER_H10_BOND_AUTO_CLEAR_COOLDOWN_MS;
+  logger_h10_reset_security_failure_counters(state);
+  logger_h10_emit_recovery_event(state,
+                                 LOGGER_H10_RECOVERY_EVENT_BOND_AUTO_CLEARED);
+  printf("[logger] h10 auto-cleared bond for %s\n",
+         state->connected_address[0] != '\0' ? state->connected_address
+                                             : bd_addr_to_str(g_peer_addr));
+  return true;
+}
+
+static void
+logger_h10_note_security_failure(logger_h10_state_t *state,
+                                 logger_h10_security_failure_t failure,
+                                 uint32_t now_ms) {
+  if (state == NULL || failure == LOGGER_H10_SECURITY_FAILURE_NONE ||
+      state->disconnect_requested) {
+    return;
+  }
+
+  state->last_security_failure = failure;
+  if (state->security_failure_count < UINT32_MAX) {
+    state->security_failure_count += 1u;
+  }
+  printf("[logger] h10 security failure kind=%s count=%lu\n",
+         logger_h10_security_failure_name(failure),
+         (unsigned long)state->security_failure_count);
+  (void)logger_h10_maybe_auto_clear_bond(state, now_ms);
+}
+
+static void logger_h10_note_secure_start_success(logger_h10_state_t *state) {
+  if (state == NULL) {
+    return;
+  }
+
+  logger_h10_reset_security_failure_counters(state);
+  state->last_security_failure = LOGGER_H10_SECURITY_FAILURE_NONE;
+  if (!state->bond_repair_in_progress) {
+    return;
+  }
+
+  state->bond_repair_in_progress = false;
+  state->bond_auto_repair_count += 1u;
+  logger_h10_emit_recovery_event(state,
+                                 LOGGER_H10_RECOVERY_EVENT_BOND_AUTO_REPAIRED);
+  printf("[logger] h10 auto-repaired bond for %s\n",
+         state->connected_address[0] != '\0' ? state->connected_address
+                                             : state->bound_address);
+}
+
+static bool logger_h10_force_stale_bond_injection(logger_h10_state_t *state,
+                                                  uint32_t now_ms) {
+  if (state == NULL || !state->connected || state->disconnect_requested ||
+      g_conn_handle == HCI_CON_HANDLE_INVALID ||
+      g_peer_addr_type == BD_ADDR_TYPE_UNKNOWN) {
+    return false;
+  }
+
+  state->debug_stale_bond_injection_armed = false;
+  state->bond_clear_cooldown_until_mono_ms = 0u;
+  state->security_failure_count = LOGGER_H10_SECURITY_FAILURE_THRESHOLD - 1u;
+  logger_h10_note_security_failure(
+      state, LOGGER_H10_SECURITY_FAILURE_SECURE_TIMEOUT, now_ms);
+  logger_h10_disconnect_for_restart(state);
+  return true;
 }
 
 static void logger_h10_reset_packet_queue(logger_h10_state_t *state) {
@@ -210,10 +362,12 @@ static void logger_h10_clear_link_state(logger_h10_state_t *state) {
   state->scanning = false;
   state->connect_intent = false;
   state->connected = false;
+  state->disconnect_requested = false;
   state->encrypted = false;
   state->secure = false;
   state->pairing_requested = false;
   state->encryption_key_size = 0u;
+  state->secure_deadline_mono_ms = 0u;
   state->connected_address[0] = '\0';
   g_conn_handle = HCI_CON_HANDLE_INVALID;
   g_peer_addr_type = BD_ADDR_TYPE_UNKNOWN;
@@ -257,6 +411,10 @@ static void logger_h10_disconnect_for_restart(logger_h10_state_t *state) {
   state->start_in_progress = false;
   state->start_deadline_mono_ms = 0u;
   if (state->connected && g_conn_handle != HCI_CON_HANDLE_INVALID) {
+    if (state->disconnect_requested) {
+      return;
+    }
+    state->disconnect_requested = true;
     (void)gap_disconnect(g_conn_handle);
     return;
   }
@@ -321,6 +479,52 @@ bool logger_h10_take_battery_event(logger_h10_state_t *state,
           : "periodic";
   state->battery_event_pending = false;
   state->battery_event_reason = LOGGER_H10_BATTERY_REASON_NONE;
+  return true;
+}
+
+bool logger_h10_take_recovery_event(logger_h10_state_t *state,
+                                    logger_h10_recovery_event_t *out) {
+  if (state == NULL || out == NULL ||
+      state->recovery_event == LOGGER_H10_RECOVERY_EVENT_NONE) {
+    return false;
+  }
+
+  *out = state->recovery_event;
+  state->recovery_event = LOGGER_H10_RECOVERY_EVENT_NONE;
+  return true;
+}
+
+bool logger_h10_debug_arm_stale_bond_injection(logger_h10_state_t *state,
+                                               uint32_t now_ms,
+                                               bool *restart_requested_out) {
+  if (restart_requested_out != NULL) {
+    *restart_requested_out = false;
+  }
+  if (state == NULL || !state->enabled || !state->target_address_valid) {
+    return false;
+  }
+
+  state->debug_stale_bond_injection_armed = true;
+
+  if (state->scanning) {
+    logger_h10_stop_scan(state);
+  }
+  if (state->connect_intent) {
+    state->connect_intent = false;
+  }
+  if (state->connected) {
+    logger_h10_disconnect_for_restart(state);
+    if (restart_requested_out != NULL) {
+      *restart_requested_out = true;
+    }
+    return true;
+  }
+  if (state->controller_ready) {
+    logger_h10_schedule_retry(state, now_ms);
+    if (restart_requested_out != NULL) {
+      *restart_requested_out = true;
+    }
+  }
   return true;
 }
 
@@ -838,6 +1042,17 @@ static bool logger_h10_start_measurement(logger_h10_state_t *state,
   }
 
   if (result != POLAR_SDK_PMD_START_RESULT_OK) {
+    if (result == POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT ||
+        (result == POLAR_SDK_PMD_START_RESULT_CCC_REJECTED &&
+         polar_sdk_pmd_att_status_requires_security(
+             state->last_gatt_att_status))) {
+      logger_h10_note_security_failure(
+          state,
+          result == POLAR_SDK_PMD_START_RESULT_SECURITY_TIMEOUT
+              ? LOGGER_H10_SECURITY_FAILURE_SECURE_TIMEOUT
+              : LOGGER_H10_SECURITY_FAILURE_PMD_AUTH,
+          btstack_run_loop_get_time_ms());
+    }
     printf("[logger] h10 %s start failed result=%d att=0x%02x resp=0x%02x\n",
            is_acc ? "acc" : "ecg", (int)result,
            (unsigned)state->last_gatt_att_status,
@@ -877,6 +1092,7 @@ static bool logger_h10_start_streams(logger_h10_state_t *state,
 
   state->start_succeeded = true;
   state->start_deadline_mono_ms = now_ms + LOGGER_H10_STREAM_START_TIMEOUT_MS;
+  logger_h10_note_secure_start_success(state);
   logger_h10_set_phase(state, LOGGER_H10_PHASE_STARTING);
   printf("[logger] h10 ecg+acc start ok mtu=%u\n", (unsigned)state->att_mtu);
   return true;
@@ -886,6 +1102,7 @@ static void logger_h10_on_connected_ready(void *ctx,
                                           const polar_sdk_link_event_t *event) {
   logger_h10_state_t *state = (logger_h10_state_t *)ctx;
   state->connected = true;
+  state->disconnect_requested = false;
   state->connect_intent = false;
   state->scanning = false;
   state->connect_count += 1u;
@@ -898,6 +1115,8 @@ static void logger_h10_on_connected_ready(void *ctx,
   }
   logger_h10_reset_pmd_state(state);
   state->battery_read_due_connect = true;
+  state->secure_deadline_mono_ms =
+      btstack_run_loop_get_time_ms() + LOGGER_H10_SECURING_TIMEOUT_MS;
   logger_h10_set_phase(state, LOGGER_H10_PHASE_SECURING);
 }
 
@@ -1034,7 +1253,12 @@ logger_h10_dispatch_on_sm_event(void *ctx,
     state->last_pairing_reason = sm_event->reason;
     if (sm_event->status == ERROR_CODE_SUCCESS) {
       state->bonded = true;
+      return;
     }
+    logger_h10_note_security_failure(state,
+                                     LOGGER_H10_SECURITY_FAILURE_PAIRING_FAILED,
+                                     btstack_run_loop_get_time_ms());
+    logger_h10_disconnect_for_restart(state);
   }
 }
 
@@ -1051,7 +1275,7 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
       .ctx = g_h10,
       .on_adv_report = logger_h10_dispatch_on_adv_report,
       .on_link_event = logger_h10_dispatch_on_link_event,
-      .on_sm_event = logger_h10_dispatch_on_sm_event,
+      .on_sm_event = NULL,
   };
   if (polar_sdk_btstack_dispatch_event(packet_type, packet, &dispatch_ops)) {
     return;
@@ -1081,6 +1305,9 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
     g_h10->encrypted = encrypted;
     logger_h10_refresh_link_security_state(g_h10);
     g_h10->bonded = g_h10->bonded || g_h10->secure;
+    if (g_h10->secure) {
+      g_h10->secure_deadline_mono_ms = 0u;
+    }
     logger_h10_set_phase(g_h10, g_h10->secure ? LOGGER_H10_PHASE_STARTING
                                               : LOGGER_H10_PHASE_SECURING);
     break;
@@ -1096,6 +1323,9 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
     g_h10->encrypted = encrypted;
     logger_h10_refresh_link_security_state(g_h10);
     g_h10->bonded = g_h10->bonded || g_h10->secure;
+    if (g_h10->secure) {
+      g_h10->secure_deadline_mono_ms = 0u;
+    }
     logger_h10_set_phase(g_h10, g_h10->secure ? LOGGER_H10_PHASE_STARTING
                                               : LOGGER_H10_PHASE_SECURING);
     break;
@@ -1356,6 +1586,7 @@ void logger_h10_set_enabled(logger_h10_state_t *state, bool enabled) {
     state->last_pairing_reason = 0u;
     state->last_disconnect_reason = 0u;
     state->next_retry_mono_ms = 0u;
+    logger_h10_reset_security_recovery_cycle(state);
     logger_h10_clear_link_state(state);
     logger_h10_set_phase(state, LOGGER_H10_PHASE_WAITING);
     hci_power_control(HCI_POWER_ON);
@@ -1379,7 +1610,16 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
   }
 
   if (state->connected) {
+    if (state->disconnect_requested) {
+      return;
+    }
     logger_h10_refresh_link_security_state(state);
+
+    if (state->debug_stale_bond_injection_armed && !state->secure) {
+      if (logger_h10_force_stale_bond_injection(state, now_ms)) {
+        return;
+      }
+    }
 
     if (state->streaming) {
       logger_h10_maybe_schedule_battery_read(state, now_ms);
@@ -1389,6 +1629,16 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
 
     if (!state->secure) {
       logger_h10_set_phase(state, LOGGER_H10_PHASE_SECURING);
+      if (state->secure_deadline_mono_ms == 0u) {
+        state->secure_deadline_mono_ms =
+            now_ms + LOGGER_H10_SECURING_TIMEOUT_MS;
+      }
+      if (logger_h10_deadline_reached(now_ms, state->secure_deadline_mono_ms)) {
+        logger_h10_note_security_failure(
+            state, LOGGER_H10_SECURITY_FAILURE_SECURE_TIMEOUT, now_ms);
+        logger_h10_disconnect_for_restart(state);
+        return;
+      }
       if (!state->pairing_requested &&
           g_conn_handle != HCI_CON_HANDLE_INVALID) {
         polar_sdk_btstack_security_request_pairing(g_conn_handle,
@@ -1397,6 +1647,8 @@ void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
       }
       return;
     }
+
+    state->secure_deadline_mono_ms = 0u;
 
     logger_h10_set_phase(state, LOGGER_H10_PHASE_STARTING);
     if (g_service_query_active || g_char_query_active ||

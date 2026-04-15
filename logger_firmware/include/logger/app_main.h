@@ -2,6 +2,7 @@
 #define LOGGER_FIRMWARE_APP_MAIN_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "logger/app_state.h"
@@ -17,8 +18,40 @@
 #include "logger/storage.h"
 #include "logger/system_log.h"
 
+typedef enum {
+  LOGGER_RECOVERY_NONE = 0,
+  LOGGER_RECOVERY_CONFIG_INCOMPLETE,
+  LOGGER_RECOVERY_LOW_BATTERY_BLOCKED_START,
+  LOGGER_RECOVERY_CRITICAL_LOW_BATTERY_STOPPED,
+  LOGGER_RECOVERY_SD_MISSING_OR_UNWRITABLE,
+  LOGGER_RECOVERY_SD_LOW_SPACE_RESERVE_UNMET,
+  LOGGER_RECOVERY_SD_WRITE_FAILED,
+} logger_recovery_reason_t;
+
+static inline const char *
+logger_recovery_reason_name(logger_recovery_reason_t reason) {
+  switch (reason) {
+  case LOGGER_RECOVERY_CONFIG_INCOMPLETE:
+    return "config_incomplete";
+  case LOGGER_RECOVERY_LOW_BATTERY_BLOCKED_START:
+    return "low_battery_blocked_start";
+  case LOGGER_RECOVERY_CRITICAL_LOW_BATTERY_STOPPED:
+    return "critical_low_battery_stopped";
+  case LOGGER_RECOVERY_SD_MISSING_OR_UNWRITABLE:
+    return "sd_missing_or_unwritable";
+  case LOGGER_RECOVERY_SD_LOW_SPACE_RESERVE_UNMET:
+    return "sd_low_space_reserve_unmet";
+  case LOGGER_RECOVERY_SD_WRITE_FAILED:
+    return "sd_write_failed";
+  case LOGGER_RECOVERY_NONE:
+  default:
+    return NULL;
+  }
+}
+
 typedef struct logger_app {
   logger_app_state_t runtime;
+  logger_recovery_reason_t recovery_reason;
   logger_boot_gesture_t boot_gesture;
   logger_button_t button;
   logger_battery_status_t battery;
@@ -35,6 +68,8 @@ typedef struct logger_app {
   char last_day_outcome_study_day_local[11];
   char last_day_outcome_kind[16];
   char last_day_outcome_reason[32];
+  char recovery_last_action[32];
+  char recovery_last_result[32];
   char next_span_start_reason[32];
   char stopping_end_reason[32];
   uint32_t last_observation_mono_ms;
@@ -43,8 +78,15 @@ typedef struct logger_app {
   uint32_t day_seen_baseline;
   uint32_t day_connect_baseline;
   uint32_t day_ecg_start_baseline;
+  uint32_t clock_valid_since_mono_ms;
   uint32_t last_clock_observation_mono_ms;
   uint32_t last_queue_maintenance_mono_ms;
+  uint32_t recovery_next_attempt_mono_ms;
+  uint32_t recovery_probe_interval_ms;
+  uint32_t recovery_good_since_mono_ms;
+  uint32_t recovery_last_success_mono_ms;
+  uint32_t recovery_attempt_count;
+  uint32_t recovery_validation_success_count;
   uint32_t upload_next_attempt_mono_ms;
   int64_t last_clock_observation_utc_ns;
   uint8_t upload_retry_backoff_index;
@@ -54,6 +96,7 @@ typedef struct logger_app {
   bool upload_manual_off_charger;
   bool upload_ntp_attempted;
   bool upload_pass_had_success;
+  bool service_pinned_by_user;
   bool idle_resume_on_unplug;
   bool day_tracking_initialized;
   bool current_day_has_session;
@@ -65,6 +108,7 @@ typedef struct logger_app {
   bool boot_banner_printed;
   bool boot_firmware_identity_changed;
   bool reboot_pending;
+  logger_runtime_state_t recovery_resume_state;
 } logger_app_t;
 
 void logger_app_init(logger_app_t *app, uint32_t now_ms,
