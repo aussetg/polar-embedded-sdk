@@ -100,6 +100,13 @@ static void logger_system_log_scan(logger_system_log_t *log) {
   }
 }
 
+void logger_system_log_refresh(logger_system_log_t *log) {
+  if (log == NULL || !log->initialized || !log->writable) {
+    return;
+  }
+  logger_system_log_scan(log);
+}
+
 void logger_system_log_init(logger_system_log_t *log, uint32_t boot_counter) {
   memset(log, 0, sizeof(*log));
   log->initialized = true;
@@ -125,6 +132,12 @@ bool logger_system_log_append(logger_system_log_t *log, const char *utc_or_null,
   if (log == NULL || !log->initialized || !log->writable || kind == NULL ||
       kind[0] == '\0') {
     return false;
+  }
+
+  if (log->next_event_seq == 0u ||
+      log->next_record_index > LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY ||
+      log->event_count > LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY) {
+    logger_system_log_scan(log);
   }
 
   if (log->next_record_index >= LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY) {

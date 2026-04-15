@@ -1399,6 +1399,8 @@ static void logger_handle_queue_json(logger_app_t *app) {
 }
 
 static void logger_handle_system_log_export_json(logger_app_t *app) {
+  logger_system_log_refresh(&app->system_log);
+
   jsw w;
   jsw_ok(&w, "system-log export", logger_clock_now_utc_or_null(&app->clock));
   logger_json_stream_writer_field_uint32(&w, "schema_version", 1u);

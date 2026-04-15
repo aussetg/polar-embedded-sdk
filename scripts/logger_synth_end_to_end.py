@@ -19,12 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import select
 import subprocess
 import sys
-import termios
 import time
-import tty
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -58,6 +55,11 @@ except ModuleNotFoundError:  # pragma: no cover - import path depends on invocat
     from scripts.logger_tls import TlsProbeResult
     from scripts.logger_tls import TlsTrustPlan
     from scripts.logger_tls import plan_logger_tls
+
+try:
+    from logger_serial_json import SerialJsonClient
+except ModuleNotFoundError:  # pragma: no cover - import path depends on invocation style
+    from scripts.logger_serial_json import SerialJsonClient
 
 
 INTERRUPTED_UPLOAD_DELAY_MS = 30_000
@@ -106,117 +108,6 @@ def format_rfc3339_utc(value: datetime) -> str:
 
 def parse_rfc3339_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
-
-
-class SerialJsonClient:
-    def __init__(self, port: Path) -> None:
-        self.port = port
-        self.fd: int | None = None
-        self._saved_termios: list[Any] | None = None
-
-    def __enter__(self) -> Self:
-        fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        self.fd = fd
-        self._saved_termios = termios.tcgetattr(fd)
-        tty.setraw(fd, when=termios.TCSANOW)
-        attrs = termios.tcgetattr(fd)
-        attrs[4] = termios.B115200
-        attrs[5] = termios.B115200
-        termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if self.fd is not None and self._saved_termios is not None:
-            termios.tcsetattr(self.fd, termios.TCSANOW, self._saved_termios)
-        if self.fd is not None:
-            os.close(self.fd)
-        self.fd = None
-        self._saved_termios = None
-
-    def drain_input(self, *, quiet_time_s: float = 0.25, max_time_s: float = 1.0) -> str:
-        assert self.fd is not None
-        deadline = time.monotonic() + max_time_s
-        quiet_deadline = time.monotonic() + quiet_time_s
-        chunks: list[bytes] = []
-        while time.monotonic() < deadline:
-            timeout = max(0.0, quiet_deadline - time.monotonic())
-            ready, _, _ = select.select([self.fd], [], [], timeout)
-            if not ready:
-                break
-            data = os.read(self.fd, 4096)
-            if not data:
-                break
-            chunks.append(data)
-            quiet_deadline = time.monotonic() + quiet_time_s
-        return b"".join(chunks).decode("utf-8", errors="replace")
-
-    def send_command(self, step: Step) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        assert self.fd is not None
-        self.write_line(step.line)
-        return self.read_json(step.expected_command, timeout_s=step.timeout_s)
-
-    def write_line(self, line: str) -> None:
-        assert self.fd is not None
-        os.write(self.fd, (line + "\n").encode("utf-8"))
-
-    def read_json(self, expected_command: str, *, timeout_s: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        assert self.fd is not None
-        deadline = time.monotonic() + timeout_s
-        in_object = False
-        depth = 0
-        in_string = False
-        escaping = False
-        buf: list[str] = []
-        stray: list[dict[str, Any]] = []
-
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([self.fd], [], [], 0.1)
-            if not ready:
-                continue
-            data = os.read(self.fd, 4096)
-            if not data:
-                continue
-            text = data.decode("utf-8", errors="replace")
-            for ch in text:
-                if not in_object:
-                    if ch == "{":
-                        in_object = True
-                        depth = 1
-                        in_string = False
-                        escaping = False
-                        buf = [ch]
-                    continue
-
-                buf.append(ch)
-                if in_string:
-                    if escaping:
-                        escaping = False
-                    elif ch == "\\":
-                        escaping = True
-                    elif ch == '"':
-                        in_string = False
-                    continue
-
-                if ch == '"':
-                    in_string = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        raw = "".join(buf)
-                        in_object = False
-                        buf = []
-                        try:
-                            parsed = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        if parsed.get("command") != expected_command:
-                            stray.append(parsed)
-                            continue
-                        return parsed, stray
-
-        raise TimeoutError(f"timed out waiting for JSON response to {expected_command!r}")
 
 
 class RefServerProcess:
@@ -908,7 +799,7 @@ def run_steps(
     responses: list[dict[str, Any]] = []
     stray_responses: list[dict[str, Any]] = []
     for index, step in enumerate(steps):
-        response, stray = client.send_command(step)
+        response, stray = client.send_command(step.line, step.expected_command, timeout_s=step.timeout_s)
         if index == 0 and require_service_mode:
             validate_status_service_mode(response)
         assert_no_unexpected_error(response, step)

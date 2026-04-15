@@ -37,6 +37,7 @@ typedef struct {
 } logger_system_log_t;
 
 void logger_system_log_init(logger_system_log_t *log, uint32_t boot_counter);
+void logger_system_log_refresh(logger_system_log_t *log);
 bool logger_system_log_append(logger_system_log_t *log, const char *utc_or_null,
                               const char *kind,
                               logger_system_log_severity_t severity,
