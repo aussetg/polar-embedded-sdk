@@ -1775,11 +1775,47 @@ static void logger_step_service(logger_app_t *app, uint32_t now_ms) {
   (void)logger_button_poll(&app->button, now_ms);
 
   if (!app->battery.vbus_present) {
+    /* Snapshot state before abort_mutable_session clears config_import_active.
+     */
+    const bool config_import_active = app->cli.config_import_active;
+    const uint32_t service_duration_ms =
+        now_ms - app->runtime.entered_state_mono_ms;
+
+    /* Pre-compute target so we can log where the device is headed. */
+    logger_fault_code_t target_fault = LOGGER_FAULT_NONE;
+    const logger_runtime_state_t target =
+        logger_app_select_unattended_target(app, &target_fault);
+
     logger_service_cli_abort_mutable_session(&app->cli);
     app->service_pinned_by_user = false;
+
+    logger_json_object_writer_t w;
+    char details[192];
+    logger_json_object_writer_init(&w, details, sizeof(details));
+    (void)logger_json_object_writer_uint32_field(&w, "service_duration_ms",
+                                                 service_duration_ms);
+    (void)logger_json_object_writer_bool_field(&w, "config_import_active",
+                                               config_import_active);
+    (void)logger_json_object_writer_string_field(
+        &w, "transitioning_to", logger_runtime_state_name(target));
+    if (target_fault != LOGGER_FAULT_NONE) {
+      (void)logger_json_object_writer_string_field(
+          &w, "blocking_fault", logger_fault_code_name(target_fault));
+    }
+    (void)logger_json_object_writer_finish(&w);
+
     (void)logger_system_log_append(
         &app->system_log, logger_clock_now_utc_or_null(&app->clock),
-        "service_auto_exit_usb_removed", LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
+        "service_auto_exit_usb_removed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        logger_json_object_writer_data(&w));
+
+    /*
+     * apply_unattended_target calls select_unattended_target internally,
+     * which is deterministic and cheap — the redundant call is acceptable.
+     * Keeping the log *before* the transition means the event is recorded
+     * while the device is still conceptually in SERVICE, which is the
+     * correct causal ordering for post-mortem analysis.
+     */
     logger_app_apply_unattended_target(app, "service_usb_removed", now_ms);
   }
 }
