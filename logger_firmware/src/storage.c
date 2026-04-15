@@ -6,6 +6,7 @@
 #include "ff.h"
 // ff.h needs to be included before diskio.h
 #include "diskio.h"
+#include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "logger/util.h"
@@ -42,6 +43,15 @@ typedef struct {
 } logger_sd_driver_t;
 
 static logger_sd_driver_t g_sd;
+
+/* DMA channels for SPI bulk data phase.
+ *   TX channel: memory → SPI TX FIFO, paced by DREQ_SPIx_TX
+ *   RX channel: SPI RX FIFO → memory, paced by DREQ_SPIx_RX
+ * Claimed once at init, reused for every block transfer. */
+static int g_sd_dma_ch_tx = -1;
+static int g_sd_dma_ch_rx = -1;
+static uint8_t g_sd_dma_ff_byte = 0xFFu;
+static uint8_t g_sd_dma_sink_byte;
 
 static spi_inst_t *logger_sd_spi_bus(void) {
 #if LOGGER_SD_SPI_BUS == 0
@@ -153,6 +163,85 @@ static uint8_t logger_sd_send_command(uint8_t cmd, uint32_t arg, uint8_t crc,
   return r1;
 }
 
+/* Claim DMA channels for SPI bulk transfers. Idempotent. */
+static void logger_sd_dma_init(void) {
+  if (g_sd_dma_ch_tx >= 0) {
+    return;
+  }
+  g_sd_dma_ch_tx = dma_claim_unused_channel(true);
+  g_sd_dma_ch_rx = dma_claim_unused_channel(true);
+}
+
+/* Full-duplex SPI bulk transfer using DMA.
+ *   tx_src: data to send, or NULL to transmit constant 0xFF
+ *   rx_dst: buffer for received data, or NULL to discard
+ *   len:    number of bytes to exchange
+ *
+ * Both channels are paced by their respective SPI DREQs so the
+ * transfer proceeds at the SPI clock rate without CPU intervention. */
+static void __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
+                                                    uint8_t *rx_dst,
+                                                    size_t len) {
+  spi_inst_t *spi = logger_sd_spi_bus();
+  const uint dreq_tx = spi_get_dreq(spi, true);
+  const uint dreq_rx = spi_get_dreq(spi, false);
+
+  /* Drain stale RX FIFO entries so the RX DMA channel starts clean. */
+  while (spi_is_readable(spi)) {
+    (void)spi_get_hw(spi)->dr;
+  }
+
+  /* TX DMA: memory → SPI TX FIFO */
+  dma_channel_config_t tx_cfg =
+      dma_channel_get_default_config(g_sd_dma_ch_tx);
+  channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_8);
+  channel_config_set_dreq(&tx_cfg, dreq_tx);
+  channel_config_set_read_increment(&tx_cfg, tx_src != NULL);
+  channel_config_set_write_increment(&tx_cfg, false);
+
+  dma_channel_configure(
+      g_sd_dma_ch_tx, &tx_cfg,
+      /* write_addr  */ &spi_get_hw(spi)->dr,
+      /* read_addr   */ tx_src != NULL ? tx_src : &g_sd_dma_ff_byte,
+      /* trans_count */ dma_encode_transfer_count(len),
+      /* trigger     */ false);
+
+  /* RX DMA: SPI RX FIFO → memory */
+  dma_channel_config_t rx_cfg =
+      dma_channel_get_default_config(g_sd_dma_ch_rx);
+  channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_8);
+  channel_config_set_dreq(&rx_cfg, dreq_rx);
+  channel_config_set_read_increment(&rx_cfg, false);
+  channel_config_set_write_increment(&rx_cfg, rx_dst != NULL);
+
+  dma_channel_configure(
+      g_sd_dma_ch_rx, &rx_cfg,
+      /* write_addr  */ rx_dst != NULL ? rx_dst : &g_sd_dma_sink_byte,
+      /* read_addr   */ &spi_get_hw(spi)->dr,
+      /* trans_count */ dma_encode_transfer_count(len),
+      /* trigger     */ false);
+
+  /* Start RX before TX: RX must be ready to drain before TX clocks data in. */
+  dma_channel_start(g_sd_dma_ch_rx);
+  dma_channel_start(g_sd_dma_ch_tx);
+
+  dma_channel_wait_for_finish_blocking(g_sd_dma_ch_tx);
+  dma_channel_wait_for_finish_blocking(g_sd_dma_ch_rx);
+
+  /* SPI may still be shifting the last byte after DMA FIFO transfers complete. */
+  while (spi_is_busy(spi)) {
+    tight_loop_contents();
+  }
+
+  /* Safety drain — if this fires, the RX DMA missed bytes. */
+  unsigned drain_count = 0u;
+  while (spi_is_readable(spi)) {
+    (void)spi_get_hw(spi)->dr;
+    ++drain_count;
+  }
+  assert(drain_count == 0u);
+}
+
 static bool logger_sd_receive_data(uint8_t *buf, size_t len) {
   const uint32_t start_ms = to_ms_since_boot(get_absolute_time());
   uint8_t token = 0xffu;
@@ -167,11 +256,11 @@ static bool logger_sd_receive_data(uint8_t *buf, size_t len) {
     return false;
   }
 
-  for (size_t i = 0u; i < len; ++i) {
-    buf[i] = logger_sd_spi_xfer(0xffu);
-  }
-  (void)logger_sd_spi_xfer(0xffu);
-  (void)logger_sd_spi_xfer(0xffu);
+  /* Bulk data phase: DMA clocks out 0xFF while reading len bytes. */
+  logger_sd_dma_xfer(NULL, buf, len);
+
+  (void)logger_sd_spi_xfer(0xffu); /* CRC byte 1 */
+  (void)logger_sd_spi_xfer(0xffu); /* CRC byte 2 */
   return true;
 }
 
@@ -181,11 +270,12 @@ static bool logger_sd_send_data_block(const uint8_t *buf, size_t len) {
   }
 
   (void)logger_sd_spi_xfer(LOGGER_SD_TOKEN_START_BLOCK);
-  for (size_t i = 0u; i < len; ++i) {
-    (void)logger_sd_spi_xfer(buf[i]);
-  }
-  (void)logger_sd_spi_xfer(0xffu);
-  (void)logger_sd_spi_xfer(0xffu);
+
+  /* Bulk data phase: DMA clocks out buf while draining RX. */
+  logger_sd_dma_xfer(buf, NULL, len);
+
+  (void)logger_sd_spi_xfer(0xffu); /* CRC byte 1 */
+  (void)logger_sd_spi_xfer(0xffu); /* CRC byte 2 */
 
   const uint8_t resp = logger_sd_spi_xfer(0xffu);
   if ((resp & 0x1fu) != 0x05u) {
@@ -355,6 +445,7 @@ void logger_storage_init(void) {
   gpio_set_dir(LOGGER_SD_DETECT_PIN, GPIO_IN);
   gpio_pull_up(LOGGER_SD_DETECT_PIN);
 
+  logger_sd_dma_init();
   g_sd.io_initialized = true;
 }
 

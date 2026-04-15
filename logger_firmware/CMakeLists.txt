@@ -129,6 +129,7 @@ target_link_libraries(logger_appliance PRIVATE
     hardware_flash
     hardware_sync
     hardware_i2c
+    hardware_dma
     hardware_spi
     hardware_watchdog
 )
