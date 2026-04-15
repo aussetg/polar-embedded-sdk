@@ -448,7 +448,7 @@ bool logger_journal_scan(const char *path,
       break;
     }
 
-    uint32_t running_crc = 0xffffffffu;
+    uint32_t running_crc = logger_crc32_begin();
     memset(payload_capture, 0, sizeof(payload_capture));
     uint32_t payload_remaining = payload_bytes;
     size_t capture_offset = 0u;
@@ -463,13 +463,7 @@ bool logger_journal_scan(const char *path,
         payload_remaining = UINT32_MAX;
         break;
       }
-      for (UINT i = 0u; i < want; ++i) {
-        running_crc ^= chunk[i];
-        for (int bit = 0; bit < 8; ++bit) {
-          const uint32_t mask = (uint32_t)(-(int32_t)(running_crc & 1u));
-          running_crc = (running_crc >> 1) ^ (0xedb88320u & mask);
-        }
-      }
+      running_crc = logger_crc32_update(running_crc, chunk, want);
       const size_t capture_room =
           LOGGER_JOURNAL_SCAN_PAYLOAD_CAPTURE_MAX - capture_offset;
       const size_t capture_now =
@@ -483,8 +477,7 @@ bool logger_journal_scan(const char *path,
     if (payload_remaining == UINT32_MAX) {
       break;
     }
-    running_crc ^= 0xffffffffu;
-    if (running_crc != payload_crc) {
+    if (logger_crc32_finish(running_crc) != payload_crc) {
       break;
     }
 
