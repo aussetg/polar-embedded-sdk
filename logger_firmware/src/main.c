@@ -32,6 +32,18 @@ int main(void) {
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     logger_app_step(&app, now_ms);
     cyw43_arch_poll();
-    sleep_ms(10);
+
+    /*
+     * Sleep until the earlier of:
+     *   1. The state-appropriate deadline from logger_app_max_sleep_ms()
+     *   2. The next CYW43 async event (BLE notification, WiFi callback)
+     *
+     * During LOG_STREAMING the effective sleep is ~10 ms (driven by BLE notify
+     * events). During RECOVERY_HOLD or IDLE on battery the CPU sleeps for 1–5 s
+     * between wake-ups, cutting CPU power from ~15 mA to < 1 mA average.
+     */
+    uint32_t after_step_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t sleep_for_ms = logger_app_max_sleep_ms(&app, after_step_ms);
+    cyw43_arch_wait_for_work_until(make_timeout_time_ms(sleep_for_ms));
   }
 }

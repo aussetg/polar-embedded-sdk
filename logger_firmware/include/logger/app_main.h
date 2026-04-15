@@ -123,4 +123,22 @@ bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,
                                      bool *will_stop_logging_out);
 void logger_app_step(logger_app_t *app, uint32_t now_ms);
 
+/*
+ * Returns the maximum safe sleep duration in milliseconds given the current
+ * application state, power source, and pending deadlines.
+ *
+ * The main loop should call cyw43_arch_wait_for_work_until() with this value
+ * instead of a fixed sleep_ms().  The actual sleep may be shorter if CYW43
+ * async events (BLE notifications, WiFi callbacks) arrive before the deadline.
+ *
+ * Principles:
+ *   - Active streaming (130 Hz ECG): 10 ms, same as the old fixed delay.
+ *   - BLE active but idle (scan, connect, secure): 50–500 ms.
+ *     CYW43 async events wake the CPU immediately on BLE data.
+ *   - No BLE, on battery (recovery, idle): 1–5 s.  Tightened to the next
+ *     recovery/upload deadline when one is pending.
+ *   - On USB (service, upload): shorter caps for CLI responsiveness.
+ */
+uint32_t logger_app_max_sleep_ms(const logger_app_t *app, uint32_t now_ms);
+
 #endif

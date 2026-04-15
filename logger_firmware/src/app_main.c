@@ -2058,6 +2058,102 @@ static void logger_step_idle_upload_complete(logger_app_t *app,
   }
 }
 
+static uint32_t logger_app_tighten_deadline(uint32_t cap_ms, uint32_t now_ms,
+                                            uint32_t deadline_ms) {
+  if (deadline_ms == 0u)
+    return cap_ms;
+  int32_t remaining = (int32_t)(deadline_ms - now_ms);
+  if (remaining > 0 && (uint32_t)remaining < cap_ms) {
+    return (uint32_t)remaining;
+  }
+  return cap_ms;
+}
+
+uint32_t logger_app_max_sleep_ms(const logger_app_t *app, uint32_t now_ms) {
+  uint32_t cap_ms;
+
+  switch (app->runtime.current_state) {
+  case LOGGER_RUNTIME_BOOT:
+  case LOGGER_RUNTIME_LOG_STOPPING:
+    /* One-shot transitions — process immediately. */
+    cap_ms = 20u;
+    break;
+
+  case LOGGER_RUNTIME_SERVICE:
+    /* On USB. Keep CLI responsive. */
+    cap_ms = 100u;
+    break;
+
+  case LOGGER_RUNTIME_LOG_STREAMING:
+    /* 130 Hz ECG ≈ 8 ms period. CYW43 async events wake us on BLE
+       notifications, but keep a 10 ms safety cap. */
+    cap_ms = 10u;
+    break;
+
+  case LOGGER_RUNTIME_LOG_CONNECTING:
+  case LOGGER_RUNTIME_LOG_SECURING:
+  case LOGGER_RUNTIME_LOG_STARTING_STREAM:
+    /* BLE active, events arrive quickly via async context. */
+    cap_ms = 50u;
+    break;
+
+  case LOGGER_RUNTIME_LOG_WAIT_H10:
+    /* BLE scan is active — CYW43 wakes us on advertisements.
+       Cap exists so the 1 s observation refresh runs on time. */
+    cap_ms = app->runtime.charger_present ? 200u : 500u;
+    break;
+
+  case LOGGER_RUNTIME_RECOVERY_HOLD:
+    /* No BLE. On battery this is where the biggest savings live.
+       1 000 ms cap preserves the diagnostic double-blink LED pattern
+       (1 000 ms phase).  Tightened further below when a recovery
+       deadline is pending. */
+    cap_ms = app->runtime.charger_present ? 500u : 1000u;
+    break;
+
+  case LOGGER_RUNTIME_UPLOAD_PREP:
+  case LOGGER_RUNTIME_UPLOAD_RUNNING:
+    /* WiFi active, usually on USB. */
+    cap_ms = 100u;
+    break;
+
+  case LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER:
+    /* No BLE. LED blinks on a 2 000 ms phase. */
+    cap_ms = 2000u;
+    break;
+
+  case LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE:
+    /* No BLE. LED is off. On battery, can sleep deep. */
+    cap_ms = app->runtime.charger_present ? 2000u : 5000u;
+    break;
+
+  default:
+    cap_ms = 100u;
+    break;
+  }
+
+  /* Tighten towards the next recovery probe attempt. */
+  cap_ms = logger_app_tighten_deadline(cap_ms, now_ms,
+                                       app->recovery_next_attempt_mono_ms);
+
+  /* Tighten towards the next upload retry attempt. */
+  cap_ms = logger_app_tighten_deadline(cap_ms, now_ms,
+                                       app->upload_next_attempt_mono_ms);
+
+  /* Tighten towards the next session live-flush (5 s interval). */
+  if (app->session.active && app->last_session_live_flush_mono_ms != 0u &&
+      logger_runtime_state_is_logging(app->runtime.current_state)) {
+    cap_ms = logger_app_tighten_deadline(
+        cap_ms, now_ms, app->last_session_live_flush_mono_ms + 5000u);
+  }
+
+  /* Absolute floor. */
+  if (cap_ms < 1u)
+    cap_ms = 1u;
+
+  return cap_ms;
+}
+
 void logger_app_step(logger_app_t *app, uint32_t now_ms) {
   app->runtime.step_counter += 1u;
 
