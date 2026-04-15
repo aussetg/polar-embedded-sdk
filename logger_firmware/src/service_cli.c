@@ -877,6 +877,10 @@ static bool logger_cli_is_service_mode(const logger_app_t *app) {
   return app->runtime.current_state == LOGGER_RUNTIME_SERVICE;
 }
 
+static bool logger_cli_is_recovery_hold_mode(const logger_app_t *app) {
+  return app->runtime.current_state == LOGGER_RUNTIME_RECOVERY_HOLD;
+}
+
 static bool logger_cli_is_logging_mode(const logger_app_t *app) {
   return logger_runtime_state_is_logging(app->runtime.current_state);
 }
@@ -918,6 +922,26 @@ static bool logger_debug_require_service_unlocked(
     const logger_service_cli_t *cli, const logger_app_t *app,
     const char *command, const char *mode_message) {
   if (!logger_cli_is_service_mode(app)) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode", mode_message);
+    return false;
+  }
+  if (!logger_service_cli_is_unlocked(cli,
+                                      to_ms_since_boot(get_absolute_time()))) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "service_locked", "service unlock is required");
+    return false;
+  }
+  return true;
+}
+
+static bool logger_debug_require_service_or_recovery_hold_unlocked(
+    const logger_service_cli_t *cli, const logger_app_t *app,
+    const char *command, const char *mode_message) {
+  if (!logger_cli_is_service_mode(app) &&
+      !logger_cli_is_recovery_hold_mode(app)) {
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
             "not_permitted_in_mode", mode_message);
@@ -1012,7 +1036,9 @@ static bool logger_cli_fault_condition_still_present(const logger_app_t *app) {
     return logger_fault_from_storage(&app->storage) ==
            app->persisted.current_fault_code;
   case LOGGER_FAULT_SD_WRITE_FAILED:
-    return logger_fault_from_storage(&app->storage) != LOGGER_FAULT_NONE;
+    return app->debug_storage_fault ==
+               LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED ||
+           logger_fault_from_storage(&app->storage) != LOGGER_FAULT_NONE;
   case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
     return logger_cli_upload_blocked_fault_present();
   case LOGGER_FAULT_NONE:
@@ -2033,6 +2059,60 @@ static void logger_handle_debug_synth_clock_valid(logger_service_cli_t *cli,
          logger_clock_now_utc_or_null(&app->clock));
   logger_json_stream_writer_field_bool(&w, "forced", false);
   logger_json_stream_writer_field_bool(&w, "clock_valid", app->clock.valid);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "fault_code",
+      logger_fault_code_name(app->persisted.current_fault_code));
+  jsw_end(&w);
+}
+
+static void logger_handle_debug_synth_storage_fault(
+    logger_service_cli_t *cli, logger_app_t *app,
+    logger_debug_storage_fault_t fault, const char *command, uint32_t now_ms) {
+  if (!logger_debug_require_service_or_recovery_hold_unlocked(
+          cli, app, command,
+          "synthetic storage commands are only allowed in service mode or "
+          "recovery_hold")) {
+    return;
+  }
+
+  logger_app_debug_force_storage_fault(app, fault, now_ms);
+
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "forced_fault", logger_debug_storage_fault_name(fault));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "mode", logger_mode_name(&app->runtime));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "runtime_state",
+      logger_runtime_state_name(app->runtime.current_state));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "fault_code",
+      logger_fault_code_name(app->persisted.current_fault_code));
+  jsw_end(&w);
+}
+
+static void logger_handle_debug_synth_storage_valid(logger_service_cli_t *cli,
+                                                    logger_app_t *app,
+                                                    uint32_t now_ms) {
+  if (!logger_debug_require_service_or_recovery_hold_unlocked(
+          cli, app, "debug synth storage-valid",
+          "synthetic storage commands are only allowed in service mode or "
+          "recovery_hold")) {
+    return;
+  }
+
+  logger_app_debug_clear_forced_storage_fault(app, now_ms);
+
+  jsw w;
+  jsw_ok(&w, "debug synth storage-valid",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_null(&w, "forced_fault");
+  logger_json_stream_writer_field_string_or_null(
+      &w, "mode", logger_mode_name(&app->runtime));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "runtime_state",
+      logger_runtime_state_name(app->runtime.current_state));
   logger_json_stream_writer_field_string_or_null(
       &w, "fault_code",
       logger_fault_code_name(app->persisted.current_fault_code));
@@ -3592,6 +3672,28 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strcmp(line, "debug synth clock-valid") == 0) {
     logger_handle_debug_synth_clock_valid(cli, app, now_ms);
+    return;
+  }
+  if (strcmp(line, "debug synth storage-missing") == 0) {
+    logger_handle_debug_synth_storage_fault(
+        cli, app, LOGGER_DEBUG_STORAGE_FAULT_MISSING,
+        "debug synth storage-missing", now_ms);
+    return;
+  }
+  if (strcmp(line, "debug synth storage-low-space") == 0) {
+    logger_handle_debug_synth_storage_fault(
+        cli, app, LOGGER_DEBUG_STORAGE_FAULT_LOW_SPACE,
+        "debug synth storage-low-space", now_ms);
+    return;
+  }
+  if (strcmp(line, "debug synth storage-write-failed") == 0) {
+    logger_handle_debug_synth_storage_fault(
+        cli, app, LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED,
+        "debug synth storage-write-failed", now_ms);
+    return;
+  }
+  if (strcmp(line, "debug synth storage-valid") == 0) {
+    logger_handle_debug_synth_storage_valid(cli, app, now_ms);
     return;
   }
   if (strncmp(line, "debug synth clock-fix ", 22) == 0) {

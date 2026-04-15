@@ -28,6 +28,28 @@ typedef enum {
   LOGGER_RECOVERY_SD_WRITE_FAILED,
 } logger_recovery_reason_t;
 
+typedef enum {
+  LOGGER_DEBUG_STORAGE_FAULT_NONE = 0,
+  LOGGER_DEBUG_STORAGE_FAULT_MISSING,
+  LOGGER_DEBUG_STORAGE_FAULT_LOW_SPACE,
+  LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED,
+} logger_debug_storage_fault_t;
+
+static inline const char *
+logger_debug_storage_fault_name(logger_debug_storage_fault_t fault) {
+  switch (fault) {
+  case LOGGER_DEBUG_STORAGE_FAULT_MISSING:
+    return "sd_missing_or_unwritable";
+  case LOGGER_DEBUG_STORAGE_FAULT_LOW_SPACE:
+    return "sd_low_space_reserve_unmet";
+  case LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED:
+    return "sd_write_failed";
+  case LOGGER_DEBUG_STORAGE_FAULT_NONE:
+  default:
+    return NULL;
+  }
+}
+
 static inline const char *
 logger_recovery_reason_name(logger_recovery_reason_t reason) {
   switch (reason) {
@@ -99,6 +121,7 @@ typedef struct logger_app {
   bool upload_pass_had_success;
   bool service_pinned_by_user;
   bool debug_force_clock_invalid;
+  logger_debug_storage_fault_t debug_storage_fault;
   bool idle_resume_on_unplug;
   bool day_tracking_initialized;
   bool current_day_has_session;
@@ -125,6 +148,11 @@ void logger_app_debug_force_clock_invalid(logger_app_t *app, uint32_t now_ms);
 void logger_app_debug_clear_forced_clock_invalid(logger_app_t *app,
                                                  uint32_t now_ms,
                                                  const char *clear_source);
+void logger_app_debug_force_storage_fault(logger_app_t *app,
+                                          logger_debug_storage_fault_t fault,
+                                          uint32_t now_ms);
+void logger_app_debug_clear_forced_storage_fault(logger_app_t *app,
+                                                 uint32_t now_ms);
 bool logger_app_clock_sync_ntp(logger_app_t *app,
                                logger_clock_ntp_sync_result_t *result);
 bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,

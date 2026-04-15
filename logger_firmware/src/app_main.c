@@ -122,6 +122,28 @@ static void logger_app_refresh_observations(logger_app_t *app,
     app->clock.now_utc[0] = '\0';
   }
   (void)logger_storage_refresh(&app->storage);
+  switch (app->debug_storage_fault) {
+  case LOGGER_DEBUG_STORAGE_FAULT_MISSING:
+    app->storage.card_present = false;
+    app->storage.card_initialized = false;
+    app->storage.mounted = false;
+    app->storage.writable = false;
+    app->storage.logger_root_ready = false;
+    app->storage.reserve_ok = false;
+    app->storage.filesystem[0] = '\0';
+    break;
+  case LOGGER_DEBUG_STORAGE_FAULT_LOW_SPACE:
+    app->storage.reserve_ok = false;
+    if (app->storage.mounted &&
+        app->storage.free_bytes >= LOGGER_SD_MIN_FREE_RESERVE_BYTES) {
+      app->storage.free_bytes = LOGGER_SD_MIN_FREE_RESERVE_BYTES - 1u;
+    }
+    break;
+  case LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED:
+  case LOGGER_DEBUG_STORAGE_FAULT_NONE:
+  default:
+    break;
+  }
   (void)logger_h10_set_bound_address(&app->h10,
                                      app->persisted.config.bound_h10_address);
 
@@ -510,7 +532,41 @@ static void logger_app_reconcile_clock_invalid_fault(logger_app_t *app,
   }
 }
 
-static bool logger_app_storage_self_test(void) {
+static logger_fault_code_t
+logger_app_fault_from_debug_storage_fault(logger_debug_storage_fault_t fault) {
+  switch (fault) {
+  case LOGGER_DEBUG_STORAGE_FAULT_MISSING:
+    return LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE;
+  case LOGGER_DEBUG_STORAGE_FAULT_LOW_SPACE:
+    return LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET;
+  case LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED:
+    return LOGGER_FAULT_SD_WRITE_FAILED;
+  case LOGGER_DEBUG_STORAGE_FAULT_NONE:
+  default:
+    return LOGGER_FAULT_NONE;
+  }
+}
+
+static const char *
+logger_app_debug_storage_fault_reason(logger_debug_storage_fault_t fault) {
+  switch (fault) {
+  case LOGGER_DEBUG_STORAGE_FAULT_MISSING:
+    return "debug_storage_missing";
+  case LOGGER_DEBUG_STORAGE_FAULT_LOW_SPACE:
+    return "debug_storage_low_space";
+  case LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED:
+    return "debug_storage_write_failed";
+  case LOGGER_DEBUG_STORAGE_FAULT_NONE:
+  default:
+    return "debug_storage_clear";
+  }
+}
+
+static bool logger_app_storage_self_test(const logger_app_t *app) {
+  if (app != NULL &&
+      app->debug_storage_fault == LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED) {
+    return false;
+  }
   static const char probe_data[] = "ok\n";
   return logger_storage_write_file_atomic(
              LOGGER_RECOVERY_PROBE_PATH, probe_data, sizeof(probe_data) - 1u) &&
@@ -525,7 +581,7 @@ static bool logger_app_validate_storage_missing_recovery(logger_app_t *app,
     logger_app_recovery_set_status(app, "storage_validate", "blocked");
     return false;
   }
-  if (!logger_app_storage_self_test()) {
+  if (!logger_app_storage_self_test(app)) {
     logger_app_recovery_set_status(app, "storage_self_test", "failed");
     return false;
   }
@@ -560,7 +616,7 @@ static bool logger_app_validate_storage_write_recovery(logger_app_t *app,
     logger_app_recovery_set_status(app, "storage_validate", "blocked");
     return false;
   }
-  if (!logger_app_storage_self_test()) {
+  if (!logger_app_storage_self_test(app)) {
     logger_app_recovery_set_status(app, "storage_self_test", "failed");
     return false;
   }
@@ -862,6 +918,52 @@ void logger_app_debug_clear_forced_clock_invalid(logger_app_t *app,
   }
 
   logger_app_note_wall_clock_changed(app);
+}
+
+void logger_app_debug_force_storage_fault(logger_app_t *app,
+                                          logger_debug_storage_fault_t fault,
+                                          uint32_t now_ms) {
+  const logger_fault_code_t fault_code =
+      logger_app_fault_from_debug_storage_fault(fault);
+  if (app == NULL || fault_code == LOGGER_FAULT_NONE) {
+    return;
+  }
+
+  app->debug_storage_fault = fault;
+  app->last_observation_mono_ms = 0u;
+  logger_app_refresh_observations(app, now_ms);
+  logger_app_route_blocking_fault(app, fault_code, LOGGER_RUNTIME_BOOT,
+                                  logger_app_debug_storage_fault_reason(fault),
+                                  now_ms);
+}
+
+void logger_app_debug_clear_forced_storage_fault(logger_app_t *app,
+                                                 uint32_t now_ms) {
+  if (app == NULL) {
+    return;
+  }
+
+  app->debug_storage_fault = LOGGER_DEBUG_STORAGE_FAULT_NONE;
+  app->last_observation_mono_ms = 0u;
+  logger_app_refresh_observations(app, now_ms);
+  if (app->runtime.current_state != LOGGER_RUNTIME_RECOVERY_HOLD) {
+    return;
+  }
+
+  switch (app->recovery_reason) {
+  case LOGGER_RECOVERY_SD_MISSING_OR_UNWRITABLE:
+  case LOGGER_RECOVERY_SD_LOW_SPACE_RESERVE_UNMET:
+  case LOGGER_RECOVERY_SD_WRITE_FAILED:
+    logger_app_recovery_set_status(app, "debug_storage_clear", "pending");
+    app->recovery_next_attempt_mono_ms = now_ms;
+    break;
+  case LOGGER_RECOVERY_NONE:
+  case LOGGER_RECOVERY_CONFIG_INCOMPLETE:
+  case LOGGER_RECOVERY_LOW_BATTERY_BLOCKED_START:
+  case LOGGER_RECOVERY_CRITICAL_LOW_BATTERY_STOPPED:
+  default:
+    break;
+  }
 }
 
 static void
