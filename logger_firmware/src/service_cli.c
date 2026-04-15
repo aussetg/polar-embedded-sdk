@@ -1995,6 +1995,50 @@ static void logger_handle_clock_sync(logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+static void logger_handle_debug_synth_clock_invalid(logger_service_cli_t *cli,
+                                                    logger_app_t *app,
+                                                    uint32_t now_ms) {
+  if (!logger_debug_require_service_unlocked(
+          cli, app, "debug synth clock-invalid",
+          "synthetic clock commands are only allowed in service mode")) {
+    return;
+  }
+
+  logger_app_debug_force_clock_invalid(app, now_ms);
+
+  jsw w;
+  jsw_ok(&w, "debug synth clock-invalid",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "forced", true);
+  logger_json_stream_writer_field_bool(&w, "clock_valid", app->clock.valid);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "fault_code",
+      logger_fault_code_name(app->persisted.current_fault_code));
+  jsw_end(&w);
+}
+
+static void logger_handle_debug_synth_clock_valid(logger_service_cli_t *cli,
+                                                  logger_app_t *app,
+                                                  uint32_t now_ms) {
+  if (!logger_debug_require_service_unlocked(
+          cli, app, "debug synth clock-valid",
+          "synthetic clock commands are only allowed in service mode")) {
+    return;
+  }
+
+  logger_app_debug_clear_forced_clock_invalid(app, now_ms, "debug_clock_valid");
+
+  jsw w;
+  jsw_ok(&w, "debug synth clock-valid",
+         logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "forced", false);
+  logger_json_stream_writer_field_bool(&w, "clock_valid", app->clock.valid);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "fault_code",
+      logger_fault_code_name(app->persisted.current_fault_code));
+  jsw_end(&w);
+}
+
 static void logger_apply_config_import_json(logger_service_cli_t *cli,
                                             logger_app_t *app,
                                             const char *command,
@@ -3540,6 +3584,14 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strncmp(line, "debug synth rollover ", 21) == 0) {
     logger_handle_debug_synth_rollover(cli, app, line + 21, now_ms);
+    return;
+  }
+  if (strcmp(line, "debug synth clock-invalid") == 0) {
+    logger_handle_debug_synth_clock_invalid(cli, app, now_ms);
+    return;
+  }
+  if (strcmp(line, "debug synth clock-valid") == 0) {
+    logger_handle_debug_synth_clock_valid(cli, app, now_ms);
     return;
   }
   if (strncmp(line, "debug synth clock-fix ", 22) == 0) {

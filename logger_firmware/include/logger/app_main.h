@@ -98,6 +98,7 @@ typedef struct logger_app {
   bool upload_ntp_attempted;
   bool upload_pass_had_success;
   bool service_pinned_by_user;
+  bool debug_force_clock_invalid;
   bool idle_resume_on_unplug;
   bool day_tracking_initialized;
   bool current_day_has_session;
@@ -120,6 +121,10 @@ void logger_app_set_last_day_outcome(logger_app_t *app,
 void logger_app_note_wall_clock_changed(logger_app_t *app);
 void logger_app_note_explicit_clock_valid(logger_app_t *app, uint32_t now_ms,
                                           const char *clear_source);
+void logger_app_debug_force_clock_invalid(logger_app_t *app, uint32_t now_ms);
+void logger_app_debug_clear_forced_clock_invalid(logger_app_t *app,
+                                                 uint32_t now_ms,
+                                                 const char *clear_source);
 bool logger_app_clock_sync_ntp(logger_app_t *app,
                                logger_clock_ntp_sync_result_t *result);
 bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,

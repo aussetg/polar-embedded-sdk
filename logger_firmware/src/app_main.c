@@ -117,6 +117,10 @@ static void logger_app_refresh_observations(logger_app_t *app,
 
   logger_battery_sample(&app->battery);
   logger_clock_sample(&app->clock);
+  if (app->debug_force_clock_invalid) {
+    app->clock.valid = false;
+    app->clock.now_utc[0] = '\0';
+  }
   (void)logger_storage_refresh(&app->storage);
   (void)logger_h10_set_bound_address(&app->h10,
                                      app->persisted.config.bound_h10_address);
@@ -813,6 +817,7 @@ void logger_app_note_explicit_clock_valid(logger_app_t *app, uint32_t now_ms,
     return;
   }
 
+  app->debug_force_clock_invalid = false;
   logger_app_note_wall_clock_changed(app);
   if (!app->clock.valid) {
     app->clock_valid_since_mono_ms = 0u;
@@ -824,6 +829,39 @@ void logger_app_note_explicit_clock_valid(logger_app_t *app, uint32_t now_ms,
     logger_app_clear_current_fault(app, clear_source != NULL ? clear_source
                                                              : "clock_valid");
   }
+}
+
+void logger_app_debug_force_clock_invalid(logger_app_t *app, uint32_t now_ms) {
+  if (app == NULL) {
+    return;
+  }
+
+  app->debug_force_clock_invalid = true;
+  app->clock.valid = false;
+  app->clock.now_utc[0] = '\0';
+  app->runtime.wall_clock_valid = false;
+  app->clock_valid_since_mono_ms = 0u;
+  logger_app_note_wall_clock_changed(app);
+  logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_CLOCK_INVALID);
+  app->last_observation_mono_ms = now_ms;
+}
+
+void logger_app_debug_clear_forced_clock_invalid(logger_app_t *app,
+                                                 uint32_t now_ms,
+                                                 const char *clear_source) {
+  if (app == NULL) {
+    return;
+  }
+
+  app->debug_force_clock_invalid = false;
+  app->last_observation_mono_ms = 0u;
+  logger_app_refresh_observations(app, now_ms);
+  if (app->clock.valid) {
+    logger_app_note_explicit_clock_valid(app, now_ms, clear_source);
+    return;
+  }
+
+  logger_app_note_wall_clock_changed(app);
 }
 
 static void
