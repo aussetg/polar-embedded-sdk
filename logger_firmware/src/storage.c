@@ -192,34 +192,32 @@ static void __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
   }
 
   /* TX DMA: memory → SPI TX FIFO */
-  dma_channel_config_t tx_cfg =
-      dma_channel_get_default_config(g_sd_dma_ch_tx);
+  dma_channel_config_t tx_cfg = dma_channel_get_default_config(g_sd_dma_ch_tx);
   channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_8);
   channel_config_set_dreq(&tx_cfg, dreq_tx);
   channel_config_set_read_increment(&tx_cfg, tx_src != NULL);
   channel_config_set_write_increment(&tx_cfg, false);
 
-  dma_channel_configure(
-      g_sd_dma_ch_tx, &tx_cfg,
-      /* write_addr  */ &spi_get_hw(spi)->dr,
-      /* read_addr   */ tx_src != NULL ? tx_src : &g_sd_dma_ff_byte,
-      /* trans_count */ dma_encode_transfer_count(len),
-      /* trigger     */ false);
+  dma_channel_configure(g_sd_dma_ch_tx, &tx_cfg,
+                        /* write_addr  */ &spi_get_hw(spi)->dr,
+                        /* read_addr   */ tx_src != NULL ? tx_src
+                                                         : &g_sd_dma_ff_byte,
+                        /* trans_count */ dma_encode_transfer_count(len),
+                        /* trigger     */ false);
 
   /* RX DMA: SPI RX FIFO → memory */
-  dma_channel_config_t rx_cfg =
-      dma_channel_get_default_config(g_sd_dma_ch_rx);
+  dma_channel_config_t rx_cfg = dma_channel_get_default_config(g_sd_dma_ch_rx);
   channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_8);
   channel_config_set_dreq(&rx_cfg, dreq_rx);
   channel_config_set_read_increment(&rx_cfg, false);
   channel_config_set_write_increment(&rx_cfg, rx_dst != NULL);
 
-  dma_channel_configure(
-      g_sd_dma_ch_rx, &rx_cfg,
-      /* write_addr  */ rx_dst != NULL ? rx_dst : &g_sd_dma_sink_byte,
-      /* read_addr   */ &spi_get_hw(spi)->dr,
-      /* trans_count */ dma_encode_transfer_count(len),
-      /* trigger     */ false);
+  dma_channel_configure(g_sd_dma_ch_rx, &rx_cfg,
+                        /* write_addr  */ rx_dst != NULL ? rx_dst
+                                                         : &g_sd_dma_sink_byte,
+                        /* read_addr   */ &spi_get_hw(spi)->dr,
+                        /* trans_count */ dma_encode_transfer_count(len),
+                        /* trigger     */ false);
 
   /* Start RX before TX: RX must be ready to drain before TX clocks data in. */
   dma_channel_start(g_sd_dma_ch_rx);
@@ -228,7 +226,8 @@ static void __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
   dma_channel_wait_for_finish_blocking(g_sd_dma_ch_tx);
   dma_channel_wait_for_finish_blocking(g_sd_dma_ch_rx);
 
-  /* SPI may still be shifting the last byte after DMA FIFO transfers complete. */
+  /* SPI may still be shifting the last byte after DMA FIFO transfers complete.
+   */
   while (spi_is_busy(spi)) {
     tight_loop_contents();
   }
