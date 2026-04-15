@@ -41,8 +41,37 @@
 #define MBEDTLS_PLATFORM_C
 #define MBEDTLS_RSA_C
 #define MBEDTLS_SHA1_C
+
+// SHA-256: software implementation for mbedtls / TLS.
+//
+// The RP2350 has a hardware SHA-256 engine which we *do* use directly
+// (see logger/sha256.h → pico_sha256_*).  However, mbedtls TLS 1.2
+// requires mbedtls_sha256_clone() for two purposes:
+//
+//   1) Constant-time HMAC via mbedtls_ct_hmac() in ssl_msg.c — clones
+//      the running hash per byte to avoid timing side-channels.
+//   2) Handshake transcript hash for Finished messages in ssl_tls.c.
+//
+// The RP2350 SHA-256 hardware is a single-instance streaming engine:
+//   • The intermediate hash state (H0–H7) lives in internal registers
+//     that cannot be read or written by software.
+//   • Only the final result (SUM0–SUM7) is readable, and only after a
+//     complete 64-byte block is processed.
+//   • There is no way to snapshot or restore mid-computation state.
+//
+// pico-sdk ships sha256_alt.h + an ALT implementation in pico_mbedtls.c
+// but omits mbedtls_sha256_clone() — precisely because it *cannot* be
+// implemented on this hardware.  Enabling MBEDTLS_SHA256_ALT causes a
+// link-time undefined reference to mbedtls_sha256_clone as soon as TLS
+// is used.
+//
+// We keep MBEDTLS_SHA256_SMALLER (compact software lookup tables) for
+// the TLS path, while logger_sha256_* routes through the hardware
+// accelerator for data-integrity hashes (upload bundles, etc.).
+
 #define MBEDTLS_SHA256_C
 #define MBEDTLS_SHA256_SMALLER
+
 #define MBEDTLS_SHA384_C
 #define MBEDTLS_SHA512_C
 #define MBEDTLS_SSL_CLI_C
