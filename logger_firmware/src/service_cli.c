@@ -1871,6 +1871,10 @@ static void logger_handle_fault_clear(logger_app_t *app) {
 
   logger_app_clear_current_fault(app, "manual");
 
+  if (app->runtime.current_state == LOGGER_RUNTIME_RECOVERY_HOLD) {
+    app->recovery_next_attempt_mono_ms = 0u;
+  }
+
   jsw w;
   jsw_ok(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock));
   logger_json_stream_writer_field_bool(&w, "cleared", true);
