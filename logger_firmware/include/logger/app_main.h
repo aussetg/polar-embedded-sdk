@@ -81,6 +81,7 @@ typedef struct logger_app {
   uint32_t clock_valid_since_mono_ms;
   uint32_t last_clock_observation_mono_ms;
   uint32_t last_queue_maintenance_mono_ms;
+  uint32_t last_upload_blocked_recheck_mono_ms;
   uint32_t recovery_next_attempt_mono_ms;
   uint32_t recovery_probe_interval_ms;
   uint32_t recovery_good_since_mono_ms;
@@ -117,6 +118,8 @@ void logger_app_set_last_day_outcome(logger_app_t *app,
                                      const char *study_day_local,
                                      const char *kind, const char *reason);
 void logger_app_note_wall_clock_changed(logger_app_t *app);
+void logger_app_note_explicit_clock_valid(logger_app_t *app, uint32_t now_ms,
+                                          const char *clear_source);
 bool logger_app_clock_sync_ntp(logger_app_t *app,
                                logger_clock_ntp_sync_result_t *result);
 bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,

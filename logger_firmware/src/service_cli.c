@@ -1942,7 +1942,8 @@ static void logger_handle_clock_set(const logger_service_cli_t *cli,
             "invalid_config", "invalid RFC3339 UTC timestamp");
     return;
   }
-  logger_app_note_wall_clock_changed(app);
+  logger_app_note_explicit_clock_valid(
+      app, to_ms_since_boot(get_absolute_time()), "clock_set");
   (void)logger_system_log_append(
       &app->system_log, logger_clock_now_utc_or_null(&app->clock), "clock_set",
       LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");

@@ -30,6 +30,7 @@
 #define LOGGER_RECOVERY_LOW_START_CLEAR_MV 3750u
 #define LOGGER_RECOVERY_CRITICAL_CLEAR_MV 3700u
 #define LOGGER_RECOVERY_PROBE_PATH "0:/logger/state/.recovery_probe"
+#define LOGGER_UPLOAD_BLOCKED_RECHECK_INTERVAL_MS 60000u
 
 static bool logger_app_try_finalize_no_session_day(logger_app_t *app,
                                                    uint32_t now_ms);
@@ -42,6 +43,9 @@ static void logger_app_begin_upload_flow(logger_app_t *app,
                                          bool manual_off_charger);
 static bool logger_app_run_queue_maintenance(logger_app_t *app, uint32_t now_ms,
                                              bool force);
+static void logger_app_reconcile_upload_blocked_fault(logger_app_t *app,
+                                                      uint32_t now_ms,
+                                                      bool force);
 
 static int64_t logger_app_i64_abs(int64_t value) {
   return value < 0 ? -(value + 1) + 1 : value;
@@ -663,6 +667,44 @@ logger_app_prepare_upload_pass(logger_app_t *app,
   return true;
 }
 
+static void logger_app_reconcile_upload_blocked_fault(logger_app_t *app,
+                                                      uint32_t now_ms,
+                                                      bool force) {
+  if (app == NULL) {
+    return;
+  }
+  if (!force && app->last_upload_blocked_recheck_mono_ms != 0u &&
+      (now_ms - app->last_upload_blocked_recheck_mono_ms) <
+          LOGGER_UPLOAD_BLOCKED_RECHECK_INTERVAL_MS) {
+    return;
+  }
+  if (!app->storage.mounted || !app->storage.writable ||
+      !app->storage.logger_root_ready) {
+    return;
+  }
+
+  logger_upload_queue_t queue;
+  logger_upload_queue_summary_t summary;
+  logger_upload_queue_init(&queue);
+  logger_upload_queue_summary_init(&summary);
+  if (!logger_upload_queue_load(&queue)) {
+    return;
+  }
+
+  app->last_upload_blocked_recheck_mono_ms = now_ms;
+  logger_upload_queue_compute_summary(&queue, &summary);
+  if (summary.blocked_count == 0u) {
+    if (app->persisted.current_fault_code ==
+        LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE) {
+      logger_app_clear_current_fault(app, "upload_queue_unblocked");
+    }
+    return;
+  }
+
+  logger_app_maybe_latch_new_fault(app,
+                                   LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE);
+}
+
 static void logger_app_schedule_upload_retry(logger_app_t *app,
                                              uint32_t now_ms) {
   static const uint32_t delays_ms[] = {
@@ -765,6 +807,25 @@ void logger_app_note_wall_clock_changed(logger_app_t *app) {
   app->pending_day_study_day_local[0] = '\0';
 }
 
+void logger_app_note_explicit_clock_valid(logger_app_t *app, uint32_t now_ms,
+                                          const char *clear_source) {
+  if (app == NULL) {
+    return;
+  }
+
+  logger_app_note_wall_clock_changed(app);
+  if (!app->clock.valid) {
+    app->clock_valid_since_mono_ms = 0u;
+    return;
+  }
+
+  app->clock_valid_since_mono_ms = now_ms;
+  if (app->persisted.current_fault_code == LOGGER_FAULT_CLOCK_INVALID) {
+    logger_app_clear_current_fault(app, clear_source != NULL ? clear_source
+                                                             : "clock_valid");
+  }
+}
+
 static void
 logger_app_log_ntp_sync_result(logger_app_t *app, const char *event_kind,
                                logger_system_log_severity_t severity,
@@ -826,7 +887,13 @@ bool logger_app_clock_sync_ntp(logger_app_t *app,
 
   const bool synced = logger_clock_ntp_sync(&app->clock, result, &app->clock);
   logger_net_wifi_leave();
-  logger_app_note_wall_clock_changed(app);
+
+  if (synced) {
+    logger_app_note_explicit_clock_valid(
+        app, to_ms_since_boot(get_absolute_time()), "ntp_sync");
+  } else {
+    logger_app_note_wall_clock_changed(app);
+  }
 
   if (synced) {
     logger_app_log_ntp_sync_result(app, "ntp_sync",
@@ -1456,6 +1523,7 @@ static logger_step_result_t logger_step_common_prologue(logger_app_t *app,
                                                         bool h10_enabled) {
   logger_app_refresh_observations(app, now_ms);
   logger_app_reconcile_clock_invalid_fault(app, now_ms);
+  logger_app_reconcile_upload_blocked_fault(app, now_ms, false);
   if (!logger_app_run_queue_maintenance(app, now_ms,
                                         !app->storage.reserve_ok)) {
     logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
@@ -1510,6 +1578,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
                                       now_ms);
       return;
     }
+    logger_app_reconcile_upload_blocked_fault(app, now_ms, true);
   }
 
   if (app->boot_gesture == LOGGER_BOOT_GESTURE_SERVICE) {
