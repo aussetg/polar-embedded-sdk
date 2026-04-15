@@ -136,6 +136,7 @@ typedef struct logger_app {
   logger_runtime_state_t recovery_resume_state;
 } logger_app_t;
 
+void logger_app_clear_current_fault(logger_app_t *app, const char *source);
 void logger_app_init(logger_app_t *app, uint32_t now_ms,
                      logger_boot_gesture_t boot_gesture);
 void logger_app_set_last_day_outcome(logger_app_t *app,

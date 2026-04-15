@@ -229,8 +229,7 @@ static void logger_app_maybe_latch_new_fault(logger_app_t *app,
       logger_json_object_writer_data(&writer));
 }
 
-static void logger_app_clear_current_fault(logger_app_t *app,
-                                           const char *source) {
+void logger_app_clear_current_fault(logger_app_t *app, const char *source) {
   const logger_fault_code_t previous = app->persisted.current_fault_code;
   if (previous == LOGGER_FAULT_NONE) {
     return;

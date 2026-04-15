@@ -1869,12 +1869,7 @@ static void logger_handle_fault_clear(logger_app_t *app) {
     return;
   }
 
-  app->persisted.last_cleared_fault_code = previous;
-  app->persisted.current_fault_code = LOGGER_FAULT_NONE;
-  (void)logger_config_store_save(&app->persisted);
-  (void)logger_system_log_append(
-      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
-      "fault_cleared", LOGGER_SYSTEM_LOG_SEVERITY_INFO, "{}");
+  logger_app_clear_current_fault(app, "manual");
 
   jsw w;
   jsw_ok(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock));
