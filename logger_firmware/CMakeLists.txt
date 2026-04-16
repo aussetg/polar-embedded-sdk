@@ -71,6 +71,7 @@ add_executable(logger_appliance
     src/json_writer.c
     src/json_stream_writer.c
     src/journal.c
+    src/journal_writer.c
     src/queue.c
     src/session.c
     src/service_cli.c

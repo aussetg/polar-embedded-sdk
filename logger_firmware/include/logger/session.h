@@ -17,6 +17,7 @@
 
 #include "logger/capture_stats.h"
 #include "logger/chunk_builder.h"
+#include "logger/journal_writer.h"
 void logger_session_set_capture_stats(logger_capture_stats_t *stats);
 
 enum {
@@ -48,6 +49,7 @@ typedef struct {
   char manifest_path[LOGGER_STORAGE_PATH_MAX];
   uint64_t next_record_seq;
   uint64_t journal_size_bytes;
+  logger_journal_writer_t journal_writer;
   uint8_t current_span_id_raw[16];
   uint32_t next_chunk_seq_in_session;
   uint32_t next_packet_seq_in_span;
