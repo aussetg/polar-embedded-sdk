@@ -52,35 +52,6 @@ static void logger_put_u64le(uint8_t *dst, uint64_t value) {
   }
 }
 
-static bool logger_hex_nibble(char ch, uint8_t *value) {
-  if (ch >= '0' && ch <= '9') {
-    *value = (uint8_t)(ch - '0');
-    return true;
-  }
-  ch = (char)toupper((unsigned char)ch);
-  if (ch >= 'A' && ch <= 'F') {
-    *value = (uint8_t)(10 + (ch - 'A'));
-    return true;
-  }
-  return false;
-}
-
-static bool logger_hex_to_bytes_16(const char *hex, uint8_t out[16]) {
-  if (hex == NULL || strlen(hex) != LOGGER_JOURNAL_ID_HEX_LEN) {
-    return false;
-  }
-  for (size_t i = 0u; i < 16u; ++i) {
-    uint8_t hi = 0u;
-    uint8_t lo = 0u;
-    if (!logger_hex_nibble(hex[i * 2u], &hi) ||
-        !logger_hex_nibble(hex[(i * 2u) + 1u], &lo)) {
-      return false;
-    }
-    out[i] = (uint8_t)((hi << 4) | lo);
-  }
-  return true;
-}
-
 static void logger_bytes_to_hex_16(const uint8_t in[16],
                                    char out[LOGGER_JOURNAL_ID_HEX_LEN + 1]) {
   static const char hex[] = "0123456789abcdef";

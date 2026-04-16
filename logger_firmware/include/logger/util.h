@@ -6,6 +6,7 @@
  * All are static inline — the compiler folds them away at -O1 and above.
  */
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -149,6 +150,43 @@ static inline bool logger_timezone_is_utc_like(const char *timezone) {
  */
 static inline bool logger_string_present(const char *value) {
   return value != NULL && value[0] != '\0';
+}
+
+/*
+ * Convert one hex character to its 4-bit value.
+ * Returns false for non-hex characters.
+ */
+static inline bool logger_hex_nibble(char ch, uint8_t *value) {
+  if (ch >= '0' && ch <= '9') {
+    *value = (uint8_t)(ch - '0');
+    return true;
+  }
+  ch = (char)toupper((unsigned char)ch);
+  if (ch >= 'A' && ch <= 'F') {
+    *value = (uint8_t)(10 + (ch - 'A'));
+    return true;
+  }
+  return false;
+}
+
+/*
+ * Convert a 32-character hex string to 16 bytes (little-endian agnostic).
+ * Returns false if hex is NULL, wrong length, or contains non-hex chars.
+ */
+static inline bool logger_hex_to_bytes_16(const char *hex, uint8_t out[16]) {
+  if (hex == NULL || strlen(hex) != 32) {
+    return false;
+  }
+  for (size_t i = 0u; i < 16u; ++i) {
+    uint8_t hi = 0u;
+    uint8_t lo = 0u;
+    if (!logger_hex_nibble(hex[i * 2u], &hi) ||
+        !logger_hex_nibble(hex[(i * 2u) + 1u], &lo)) {
+      return false;
+    }
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
 }
 
 /*

@@ -16,6 +16,7 @@
 #define LOGGER_SESSION_ID_HEX_LEN 32
 
 #include "logger/capture_stats.h"
+#include "logger/chunk_builder.h"
 void logger_session_set_capture_stats(logger_capture_stats_t *stats);
 
 enum {
@@ -47,10 +48,12 @@ typedef struct {
   char manifest_path[LOGGER_STORAGE_PATH_MAX];
   uint64_t next_record_seq;
   uint64_t journal_size_bytes;
+  uint8_t current_span_id_raw[16];
   uint32_t next_chunk_seq_in_session;
   uint32_t next_packet_seq_in_span;
   uint32_t span_count;
   logger_journal_span_summary_t spans[LOGGER_JOURNAL_MAX_SPANS];
+  logger_chunk_builder_t chunk_builder;
 } logger_session_state_t;
 
 void logger_session_init(logger_session_state_t *session);
@@ -95,6 +98,14 @@ bool logger_session_append_pmd_packet(logger_session_state_t *session,
                                       const logger_clock_status_t *clock,
                                       uint16_t stream_kind, uint64_t mono_us,
                                       const uint8_t *value, size_t value_len);
+
+/*
+ * Check time-based chunk seal.  Call periodically from the main loop
+ * (recommended: every ~1 s while a session is active and streaming).
+ * Returns false on storage write failure.
+ */
+bool logger_session_seal_chunk_if_needed(logger_session_state_t *session,
+                                         uint32_t now_ms);
 
 bool logger_session_handle_disconnect(logger_session_state_t *session,
                                       const logger_clock_status_t *clock,

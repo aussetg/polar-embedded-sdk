@@ -168,10 +168,12 @@ static bool logger_app_recover_session_if_needed(logger_app_t *app,
   if (recovered_active) {
     app->last_session_live_flush_mono_ms = now_ms;
     app->last_session_snapshot_mono_ms = now_ms;
+    app->last_chunk_seal_mono_ms = now_ms;
   }
   if (closed_session) {
     app->last_session_live_flush_mono_ms = 0u;
     app->last_session_snapshot_mono_ms = 0u;
+    app->last_chunk_seal_mono_ms = 0u;
   }
   return true;
 }
@@ -1367,6 +1369,7 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
       app->current_day_has_session = true;
       app->last_session_live_flush_mono_ms = now_ms;
       app->last_session_snapshot_mono_ms = now_ms;
+      app->last_chunk_seal_mono_ms = now_ms;
     }
 
     if (!logger_session_append_pmd_packet(&app->session, &app->clock,
@@ -1404,6 +1407,7 @@ static bool logger_app_handle_h10_disconnect(logger_app_t *app,
     return false;
   }
   app->last_session_live_flush_mono_ms = now_ms;
+  app->last_chunk_seal_mono_ms = now_ms;
   return true;
 }
 
@@ -2009,6 +2013,22 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
     app->last_session_live_flush_mono_ms = now_ms;
   }
 
+  /* Time-based chunk seal: ~1 s cadence while streaming.
+   * Size seals happen inline in append_pmd_packet; barrier seals
+   * happen before every non-data journal record.  This timer
+   * covers the 60-second max-chunk-age rule from the data contract. */
+  if (app->session.active &&
+      (app->last_chunk_seal_mono_ms == 0u ||
+       (now_ms - app->last_chunk_seal_mono_ms) >= 1000u)) {
+    if (!logger_session_seal_chunk_if_needed(&app->session, now_ms)) {
+      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                      LOGGER_RUNTIME_BOOT,
+                                      "session_chunk_seal_failed", now_ms);
+      return;
+    }
+    app->last_chunk_seal_mono_ms = now_ms;
+  }
+
   const logger_fault_code_t storage_fault =
       logger_fault_from_storage(&app->storage);
   if (storage_fault != LOGGER_FAULT_NONE) {
@@ -2120,6 +2140,7 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
                                     "session_closed");
     app->last_session_live_flush_mono_ms = 0u;
     app->last_session_snapshot_mono_ms = 0u;
+    app->last_chunk_seal_mono_ms = 0u;
   }
   if (app->pending_day_study_day_local[0] != '\0') {
     logger_app_reset_day_tracking(app, app->pending_day_study_day_local);
@@ -2393,6 +2414,13 @@ uint32_t logger_app_max_sleep_ms(const logger_app_t *app, uint32_t now_ms) {
       logger_runtime_state_is_logging(app->runtime.current_state)) {
     cap_ms = logger_app_tighten_deadline(
         cap_ms, now_ms, app->last_session_live_flush_mono_ms + 5000u);
+  }
+
+  /* Tighten towards the next chunk seal check (1 s interval). */
+  if (app->session.active && app->last_chunk_seal_mono_ms != 0u &&
+      logger_runtime_state_is_logging(app->runtime.current_state)) {
+    cap_ms = logger_app_tighten_deadline(cap_ms, now_ms,
+                                         app->last_chunk_seal_mono_ms + 1000u);
   }
 
   /* Absolute floor. */

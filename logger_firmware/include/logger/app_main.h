@@ -99,6 +99,7 @@ typedef struct logger_app {
   uint32_t last_observation_mono_ms;
   uint32_t last_session_live_flush_mono_ms;
   uint32_t last_session_snapshot_mono_ms;
+  uint32_t last_chunk_seal_mono_ms;
   uint32_t day_seen_baseline;
   uint32_t day_connect_baseline;
   uint32_t day_ecg_start_baseline;

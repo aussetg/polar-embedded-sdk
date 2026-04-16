@@ -21,9 +21,10 @@
 #define LOGGER_SESSION_JSON_MAX 1024
 #define LOGGER_SESSION_MANIFEST_MAX 8192
 #define LOGGER_SESSION_LIVE_JSON_TOKEN_MAX 64u
-#define LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES 80u
-#define LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES 28u
-#define LOGGER_SESSION_DATA_ENCODING_RAW_PMD_NOTIFICATION_LIST_V1 1u
+
+/* Chunk assembly buffer: 64 KiB static, no heap in the hot path */
+#define LOGGER_SESSION_CHUNK_BUF_SIZE (64u * 1024u)
+static uint8_t g_chunk_buf[LOGGER_SESSION_CHUNK_BUF_SIZE];
 
 static logger_capture_stats_t *g_session_stats = NULL;
 
@@ -49,58 +50,6 @@ static void logger_random_hex128(char out[LOGGER_SESSION_ID_HEX_LEN + 1]) {
   }
   out[LOGGER_SESSION_ID_HEX_LEN] = '\0';
 }
-
-static bool logger_hex_nibble(char ch, uint8_t *value) {
-  if (ch >= '0' && ch <= '9') {
-    *value = (uint8_t)(ch - '0');
-    return true;
-  }
-  if (ch >= 'a' && ch <= 'f') {
-    *value = (uint8_t)(10 + (ch - 'a'));
-    return true;
-  }
-  if (ch >= 'A' && ch <= 'F') {
-    *value = (uint8_t)(10 + (ch - 'A'));
-    return true;
-  }
-  return false;
-}
-
-static bool logger_hex_to_bytes_16(const char *hex, uint8_t out[16]) {
-  if (hex == NULL || strlen(hex) != LOGGER_SESSION_ID_HEX_LEN) {
-    return false;
-  }
-  for (size_t i = 0u; i < 16u; ++i) {
-    uint8_t hi = 0u;
-    uint8_t lo = 0u;
-    if (!logger_hex_nibble(hex[i * 2u], &hi) ||
-        !logger_hex_nibble(hex[(i * 2u) + 1u], &lo)) {
-      return false;
-    }
-    out[i] = (uint8_t)((hi << 4) | lo);
-  }
-  return true;
-}
-
-static void logger_put_u16le(uint8_t *dst, uint16_t value) {
-  dst[0] = (uint8_t)value;
-  dst[1] = (uint8_t)(value >> 8);
-}
-
-static void logger_put_u32le(uint8_t *dst, uint32_t value) {
-  dst[0] = (uint8_t)value;
-  dst[1] = (uint8_t)(value >> 8);
-  dst[2] = (uint8_t)(value >> 16);
-  dst[3] = (uint8_t)(value >> 24);
-}
-
-static void logger_put_u64le(uint8_t *dst, uint64_t value) {
-  for (size_t i = 0u; i < 8u; ++i) {
-    dst[i] = (uint8_t)(value >> (8u * i));
-  }
-}
-
-static size_t logger_align4(size_t n) { return (n + 3u) & ~((size_t)3u); }
 
 static int64_t
 logger_session_observed_utc_ns_or_zero(const logger_clock_status_t *clock) {
@@ -199,6 +148,55 @@ static bool logger_session_set_paths(logger_session_state_t *session) {
          dir_path_n > 0 &&
          (size_t)dir_path_n < sizeof(session->session_dir_path) && journal_ok &&
          live_ok && manifest_ok;
+}
+
+/*
+ * Seal any in-flight chunk data and emit it to the journal.
+ *
+ * Updates span counters only on success, so span stats always
+ * reflect durable journal bytes.
+ *
+ * No-op when the builder is empty.
+ */
+static bool logger_session_seal_active_chunk(logger_session_state_t *session) {
+  logger_chunk_builder_t *cb = &session->chunk_builder;
+  if (!logger_chunk_builder_has_data(cb)) {
+    return true;
+  }
+
+  const uint32_t pkt_count = cb->packet_count;
+  const uint32_t first_seq = cb->first_seq_in_span;
+  const uint32_t last_seq = cb->last_seq_in_span;
+
+  const uint8_t *payload = NULL;
+  size_t payload_len = 0u;
+  if (!logger_chunk_builder_seal(cb, session->next_chunk_seq_in_session,
+                                 &payload, &payload_len)) {
+    return false;
+  }
+  if (!logger_journal_append_binary_record(
+          session->journal_path, LOGGER_JOURNAL_RECORD_DATA_CHUNK,
+          session->next_record_seq++, payload, payload_len,
+          &session->journal_size_bytes)) {
+    /* Journal write failed — lose in-flight data, keep journal consistent */
+    logger_chunk_builder_clear(cb);
+    return false;
+  }
+
+  /* Update span counters from the chunk we just emitted */
+  if (session->current_span_index < session->span_count) {
+    logger_journal_span_summary_t *span =
+        &session->spans[session->current_span_index];
+    if (span->packet_count == 0u) {
+      span->first_seq_in_span = first_seq;
+    }
+    span->packet_count += pkt_count;
+    span->last_seq_in_span = last_seq;
+  }
+
+  session->next_chunk_seq_in_session++;
+  logger_chunk_builder_clear(cb);
+  return true;
 }
 
 static void
@@ -333,6 +331,19 @@ static bool logger_session_begin_span(logger_session_state_t *session,
   session->current_span_index = session->span_count;
   session->span_active = true;
 
+  /* Cache raw span_id for chunk builder (avoids per-packet hex conversion) */
+  if (!logger_hex_to_bytes_16(span->span_id, session->current_span_id_raw)) {
+    session->span_count -= 1u;
+    session->span_active = false;
+    session->current_span_id[0] = '\0';
+    session->current_span_index = 0xffffffffu;
+    memset(span, 0, sizeof(*span));
+    return false;
+  }
+
+  /* Reset chunk builder for new span */
+  logger_chunk_builder_reset(&session->chunk_builder);
+
   logger_copy_string(span->start_reason, sizeof(span->start_reason),
                      start_reason);
   logger_copy_string(span->start_utc, sizeof(span->start_utc),
@@ -378,6 +389,11 @@ static bool logger_session_close_active_span(
     return true;
   }
 
+  /* Barrier: seal any in-flight chunk data before span_end */
+  if (!logger_session_seal_active_chunk(session)) {
+    return false;
+  }
+
   logger_journal_span_summary_t *span =
       &session->spans[session->current_span_index];
   if (ended_span_id_out != NULL) {
@@ -418,6 +434,11 @@ static bool logger_session_append_gap(logger_session_state_t *session,
                                       const char *ended_span_id,
                                       const char *gap_reason,
                                       uint32_t boot_counter, uint32_t now_ms) {
+  /* Barrier: spec §6.7 lists gap as an explicit seal trigger */
+  if (!logger_session_seal_active_chunk(session)) {
+    return false;
+  }
+
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
       payload, sizeof(payload),
@@ -456,6 +477,11 @@ static bool logger_session_append_recovery(logger_session_state_t *session,
 static bool logger_session_append_session_end(
     logger_session_state_t *session, const logger_clock_status_t *clock,
     const char *end_reason, uint32_t boot_counter, uint32_t now_ms) {
+  /* Barrier: spec §6.7 lists session_end as an explicit seal trigger */
+  if (!logger_session_seal_active_chunk(session)) {
+    return false;
+  }
+
   char reasons_json[128];
   logger_session_quarantine_reasons_json(session, reasons_json);
   logger_copy_string(session->session_end_utc, sizeof(session->session_end_utc),
@@ -904,6 +930,8 @@ static bool logger_session_load_live_session_id(
 void logger_session_init(logger_session_state_t *session) {
   memset(session, 0, sizeof(*session));
   session->current_span_index = 0xffffffffu;
+  logger_chunk_builder_init(&session->chunk_builder, g_chunk_buf,
+                            LOGGER_SESSION_CHUNK_BUF_SIZE);
 }
 
 bool logger_session_start_debug(
@@ -949,6 +977,11 @@ bool logger_session_write_status_snapshot(
     return false;
   }
 
+  /* Barrier: seal any in-flight chunk data before metadata record */
+  if (!logger_session_seal_active_chunk(session)) {
+    return false;
+  }
+
   logger_session_recompute_quarantine(session, clock);
 
   char active_span_id_json[64];
@@ -989,6 +1022,11 @@ bool logger_session_write_marker(logger_session_state_t *session,
                                  const logger_clock_status_t *clock,
                                  uint32_t boot_counter, uint32_t now_ms) {
   if (!session->active || !session->span_active) {
+    return false;
+  }
+
+  /* Barrier: seal any in-flight chunk data before marker record */
+  if (!logger_session_seal_active_chunk(session)) {
     return false;
   }
 
@@ -1061,85 +1099,55 @@ bool logger_session_append_pmd_packet(logger_session_state_t *session,
     return false;
   }
 
-  const size_t entry_len_unpadded =
-      LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES + value_len;
-  const size_t entry_len = logger_align4(entry_len_unpadded);
-  uint8_t payload[LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES +
-                  LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES +
-                  LOGGER_H10_PACKET_MAX_BYTES + 4u];
-  memset(payload, 0, sizeof(payload));
-
-  logger_journal_span_summary_t *span =
-      &session->spans[session->current_span_index];
+  logger_chunk_builder_t *cb = &session->chunk_builder;
   const uint32_t seq_in_span = session->next_packet_seq_in_span;
-  const uint32_t old_packet_count = span->packet_count;
-  const uint32_t old_first_seq = span->first_seq_in_span;
-  const uint32_t old_last_seq = span->last_seq_in_span;
-  const uint32_t old_next_packet_seq = session->next_packet_seq_in_span;
-  const uint32_t old_next_chunk_seq = session->next_chunk_seq_in_session;
-
-  if (span->packet_count == 0u) {
-    span->first_seq_in_span = seq_in_span;
-  }
-  span->packet_count += 1u;
-  span->last_seq_in_span = seq_in_span;
   session->next_packet_seq_in_span += 1u;
 
   int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
-  if (!logger_hex_to_bytes_16(session->current_span_id, payload + 8u)) {
-    span->packet_count = old_packet_count;
-    span->first_seq_in_span = old_first_seq;
-    span->last_seq_in_span = old_last_seq;
-    session->next_packet_seq_in_span = old_next_packet_seq;
-    const uint32_t elapsed =
-        (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
-    logger_capture_stats_record_session_append(g_session_stats, elapsed, false);
-    return false;
+  const uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+
+  logger_chunk_result_t r = logger_chunk_builder_append(
+      cb, stream_kind, session->current_span_id_raw, seq_in_span, mono_us,
+      utc_ns, value, value_len, now_ms);
+
+  /*
+   * FULL means the current chunk must be sealed first.
+   * This also covers stream/span identity changes.
+   */
+  if (r == LOGGER_CHUNK_FULL) {
+    if (!logger_session_seal_active_chunk(session)) {
+      session->next_packet_seq_in_span -= 1u;
+      const uint32_t elapsed =
+          (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+      logger_capture_stats_record_session_append(g_session_stats, elapsed,
+                                                 false);
+      logger_capture_stats_record_journal_append(g_session_stats, false);
+      return false;
+    }
+    r = logger_chunk_builder_append(cb, stream_kind,
+                                    session->current_span_id_raw, seq_in_span,
+                                    mono_us, utc_ns, value, value_len, now_ms);
+    if (r == LOGGER_CHUNK_FULL) {
+      /* Single packet too large for buffer — should not happen at 64 KiB */
+      session->next_packet_seq_in_span -= 1u;
+      const uint32_t elapsed =
+          (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+      logger_capture_stats_record_session_append(g_session_stats, elapsed,
+                                                 false);
+      return false;
+    }
   }
 
-  logger_put_u16le(payload + 0u, stream_kind);
-  logger_put_u16le(payload + 2u,
-                   LOGGER_SESSION_DATA_ENCODING_RAW_PMD_NOTIFICATION_LIST_V1);
-  logger_put_u32le(payload + 4u, session->next_chunk_seq_in_session);
-  logger_put_u32le(payload + 24u, 1u);
-  logger_put_u32le(payload + 28u, seq_in_span);
-  logger_put_u32le(payload + 32u, seq_in_span);
-  logger_put_u64le(payload + 40u, mono_us);
-  logger_put_u64le(payload + 48u, mono_us);
-  logger_put_u64le(payload + 56u, (uint64_t)utc_ns);
-  logger_put_u64le(payload + 64u, (uint64_t)utc_ns);
-  logger_put_u32le(payload + 72u, (uint32_t)entry_len);
-
-  uint8_t *entry = payload + LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES;
-  logger_put_u32le(entry + 0u, seq_in_span);
-  logger_put_u64le(entry + 8u, mono_us);
-  logger_put_u64le(entry + 16u, (uint64_t)utc_ns);
-  logger_put_u16le(entry + 24u, (uint16_t)value_len);
-  memcpy(entry + LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES, value, value_len);
-
-  const size_t payload_len = LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES + entry_len;
-  if (!logger_journal_append_binary_record(
-          session->journal_path, LOGGER_JOURNAL_RECORD_DATA_CHUNK,
-          session->next_record_seq++, payload, payload_len,
-          &session->journal_size_bytes)) {
-    span->packet_count = old_packet_count;
-    span->first_seq_in_span = old_first_seq;
-    span->last_seq_in_span = old_last_seq;
-    session->next_packet_seq_in_span = old_next_packet_seq;
-    session->next_chunk_seq_in_session = old_next_chunk_seq;
-    session->next_record_seq -= 1u;
-    const uint32_t elapsed =
-        (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
-    logger_capture_stats_record_session_append(g_session_stats, elapsed, false);
-    logger_capture_stats_record_journal_append(g_session_stats, false);
-    return false;
+  /* SEAL means target size reached — emit now */
+  bool ok = true;
+  if (r == LOGGER_CHUNK_SEAL) {
+    ok = logger_session_seal_active_chunk(session);
   }
 
-  session->next_chunk_seq_in_session += 1u;
   const uint32_t elapsed = (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
-  logger_capture_stats_record_session_append(g_session_stats, elapsed, true);
-  logger_capture_stats_record_journal_append(g_session_stats, true);
-  return true;
+  logger_capture_stats_record_session_append(g_session_stats, elapsed, ok);
+  logger_capture_stats_record_journal_append(g_session_stats, ok);
+  return ok;
 }
 
 bool logger_session_append_ecg_packet(logger_session_state_t *session,
@@ -1149,6 +1157,20 @@ bool logger_session_append_ecg_packet(logger_session_state_t *session,
   return logger_session_append_pmd_packet(session, clock,
                                           LOGGER_SESSION_STREAM_KIND_ECG,
                                           mono_us, value, value_len);
+}
+
+bool logger_session_seal_chunk_if_needed(logger_session_state_t *session,
+                                         uint32_t now_ms) {
+  if (!session->active || !session->span_active) {
+    return true;
+  }
+  if (!logger_chunk_builder_has_data(&session->chunk_builder)) {
+    return true;
+  }
+  if (logger_chunk_builder_age_exceeded(&session->chunk_builder, now_ms)) {
+    return logger_session_seal_active_chunk(session);
+  }
+  return true;
 }
 
 bool logger_session_handle_disconnect(logger_session_state_t *session,
@@ -1183,6 +1205,11 @@ bool logger_session_handle_clock_event(logger_session_state_t *session,
                                        int64_t new_utc_ns, bool split_span) {
   if (!session->active || event_kind == NULL) {
     return true;
+  }
+
+  /* Barrier: seal any in-flight chunk data before clock_event */
+  if (!logger_session_seal_active_chunk(session)) {
+    return false;
   }
 
   if (strcmp(event_kind, "clock_fixed") == 0) {
@@ -1230,6 +1257,11 @@ bool logger_session_append_h10_battery(logger_session_state_t *session,
                                        const char *read_reason) {
   if (!session->active) {
     return true;
+  }
+
+  /* Barrier: seal any in-flight chunk data before h10_battery record */
+  if (!logger_session_seal_active_chunk(session)) {
+    return false;
   }
 
   char span_id_json[64];
@@ -1375,6 +1407,16 @@ bool logger_session_recover_on_boot(
       scan.active_span_open ? scan.active_span_index : 0xffffffffu;
   logger_copy_string(session->current_span_id, sizeof(session->current_span_id),
                      scan.active_span_open ? scan.active_span_id : NULL);
+  if (scan.active_span_open &&
+      !logger_hex_to_bytes_16(session->current_span_id,
+                              session->current_span_id_raw)) {
+    logger_session_log_recovery_issue(
+        system_log, clock != NULL ? clock->now_utc : NULL,
+        "session_recovery_failed", "{\"reason\":\"span_id_parse_failed\"}");
+    return false;
+  }
+  /* Initialize chunk builder for the recovered session */
+  logger_chunk_builder_reset(&session->chunk_builder);
   session->quarantine_clock_invalid_at_start =
       scan.quarantine_clock_invalid_at_start;
   session->quarantine_clock_fixed_mid_session =
