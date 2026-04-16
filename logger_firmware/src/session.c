@@ -34,6 +34,30 @@ void logger_session_set_capture_stats(logger_capture_stats_t *stats) {
   g_session_stats = stats;
 }
 
+/*
+ * Central dispatch: routes writer commands through the capture pipe
+ * when one is attached, or falls back to direct dispatch otherwise.
+ *
+ * This is the ONLY place that should call logger_writer_dispatch()
+ * (aside from the pipe's own inline consumer for PMD batch drains).
+ * Every session function calls session_dispatch() instead of
+ * logger_writer_dispatch() directly.
+ */
+static bool session_dispatch(logger_session_state_t *session,
+                             const logger_writer_cmd_t *cmd) {
+  if (session == NULL || cmd == NULL) {
+    return false;
+  }
+  if (session->pipe != NULL) {
+    if (cmd->type == LOGGER_WRITER_APPEND_PMD_PACKET) {
+      return capture_pipe_submit_pmd(session->pipe, cmd);
+    }
+    return capture_pipe_submit_cmd(session->pipe,
+                                   (logger_session_context_t *)session, cmd);
+  }
+  return logger_writer_dispatch((logger_session_context_t *)session, cmd);
+}
+
 typedef struct {
   char *buf;
   size_t cap;
@@ -320,7 +344,7 @@ logger_session_append_session_start(logger_session_state_t *session,
                      persisted->config.subject_id);
   logger_copy_string(s->timezone, sizeof(s->timezone),
                      persisted->config.timezone);
-  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
+  return session_dispatch(session, &cmd);
 }
 
 static bool logger_session_begin_span(logger_session_state_t *session,
@@ -379,7 +403,7 @@ static bool logger_session_begin_span(logger_session_state_t *session,
   ss->encrypted = encrypted;
   ss->bonded = bonded;
 
-  if (!logger_writer_dispatch((logger_session_context_t *)session, &cmd)) {
+  if (!session_dispatch(session, &cmd)) {
     /* Rollback control-plane state on writer failure */
     session->span_count -= 1u;
     session->span_active = false;
@@ -500,7 +524,7 @@ static bool logger_session_append_recovery(logger_session_state_t *session,
   r->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
   logger_copy_string(r->session_id, sizeof(r->session_id), session->session_id);
   logger_copy_string(r->recovery_reason, sizeof(r->recovery_reason), reason);
-  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
+  return session_dispatch(session, &cmd);
 }
 
 static bool logger_session_append_session_end(
@@ -538,7 +562,7 @@ static bool logger_session_append_session_end(
   logger_copy_string(se->quarantine_reasons, sizeof(se->quarantine_reasons),
                      reasons_json);
 
-  if (!logger_writer_dispatch((logger_session_context_t *)session, &cmd)) {
+  if (!session_dispatch(session, &cmd)) {
     return false;
   }
   session->journal_size_bytes =
@@ -977,16 +1001,29 @@ static bool logger_session_load_live_session_id(
 }
 
 void logger_session_init(logger_session_state_t *session) {
+  /* Preserve pipe pointer across reinit */
+  struct capture_pipe *pipe = NULL;
+  if (session != NULL) {
+    pipe = session->pipe;
+  }
   /* Force-close any open writer handle before zeroing the struct */
   if (session != NULL &&
       logger_journal_writer_is_open(&session->journal_writer)) {
     logger_journal_writer_force_close(&session->journal_writer);
   }
   memset(session, 0, sizeof(*session));
+  session->pipe = pipe;
   session->current_span_index = 0xffffffffu;
   logger_chunk_builder_init(&session->chunk_builder, g_chunk_buf,
                             LOGGER_SESSION_CHUNK_BUF_SIZE);
   logger_journal_writer_init(&session->journal_writer);
+}
+
+void logger_session_set_pipe(logger_session_state_t *session,
+                             struct capture_pipe *pipe) {
+  if (session != NULL) {
+    session->pipe = pipe;
+  }
 }
 
 bool logger_session_start_debug(
@@ -1031,7 +1068,7 @@ bool logger_session_refresh_live(logger_session_state_t *session,
                        sizeof(cmd.refresh_live.now_utc), clock->now_utc);
   }
 
-  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
+  return session_dispatch(session, &cmd);
 }
 
 bool logger_session_write_status_snapshot(
@@ -1074,7 +1111,7 @@ bool logger_session_write_status_snapshot(
     logger_copy_string(s->now_utc, sizeof(s->now_utc), clock->now_utc);
   }
 
-  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
+  return session_dispatch(session, &cmd);
 }
 
 bool logger_session_write_marker(logger_session_state_t *session,
@@ -1098,7 +1135,7 @@ bool logger_session_write_marker(logger_session_state_t *session,
   logger_copy_string(m->session_id, sizeof(m->session_id), session->session_id);
   logger_copy_string(m->span_id, sizeof(m->span_id), session->current_span_id);
 
-  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
+  return session_dispatch(session, &cmd);
 }
 
 bool logger_session_ensure_active_span(
@@ -1142,12 +1179,64 @@ bool logger_session_ensure_active_span(
   return true;
 }
 
+/*
+ * Prepare the stable skeleton of an APPEND_PMD_PACKET command.
+ * Called once before a drain loop; per-packet fields are then set by
+ * logger_session_pmd_cmd_submit() without zeroing ~320 bytes each time.
+ */
+void logger_session_pmd_cmd_init(logger_session_state_t *session,
+                                 const logger_clock_status_t *clock,
+                                 logger_writer_cmd_t *cmd) {
+  memset(cmd, 0, sizeof(*cmd));
+  cmd->type = LOGGER_WRITER_APPEND_PMD_PACKET;
+  logger_writer_append_pmd_packet_t *p = &cmd->append_pmd_packet;
+  p->type = LOGGER_WRITER_APPEND_PMD_PACKET;
+  p->now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  (void)logger_clock_observed_utc_ns(clock, &p->utc_ns);
+  memcpy(p->span_id_raw, session->current_span_id_raw, 16);
+}
+
+/*
+ * Update per-packet fields on an existing command skeleton.
+ * No memset — only the fields that change between packets are written.
+ * The value[] tail beyond value_len is stale but unread by the consumer.
+ */
+bool logger_session_pmd_cmd_submit(logger_session_state_t *session,
+                                   logger_writer_cmd_t *cmd,
+                                   uint16_t stream_kind, uint64_t mono_us,
+                                   const uint8_t *value, size_t value_len) {
+  if (!session->active || !session->span_active || value == NULL ||
+      value_len == 0u || value_len > LOGGER_H10_PACKET_MAX_BYTES ||
+      (stream_kind != LOGGER_SESSION_STREAM_KIND_ECG &&
+       stream_kind != LOGGER_SESSION_STREAM_KIND_ACC)) {
+    return false;
+  }
+
+  const uint32_t t0 = (uint32_t)to_us_since_boot(get_absolute_time());
+
+  logger_writer_append_pmd_packet_t *p = &cmd->append_pmd_packet;
+  p->stream_kind = stream_kind;
+  p->seq_in_span = session->next_packet_seq_in_span;
+  p->mono_us = mono_us;
+  p->value_len = (uint16_t)value_len;
+  memcpy(p->value, value, value_len);
+
+  const bool ok = session_dispatch(session, cmd);
+
+  const uint32_t elapsed = (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+  logger_capture_stats_record_session_append(g_session_stats, elapsed, ok);
+  logger_capture_stats_record_journal_append(g_session_stats, ok);
+
+  if (ok) {
+    session->next_packet_seq_in_span += 1u;
+  }
+  return ok;
+}
+
 bool logger_session_append_pmd_packet(logger_session_state_t *session,
                                       const logger_clock_status_t *clock,
                                       uint16_t stream_kind, uint64_t mono_us,
                                       const uint8_t *value, size_t value_len) {
-  const uint32_t t0 = (uint32_t)to_us_since_boot(get_absolute_time());
-
   if (!session->active || !session->span_active || value == NULL ||
       value_len == 0u || value_len > LOGGER_H10_PACKET_MAX_BYTES ||
       session->current_span_index >= session->span_count ||
@@ -1156,39 +1245,10 @@ bool logger_session_append_pmd_packet(logger_session_state_t *session,
     return false;
   }
 
-  /* Control-core ownership: assign seq_in_span before dispatch */
-  const uint32_t seq_in_span = session->next_packet_seq_in_span;
-
-  int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
-  const uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
-
-  /* Construct the writer command with all data copied in */
   logger_writer_cmd_t cmd;
-  memset(&cmd, 0, sizeof(cmd));
-  cmd.type = LOGGER_WRITER_APPEND_PMD_PACKET;
-  logger_writer_append_pmd_packet_t *p = &cmd.append_pmd_packet;
-  p->type = LOGGER_WRITER_APPEND_PMD_PACKET;
-  p->now_ms = now_ms;
-  p->stream_kind = stream_kind;
-  memcpy(p->span_id_raw, session->current_span_id_raw, 16);
-  p->seq_in_span = seq_in_span;
-  p->mono_us = mono_us;
-  p->utc_ns = utc_ns;
-  p->value_len = (uint16_t)value_len;
-  memcpy(p->value, value, value_len);
-
-  const bool ok =
-      logger_writer_dispatch((logger_session_context_t *)session, &cmd);
-
-  const uint32_t elapsed = (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
-  logger_capture_stats_record_session_append(g_session_stats, elapsed, ok);
-  logger_capture_stats_record_journal_append(g_session_stats, ok);
-
-  /* Advance control-core seq_in_span only on success */
-  if (ok) {
-    session->next_packet_seq_in_span += 1u;
-  }
-  return ok;
+  logger_session_pmd_cmd_init(session, clock, &cmd);
+  return logger_session_pmd_cmd_submit(session, &cmd, stream_kind, mono_us,
+                                       value, value_len);
 }
 
 bool logger_session_append_ecg_packet(logger_session_state_t *session,
@@ -1214,7 +1274,7 @@ bool logger_session_seal_chunk_if_needed(logger_session_state_t *session,
     cmd.type = LOGGER_WRITER_FLUSH_BARRIER;
     cmd.flush_barrier.type = LOGGER_WRITER_FLUSH_BARRIER;
     cmd.flush_barrier.now_ms = now_ms;
-    return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
+    return session_dispatch(session, &cmd);
   }
   return true;
 }
@@ -1342,7 +1402,7 @@ bool logger_session_append_h10_battery(logger_session_state_t *session,
   logger_copy_string(b->read_reason, sizeof(b->read_reason),
                      read_reason != NULL ? read_reason : "periodic");
 
-  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
+  return session_dispatch(session, &cmd);
 }
 
 bool logger_session_finalize(

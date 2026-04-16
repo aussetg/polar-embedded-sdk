@@ -1333,6 +1333,48 @@ static void logger_app_handle_h10_recovery_events(logger_app_t *app) {
   }
 }
 
+/*
+ * Drain the capture pipe: staging → command ring → inline execution.
+ *
+ * This is the main-loop counterpart to the BLE-callback staging push.
+ * For now, execution is inline (same core).  When core 1 launches,
+ * this becomes a staging→ring drain only, and core 1 owns execution.
+ */
+static bool logger_app_drain_capture_pipe(logger_app_t *app, uint32_t now_ms) {
+  capture_pipe_t *pipe = &app->capture_pipe;
+
+  /* Drain source staging into the command ring */
+  if (capture_staging_has_data(pipe)) {
+    (void)capture_staging_drain(pipe, CAPTURE_STAGING_DUAL_CORE_CAPACITY);
+  }
+
+  /* Execute commands inline (temporary, until core 1) */
+  if (capture_cmd_ring_occupancy(pipe) > 0u) {
+    (void)capture_pipe_drain_and_execute(
+        pipe, (logger_session_context_t *)&app->session,
+        CAPTURE_CMD_RING_CAPACITY);
+  }
+
+  /* Process any events (barrier completions, failures) */
+  capture_pipe_process_events(pipe);
+
+  /* Evaluate health */
+  (void)capture_pipe_evaluate_health(pipe, now_ms);
+
+  /* If a hard failure occurred during execution, check the deadline */
+  if (pipe->has_seen_hard_failure) {
+    if (capture_pipe_needs_recovery(pipe, now_ms)) {
+      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                      LOGGER_RUNTIME_BOOT,
+                                      "writer_degraded_deadline", now_ms);
+      return false;
+    }
+    return true;
+  }
+
+  return true;
+}
+
 static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
   if (app->h10.packet_count == 0u) {
     return true;
@@ -1342,13 +1384,25 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
   app->runtime.wall_clock_valid = app->clock.valid;
 
   logger_h10_packet_t packet;
-  bool appended_any = false;
+  bool pushed_any = false;
+
+  /*
+   * The command skeleton is initialised once, then only per-packet fields
+   * are updated inside the loop.  This avoids ~320 B of zeroing per packet
+   * (~230 packets/s → ~73 KB/s of dead stores eliminated).
+   *
+   * span_id_raw may change when a new span is opened (first packet only).
+   * In that case we re-init the skeleton to pick up the new span id.
+   */
+  logger_writer_cmd_t cmd;
+  bool cmd_initialized = false;
+
   while (logger_h10_pop_packet(&app->h10, &packet)) {
-    char reason_buf[sizeof(app->next_span_start_reason)];
-    const char *span_start_reason = logger_app_take_next_span_start_reason(
-        app, app->session.active ? "reconnect" : "session_start", reason_buf,
-        sizeof(reason_buf));
     if (!app->session.span_active) {
+      char reason_buf[sizeof(app->next_span_start_reason)];
+      const char *span_start_reason = logger_app_take_next_span_start_reason(
+          app, app->session.active ? "reconnect" : "session_start", reason_buf,
+          sizeof(reason_buf));
       const char *error_code = NULL;
       const char *error_message = NULL;
       if (!logger_session_ensure_active_span(
@@ -1370,20 +1424,28 @@ static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
       app->last_session_live_flush_mono_ms = now_ms;
       app->last_session_snapshot_mono_ms = now_ms;
       app->last_chunk_seal_mono_ms = now_ms;
+      /* (Re-)init skeleton after span open — span_id_raw has changed */
+      logger_session_pmd_cmd_init(&app->session, &app->clock, &cmd);
+      cmd_initialized = true;
     }
 
-    if (!logger_session_append_pmd_packet(&app->session, &app->clock,
-                                          packet.stream_kind, packet.mono_us,
-                                          packet.value, packet.value_len)) {
+    if (!cmd_initialized) {
+      logger_session_pmd_cmd_init(&app->session, &app->clock, &cmd);
+      cmd_initialized = true;
+    }
+
+    if (!logger_session_pmd_cmd_submit(&app->session, &cmd, packet.stream_kind,
+                                       packet.mono_us, packet.value,
+                                       packet.value_len)) {
       logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                       LOGGER_RUNTIME_BOOT,
-                                      "session_packet_write_failed", now_ms);
+                                      "control_stage_overflow", now_ms);
       return false;
     }
-    appended_any = true;
+    pushed_any = true;
   }
 
-  if (appended_any &&
+  if (pushed_any &&
       app->runtime.current_state != LOGGER_RUNTIME_LOG_STREAMING) {
     logger_app_state_transition(&app->runtime, LOGGER_RUNTIME_LOG_STREAMING,
                                 "h10_pmd_packets", now_ms);
@@ -1627,6 +1689,8 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
   logger_session_init(&app->session);
   logger_capture_stats_init(&app->capture_stats);
   logger_session_set_capture_stats(&app->capture_stats);
+  capture_pipe_init(&app->capture_pipe);
+  logger_session_set_pipe(&app->session, &app->capture_pipe);
   logger_system_log_init(&app->system_log, app->persisted.boot_counter);
 
   logger_app_refresh_observations(app, now_ms);
@@ -1994,6 +2058,9 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
   }
 
   if (!logger_app_handle_h10_packets(app, now_ms)) {
+    return;
+  }
+  if (!logger_app_drain_capture_pipe(app, now_ms)) {
     return;
   }
   if (!logger_app_handle_h10_disconnect(app, now_ms)) {

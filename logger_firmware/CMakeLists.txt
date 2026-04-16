@@ -58,6 +58,7 @@ add_executable(logger_appliance
     src/app_state.c
     src/battery.c
     src/button.c
+    src/capture_pipe.c
     src/capture_stats.c
     src/chunk_builder.c
     src/clock.c

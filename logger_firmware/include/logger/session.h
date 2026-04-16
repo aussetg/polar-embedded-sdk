@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "logger/battery.h"
+#include "logger/capture_pipe.h"
 #include "logger/clock.h"
 #include "logger/config_store.h"
 #include "logger/faults.h"
@@ -70,9 +71,14 @@ typedef struct logger_session_state {
   uint32_t span_count;
   logger_journal_span_summary_t spans[LOGGER_JOURNAL_MAX_SPANS];
   logger_chunk_builder_t chunk_builder;
+  /* Capture pipe — when set, all writer dispatch routes through it.
+   * NULL during init or unit tests that don't need the pipe. */
+  struct capture_pipe *pipe;
 } logger_session_state_t;
 
 void logger_session_init(logger_session_state_t *session);
+void logger_session_set_pipe(logger_session_state_t *session,
+                             struct capture_pipe *pipe);
 
 bool logger_session_start_debug(
     logger_session_state_t *session, logger_system_log_t *system_log,
@@ -105,15 +111,35 @@ bool logger_session_ensure_active_span(
     uint32_t now_ms, const char **error_code_out,
     const char **error_message_out);
 
-bool logger_session_append_ecg_packet(logger_session_state_t *session,
-                                      const logger_clock_status_t *clock,
-                                      uint64_t mono_us, const uint8_t *value,
-                                      size_t value_len);
-
+/*
+ * PMD packet submission — routes through the capture pipe when attached.
+ * seq_in_span is assigned internally and advanced on acceptance.
+ */
 bool logger_session_append_pmd_packet(logger_session_state_t *session,
                                       const logger_clock_status_t *clock,
                                       uint16_t stream_kind, uint64_t mono_us,
                                       const uint8_t *value, size_t value_len);
+
+/*
+ * Split append for batch drain loops: init once, then update per packet.
+ * The caller is responsible for ensuring a span is active before init.
+ *
+ *   logger_session_pmd_cmd_init(session, clock, &cmd);   // once
+ *   while (have packets)
+ *       logger_session_pmd_cmd_submit(session, &cmd, ...);
+ */
+void logger_session_pmd_cmd_init(logger_session_state_t *session,
+                                 const logger_clock_status_t *clock,
+                                 logger_writer_cmd_t *cmd);
+bool logger_session_pmd_cmd_submit(logger_session_state_t *session,
+                                   logger_writer_cmd_t *cmd,
+                                   uint16_t stream_kind, uint64_t mono_us,
+                                   const uint8_t *value, size_t value_len);
+
+bool logger_session_append_ecg_packet(logger_session_state_t *session,
+                                      const logger_clock_status_t *clock,
+                                      uint64_t mono_us, const uint8_t *value,
+                                      size_t value_len);
 
 /*
  * Check time-based chunk seal.  Call periodically from the main loop

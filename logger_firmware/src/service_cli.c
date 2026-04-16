@@ -2720,6 +2720,7 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
     packet[9] = 0xf0u;
     packet[10] = 0xdeu;
     packet[11] = 0x01u;
+
     if (!logger_session_append_ecg_packet(&app->session, &app->clock,
                                           ((uint64_t)now_ms * 1000ull) +
                                               ((uint64_t)i * 1000ull),
@@ -2731,6 +2732,16 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
     }
     appended += 1u;
   }
+
+  /* Drain staging → command ring → inline execution */
+  if (capture_staging_has_data(&app->capture_pipe)) {
+    capture_staging_drain(&app->capture_pipe,
+                          CAPTURE_STAGING_DUAL_CORE_CAPACITY);
+  }
+  capture_pipe_drain_and_execute(&app->capture_pipe,
+                                 (logger_session_context_t *)&app->session,
+                                 CAPTURE_CMD_RING_CAPACITY);
+  capture_pipe_process_events(&app->capture_pipe);
 
   jsw w;
   jsw_ok(&w, "debug synth ecg", logger_clock_now_utc_or_null(&app->clock));
