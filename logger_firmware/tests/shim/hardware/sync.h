@@ -11,4 +11,8 @@
 #define __mem_fence_release() __asm volatile("" ::: "memory")
 #define __mem_fence_acquire() __asm volatile("" ::: "memory")
 
+/* ARM event intrinsics — no-ops on host. */
+static inline void __sev(void) {}
+static inline void __wfe(void) {}
+
 #endif

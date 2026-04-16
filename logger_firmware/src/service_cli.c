@@ -2733,15 +2733,18 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
     appended += 1u;
   }
 
-  /* Drain staging → command ring → inline execution */
-  if (capture_staging_has_data(&app->capture_pipe)) {
-    capture_staging_drain(&app->capture_pipe,
-                          CAPTURE_STAGING_DUAL_CORE_CAPACITY);
-  }
-  capture_pipe_drain_and_execute(&app->capture_pipe,
-                                 (logger_session_context_t *)&app->session,
-                                 CAPTURE_CMD_RING_CAPACITY);
-  capture_pipe_process_events(&app->capture_pipe);
+  /* Flush all queued packets through core 1 with a barrier.
+   * capture_pipe_submit_cmd() drains staging, enqueues the
+   * barrier, and waits for core 1 to process everything —
+   * no magic sleep needed. */
+  logger_writer_cmd_t flush_cmd;
+  memset(&flush_cmd, 0, sizeof(flush_cmd));
+  flush_cmd.flush_barrier.type = LOGGER_WRITER_FLUSH_BARRIER;
+  flush_cmd.flush_barrier.boot_counter = app->persisted.boot_counter;
+  flush_cmd.flush_barrier.now_ms = now_ms;
+  capture_pipe_submit_cmd(&app->capture_pipe,
+                          (logger_session_context_t *)&app->session,
+                          &flush_cmd);
 
   jsw w;
   jsw_ok(&w, "debug synth ecg", logger_clock_now_utc_or_null(&app->clock));

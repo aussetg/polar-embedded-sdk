@@ -5,6 +5,12 @@
 
 #include "logger/app_main.h"
 #include "logger/button.h"
+#include "logger/storage_worker.h"
+
+/* Shared state for the core-1 storage worker.  Static so it survives
+ * the lifetime of the boot.  Core 0 sets this up before launch;
+ * core 1 reads it from the entry function via the FIFO mailbox. */
+static storage_worker_shared_t g_storage_worker_shared;
 
 int main(void) {
   stdio_init_all();
@@ -27,6 +33,33 @@ int main(void) {
 
   static logger_app_t app;
   logger_app_init(&app, to_ms_since_boot(get_absolute_time()), boot_gesture);
+
+  /*
+   * Launch core 1 storage worker.
+   *
+   * This is a BOOT-time, one-shot operation.  The worker runs for
+   * the lifetime of this boot.  It is not torn down or relaunched
+   * during mode transitions.
+   *
+   * Sequence:
+   *   1. Wire the capture pipe and session context into shared state
+   *   2. Launch core 1 (blocks until core 1 is lockout-ready)
+   *   3. Initialize flash-safe lockout on core 0
+   *
+   * After this returns, both cores are flash-safe initialized and
+   * core 1 is the exclusive SD/FatFS owner.
+   */
+  app.storage_worker_shared = &g_storage_worker_shared;
+  logger_storage_worker_init(&g_storage_worker_shared, &app.capture_pipe,
+                             (logger_session_context_t *)&app.session);
+  if (!logger_storage_worker_launch(&g_storage_worker_shared)) {
+    printf("[logger] fatal: storage worker launch failed\n");
+    while (true) {
+      sleep_ms(1000);
+    }
+  }
+
+  printf("[logger] core 1 storage worker alive, entering main loop\n");
 
   while (true) {
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());

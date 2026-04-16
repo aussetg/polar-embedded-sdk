@@ -1,6 +1,7 @@
 #include "logger/capture_pipe.h"
 
 #include "hardware/sync.h"
+#include "pico/stdlib.h"
 #include <string.h>
 
 /* ── Internal helpers ──────────────────────────────────────────── */
@@ -41,11 +42,11 @@ void capture_pipe_init(capture_pipe_t *pipe) {
 
 /* ── Source staging ────────────────────────────────────────────── */
 
-#if CAPTURE_STAGING_CAPACITY > 0
-
 /*
- * Dual-core phase: real staging buffer decouples BLE callback timing
- * from inter-core ring drain timing.
+ * Source staging decouples BLE callback timing from inter-core
+ * ring drain timing.  The BLE callback pushes into staging; the
+ * main loop drains staging into the command ring that core 1
+ * consumes.
  */
 
 bool capture_staging_push_pmd(capture_pipe_t *pipe,
@@ -69,7 +70,7 @@ bool capture_staging_push_pmd(capture_pipe_t *pipe,
   s->tail += 1u;
 
   pipe->telemetry.staging_enqueue_count += 1u;
-  const uint32_t occ = s->tail - s->head;
+  const uint32_t occ = (uint32_t)(s->tail - s->head);
   if (occ > pipe->telemetry.staging_occupancy_hwm) {
     pipe->telemetry.staging_occupancy_hwm = (uint8_t)occ;
   }
@@ -109,48 +110,12 @@ uint32_t capture_staging_drain(capture_pipe_t *pipe, uint32_t max_entries) {
 
   if (drained > 0u) {
     pipe->telemetry.staging_drain_count += drained;
-    const uint32_t occ = s->tail - s->head;
+    const uint32_t occ = (uint32_t)(s->tail - s->head);
     pipe->telemetry.staging_occupancy_now = (uint8_t)occ;
   }
 
   return drained;
 }
-
-#else /* CAPTURE_STAGING_CAPACITY == 0: inline phase */
-
-/*
- * Inline phase: no staging array.  Push goes directly to the command
- * ring.  The h10 packet queue (packets[32]) already decouples the BLE
- * callback from the main loop.  Adding another buffer here would be
- * a redundant ~70 KiB copy for no concurrency benefit.
- *
- * Switch to the staging path above when core 1 owns the ring consumer.
- */
-
-bool capture_staging_push_pmd(capture_pipe_t *pipe,
-                              const logger_writer_cmd_t *cmd) {
-  const bool ok = capture_cmd_ring_enqueue(pipe, cmd);
-  if (ok) {
-    pipe->telemetry.staging_enqueue_count += 1u;
-  } else {
-    pipe->staging.overflow_count += 1u;
-    pipe->telemetry.staging_overflow_count += 1u;
-  }
-  return ok;
-}
-
-bool capture_staging_has_data(const capture_pipe_t *pipe) {
-  (void)pipe;
-  return false;
-}
-
-uint32_t capture_staging_drain(capture_pipe_t *pipe, uint32_t max_entries) {
-  (void)pipe;
-  (void)max_entries;
-  return 0u;
-}
-
-#endif /* CAPTURE_STAGING_CAPACITY */
 
 /* ── Command ring ──────────────────────────────────────────────── */
 
@@ -211,6 +176,14 @@ uint32_t capture_cmd_ring_occupancy(const capture_pipe_t *pipe) {
   if (pipe == NULL) {
     return 0u;
   }
+  /*
+   * Acquire fence: head is written by core 1 (release fence in
+   * dequeue).  Without this acquire, core 0 can observe a stale
+   * head value, making occupancy appear higher than reality.
+   * That's safe (longer spin) but architecturally wrong without
+   * the fence.  tail is core 0's own word and is always current.
+   */
+  __mem_fence_acquire();
   return ring_occ(pipe->cmd_ring.head, pipe->cmd_ring.tail);
 }
 
@@ -266,7 +239,29 @@ bool capture_event_ring_has_data(const capture_pipe_t *pipe) {
   if (pipe == NULL) {
     return false;
   }
+  /* tail is written by core 1 (release fence in push). */
+  __mem_fence_acquire();
   return !ring_empty(pipe->event_ring.head, pipe->event_ring.tail);
+}
+
+/* ── Internal: tally one popped event into telemetry ─────────── */
+
+static void capture_pipe_tally_event(capture_pipe_t *pipe,
+                                     const capture_event_t *event) {
+  switch (event->kind) {
+  case CAPTURE_EVENT_BARRIER_COMPLETE:
+    pipe->telemetry.event_barrier_complete_count += 1u;
+    break;
+  case CAPTURE_EVENT_WRITE_FAILED:
+    pipe->telemetry.event_write_failed_count += 1u;
+    break;
+  case CAPTURE_EVENT_WORKER_DISTRESS:
+    pipe->telemetry.event_worker_distress_count += 1u;
+    break;
+  case CAPTURE_EVENT_STATS_SNAPSHOT:
+    pipe->telemetry.event_stats_snapshot_count += 1u;
+    break;
+  }
 }
 
 /* ── High-level submit ─────────────────────────────────────────── */
@@ -288,30 +283,86 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
     (void)capture_staging_drain(pipe, CAPTURE_STAGING_DUAL_CORE_CAPACITY);
   }
 
-  /* Inline: drain all queued commands, then execute barrier */
-  if (capture_cmd_ring_occupancy(pipe) > 0u) {
-    (void)capture_pipe_drain_and_execute(pipe, session_ctx,
-                                         CAPTURE_CMD_RING_CAPACITY);
-  }
-
-  /* Execute the barrier command directly.
+  /* Enqueue the barrier command into the command ring.
    *
-   * Core-1 path: enqueue into command ring, then wait for
-   * a BARRIER_COMPLETE event from the worker.  Do NOT
-   * call logger_writer_dispatch() here once core 1 owns SD.
+   * Core 1 will drain all queued commands (both PMD packets and
+   * this barrier) in order.  The ordering guarantee is that
+   * everything in the ring before this barrier is executed first.
+   *
+   * After enqueueing, wait for the ring to drain so the barrier
+   * is processed.  Core 1 signals __sev() after draining.
+   *
+   * We poll the ring occupancy with a timeout rather than blocking
+   * indefinitely.  If the ring is stuck, the health/degraded
+   * deadline machinery in the caller will catch it.
    */
-  const bool ok = logger_writer_dispatch(session_ctx, cmd);
-
-  if (!ok) {
+  if (!capture_cmd_ring_enqueue(pipe, cmd)) {
+    /* Ring is full — barrier cannot be enqueued.
+     * This is a hard failure condition. */
     capture_event_t event;
     memset(&event, 0, sizeof(event));
     event.kind = CAPTURE_EVENT_WRITE_FAILED;
     event.success = false;
     capture_pipe_note_hard_failure(pipe, 0u);
     capture_event_ring_push(pipe, &event);
+    return false;
   }
 
-  return ok;
+  /* Signal core 1 that work is available. */
+  __sev();
+
+  /*
+   * Wait for core 1 to process the barrier.
+   *
+   * Snapshot the completion counter before the barrier was
+   * enqueued, then spin until it advances — meaning core 1
+   * has actually dispatched the command.
+   *
+   * After the counter advances, read barrier_last_ok for the
+   * dispatch result.  This is reliable regardless of whether
+   * the event ring overflowed.
+   *
+   * Also drain any event ring entries for telemetry, but do
+   * not rely on them for the barrier result.
+   */
+  const uint32_t wait_seq = pipe->barriers_done_seq;
+  const uint32_t barrier_deadline_us = 5000000u; /* 5 s */
+  const uint64_t start_us = time_us_64();
+
+  while ((time_us_64() - start_us) < barrier_deadline_us) {
+    /* Drain event ring entries for telemetry (best-effort).
+     * WRITE_FAILED here is redundant — the counter + flag are
+     * authoritative — but drain anyway so the ring doesn't fill.
+     * Tally every popped event by kind so nothing is silently lost. */
+    capture_event_t event;
+    while (capture_event_ring_pop(pipe, &event)) {
+      capture_pipe_tally_event(pipe, &event);
+    }
+
+    /* Core 1 set barrier_last_ok before advancing barriers_done_seq.
+     * The acquire fence ensures we see the result flag. */
+    if (pipe->barriers_done_seq != wait_seq) {
+      __mem_fence_acquire();
+      return pipe->barrier_last_ok;
+    }
+
+    /* Yield until core 1 makes progress. */
+    __wfe();
+  }
+
+  /* Timeout — core 1 did not drain the barrier within 5 s.
+   * This is as serious as a write failure or a full ring.
+   * Record it so the health/distress machinery and the caller
+   * can see it through the normal sd_write_failed recovery path. */
+  capture_pipe_note_hard_failure(pipe, 0u);
+  {
+    capture_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.kind = CAPTURE_EVENT_WRITE_FAILED;
+    event.success = false;
+    capture_event_ring_push(pipe, &event);
+  }
+  return false;
 }
 
 /* ── Health / distress ─────────────────────────────────────────── */
@@ -416,52 +467,7 @@ bool capture_pipe_needs_recovery(const capture_pipe_t *pipe, uint32_t now_ms) {
   return false;
 }
 
-/* ── Inline writer consumer (temporary, until core 1) ──────────── */
-
-uint32_t capture_pipe_drain_and_execute(capture_pipe_t *pipe,
-                                        logger_session_context_t *session_ctx,
-                                        uint32_t max_cmds) {
-  if (pipe == NULL || session_ctx == NULL) {
-    return 0u;
-  }
-
-  uint32_t executed = 0u;
-  const uint32_t cmd_seq_start = pipe->cmd_ring.seq;
-
-  while (executed < max_cmds) {
-    logger_writer_cmd_t cmd;
-    if (!capture_cmd_ring_dequeue(pipe, &cmd)) {
-      break;
-    }
-
-    const bool ok = logger_writer_dispatch(session_ctx, &cmd);
-
-    /* Determine event kind based on command type */
-    const bool is_barrier = cmd.type != LOGGER_WRITER_APPEND_PMD_PACKET &&
-                            cmd.type != LOGGER_WRITER_REFRESH_LIVE;
-
-    if (is_barrier || !ok) {
-      capture_event_t event;
-      memset(&event, 0, sizeof(event));
-      event.cmd_seq = cmd_seq_start + executed;
-
-      if (!ok) {
-        event.kind = CAPTURE_EVENT_WRITE_FAILED;
-        event.success = false;
-        capture_pipe_note_hard_failure(pipe, 0u);
-      } else {
-        event.kind = CAPTURE_EVENT_BARRIER_COMPLETE;
-        event.success = true;
-      }
-
-      capture_event_ring_push(pipe, &event);
-    }
-
-    executed += 1u;
-  }
-
-  return executed;
-}
+/* ── Event processing ─────────────────────────────────────────── */
 
 uint32_t capture_pipe_process_events(capture_pipe_t *pipe) {
   if (pipe == NULL) {
@@ -472,10 +478,7 @@ uint32_t capture_pipe_process_events(capture_pipe_t *pipe) {
   capture_event_t event;
 
   while (capture_event_ring_pop(pipe, &event)) {
-    /* For now, just count.  The caller (app_main) inspects
-     * pipe->health and pipe->telemetry for side effects.
-     * When core 1 is live, barrier completions will unblock
-     * waiting control-core state transitions. */
+    capture_pipe_tally_event(pipe, &event);
     processed += 1u;
   }
 

@@ -1,7 +1,10 @@
 #include "logger/app_main.h"
 
 #include "logger/faults.h"
+#include "logger/storage_worker.h"
 
+#include "hardware/sync.h"
+#include "pico/stdlib.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -1334,11 +1337,13 @@ static void logger_app_handle_h10_recovery_events(logger_app_t *app) {
 }
 
 /*
- * Drain the capture pipe: staging → command ring → inline execution.
+ * Drain the capture pipe: staging → command ring → signal core 1.
  *
- * This is the main-loop counterpart to the BLE-callback staging push.
- * For now, execution is inline (same core).  When core 1 launches,
- * this becomes a staging→ring drain only, and core 1 owns execution.
+ * Core 0 drains source staging into the command ring.  Core 1
+ * consumes the command ring and executes commands.
+ *
+ * This function does NOT execute commands inline — core 1 owns
+ * SD/FatFS and is the exclusive writer.
  */
 static bool logger_app_drain_capture_pipe(logger_app_t *app, uint32_t now_ms) {
   capture_pipe_t *pipe = &app->capture_pipe;
@@ -1348,11 +1353,9 @@ static bool logger_app_drain_capture_pipe(logger_app_t *app, uint32_t now_ms) {
     (void)capture_staging_drain(pipe, CAPTURE_STAGING_DUAL_CORE_CAPACITY);
   }
 
-  /* Execute commands inline (temporary, until core 1) */
+  /* Signal core 1 that work may be available. */
   if (capture_cmd_ring_occupancy(pipe) > 0u) {
-    (void)capture_pipe_drain_and_execute(
-        pipe, (logger_session_context_t *)&app->session,
-        CAPTURE_CMD_RING_CAPACITY);
+    __sev();
   }
 
   /* Process any events (barrier completions, failures) */

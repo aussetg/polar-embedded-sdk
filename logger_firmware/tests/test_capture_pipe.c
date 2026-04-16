@@ -1,10 +1,8 @@
 /*
- * Host-side tests for capture_pipe (inline single-core phase).
+ * Host-side tests for capture_pipe.
  *
- * During the inline phase (CAPTURE_STAGING_CAPACITY == 0), staging push
- * goes directly to the command ring and drain is a no-op.  These tests
- * verify that contract.  The dual-core staging path should be tested
- * separately when core 1 is introduced.
+ * Tests the SPSC command ring, event ring, source staging buffer,
+ * health/distress state machine, and inline drain-and-execute.
  *
  * Compile:
  *   gcc -Wall -Wextra -Wno-sign-conversion -Wno-conversion \
@@ -77,7 +75,7 @@ static void test_init(void) {
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
   assert(capture_cmd_ring_occupancy_pct(&pipe) == 0u);
 
-  /* Inline phase: staging has_data is always false */
+  /* Freshly initialized: staging is empty */
   assert(capture_staging_has_data(&pipe) == false);
   assert(capture_event_ring_has_data(&pipe) == false);
 
@@ -135,29 +133,30 @@ static void test_cmd_ring_full(void) {
   printf(" ok\n");
 }
 
-/* ── Test: staging push goes directly to command ring (inline) ── */
+/* ── Test: staging buffer push/drain ─────────────────────────── */
 
-static void test_staging_inline_passthrough(void) {
-  printf("  staging_inline_passthrough...");
+static void test_staging_push_drain(void) {
+  printf("  staging_push_drain...");
 
-  assert(CAPTURE_STAGING_CAPACITY == 0u && "test requires inline phase");
+  assert(CAPTURE_STAGING_CAPACITY > 0u && "test requires real staging buffer");
 
   capture_pipe_t pipe;
   capture_pipe_init(&pipe);
 
-  /* Push via staging — should land in command ring directly */
+  /* Push via staging — lands in staging slots, not in command ring yet */
   logger_writer_cmd_t cmd = make_packet_cmd(42);
   assert(capture_staging_push_pmd(&pipe, &cmd) == true);
   assert(pipe.telemetry.staging_enqueue_count == 1u);
+  assert(capture_staging_has_data(&pipe) == true);
+  assert(capture_cmd_ring_occupancy(&pipe) == 0u);
 
-  /* Staging has_data is always false in inline mode */
+  /* Drain moves it into the command ring */
+  assert(capture_staging_drain(&pipe, 10) == 1u);
   assert(capture_staging_has_data(&pipe) == false);
-
-  /* Drain is a no-op */
-  assert(capture_staging_drain(&pipe, 10) == 0u);
-
-  /* But the command ring has the entry */
   assert(capture_cmd_ring_occupancy(&pipe) == 1u);
+  assert(pipe.telemetry.staging_drain_count == 1u);
+
+  /* Verify the command arrived intact */
   logger_writer_cmd_t out;
   assert(capture_cmd_ring_dequeue(&pipe, &out) == true);
   assert(out.append_pmd_packet.seq_in_span == 42u);
@@ -165,27 +164,71 @@ static void test_staging_inline_passthrough(void) {
   printf(" ok\n");
 }
 
-/* ── Test: staging overflow = command ring full (inline) ──────── */
+/* ── Test: staging fills to capacity ─────────────────────────── */
 
-static void test_staging_inline_overflow(void) {
-  printf("  staging_inline_overflow...");
+static void test_staging_fill_and_drain(void) {
+  printf("  staging_fill_and_drain...");
+
+  assert(CAPTURE_STAGING_CAPACITY > 0u);
 
   capture_pipe_t pipe;
   capture_pipe_init(&pipe);
 
-  /* Fill command ring via staging */
-  for (uint32_t i = 0; i < CAPTURE_CMD_RING_CAPACITY; i++) {
+  /* Fill staging to capacity */
+  for (uint32_t i = 0; i < CAPTURE_STAGING_CAPACITY; i++) {
+    logger_writer_cmd_t cmd = make_packet_cmd(i);
+    assert(capture_staging_push_pmd(&pipe, &cmd) == true);
+  }
+  assert(capture_staging_has_data(&pipe) == true);
+
+  /* One more overflows */
+  logger_writer_cmd_t overflow = make_packet_cmd(999);
+  assert(capture_staging_push_pmd(&pipe, &overflow) == false);
+  assert(pipe.staging.overflow_count == 1u);
+  assert(pipe.telemetry.staging_overflow_count == 1u);
+
+  /* Drain in batches: staging (128) > command ring (64), so we
+   * drain → dequeue-ring loop until staging is empty. */
+  uint32_t total_dequeued = 0u;
+  while (capture_staging_has_data(&pipe)) {
+    capture_staging_drain(&pipe, CAPTURE_STAGING_CAPACITY + 1u);
+    while (capture_cmd_ring_occupancy(&pipe) > 0u) {
+      logger_writer_cmd_t out;
+      assert(capture_cmd_ring_dequeue(&pipe, &out) == true);
+      assert(out.append_pmd_packet.seq_in_span == total_dequeued);
+      total_dequeued += 1u;
+    }
+  }
+  assert(total_dequeued == CAPTURE_STAGING_CAPACITY);
+  assert(capture_staging_has_data(&pipe) == false);
+  assert(capture_cmd_ring_occupancy(&pipe) == 0u);
+
+  printf(" ok\n");
+}
+
+/* ── Test: staging overflow when buffer is full ─────────────── */
+
+static void test_staging_overflow(void) {
+  printf("  staging_overflow...");
+
+  assert(CAPTURE_STAGING_CAPACITY > 0u);
+
+  capture_pipe_t pipe;
+  capture_pipe_init(&pipe);
+
+  /* Fill staging to capacity */
+  for (uint32_t i = 0; i < CAPTURE_STAGING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     assert(capture_staging_push_pmd(&pipe, &cmd) == true);
   }
 
-  /* Next staging push fails — counted as staging overflow */
+  /* Next push overflows staging */
   logger_writer_cmd_t cmd = make_packet_cmd(999);
   assert(capture_staging_push_pmd(&pipe, &cmd) == false);
   assert(pipe.staging.overflow_count == 1u);
   assert(pipe.telemetry.staging_overflow_count == 1u);
 
-  /* Needs recovery should be true */
+  /* Staging overflow triggers recovery */
   assert(capture_pipe_needs_recovery(&pipe, 0u) == true);
 
   printf(" ok\n");
@@ -439,8 +482,16 @@ static void test_hwm(void) {
 
 /* ── Test: drain_and_execute ───────────────────────────────────── */
 
-static void test_drain_and_execute(void) {
-  printf("  drain_and_execute...");
+/* ── Test: manual drain simulating what core 1 does ────────── */
+
+/*
+ * The old capture_pipe_drain_and_execute() helper is gone — core 1
+ * now owns dispatch.  This test manually drains the ring and
+ * advances the barrier counter, simulating the worker's drain loop
+ * so we can verify ring/event/counter mechanics without core 1.
+ */
+static void test_barrier_counter_and_events(void) {
+  printf("  barrier_counter_and_events...");
 
   capture_pipe_t pipe;
   capture_pipe_init(&pipe);
@@ -455,11 +506,32 @@ static void test_drain_and_execute(void) {
 
   assert(capture_cmd_ring_occupancy(&pipe) == 5u);
 
-  /* Execute all — barrier produces an event.  Pass a non-NULL ctx
-   * (the dispatch stub ignores it). */
-  uint32_t executed = capture_pipe_drain_and_execute(&pipe, (void *)1u, 10);
-  assert(executed == 5u);
+  /* Simulate core 1 drain: dequeue + dispatch + advance counter. */
+  const uint32_t seq_before = pipe.barriers_done_seq;
+  for (uint32_t i = 0; i < 5u; i++) {
+    logger_writer_cmd_t cmd;
+    assert(capture_cmd_ring_dequeue(&pipe, &cmd) == true);
+    const bool ok = logger_writer_dispatch(NULL, &cmd);
+    assert(ok);
+
+    const bool is_barrier = cmd.type != LOGGER_WRITER_APPEND_PMD_PACKET &&
+                            cmd.type != LOGGER_WRITER_REFRESH_LIVE;
+    if (is_barrier) {
+      pipe.barrier_last_ok = true;
+      pipe.barriers_done_seq += 1u;
+      capture_event_t ev;
+      memset(&ev, 0, sizeof(ev));
+      ev.kind = CAPTURE_EVENT_BARRIER_COMPLETE;
+      ev.success = true;
+      capture_event_ring_push(&pipe, &ev);
+    }
+  }
+
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
+
+  /* Counter advanced exactly once (one barrier). */
+  assert(pipe.barriers_done_seq == seq_before + 1u);
+  assert(pipe.barrier_last_ok == true);
 
   /* One event for the barrier */
   assert(capture_event_ring_has_data(&pipe) == true);
@@ -474,14 +546,16 @@ static void test_drain_and_execute(void) {
 /* ── Main ──────────────────────────────────────────────────────── */
 
 int main(void) {
-  printf("capture_pipe tests (inline phase, CAPTURE_STAGING_CAPACITY=%u):\n",
-         CAPTURE_STAGING_CAPACITY);
+  printf("capture_pipe tests (CAPTURE_STAGING_CAPACITY=%u,"
+         " CAPTURE_CMD_RING_CAPACITY=%u):\n",
+         CAPTURE_STAGING_CAPACITY, CAPTURE_CMD_RING_CAPACITY);
 
   test_init();
   test_cmd_ring_basic();
   test_cmd_ring_full();
-  test_staging_inline_passthrough();
-  test_staging_inline_overflow();
+  test_staging_push_drain();
+  test_staging_fill_and_drain();
+  test_staging_overflow();
   test_health_transitions();
   test_hard_failure_deadline();
   test_hard_failure_sticky();
@@ -491,7 +565,7 @@ int main(void) {
   test_process_events();
   test_wrap_around();
   test_hwm();
-  test_drain_and_execute();
+  test_barrier_counter_and_events();
 
   printf("  all passed\n");
   return 0;

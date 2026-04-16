@@ -7,24 +7,19 @@
  * Design (from logger_capture_pipeline_v1.md):
  *
  *   BLE callback ──▶ source staging ──▶ command ring ──▶ writer consumer
- *     (core 0)        (core 0)           (core 0→1)       (core 1, later)
+ *     (core 0)        (core 0)           (core 0→1)       (core 1)
  *
  *   writer ──▶ event ring ──▶ core 0
  *     (core 1)    (core 1→0)
  *
- * For now, the writer consumer is inline (same core).  The pipe API
- * exists so the later core-1 move is a transport consumer swap, not a
- * redesign.
+ * Core 1 owns the command ring consumer and executes all writer
+ * dispatch.  Core 0 never calls logger_writer_dispatch() directly.
  *
- * Memory budget during inline phase:
- *   - Command ring only: 64 slots × sizeof(logger_writer_cmd_t) ≈ 20 KiB
- *   - Source staging: 0 slots (CAPTURE_STAGING_CAPACITY == 0)
+ * Memory budget:
+ *   - Command ring: 64 slots × sizeof(logger_writer_cmd_t) ≈ 20 KiB
+ *   - Source staging: 128 slots × sizeof(logger_writer_cmd_t) ≈ 42 KiB
  *   - Event ring: 16 × 16 bytes = 256 bytes
- *   - Total ≈ 20 KiB
- *
- * When core 1 launches, set CAPTURE_STAGING_CAPACITY to 128 and add
- * the staging slot array back.  That adds ~42 KiB but decouples the
- * BLE callback from the inter-core ring consumer.
+ *   - Total ≈ 62 KiB
  *
  * Constraints:
  *   - All structures are bounded, preallocated, static.
@@ -49,14 +44,14 @@
 #define CAPTURE_EVENT_RING_CAPACITY 16u
 
 /*
- * Source staging: only needed when core 1 owns the ring consumer.
- * During the inline single-core phase, capacity is 0 — push goes
- * directly to the command ring, saving ~70 KiB.
+ * Source staging capacity.
  *
- * When core 1 launches, set to 128 (~0.5 s ECG+ACC, power of 2).
+ * 128 slots (~0.5 s ECG+ACC at typical rates, power of 2).
+ * The BLE callback pushes into staging; the main loop drains
+ * staging into the command ring that core 1 consumes.
  */
 #define CAPTURE_STAGING_DUAL_CORE_CAPACITY 128u
-#define CAPTURE_STAGING_CAPACITY 0u /* inline phase: no staging array */
+#define CAPTURE_STAGING_CAPACITY CAPTURE_STAGING_DUAL_CORE_CAPACITY
 
 /* ── Distress thresholds ───────────────────────────────────────── */
 
@@ -82,10 +77,10 @@
  *              producer sees the slot as reclaimed before it
  *              observes the advanced head.
  *
- * On single-core inline execution these compile to a compiler
- * barrier only (no DMB emitted).  On dual-core they emit a real
- * DMB, preventing the M33 write buffer from retiring stores out
- * of order from the other core's perspective.
+ * On single-core execution these compile to a compiler barrier
+ * only (no DMB emitted).  On dual-core they emit a real DMB,
+ * preventing the M33 write buffer from retiring stores out of
+ * order from the other core's perspective.
  */
 typedef struct {
   logger_writer_cmd_t slots[CAPTURE_CMD_RING_CAPACITY];
@@ -123,15 +118,15 @@ typedef struct {
 /* ── Source staging ────────────────────────────────────────────── */
 
 /*
- * During inline phase (CAPTURE_STAGING_CAPACITY == 0), this struct
- * carries no slot array — just overflow accounting.  The push
- * function routes directly to the command ring.
+ * Source staging: decouples BLE callback timing from inter-core
+ * ring drain timing.
  *
- * When CAPTURE_STAGING_CAPACITY > 0 (dual-core phase), a
- *   logger_writer_cmd_t slots[CAPTURE_STAGING_CAPACITY];
- * array must be added here.
+ * During the dual-core phase, a real staging buffer sits between
+ * the BLE callback (which pushes to staging) and the main loop
+ * (which drains staging into the command ring that core 1 consumes).
  */
 typedef struct {
+  logger_writer_cmd_t slots[CAPTURE_STAGING_DUAL_CORE_CAPACITY];
   uint64_t head;
   uint64_t tail;
   uint32_t overflow_count;
@@ -160,6 +155,14 @@ typedef struct {
   uint32_t event_push_overflow_count;
   uint32_t event_pop_count;
 
+  /* Per-kind event tally (core 0 side, from event ring drains).
+   * Every popped event increments the matching counter regardless
+   * of where the drain happens (barrier wait or main loop). */
+  uint32_t event_barrier_complete_count;
+  uint32_t event_write_failed_count;
+  uint32_t event_worker_distress_count;
+  uint32_t event_stats_snapshot_count;
+
   /* Source staging */
   uint32_t staging_enqueue_count;
   uint32_t staging_overflow_count;
@@ -181,6 +184,24 @@ typedef struct capture_pipe {
   capture_event_ring_t event_ring;
   capture_source_staging_t staging;
 
+  /* Reliable barrier completion signal.
+   *
+   * Core 1 advances barriers_done_seq after dispatching ANY
+   * barrier command — whether it succeeded or failed.
+   * Core 0 snapshots the counter before enqueueing, then
+   * spins until it advances.
+   *
+   * barrier_last_ok holds the result of the most recent
+   * barrier dispatch.  Core 0 reads it only after seeing
+   * the counter advance.
+   *
+   * These fields are immune to event-ring overflow.
+   *
+   * volatile because core 1 writes and core 0 reads without
+   * a lock; the fences in the ring ops provide ordering. */
+  volatile uint32_t barriers_done_seq;
+  volatile bool barrier_last_ok;
+
   /* Distress / degraded deadline */
   capture_health_t health;
   uint32_t degraded_deadline_start_ms;
@@ -198,9 +219,7 @@ void capture_pipe_init(capture_pipe_t *pipe);
 /* ── High-level submit (routes through staging → ring → execution) */
 
 /*
- * Submit a PMD packet command.
- * During inline phase: goes directly to the command ring.
- * During dual-core phase: goes to staging, drained later.
+ * Submit a PMD packet command into source staging.
  * Returns true on success, false if full/overflow.
  */
 bool capture_pipe_submit_pmd(capture_pipe_t *pipe,
@@ -209,16 +228,10 @@ bool capture_pipe_submit_pmd(capture_pipe_t *pipe,
 /*
  * Submit a barrier/control command through the pipe.
  *
- * Inline path:
  *   1. drains staging into command ring (ordering)
- *   2. drains command ring (executes all queued PMD packets)
- *   3. executes the barrier command
- *   4. returns the dispatch result
- *
- * Core-1 path (future):
- *   1. drains staging into command ring
  *   2. enqueues the barrier into the command ring
- *   3. waits for completion event from core 1
+ *   3. signals core 1 (__sev)
+ *   4. waits for core 1 to process the command
  */
 bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
                              logger_session_context_t *session_ctx,
@@ -227,9 +240,7 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
 /* ── Source staging (BLE callback context) ─────────────────────── */
 
 /*
- * Submit a PMD packet command.
- * During inline phase: goes directly to the command ring.
- * During dual-core phase: goes to staging, drained later.
+ * Push a PMD packet into source staging.
  * Returns true on success, false if full/overflow.
  */
 bool capture_staging_push_pmd(capture_pipe_t *pipe,
@@ -263,16 +274,7 @@ void capture_pipe_clear_degraded_deadline(capture_pipe_t *pipe);
 void capture_pipe_note_hard_failure(capture_pipe_t *pipe, uint32_t now_ms);
 bool capture_pipe_needs_recovery(const capture_pipe_t *pipe, uint32_t now_ms);
 
-/* ── Inline writer consumer (temporary, until core 1) ──────────── */
-
-/*
- * Drain the command ring and execute each command inline via
- * logger_writer_dispatch().  Pushes completion/failure events
- * into the event ring.  Returns the number of commands executed.
- */
-uint32_t capture_pipe_drain_and_execute(capture_pipe_t *pipe,
-                                        logger_session_context_t *session_ctx,
-                                        uint32_t max_cmds);
+/* ── Event processing ─────────────────────────────────────────── */
 
 /*
  * Process pending events from the event ring.

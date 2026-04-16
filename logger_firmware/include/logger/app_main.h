@@ -18,6 +18,7 @@
 #include "logger/service_cli.h"
 #include "logger/session.h"
 #include "logger/storage.h"
+#include "logger/storage_worker.h"
 #include "logger/system_log.h"
 
 typedef enum {
@@ -88,6 +89,7 @@ typedef struct logger_app {
   logger_capture_stats_t capture_stats;
   capture_pipe_t capture_pipe;
   logger_service_cli_t cli;
+  storage_worker_shared_t *storage_worker_shared;
   char hardware_id[LOGGER_HARDWARE_ID_HEX_LEN + 1];
   char current_day_study_day_local[11];
   char pending_day_study_day_local[11];

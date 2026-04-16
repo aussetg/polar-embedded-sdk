@@ -78,6 +78,7 @@ add_executable(logger_appliance
     src/service_cli.c
     src/sha256.c
     src/storage.c
+    src/storage_worker.c
     src/system_log.c
     src/upload.c
     src/upload_bundle.c
@@ -126,6 +127,8 @@ target_link_libraries(logger_appliance PRIVATE
     pico_btstack_ble
     pico_btstack_cyw43
     pico_mbedtls
+    pico_multicore
+    pico_flash
     pico_rand
     pico_sha256
     pico_unique_id
