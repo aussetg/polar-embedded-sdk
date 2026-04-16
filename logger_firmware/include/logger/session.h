@@ -18,6 +18,8 @@
 #include "logger/capture_stats.h"
 #include "logger/chunk_builder.h"
 #include "logger/journal_writer.h"
+#include "logger/writer_protocol.h"
+
 void logger_session_set_capture_stats(logger_capture_stats_t *stats);
 
 enum {
@@ -25,7 +27,7 @@ enum {
   LOGGER_SESSION_STREAM_KIND_ACC = 2u,
 };
 
-typedef struct {
+typedef struct logger_session_state {
   bool active;
   bool span_active;
   bool quarantined;
@@ -47,11 +49,23 @@ typedef struct {
   char journal_path[LOGGER_STORAGE_PATH_MAX];
   char live_path[LOGGER_STORAGE_PATH_MAX];
   char manifest_path[LOGGER_STORAGE_PATH_MAX];
+  /*
+   * Cached raw (binary 128-bit) form of current_span_id.
+   * Used by the chunk builder to avoid per-packet hex-to-bytes conversion.
+   * Updated by the control core when span identity changes.
+   */
+  uint8_t current_span_id_raw[16];
+  /*
+   * Writer-side durable counters.  Assigned only when journal records
+   * are actually emitted.  For the current inline path these are
+   * incremented inside the writer dispatch; when the writer moves
+   * to core 1, core 0 never touches these.
+   */
   uint64_t next_record_seq;
   uint64_t journal_size_bytes;
   logger_journal_writer_t journal_writer;
-  uint8_t current_span_id_raw[16];
   uint32_t next_chunk_seq_in_session;
+  /* Control-core owned counters */
   uint32_t next_packet_seq_in_span;
   uint32_t span_count;
   logger_journal_span_summary_t spans[LOGGER_JOURNAL_MAX_SPANS];

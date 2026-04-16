@@ -1,4 +1,5 @@
 #include "logger/session.h"
+#include "logger/writer_protocol.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -254,8 +255,8 @@ logger_session_quarantine_reasons_json(const logger_session_state_t *session,
 
 static bool
 logger_session_write_live_internal(const logger_session_state_t *session,
-                                   const logger_clock_status_t *clock,
-                                   uint32_t boot_counter, uint32_t now_ms) {
+                                   const char *now_utc, uint32_t boot_counter,
+                                   uint32_t now_ms) {
   char payload[640];
   char current_span_id_json[64];
   char current_span_index_json[24];
@@ -272,7 +273,7 @@ logger_session_write_live_internal(const logger_session_state_t *session,
                        "null");
   }
   logger_json_string_literal(last_flush_utc_json, sizeof(last_flush_utc_json),
-                             clock != NULL ? clock->now_utc : NULL);
+                             now_utc);
 
   const int n = snprintf(
       payload, sizeof(payload),
@@ -296,33 +297,30 @@ logger_session_append_session_start(logger_session_state_t *session,
                                     const logger_persisted_state_t *persisted,
                                     const logger_clock_status_t *clock,
                                     uint32_t boot_counter, uint32_t now_ms) {
-  char logger_id_escaped[LOGGER_CONFIG_LOGGER_ID_MAX * 2u];
-  char subject_id_escaped[LOGGER_CONFIG_SUBJECT_ID_MAX * 2u];
-  char timezone_escaped[LOGGER_CONFIG_TIMEZONE_MAX * 2u];
-  logger_json_escape_into(logger_id_escaped, sizeof(logger_id_escaped),
-                          persisted->config.logger_id);
-  logger_json_escape_into(subject_id_escaped, sizeof(subject_id_escaped),
-                          persisted->config.subject_id);
-  logger_json_escape_into(timezone_escaped, sizeof(timezone_escaped),
-                          persisted->config.timezone);
-
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"session_start\",\"utc_ns\":%lld,"
-      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"study_day_"
-      "local\":\"%s\",\"logger_id\":\"%s\",\"subject_id\":\"%s\",\"timezone\":"
-      "\"%s\",\"clock_state\":\"%s\",\"start_reason\":\"%s\"}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, session->study_day_local, logger_id_escaped,
-      subject_id_escaped, timezone_escaped, session->clock_state,
-      session->session_start_reason);
-  return n > 0 && (size_t)n < sizeof(payload) &&
-         logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_SESSION_START,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_SESSION_START;
+  logger_writer_session_start_t *s = &cmd.session_start;
+  s->type = LOGGER_WRITER_SESSION_START;
+  s->boot_counter = boot_counter;
+  s->now_ms = now_ms;
+  s->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  logger_copy_string(s->session_id, sizeof(s->session_id), session->session_id);
+  logger_copy_string(s->study_day_local, sizeof(s->study_day_local),
+                     session->study_day_local);
+  logger_copy_string(s->session_start_utc, sizeof(s->session_start_utc),
+                     session->session_start_utc);
+  logger_copy_string(s->session_start_reason, sizeof(s->session_start_reason),
+                     session->session_start_reason);
+  logger_copy_string(s->clock_state, sizeof(s->clock_state),
+                     session->clock_state);
+  logger_copy_string(s->logger_id, sizeof(s->logger_id),
+                     persisted->config.logger_id);
+  logger_copy_string(s->subject_id, sizeof(s->subject_id),
+                     persisted->config.subject_id);
+  logger_copy_string(s->timezone, sizeof(s->timezone),
+                     persisted->config.timezone);
+  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
 }
 
 static bool logger_session_begin_span(logger_session_state_t *session,
@@ -346,7 +344,6 @@ static bool logger_session_begin_span(logger_session_state_t *session,
 
   /* Cache raw span_id for chunk builder (avoids per-packet hex conversion) */
   if (!logger_hex_to_bytes_16(span->span_id, session->current_span_id_raw)) {
-    session->span_count -= 1u;
     session->span_active = false;
     session->current_span_id[0] = '\0';
     session->current_span_index = 0xffffffffu;
@@ -364,26 +361,26 @@ static bool logger_session_begin_span(logger_session_state_t *session,
   session->span_count += 1u;
   session->next_packet_seq_in_span = 0u;
 
-  char h10_escaped[LOGGER_CONFIG_BOUND_H10_ADDR_MAX * 2u];
-  logger_json_escape_into(h10_escaped, sizeof(h10_escaped), h10_address);
+  /* Writer: SPAN_START */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_SPAN_START;
+  logger_writer_span_start_t *ss = &cmd.span_start;
+  ss->type = LOGGER_WRITER_SPAN_START;
+  ss->boot_counter = boot_counter;
+  ss->now_ms = now_ms;
+  ss->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  logger_copy_string(ss->session_id, sizeof(ss->session_id),
+                     session->session_id);
+  logger_copy_string(ss->span_id, sizeof(ss->span_id), span->span_id);
+  ss->span_index_in_session = session->current_span_index;
+  logger_copy_string(ss->start_reason, sizeof(ss->start_reason), start_reason);
+  logger_copy_string(ss->h10_address, sizeof(ss->h10_address), h10_address);
+  ss->encrypted = encrypted;
+  ss->bonded = bonded;
 
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"span_start\",\"utc_ns\":%lld,"
-      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":"
-      "\"%s\",\"span_index_in_session\":%lu,\"start_reason\":\"%s\",\"h10_"
-      "address\":\"%s\",\"encrypted\":%s,\"bonded\":%s}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, span->span_id,
-      (unsigned long)session->current_span_index, start_reason, h10_escaped,
-      encrypted ? "true" : "false", bonded ? "true" : "false");
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_SPAN_START,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
+  if (!logger_writer_dispatch((logger_session_context_t *)session, &cmd)) {
+    /* Rollback control-plane state on writer failure */
     session->span_count -= 1u;
     session->span_active = false;
     session->current_span_id[0] = '\0';
@@ -394,7 +391,17 @@ static bool logger_session_begin_span(logger_session_state_t *session,
   return true;
 }
 
-static bool logger_session_close_active_span(
+/*
+ * Control-plane span close: seal in-flight chunk data, emit span_end
+ * journal record, and clear control-plane span state.
+ *
+ * This is the single shared path for closing an active span regardless
+ * of caller (disconnect, clock_event, finalize, recovery).  It
+ * combines the writer-side barrier (seal + write + sync) with the
+ * control-plane state update (span_active=false, clear IDs) so the
+ * two never diverge.
+ */
+static bool logger_session_control_close_span(
     logger_session_state_t *session, const logger_clock_status_t *clock,
     const char *end_reason, uint32_t boot_counter, uint32_t now_ms,
     char ended_span_id_out[LOGGER_SESSION_ID_HEX_LEN + 1]) {
@@ -483,25 +490,17 @@ static bool logger_session_append_recovery(logger_session_state_t *session,
                                            const char *reason,
                                            uint32_t boot_counter,
                                            uint32_t now_ms) {
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"recovery\",\"utc_ns\":%lld,"
-      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"recovery_"
-      "reason\":\"%s\",\"previous_reset_cause\":\"unknown\"}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, reason);
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_RECOVERY,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
-    return false;
-  }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
-  return true;
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_WRITE_RECOVERY;
+  logger_writer_write_recovery_t *r = &cmd.write_recovery;
+  r->type = LOGGER_WRITER_WRITE_RECOVERY;
+  r->boot_counter = boot_counter;
+  r->now_ms = now_ms;
+  r->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  logger_copy_string(r->session_id, sizeof(r->session_id), session->session_id);
+  logger_copy_string(r->recovery_reason, sizeof(r->recovery_reason), reason);
+  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
 }
 
 static bool logger_session_append_session_end(
@@ -512,29 +511,34 @@ static bool logger_session_append_session_end(
     return false;
   }
 
-  char reasons_json[128];
-  logger_session_quarantine_reasons_json(session, reasons_json);
+  /* Control-plane: capture session end metadata */
   logger_copy_string(session->session_end_utc, sizeof(session->session_end_utc),
                      clock != NULL ? clock->now_utc : NULL);
   logger_copy_string(session->session_end_reason,
                      sizeof(session->session_end_reason), end_reason);
 
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"session_end\",\"utc_ns\":%lld,"
-      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"end_"
-      "reason\":\"%s\",\"span_count\":%lu,\"quarantined\":%s,\"quarantine_"
-      "reasons\":%s}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, end_reason, (unsigned long)session->span_count,
-      session->quarantined ? "true" : "false", reasons_json);
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_SESSION_END,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
+  /* Pre-serialize quarantine reasons for the command */
+  char reasons_json[128];
+  logger_session_quarantine_reasons_json(session, reasons_json);
+
+  /* Writer: SESSION_END */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_SESSION_END;
+  logger_writer_session_end_t *se = &cmd.session_end;
+  se->type = LOGGER_WRITER_SESSION_END;
+  se->boot_counter = boot_counter;
+  se->now_ms = now_ms;
+  se->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  logger_copy_string(se->session_id, sizeof(se->session_id),
+                     session->session_id);
+  logger_copy_string(se->end_reason, sizeof(se->end_reason), end_reason);
+  se->span_count = session->span_count;
+  se->quarantined = session->quarantined;
+  logger_copy_string(se->quarantine_reasons, sizeof(se->quarantine_reasons),
+                     reasons_json);
+
+  if (!logger_writer_dispatch((logger_session_context_t *)session, &cmd)) {
     return false;
   }
   session->journal_size_bytes =
@@ -716,8 +720,8 @@ static bool logger_session_finalize_internal(
 
   logger_session_recompute_quarantine(session, clock);
 
-  if (!logger_session_close_active_span(session, clock, end_reason,
-                                        boot_counter, now_ms, NULL)) {
+  if (!logger_session_control_close_span(session, clock, end_reason,
+                                         boot_counter, now_ms, NULL)) {
     return false;
   }
   if (!logger_session_append_session_end(session, clock, end_reason,
@@ -859,8 +863,9 @@ static bool logger_session_start_new_active_internal(
   }
 
   session->active = true;
-  if (!logger_session_write_live_internal(session, clock, boot_counter,
-                                          now_ms)) {
+  if (!logger_session_write_live_internal(session,
+                                          clock != NULL ? clock->now_utc : NULL,
+                                          boot_counter, now_ms)) {
     logger_session_set_error(error_code_out, error_message_out,
                              "storage_unavailable",
                              "failed to write live.json");
@@ -1014,8 +1019,19 @@ bool logger_session_refresh_live(logger_session_state_t *session,
     return false;
   }
   logger_session_recompute_quarantine(session, clock);
-  return logger_session_write_live_internal(session, clock, boot_counter,
-                                            now_ms);
+
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_REFRESH_LIVE;
+  cmd.refresh_live.type = LOGGER_WRITER_REFRESH_LIVE;
+  cmd.refresh_live.boot_counter = boot_counter;
+  cmd.refresh_live.now_ms = now_ms;
+  if (clock != NULL && clock->now_utc[0] != '\0') {
+    logger_copy_string(cmd.refresh_live.now_utc,
+                       sizeof(cmd.refresh_live.now_utc), clock->now_utc);
+  }
+
+  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
 }
 
 bool logger_session_write_status_snapshot(
@@ -1027,48 +1043,38 @@ bool logger_session_write_status_snapshot(
     return false;
   }
 
-  /* Barrier: seal any in-flight chunk data before metadata record */
-  if (!logger_session_seal_active_chunk(session)) {
-    return false;
-  }
-
+  /* Control-plane: recompute quarantine state from current clock */
   logger_session_recompute_quarantine(session, clock);
 
-  char active_span_id_json[64];
-  char fault_code_json[64];
-  logger_json_string_literal(active_span_id_json, sizeof(active_span_id_json),
-                             session->span_active ? session->current_span_id
-                                                  : NULL);
-  logger_json_string_literal(fault_code_json, sizeof(fault_code_json),
-                             logger_fault_code_name(current_fault));
+  const int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
 
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"status_snapshot\",\"utc_ns\":%"
-      "lld,\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\","
-      "\"active_span_id\":%s,\"battery_voltage_mv\":%u,\"battery_estimate_"
-      "pct\":%d,\"vbus_present\":%s,\"sd_free_bytes\":%llu,\"sd_reserve_"
-      "bytes\":%lu,\"wifi_enabled\":false,\"quarantined\":%s,\"fault_code\":%"
-      "s}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, active_span_id_json, (unsigned)battery->voltage_mv,
-      battery->estimate_pct, battery->vbus_present ? "true" : "false",
-      (unsigned long long)storage->free_bytes,
-      (unsigned long)LOGGER_SD_MIN_FREE_RESERVE_BYTES,
-      session->quarantined ? "true" : "false", fault_code_json);
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
-    return false;
+  /* Construct command with all data copied in */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_WRITE_STATUS_SNAPSHOT;
+  logger_writer_write_status_snapshot_t *s = &cmd.write_status_snapshot;
+  s->type = LOGGER_WRITER_WRITE_STATUS_SNAPSHOT;
+  s->boot_counter = boot_counter;
+  s->now_ms = now_ms;
+  s->utc_ns = utc_ns;
+  logger_copy_string(s->session_id, sizeof(s->session_id), session->session_id);
+  if (session->span_active) {
+    logger_copy_string(s->active_span_id, sizeof(s->active_span_id),
+                       session->current_span_id);
   }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
-  return logger_session_write_live_internal(session, clock, boot_counter,
-                                            now_ms);
+  s->battery_voltage_mv = battery->voltage_mv;
+  s->battery_estimate_pct = (int16_t)battery->estimate_pct;
+  s->vbus_present = battery->vbus_present;
+  s->sd_free_bytes = storage->free_bytes;
+  s->sd_reserve_bytes = LOGGER_SD_MIN_FREE_RESERVE_BYTES;
+  s->quarantined = session->quarantined;
+  logger_copy_string(s->fault_code, sizeof(s->fault_code),
+                     logger_fault_code_name(current_fault));
+  if (clock != NULL && clock->now_utc[0] != '\0') {
+    logger_copy_string(s->now_utc, sizeof(s->now_utc), clock->now_utc);
+  }
+
+  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
 }
 
 bool logger_session_write_marker(logger_session_state_t *session,
@@ -1078,30 +1084,21 @@ bool logger_session_write_marker(logger_session_state_t *session,
     return false;
   }
 
-  /* Barrier: seal any in-flight chunk data before marker record */
-  if (!logger_session_seal_active_chunk(session)) {
-    return false;
-  }
+  const int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
 
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"marker\",\"utc_ns\":%lld,\"mono_"
-      "us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":\"%s\","
-      "\"marker_kind\":\"generic\"}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, session->current_span_id);
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_MARKER,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
-    return false;
-  }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
-  return true;
+  /* Control-plane decision: session/span active. Construct command. */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_WRITE_MARKER;
+  logger_writer_write_marker_t *m = &cmd.write_marker;
+  m->type = LOGGER_WRITER_WRITE_MARKER;
+  m->boot_counter = boot_counter;
+  m->now_ms = now_ms;
+  m->utc_ns = utc_ns;
+  logger_copy_string(m->session_id, sizeof(m->session_id), session->session_id);
+  logger_copy_string(m->span_id, sizeof(m->span_id), session->current_span_id);
+
+  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
 }
 
 bool logger_session_ensure_active_span(
@@ -1133,8 +1130,9 @@ bool logger_session_ensure_active_span(
   logger_session_recompute_quarantine(session, clock);
   if (!logger_session_begin_span(session, clock, start_reason, h10_address,
                                  encrypted, bonded, boot_counter, now_ms) ||
-      !logger_session_write_live_internal(session, clock, boot_counter,
-                                          now_ms)) {
+      !logger_session_write_live_internal(session,
+                                          clock != NULL ? clock->now_utc : NULL,
+                                          boot_counter, now_ms)) {
     logger_session_set_error(error_code_out, error_message_out,
                              "storage_unavailable",
                              "failed to write reconnect span records");
@@ -1158,54 +1156,38 @@ bool logger_session_append_pmd_packet(logger_session_state_t *session,
     return false;
   }
 
-  logger_chunk_builder_t *cb = &session->chunk_builder;
+  /* Control-core ownership: assign seq_in_span before dispatch */
   const uint32_t seq_in_span = session->next_packet_seq_in_span;
-  session->next_packet_seq_in_span += 1u;
 
   int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
   const uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
 
-  logger_chunk_result_t r = logger_chunk_builder_append(
-      cb, stream_kind, session->current_span_id_raw, seq_in_span, mono_us,
-      utc_ns, value, value_len, now_ms);
+  /* Construct the writer command with all data copied in */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_APPEND_PMD_PACKET;
+  logger_writer_append_pmd_packet_t *p = &cmd.append_pmd_packet;
+  p->type = LOGGER_WRITER_APPEND_PMD_PACKET;
+  p->now_ms = now_ms;
+  p->stream_kind = stream_kind;
+  memcpy(p->span_id_raw, session->current_span_id_raw, 16);
+  p->seq_in_span = seq_in_span;
+  p->mono_us = mono_us;
+  p->utc_ns = utc_ns;
+  p->value_len = (uint16_t)value_len;
+  memcpy(p->value, value, value_len);
 
-  /*
-   * FULL means the current chunk must be sealed first.
-   * This also covers stream/span identity changes.
-   */
-  if (r == LOGGER_CHUNK_FULL) {
-    if (!logger_session_seal_active_chunk(session)) {
-      session->next_packet_seq_in_span -= 1u;
-      const uint32_t elapsed =
-          (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
-      logger_capture_stats_record_session_append(g_session_stats, elapsed,
-                                                 false);
-      logger_capture_stats_record_journal_append(g_session_stats, false);
-      return false;
-    }
-    r = logger_chunk_builder_append(cb, stream_kind,
-                                    session->current_span_id_raw, seq_in_span,
-                                    mono_us, utc_ns, value, value_len, now_ms);
-    if (r == LOGGER_CHUNK_FULL) {
-      /* Single packet too large for buffer — should not happen at 64 KiB */
-      session->next_packet_seq_in_span -= 1u;
-      const uint32_t elapsed =
-          (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
-      logger_capture_stats_record_session_append(g_session_stats, elapsed,
-                                                 false);
-      return false;
-    }
-  }
-
-  /* SEAL means target size reached — emit now */
-  bool ok = true;
-  if (r == LOGGER_CHUNK_SEAL) {
-    ok = logger_session_seal_active_chunk(session);
-  }
+  const bool ok =
+      logger_writer_dispatch((logger_session_context_t *)session, &cmd);
 
   const uint32_t elapsed = (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
   logger_capture_stats_record_session_append(g_session_stats, elapsed, ok);
   logger_capture_stats_record_journal_append(g_session_stats, ok);
+
+  /* Advance control-core seq_in_span only on success */
+  if (ok) {
+    session->next_packet_seq_in_span += 1u;
+  }
   return ok;
 }
 
@@ -1227,11 +1209,30 @@ bool logger_session_seal_chunk_if_needed(logger_session_state_t *session,
     return true;
   }
   if (logger_chunk_builder_age_exceeded(&session->chunk_builder, now_ms)) {
-    return logger_session_seal_active_chunk(session);
+    logger_writer_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = LOGGER_WRITER_FLUSH_BARRIER;
+    cmd.flush_barrier.type = LOGGER_WRITER_FLUSH_BARRIER;
+    cmd.flush_barrier.now_ms = now_ms;
+    return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
   }
   return true;
 }
 
+/*
+ * handle_disconnect and handle_clock_event are compound operations
+ * (span_end + gap + live_refresh, or span_end + clock_event + live_refresh)
+ * that need atomicity across multiple journal writes.  Splitting them
+ * into individual writer dispatches creates partial-update risk: if
+ * SPAN_END dispatch succeeds but WRITE_GAP fails, control-plane state
+ * (span closed, IDs cleared) is already committed but the gap record
+ * is missing.  The old static functions provide this atomicity
+ * naturally because each function is a self-contained barrier.
+ *
+ * These stay on the legacy path until the worker can handle compound
+ * barriers as a single transaction.  They are cold-path operations
+ * (disconnect, clock events) — no hot-path benefit from dispatch.
+ */
 bool logger_session_handle_disconnect(logger_session_state_t *session,
                                       const logger_clock_status_t *clock,
                                       uint32_t boot_counter, uint32_t now_ms,
@@ -1242,8 +1243,8 @@ bool logger_session_handle_disconnect(logger_session_state_t *session,
 
   char ended_span_id[LOGGER_SESSION_ID_HEX_LEN + 1];
   ended_span_id[0] = '\0';
-  if (!logger_session_close_active_span(session, clock, "disconnect",
-                                        boot_counter, now_ms, ended_span_id)) {
+  if (!logger_session_control_close_span(session, clock, "disconnect",
+                                         boot_counter, now_ms, ended_span_id)) {
     return false;
   }
   if (!logger_session_append_gap(session, clock, ended_span_id,
@@ -1251,10 +1252,11 @@ bool logger_session_handle_disconnect(logger_session_state_t *session,
                                  boot_counter, now_ms)) {
     return false;
   }
-  return logger_session_write_live_internal(session, clock, boot_counter,
-                                            now_ms);
+  return logger_session_write_live_internal(
+      session, clock != NULL ? clock->now_utc : NULL, boot_counter, now_ms);
 }
 
+/* See handle_disconnect comment on compound operations and atomicity. */
 bool logger_session_handle_clock_event(logger_session_state_t *session,
                                        const logger_clock_status_t *clock,
                                        uint32_t boot_counter, uint32_t now_ms,
@@ -1279,7 +1281,7 @@ bool logger_session_handle_clock_event(logger_session_state_t *session,
   logger_session_recompute_quarantine(session, clock);
 
   if (split_span && session->span_active) {
-    if (!logger_session_close_active_span(
+    if (!logger_session_control_close_span(
             session, clock,
             span_end_reason != NULL ? span_end_reason : "clock_jump",
             boot_counter, now_ms, NULL)) {
@@ -1308,8 +1310,8 @@ bool logger_session_handle_clock_event(logger_session_state_t *session,
   session->journal_size_bytes =
       logger_journal_writer_durable_size(&session->journal_writer);
 
-  return logger_session_write_live_internal(session, clock, boot_counter,
-                                            now_ms);
+  return logger_session_write_live_internal(
+      session, clock != NULL ? clock->now_utc : NULL, boot_counter, now_ms);
 }
 
 bool logger_session_append_h10_battery(logger_session_state_t *session,
@@ -1321,36 +1323,26 @@ bool logger_session_append_h10_battery(logger_session_state_t *session,
     return true;
   }
 
-  /* Barrier: seal any in-flight chunk data before h10_battery record */
-  if (!logger_session_seal_active_chunk(session)) {
-    return false;
-  }
+  const int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
 
-  char span_id_json[64];
-  logger_json_string_literal(span_id_json, sizeof(span_id_json),
-                             session->span_active ? session->current_span_id
-                                                  : NULL);
-
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"h10_battery\",\"utc_ns\":%lld,"
-      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":"
-      "%s,\"battery_percent\":%u,\"read_reason\":\"%s\"}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, span_id_json, (unsigned)battery_percent,
-      read_reason != NULL ? read_reason : "periodic");
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_H10_BATTERY,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
-    return false;
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_WRITE_H10_BATTERY;
+  logger_writer_write_h10_battery_t *b = &cmd.write_h10_battery;
+  b->type = LOGGER_WRITER_WRITE_H10_BATTERY;
+  b->boot_counter = boot_counter;
+  b->now_ms = now_ms;
+  b->utc_ns = utc_ns;
+  logger_copy_string(b->session_id, sizeof(b->session_id), session->session_id);
+  if (session->span_active) {
+    logger_copy_string(b->span_id, sizeof(b->span_id),
+                       session->current_span_id);
   }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
-  return true;
+  b->battery_percent = battery_percent;
+  logger_copy_string(b->read_reason, sizeof(b->read_reason),
+                     read_reason != NULL ? read_reason : "periodic");
+
+  return logger_writer_dispatch((logger_session_context_t *)session, &cmd);
 }
 
 bool logger_session_finalize(
@@ -1518,9 +1510,9 @@ bool logger_session_recover_on_boot(
   char ended_span_id[LOGGER_SESSION_ID_HEX_LEN + 1];
   ended_span_id[0] = '\0';
   if (session->span_active) {
-    if (!logger_session_close_active_span(session, clock, "unexpected_reboot",
-                                          boot_counter, now_ms,
-                                          ended_span_id)) {
+    if (!logger_session_control_close_span(session, clock, "unexpected_reboot",
+                                           boot_counter, now_ms,
+                                           ended_span_id)) {
       return false;
     }
     if (!logger_session_append_gap(session, clock, ended_span_id,
@@ -1539,8 +1531,9 @@ bool logger_session_recover_on_boot(
                                  false, boot_counter, now_ms)) {
     return false;
   }
-  if (!logger_session_write_live_internal(session, clock, boot_counter,
-                                          now_ms)) {
+  if (!logger_session_write_live_internal(session,
+                                          clock != NULL ? clock->now_utc : NULL,
+                                          boot_counter, now_ms)) {
     return false;
   }
 
@@ -1553,4 +1546,439 @@ bool logger_session_recover_on_boot(
     *recovered_active_out = true;
   }
   return true;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Writer protocol dispatch
+ *
+ * This is the boundary between control-plane decisions and
+ * durable-storage actions.  For now it executes inline on the
+ * calling core.  When the core-1 worker arrives, the same command
+ * structs travel through an SPSC ring and this dispatch runs on
+ * core 1 instead.
+ *
+ * Ownership rules encoded here:
+ *   - record_seq: incremented only in this function (writer-side)
+ *   - chunk_seq_in_session: incremented only in this function
+ *   - journal_size_bytes: updated only from writer results here
+ *   - next_packet_seq_in_span: NEVER touched here (control-core owns)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * Writer-side helper: serialize and emit a session_start journal record.
+ * All data comes from the command struct — no control-plane state needed.
+ */
+static bool
+writer_emit_session_start(logger_session_state_t *session,
+                          const logger_writer_session_start_t *cmd) {
+  char logger_id_escaped[LOGGER_CONFIG_LOGGER_ID_MAX * 2u];
+  char subject_id_escaped[LOGGER_CONFIG_SUBJECT_ID_MAX * 2u];
+  char timezone_escaped[LOGGER_CONFIG_TIMEZONE_MAX * 2u];
+  logger_json_escape_into(logger_id_escaped, sizeof(logger_id_escaped),
+                          cmd->logger_id);
+  logger_json_escape_into(subject_id_escaped, sizeof(subject_id_escaped),
+                          cmd->subject_id);
+  logger_json_escape_into(timezone_escaped, sizeof(timezone_escaped),
+                          cmd->timezone);
+
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"session_start\",\"utc_ns\":%lld,"
+      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"study_day_"
+      "local\":\"%s\",\"logger_id\":\"%s\",\"subject_id\":\"%s\",\"timezone\":"
+      "\"%s\",\"clock_state\":\"%s\",\"start_reason\":\"%s\"}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, cmd->study_day_local,
+      logger_id_escaped, subject_id_escaped, timezone_escaped, cmd->clock_state,
+      cmd->session_start_reason);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_SESSION_START,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: serialize and emit a span_start journal record.
+ */
+static bool writer_emit_span_start(logger_session_state_t *session,
+                                   const logger_writer_span_start_t *cmd) {
+  char h10_escaped[18 * 2u];
+  logger_json_escape_into(h10_escaped, sizeof(h10_escaped), cmd->h10_address);
+
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"span_start\",\"utc_ns\":%lld,"
+      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":"
+      "\"%s\",\"span_index_in_session\":%lu,\"start_reason\":\"%s\",\"h10_"
+      "address\":\"%s\",\"encrypted\":%s,\"bonded\":%s}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, cmd->span_id,
+      (unsigned long)cmd->span_index_in_session, cmd->start_reason, h10_escaped,
+      cmd->encrypted ? "true" : "false", cmd->bonded ? "true" : "false");
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_SPAN_START,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: feed a PMD packet into the chunk builder.
+ * Returns false only on writer-side failure (seal failure).
+ * May seal and emit a chunk if the builder is full or at target size.
+ */
+static bool
+writer_append_pmd_packet(logger_session_state_t *session,
+                         const logger_writer_append_pmd_packet_t *cmd) {
+  logger_chunk_builder_t *cb = &session->chunk_builder;
+
+  logger_chunk_result_t r = logger_chunk_builder_append(
+      cb, cmd->stream_kind, cmd->span_id_raw, cmd->seq_in_span, cmd->mono_us,
+      cmd->utc_ns, cmd->value, cmd->value_len, cmd->now_ms);
+
+  if (r == LOGGER_CHUNK_FULL) {
+    if (!logger_session_seal_active_chunk(session)) {
+      return false;
+    }
+    r = logger_chunk_builder_append(cb, cmd->stream_kind, cmd->span_id_raw,
+                                    cmd->seq_in_span, cmd->mono_us, cmd->utc_ns,
+                                    cmd->value, cmd->value_len, cmd->now_ms);
+    if (r == LOGGER_CHUNK_FULL) {
+      /* Single packet too large for buffer — should not happen at 64 KiB */
+      return false;
+    }
+  }
+
+  if (r == LOGGER_CHUNK_SEAL) {
+    return logger_session_seal_active_chunk(session);
+  }
+
+  return true;
+}
+
+/*
+ * Writer-side helper: emit a marker journal record.
+ * Caller (dispatch) handles the barrier seal.
+ */
+static bool writer_emit_marker(logger_session_state_t *session,
+                               const logger_writer_write_marker_t *cmd) {
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"marker\",\"utc_ns\":%lld,\"mono_"
+      "us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":\"%s\","
+      "\"marker_kind\":\"generic\"}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, cmd->span_id);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_MARKER,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: emit a status_snapshot journal record.
+ */
+static bool
+writer_emit_status_snapshot(logger_session_state_t *session,
+                            const logger_writer_write_status_snapshot_t *cmd) {
+  char active_span_id_json[64];
+  char fault_code_json[64];
+  logger_json_string_literal(
+      active_span_id_json, sizeof(active_span_id_json),
+      cmd->active_span_id[0] != '\0' ? cmd->active_span_id : NULL);
+  logger_json_string_literal(fault_code_json, sizeof(fault_code_json),
+                             cmd->fault_code);
+
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"status_snapshot\",\"utc_ns\":%"
+      "lld,\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\","
+      "\"active_span_id\":%s,\"battery_voltage_mv\":%u,\"battery_estimate_"
+      "pct\":%d,\"vbus_present\":%s,\"sd_free_bytes\":%llu,\"sd_reserve_"
+      "bytes\":%lu,\"wifi_enabled\":false,\"quarantined\":%s,\"fault_code\":%"
+      "s}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, active_span_id_json,
+      (unsigned)cmd->battery_voltage_mv, (int)cmd->battery_estimate_pct,
+      cmd->vbus_present ? "true" : "false",
+      (unsigned long long)cmd->sd_free_bytes,
+      (unsigned long)cmd->sd_reserve_bytes, cmd->quarantined ? "true" : "false",
+      fault_code_json);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: emit an h10_battery journal record.
+ */
+static bool
+writer_emit_h10_battery(logger_session_state_t *session,
+                        const logger_writer_write_h10_battery_t *cmd) {
+  char span_id_json[64];
+  logger_json_string_literal(span_id_json, sizeof(span_id_json),
+                             cmd->span_id[0] != '\0' ? cmd->span_id : NULL);
+
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"h10_battery\",\"utc_ns\":%lld,"
+      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":"
+      "%s,\"battery_percent\":%u,\"read_reason\":\"%s\"}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, span_id_json,
+      (unsigned)cmd->battery_percent, cmd->read_reason);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_H10_BATTERY,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: emit a gap journal record.
+ */
+static bool writer_emit_gap(logger_session_state_t *session,
+                            const logger_writer_write_gap_t *cmd) {
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"gap\",\"utc_ns\":%lld,\"mono_"
+      "us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"ended_span_id\":"
+      "\"%s\",\"gap_reason\":\"%s\"}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, cmd->ended_span_id,
+      cmd->gap_reason);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_GAP,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: emit a clock_event journal record.
+ */
+static bool
+writer_emit_clock_event(logger_session_state_t *session,
+                        const logger_writer_write_clock_event_t *cmd) {
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"clock_event\",\"utc_ns\":%lld,"
+      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"event_"
+      "kind\":\"%s\",\"delta_ns\":%lld,\"old_utc_ns\":%lld,\"new_utc_ns\":%"
+      "lld}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, cmd->event_kind,
+      (long long)cmd->delta_ns, (long long)cmd->old_utc_ns,
+      (long long)cmd->new_utc_ns);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_CLOCK_EVENT,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: emit a recovery journal record.
+ */
+static bool writer_emit_recovery(logger_session_state_t *session,
+                                 const logger_writer_write_recovery_t *cmd) {
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"recovery\",\"utc_ns\":%lld,"
+      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"recovery_"
+      "reason\":\"%s\",\"previous_reset_cause\":\"unknown\"}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, cmd->recovery_reason);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_RECOVERY,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: emit a span_end journal record.
+ */
+static bool writer_emit_span_end(logger_session_state_t *session,
+                                 const logger_writer_span_end_t *cmd) {
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"span_end\",\"utc_ns\":%lld,"
+      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":"
+      "\"%s\",\"end_reason\":\"%s\",\"packet_count\":%lu,\"first_seq_in_span\":"
+      "%lu,\"last_seq_in_span\":%lu}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, cmd->span_id,
+      cmd->end_reason, (unsigned long)cmd->packet_count,
+      (unsigned long)cmd->first_seq_in_span,
+      (unsigned long)cmd->last_seq_in_span);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_SPAN_END,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+/*
+ * Writer-side helper: emit a session_end journal record.
+ */
+static bool writer_emit_session_end(logger_session_state_t *session,
+                                    const logger_writer_session_end_t *cmd) {
+  char payload[LOGGER_SESSION_JSON_MAX];
+  const int n = snprintf(
+      payload, sizeof(payload),
+      "{\"schema_version\":1,\"record_type\":\"session_end\",\"utc_ns\":%lld,"
+      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"end_"
+      "reason\":\"%s\",\"span_count\":%lu,\"quarantined\":%s,\"quarantine_"
+      "reasons\":%s}",
+      (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
+      (unsigned long)cmd->boot_counter, cmd->session_id, cmd->end_reason,
+      (unsigned long)cmd->span_count, cmd->quarantined ? "true" : "false",
+      cmd->quarantine_reasons);
+  return n > 0 && (size_t)n < sizeof(payload) &&
+         logger_journal_writer_append_json(
+             &session->journal_writer, LOGGER_JOURNAL_RECORD_SESSION_END,
+             session->next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->journal_writer);
+}
+
+bool logger_writer_dispatch(logger_session_context_t *ctx,
+                            const logger_writer_cmd_t *cmd) {
+  logger_session_state_t *const session = (logger_session_state_t *)ctx;
+
+  switch (cmd->type) {
+  case LOGGER_WRITER_SESSION_START:
+    return writer_emit_session_start(session, &cmd->session_start);
+
+  case LOGGER_WRITER_SPAN_START:
+    return writer_emit_span_start(session, &cmd->span_start);
+
+  case LOGGER_WRITER_APPEND_PMD_PACKET:
+    return writer_append_pmd_packet(session, &cmd->append_pmd_packet);
+
+  case LOGGER_WRITER_WRITE_MARKER:
+    /* Barrier: seal in-flight chunk data before metadata record */
+    if (!logger_session_seal_active_chunk(session))
+      return false;
+    if (!writer_emit_marker(session, &cmd->write_marker))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+
+  case LOGGER_WRITER_WRITE_STATUS_SNAPSHOT:
+    /* Barrier */
+    if (!logger_session_seal_active_chunk(session))
+      return false;
+    if (!writer_emit_status_snapshot(session, &cmd->write_status_snapshot))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    /* Status snapshot also refreshes live.json */
+    return logger_session_write_live_internal(
+        session,
+        cmd->write_status_snapshot.now_utc[0] != '\0'
+            ? cmd->write_status_snapshot.now_utc
+            : NULL,
+        cmd->write_status_snapshot.boot_counter,
+        cmd->write_status_snapshot.now_ms);
+
+  case LOGGER_WRITER_WRITE_H10_BATTERY:
+    /* Barrier */
+    if (!logger_session_seal_active_chunk(session))
+      return false;
+    if (!writer_emit_h10_battery(session, &cmd->write_h10_battery))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+
+  case LOGGER_WRITER_WRITE_GAP:
+    /* Barrier: spec §6.7 lists gap as an explicit seal trigger */
+    if (!logger_session_seal_active_chunk(session))
+      return false;
+    if (!writer_emit_gap(session, &cmd->write_gap))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+
+  case LOGGER_WRITER_WRITE_CLOCK_EVENT:
+    /* Barrier */
+    if (!logger_session_seal_active_chunk(session))
+      return false;
+    if (!writer_emit_clock_event(session, &cmd->write_clock_event))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+
+  case LOGGER_WRITER_WRITE_RECOVERY:
+    if (!writer_emit_recovery(session, &cmd->write_recovery))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+
+  case LOGGER_WRITER_SPAN_END:
+    /* Barrier: seal before span_end */
+    if (!logger_session_seal_active_chunk(session))
+      return false;
+    if (!writer_emit_span_end(session, &cmd->span_end))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+
+  case LOGGER_WRITER_SESSION_END:
+    /* Barrier: seal before session_end */
+    if (!logger_session_seal_active_chunk(session))
+      return false;
+    if (!writer_emit_session_end(session, &cmd->session_end))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+
+  /*
+   * FINALIZE_SESSION is not yet wired through dispatch.
+   * Finalize needs the full persisted config and storage state for
+   * manifest generation, which the command struct can't carry yet.
+   * The finalize path still goes through
+   * logger_session_finalize_internal() directly.
+   *
+   * This case exists so the enum is handled; it must not be reached.
+   */
+  case LOGGER_WRITER_FINALIZE_SESSION:
+    return false;
+
+  case LOGGER_WRITER_REFRESH_LIVE:
+    return logger_session_write_live_internal(
+        session,
+        cmd->refresh_live.now_utc[0] != '\0' ? cmd->refresh_live.now_utc : NULL,
+        cmd->refresh_live.boot_counter, cmd->refresh_live.now_ms);
+
+  case LOGGER_WRITER_FLUSH_BARRIER:
+    if (!logger_session_seal_active_chunk(session))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+
+  default:
+    return false;
+  }
 }
