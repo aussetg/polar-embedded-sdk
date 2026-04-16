@@ -25,6 +25,7 @@
 #include "polar_sdk_runtime_context.h"
 #include "polar_sdk_sm_control.h"
 
+#include "logger/capture_stats.h"
 #include "logger/util.h"
 
 #define LOGGER_H10_SCAN_INTERVAL_UNITS 0x0030
@@ -67,6 +68,7 @@ static const uint8_t LOGGER_H10_UUID_PMD_DATA_BE[16] = {
 };
 
 static logger_h10_state_t *g_h10 = NULL;
+static logger_capture_stats_t *g_capture_stats = NULL;
 static bool g_btstack_core_initialized = false;
 static btstack_packet_callback_registration_t g_hci_event_cb;
 static btstack_packet_callback_registration_t g_sm_event_cb;
@@ -447,6 +449,10 @@ static bool logger_h10_queue_push_packet(logger_h10_state_t *state,
   state->packet_write_index = (uint8_t)((state->packet_write_index + 1u) %
                                         LOGGER_H10_PACKET_QUEUE_DEPTH);
   state->packet_count += 1u;
+  if (g_capture_stats != NULL) {
+    logger_capture_stats_observe_queue_depth(g_capture_stats,
+                                             state->packet_count);
+  }
   return true;
 }
 
@@ -1558,6 +1564,12 @@ void logger_h10_init(logger_h10_state_t *state) {
   state->initialized = true;
   g_h10 = state;
   logger_h10_init_btstack_core();
+}
+
+void logger_h10_set_capture_stats(logger_h10_state_t *state,
+                                  logger_capture_stats_t *stats) {
+  (void)state;
+  g_capture_stats = stats;
 }
 
 bool logger_h10_set_bound_address(logger_h10_state_t *state,

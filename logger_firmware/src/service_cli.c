@@ -12,6 +12,7 @@
 
 #include "board_config.h"
 #include "logger/app_main.h"
+#include "logger/capture_stats.h"
 #include "logger/faults.h"
 #include "logger/json.h"
 #include "logger/json_stream_writer.h"
@@ -3498,6 +3499,58 @@ bool logger_service_cli_is_unlocked(const logger_service_cli_t *cli,
   return cli->unlocked && now_ms < cli->unlock_deadline_mono_ms;
 }
 
+static void logger_handle_capture_stats_json(const logger_app_t *app) {
+  const logger_capture_stats_t *s = &app->capture_stats;
+  jsw w;
+  jsw_ok(&w, "capture stats", logger_clock_now_utc_or_null(&app->clock));
+
+  logger_json_stream_writer_field_object_begin(&w, "h10_queue");
+  logger_json_stream_writer_field_uint32(&w, "depth_hwm",
+                                         (uint32_t)s->queue_depth_hwm);
+  logger_json_stream_writer_field_uint32(&w, "queue_capacity",
+                                         LOGGER_H10_PACKET_QUEUE_DEPTH);
+  logger_json_stream_writer_field_uint32(
+      &w, "ecg_packet_drops", (uint32_t)app->h10.ecg_packet_drop_count);
+  logger_json_stream_writer_field_uint32(
+      &w, "acc_packet_drops", (uint32_t)app->h10.acc_packet_drop_count);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "session_append");
+  logger_json_stream_writer_field_uint32(&w, "count", s->session_append_count);
+  logger_json_stream_writer_field_uint32(&w, "fail_count",
+                                         s->session_append_fail_count);
+  logger_json_stream_writer_field_uint32(&w, "max_us",
+                                         s->session_append_max_us);
+  logger_json_stream_writer_field_uint32(&w, "last_us",
+                                         s->session_append_last_us);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "storage_append");
+  logger_json_stream_writer_field_uint32(&w, "count", s->storage_append_count);
+  logger_json_stream_writer_field_uint32(&w, "fail_count",
+                                         s->storage_append_fail_count);
+  logger_json_stream_writer_field_uint32(&w, "max_us",
+                                         s->storage_append_max_us);
+  logger_json_stream_writer_field_uint32(&w, "last_us",
+                                         s->storage_append_last_us);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "sync");
+  logger_json_stream_writer_field_uint32(&w, "count", s->sync_count);
+  logger_json_stream_writer_field_uint32(&w, "max_us", s->sync_max_us);
+  logger_json_stream_writer_field_uint32(&w, "last_us", s->sync_last_us);
+  logger_json_stream_writer_object_end(&w);
+
+  logger_json_stream_writer_field_object_begin(&w, "journal");
+  logger_json_stream_writer_field_uint32(&w, "record_count",
+                                         s->journal_record_count);
+  logger_json_stream_writer_field_uint32(&w, "record_fail_count",
+                                         s->journal_record_fail_count);
+  logger_json_stream_writer_object_end(&w);
+
+  jsw_end(&w);
+}
+
 static void logger_service_cli_execute(logger_service_cli_t *cli,
                                        logger_app_t *app, const char *line,
                                        uint32_t now_ms) {
@@ -3507,6 +3560,19 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
 
   if (strcmp(line, "status --json") == 0) {
     logger_handle_status_json(app);
+    return;
+  }
+  if (strcmp(line, "capture stats --json") == 0) {
+    logger_handle_capture_stats_json(app);
+    return;
+  }
+  if (strcmp(line, "capture stats reset") == 0) {
+    logger_capture_stats_reset((logger_capture_stats_t *)&app->capture_stats);
+    jsw w;
+    jsw_ok(&w, "capture stats reset",
+           logger_clock_now_utc_or_null(&app->clock));
+    logger_json_stream_writer_field_bool(&w, "reset", true);
+    jsw_end(&w);
     return;
   }
   if (strcmp(line, "provisioning-status --json") == 0) {

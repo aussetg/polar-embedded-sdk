@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "logger/capture_stats.h"
+
 #define LOGGER_H10_ADDR_STR_LEN 17
 #define LOGGER_H10_PACKET_MAX_BYTES 244
 #define LOGGER_H10_PACKET_QUEUE_DEPTH 32
@@ -114,6 +116,8 @@ typedef struct {
 } logger_h10_state_t;
 
 void logger_h10_init(logger_h10_state_t *state);
+void logger_h10_set_capture_stats(logger_h10_state_t *state,
+                                  logger_capture_stats_t *stats);
 bool logger_h10_set_bound_address(logger_h10_state_t *state,
                                   const char *bound_address);
 void logger_h10_set_enabled(logger_h10_state_t *state, bool enabled);

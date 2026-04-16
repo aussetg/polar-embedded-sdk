@@ -8,6 +8,7 @@
 #include "logger/app_state.h"
 #include "logger/battery.h"
 #include "logger/button.h"
+#include "logger/capture_stats.h"
 #include "logger/clock.h"
 #include "logger/config_store.h"
 #include "logger/h10.h"
@@ -83,6 +84,7 @@ typedef struct logger_app {
   logger_storage_status_t storage;
   logger_system_log_t system_log;
   logger_session_state_t session;
+  logger_capture_stats_t capture_stats;
   logger_service_cli_t cli;
   char hardware_id[LOGGER_HARDWARE_ID_HEX_LEN + 1];
   char current_day_study_day_local[11];

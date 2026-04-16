@@ -15,6 +15,9 @@
 
 #define LOGGER_SESSION_ID_HEX_LEN 32
 
+#include "logger/capture_stats.h"
+void logger_session_set_capture_stats(logger_capture_stats_t *stats);
+
 enum {
   LOGGER_SESSION_STREAM_KIND_ECG = 1u,
   LOGGER_SESSION_STREAM_KIND_ACC = 2u,

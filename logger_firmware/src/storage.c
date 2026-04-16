@@ -9,6 +9,7 @@
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
+#include "logger/capture_stats.h"
 #include "logger/util.h"
 #include "pico/stdlib.h"
 
@@ -43,6 +44,7 @@ typedef struct {
 } logger_sd_driver_t;
 
 static logger_sd_driver_t g_sd;
+static logger_capture_stats_t *g_storage_stats = NULL;
 
 /* DMA channels for SPI bulk data phase.
  *   TX channel: memory → SPI TX FIFO, paced by DREQ_SPIx_TX
@@ -448,6 +450,10 @@ void logger_storage_init(void) {
   g_sd.io_initialized = true;
 }
 
+void logger_storage_set_capture_stats(logger_capture_stats_t *stats) {
+  g_storage_stats = stats;
+}
+
 static bool logger_storage_mount_if_needed(void) {
   if (g_sd.mounted) {
     return true;
@@ -695,30 +701,45 @@ bool logger_storage_write_file_atomic(const char *path, const void *data,
 
 bool logger_storage_append_file(const char *path, const void *data, size_t len,
                                 uint64_t *new_size_bytes) {
+  const uint32_t t0 = (uint32_t)to_us_since_boot(get_absolute_time());
+
   logger_storage_status_t status;
   (void)logger_storage_refresh(&status);
   if (!status.mounted || !status.writable) {
+    const uint32_t elapsed =
+        (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+    logger_capture_stats_record_storage_append(g_storage_stats, elapsed, false);
     return false;
   }
 
   FIL file;
   if (f_open(&file, path, FA_WRITE | FA_OPEN_APPEND) != FR_OK) {
+    const uint32_t elapsed =
+        (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+    logger_capture_stats_record_storage_append(g_storage_stats, elapsed, false);
     return false;
   }
 
   UINT written = 0u;
   const FRESULT write_fr =
       (len == 0u) ? FR_OK : f_write(&file, data, (UINT)len, &written);
+
+  const uint32_t sync_t0 = (uint32_t)to_us_since_boot(get_absolute_time());
   const FRESULT sync_fr = f_sync(&file);
+  const uint32_t sync_elapsed =
+      (uint32_t)to_us_since_boot(get_absolute_time()) - sync_t0;
+  logger_capture_stats_record_sync(g_storage_stats, sync_elapsed);
+
   if (new_size_bytes != NULL) {
     *new_size_bytes = (uint64_t)f_size(&file);
   }
   const FRESULT close_fr = f_close(&file);
-  if ((len != 0u && (write_fr != FR_OK || written != (UINT)len)) ||
-      sync_fr != FR_OK || close_fr != FR_OK) {
-    return false;
-  }
-  return true;
+  const bool ok = (len == 0u || (write_fr == FR_OK && written == (UINT)len)) &&
+                  sync_fr == FR_OK && close_fr == FR_OK;
+
+  const uint32_t elapsed = (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+  logger_capture_stats_record_storage_append(g_storage_stats, elapsed, ok);
+  return ok;
 }
 
 bool logger_storage_remove_file(const char *path) {

@@ -6,8 +6,10 @@
 
 #include "ff.h"
 #include "pico/rand.h"
+#include "pico/stdlib.h"
 
 #include "board_config.h"
+#include "logger/capture_stats.h"
 #include "logger/h10.h"
 #include "logger/json.h"
 #include "logger/json_writer.h"
@@ -22,6 +24,12 @@
 #define LOGGER_SESSION_DATA_CHUNK_HEADER_BYTES 80u
 #define LOGGER_SESSION_DATA_ENTRY_HEADER_BYTES 28u
 #define LOGGER_SESSION_DATA_ENCODING_RAW_PMD_NOTIFICATION_LIST_V1 1u
+
+static logger_capture_stats_t *g_session_stats = NULL;
+
+void logger_session_set_capture_stats(logger_capture_stats_t *stats) {
+  g_session_stats = stats;
+}
 
 typedef struct {
   char *buf;
@@ -715,6 +723,7 @@ static bool logger_session_start_new_active_internal(
     bool bonded, bool clock_jump_at_session_start, bool debug_session,
     uint32_t boot_counter, uint32_t now_ms, const char **error_code_out,
     const char **error_message_out) {
+  logger_capture_stats_reset(g_session_stats);
   if (!logger_storage_ready_for_logging(storage)) {
     logger_session_set_error(error_code_out, error_message_out,
                              "storage_unavailable",
@@ -1042,6 +1051,8 @@ bool logger_session_append_pmd_packet(logger_session_state_t *session,
                                       const logger_clock_status_t *clock,
                                       uint16_t stream_kind, uint64_t mono_us,
                                       const uint8_t *value, size_t value_len) {
+  const uint32_t t0 = (uint32_t)to_us_since_boot(get_absolute_time());
+
   if (!session->active || !session->span_active || value == NULL ||
       value_len == 0u || value_len > LOGGER_H10_PACKET_MAX_BYTES ||
       session->current_span_index >= session->span_count ||
@@ -1080,6 +1091,9 @@ bool logger_session_append_pmd_packet(logger_session_state_t *session,
     span->first_seq_in_span = old_first_seq;
     span->last_seq_in_span = old_last_seq;
     session->next_packet_seq_in_span = old_next_packet_seq;
+    const uint32_t elapsed =
+        (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+    logger_capture_stats_record_session_append(g_session_stats, elapsed, false);
     return false;
   }
 
@@ -1114,10 +1128,17 @@ bool logger_session_append_pmd_packet(logger_session_state_t *session,
     session->next_packet_seq_in_span = old_next_packet_seq;
     session->next_chunk_seq_in_session = old_next_chunk_seq;
     session->next_record_seq -= 1u;
+    const uint32_t elapsed =
+        (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+    logger_capture_stats_record_session_append(g_session_stats, elapsed, false);
+    logger_capture_stats_record_journal_append(g_session_stats, false);
     return false;
   }
 
   session->next_chunk_seq_in_session += 1u;
+  const uint32_t elapsed = (uint32_t)to_us_since_boot(get_absolute_time()) - t0;
+  logger_capture_stats_record_session_append(g_session_stats, elapsed, true);
+  logger_capture_stats_record_journal_append(g_session_stats, true);
   return true;
 }
 
