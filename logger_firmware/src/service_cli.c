@@ -2648,9 +2648,9 @@ static void logger_handle_debug_session_stop(logger_app_t *app,
     jsw_end(&w);
     return;
   }
-  if (!logger_session_stop_debug(
-          &app->session, &app->system_log, app->hardware_id, &app->persisted,
-          &app->clock, &app->storage, app->persisted.boot_counter, now_ms)) {
+  if (!logger_session_stop_debug(&app->session, &app->system_log,
+                                 &app->persisted, &app->clock,
+                                 app->persisted.boot_counter, now_ms)) {
     jsw w;
     jsw_err(&w, "debug session stop", logger_clock_now_utc_or_null(&app->clock),
             "storage_unavailable", "failed to close debug session");
@@ -3093,9 +3093,8 @@ static void logger_handle_debug_synth_rollover(const logger_service_cli_t *cli,
     return;
   }
 
-  if (!logger_session_finalize(&app->session, &app->system_log,
-                               app->hardware_id, &app->persisted, &app->clock,
-                               &app->storage, "rollover",
+  if (!logger_session_finalize(&app->session, &app->system_log, &app->persisted,
+                               &app->clock, "rollover",
                                app->persisted.boot_counter, now_ms)) {
     jsw w;
     jsw_err(&w, "debug synth rollover",
@@ -3195,8 +3194,7 @@ static void logger_handle_debug_synth_clock_boundary(
 
   if (crossed_study_day) {
     if (!logger_session_finalize(&app->session, &app->system_log,
-                                 app->hardware_id, &app->persisted, &app->clock,
-                                 &app->storage, span_end_reason,
+                                 &app->persisted, &app->clock, span_end_reason,
                                  app->persisted.boot_counter, now_ms)) {
       jsw w;
       jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),

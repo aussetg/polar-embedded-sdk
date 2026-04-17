@@ -5,6 +5,7 @@
 
 #include "logger/app_main.h"
 #include "logger/button.h"
+#include "logger/session.h"
 #include "logger/storage_worker.h"
 
 /* Shared state for the core-1 storage worker.  Static so it survives
@@ -33,6 +34,30 @@ int main(void) {
 
   static logger_app_t app;
   logger_app_init(&app, to_ms_since_boot(get_absolute_time()), boot_gesture);
+
+  /*
+   * Boot-time session recovery on core 0, BEFORE the worker is launched.
+   *
+   * session->pipe is still NULL (set below after this returns), so all
+   * writer commands execute inline on core 0 via logger_writer_dispatch().
+   * Core 1 is not running yet — core 0 owns FatFS exclusively.
+   *
+   * This is the ONLY remaining window where core 0 does direct SD/FatFS
+   * session I/O.  Once the worker is launched below, core 1 becomes the
+   * exclusive FatFS owner.
+   *
+   * Failure to recover is not fatal here — step_boot will latch the fault
+   * and route to RECOVERY_HOLD.
+   */
+  (void)logger_app_pre_worker_recovery(&app,
+                                       to_ms_since_boot(get_absolute_time()));
+
+  /*
+   * Wire the capture pipe to the session.  Until this point, pipe == NULL
+   * and all writer commands execute inline on core 0.  After this, commands
+   * go through the command ring to core 1.
+   */
+  logger_session_set_pipe(&app.session, &app.capture_pipe);
 
   /*
    * Launch core 1 storage worker.

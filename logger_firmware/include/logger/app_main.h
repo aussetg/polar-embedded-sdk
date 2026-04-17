@@ -139,6 +139,7 @@ typedef struct logger_app {
   bool indicator_led_on;
   bool boot_banner_printed;
   bool boot_firmware_identity_changed;
+  bool boot_recovery_done;
   bool reboot_pending;
   logger_runtime_state_t recovery_resume_state;
 } logger_app_t;
@@ -146,6 +147,23 @@ typedef struct logger_app {
 void logger_app_clear_current_fault(logger_app_t *app, const char *source);
 void logger_app_init(logger_app_t *app, uint32_t now_ms,
                      logger_boot_gesture_t boot_gesture);
+
+/*
+ * Run boot-time session recovery on core 0, BEFORE the storage worker
+ * is launched.
+ *
+ * This is the ONLY remaining path where core 0 does direct SD/FatFS
+ * session I/O.  It runs with session->pipe == NULL so all writer
+ * commands execute inline on core 0.  The constraint is enforced by
+ * main.c: this is called after logger_app_init() (pipe not set yet)
+ * but before logger_session_set_pipe() + logger_storage_worker_launch().
+ *
+ * Returns true on success.  On failure, latches sd_write_failed and
+ * returns false; the caller must NOT launch the worker in that case
+ * (or can — the fault will be handled by step_boot routing to
+ * RECOVERY_HOLD).
+ */
+bool logger_app_pre_worker_recovery(logger_app_t *app, uint32_t now_ms);
 void logger_app_set_last_day_outcome(logger_app_t *app,
                                      const char *study_day_local,
                                      const char *kind, const char *reason);

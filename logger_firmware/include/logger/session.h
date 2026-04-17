@@ -10,6 +10,7 @@
 #include "logger/clock.h"
 #include "logger/config_store.h"
 #include "logger/faults.h"
+#include "logger/identity.h"
 #include "logger/journal.h"
 #include "logger/storage.h"
 #include "logger/system_log.h"
@@ -20,6 +21,31 @@
 #include "logger/chunk_builder.h"
 #include "logger/journal_writer.h"
 #include "logger/writer_protocol.h"
+
+/* Manifest snapshot: config and storage fields needed for manifest
+ * generation at finalize time.
+ *
+ * Set once by core 0 during session creation / recovery.
+ * Read by core 1 during FINALIZE_SESSION dispatch.
+ * The command-ring fences provide the ordering guarantee.
+ */
+
+typedef struct {
+  char hardware_id[LOGGER_HARDWARE_ID_HEX_LEN + 1u];
+  char logger_id[LOGGER_CONFIG_LOGGER_ID_MAX];
+  char subject_id[LOGGER_CONFIG_SUBJECT_ID_MAX];
+  char timezone[LOGGER_CONFIG_TIMEZONE_MAX];
+  char bound_h10_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
+  logger_storage_status_t storage;
+  bool debug_session;
+  /*
+   * system_log pointer for use at finalize time.
+   * Set by core 0 at session creation, read by core 1 during
+   * FINALIZE_SESSION dispatch.  Internal-flash writes through
+   * this pointer are flash-safe (both cores are lockout-ready).
+   */
+  logger_system_log_t *system_log;
+} logger_session_manifest_ctx_t;
 
 void logger_session_set_capture_stats(logger_capture_stats_t *stats);
 
@@ -71,6 +97,15 @@ typedef struct logger_session_state {
   uint32_t span_count;
   logger_journal_span_summary_t spans[LOGGER_JOURNAL_MAX_SPANS];
   logger_chunk_builder_t chunk_builder;
+  /* Manifest snapshot — set at session creation, read at finalize.
+   * Owned by core 0 until FINALIZE_SESSION is dispatched, after which
+   * core 1 reads it.  Ring fences provide ordering. */
+  logger_session_manifest_ctx_t manifest_ctx;
+  /* Manifest serialization buffer.  Used only during FINALIZE_SESSION
+   * on core 1.  Avoids static storage and keeps 8 KiB off core 1's
+   * 2 KiB stack.  Zeroed at session init. */
+#define LOGGER_SESSION_MANIFEST_MAX 8192
+  char manifest_buf[LOGGER_SESSION_MANIFEST_MAX];
   /* Capture pipe — when set, all writer dispatch routes through it.
    * NULL during init or unit tests that don't need the pipe. */
   struct capture_pipe *pipe;
@@ -168,18 +203,17 @@ bool logger_session_append_h10_battery(logger_session_state_t *session,
                                        uint8_t battery_percent,
                                        const char *read_reason);
 
-bool logger_session_finalize(
-    logger_session_state_t *session, logger_system_log_t *system_log,
-    const char *hardware_id, const logger_persisted_state_t *persisted,
-    const logger_clock_status_t *clock, const logger_storage_status_t *storage,
-    const char *end_reason, uint32_t boot_counter, uint32_t now_ms);
+bool logger_session_finalize(logger_session_state_t *session,
+                             logger_system_log_t *system_log,
+                             const logger_persisted_state_t *persisted,
+                             const logger_clock_status_t *clock,
+                             const char *end_reason, uint32_t boot_counter,
+                             uint32_t now_ms);
 
 bool logger_session_stop_debug(logger_session_state_t *session,
                                logger_system_log_t *system_log,
-                               const char *hardware_id,
                                const logger_persisted_state_t *persisted,
                                const logger_clock_status_t *clock,
-                               const logger_storage_status_t *storage,
                                uint32_t boot_counter, uint32_t now_ms);
 
 bool logger_session_recover_on_boot(

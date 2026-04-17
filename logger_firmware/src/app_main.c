@@ -1693,7 +1693,13 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
   logger_capture_stats_init(&app->capture_stats);
   logger_session_set_capture_stats(&app->capture_stats);
   capture_pipe_init(&app->capture_pipe);
-  logger_session_set_pipe(&app->session, &app->capture_pipe);
+  /*
+   * Do NOT set the pipe yet.  The pipe is wired up in main.c AFTER
+   * pre-worker recovery completes.  Until then, session->pipe == NULL
+   * so all writer dispatch executes inline on core 0 — core 0 owns
+   * FatFS exclusively during this window.
+   */
+  app->boot_recovery_done = false;
   logger_system_log_init(&app->system_log, app->persisted.boot_counter);
 
   logger_app_refresh_observations(app, now_ms);
@@ -1725,6 +1731,45 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
         &app->system_log, logger_clock_now_utc_or_null(&app->clock),
         "rtc_lost_power", LOGGER_SYSTEM_LOG_SEVERITY_WARN, "{}");
   }
+}
+
+bool logger_app_pre_worker_recovery(logger_app_t *app, uint32_t now_ms) {
+  /*
+   * Boot-time session recovery runs on core 0 with pipe == NULL.
+   *
+   * This is the ONLY remaining window where core 0 does direct SD/FatFS
+   * session I/O.  session->pipe is NULL (set in main.c after this returns),
+   * so all writer dispatch executes inline on core 0.  The storage worker
+   * has not been launched yet — core 1 is idle or not yet started.
+   *
+   * Constraint: main.c MUST call this BEFORE logger_session_set_pipe()
+   * and BEFORE logger_storage_worker_launch().  After the worker is live,
+   * core 0 MUST NOT touch session FatFS directly.
+   */
+  logger_app_refresh_observations(app, now_ms);
+
+  if (!logger_storage_ready_for_logging(&app->storage)) {
+    /* No storage — nothing to recover. step_boot will handle the fault. */
+    app->boot_recovery_done = true;
+    return true;
+  }
+
+  /*
+   * We don't know the unattended target yet (it depends on charger/time/
+   * provisioning state that may change between now and step_boot), so
+   * attempt resume.  If step_boot later decides logging isn't the target,
+   * it will finalize the recovered session through the normal stopping path.
+   */
+  const bool resume_allowed = true;
+  if (!logger_app_recover_session_if_needed(app, now_ms, resume_allowed)) {
+    logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                    LOGGER_RUNTIME_BOOT,
+                                    "session_recovery_failed", now_ms);
+    app->boot_recovery_done = true;
+    return false;
+  }
+  app->boot_recovery_done = true;
+  return true;
 }
 
 typedef enum {
@@ -1797,12 +1842,19 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
 
   if (app->boot_gesture == LOGGER_BOOT_GESTURE_SERVICE) {
     printf("[logger] boot gesture: forced service mode\n");
-    if (logger_storage_ready_for_logging(&app->storage) &&
-        !logger_app_recover_session_if_needed(app, now_ms, false)) {
-      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                      LOGGER_RUNTIME_BOOT,
-                                      "session_recovery_failed", now_ms);
-      return;
+    /*
+     * Pre-worker recovery already ran.  If it recovered an active session
+     * but we're entering service mode, finalize it through the worker.
+     */
+    if (app->session.active) {
+      if (!logger_session_finalize(
+              &app->session, &app->system_log, &app->persisted, &app->clock,
+              "service_entry", app->persisted.boot_counter, now_ms)) {
+        logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                        LOGGER_RUNTIME_BOOT,
+                                        "session_finalize_failed", now_ms);
+        return;
+      }
     }
     logger_app_enter_service(app, "boot_service_hold", now_ms, true);
     return;
@@ -1812,13 +1864,20 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
   const logger_runtime_state_t unattended_target =
       logger_app_select_unattended_target(app, &fault_code);
 
-  if (logger_storage_ready_for_logging(&app->storage) &&
-      !logger_app_recover_session_if_needed(
-          app, now_ms, unattended_target == LOGGER_RUNTIME_LOG_WAIT_H10)) {
-    logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                    LOGGER_RUNTIME_BOOT,
-                                    "session_recovery_failed", now_ms);
-    return;
+  /*
+   * Pre-worker recovery already ran (see logger_app_pre_worker_recovery
+   * in main.c).  If it recovered a session but the unattended target is
+   * not logging, finalize through the worker now.
+   */
+  if (app->session.active && unattended_target != LOGGER_RUNTIME_LOG_WAIT_H10) {
+    if (!logger_session_finalize(
+            &app->session, &app->system_log, &app->persisted, &app->clock,
+            "unexpected_reboot", app->persisted.boot_counter, now_ms)) {
+      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                      LOGGER_RUNTIME_BOOT,
+                                      "session_finalize_failed", now_ms);
+      return;
+    }
   }
 
   if (unattended_target == LOGGER_RUNTIME_SERVICE) {
@@ -2197,10 +2256,10 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
     char closed_study_day_local[11];
     logger_copy_string(closed_study_day_local, sizeof(closed_study_day_local),
                        app->session.study_day_local);
-    if (!logger_session_finalize(
-            &app->session, &app->system_log, app->hardware_id, &app->persisted,
-            &app->clock, &app->storage, logger_app_session_stop_reason(app),
-            app->persisted.boot_counter, now_ms)) {
+    if (!logger_session_finalize(&app->session, &app->system_log,
+                                 &app->persisted, &app->clock,
+                                 logger_app_session_stop_reason(app),
+                                 app->persisted.boot_counter, now_ms)) {
       logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                       LOGGER_RUNTIME_BOOT,
                                       "session_stop_write_failed", now_ms);

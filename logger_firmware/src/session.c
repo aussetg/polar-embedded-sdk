@@ -21,7 +21,6 @@
 #include "logger/version.h"
 
 #define LOGGER_SESSION_JSON_MAX 1024
-#define LOGGER_SESSION_MANIFEST_MAX 8192
 #define LOGGER_SESSION_LIVE_JSON_TOKEN_MAX 64u
 
 /* Chunk assembly buffer: 64 KiB static, no heap in the hot path */
@@ -323,9 +322,11 @@ logger_session_append_session_start(logger_session_state_t *session,
                                     uint32_t boot_counter, uint32_t now_ms) {
   logger_writer_cmd_t cmd;
   memset(&cmd, 0, sizeof(cmd));
+  /* cmd.type sets the discriminant via the union's first member.
+   * Every member struct's .type field overlays the same address,
+   * so setting cmd.type once is sufficient. */
   cmd.type = LOGGER_WRITER_SESSION_START;
   logger_writer_session_start_t *s = &cmd.session_start;
-  s->type = LOGGER_WRITER_SESSION_START;
   s->boot_counter = boot_counter;
   s->now_ms = now_ms;
   s->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
@@ -390,7 +391,6 @@ static bool logger_session_begin_span(logger_session_state_t *session,
   memset(&cmd, 0, sizeof(cmd));
   cmd.type = LOGGER_WRITER_SPAN_START;
   logger_writer_span_start_t *ss = &cmd.span_start;
-  ss->type = LOGGER_WRITER_SPAN_START;
   ss->boot_counter = boot_counter;
   ss->now_ms = now_ms;
   ss->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
@@ -416,14 +416,12 @@ static bool logger_session_begin_span(logger_session_state_t *session,
 }
 
 /*
- * Control-plane span close: seal in-flight chunk data, emit span_end
- * journal record, and clear control-plane span state.
+ * Control-plane span close: dispatch SPAN_END through the pipe.
  *
- * This is the single shared path for closing an active span regardless
- * of caller (disconnect, clock_event, finalize, recovery).  It
- * combines the writer-side barrier (seal + write + sync) with the
- * control-plane state update (span_active=false, clear IDs) so the
- * two never diverge.
+ * Core 0 captures span metadata and constructs a SPAN_END command.
+ * Core 1 handles the barrier (seal + write + sync).
+ * Control-plane state is updated only on success so the two
+ * never diverge.
  */
 static bool logger_session_control_close_span(
     logger_session_state_t *session, const logger_clock_status_t *clock,
@@ -434,44 +432,36 @@ static bool logger_session_control_close_span(
     return true;
   }
 
-  /* Barrier: seal any in-flight chunk data before span_end */
-  if (!logger_session_seal_active_chunk(session)) {
-    return false;
-  }
-
   logger_journal_span_summary_t *span =
       &session->spans[session->current_span_index];
   if (ended_span_id_out != NULL) {
     logger_copy_string(ended_span_id_out, LOGGER_SESSION_ID_HEX_LEN + 1,
                        span->span_id);
   }
-  logger_copy_string(span->end_reason, sizeof(span->end_reason), end_reason);
-  logger_copy_string(span->end_utc, sizeof(span->end_utc),
-                     clock != NULL ? clock->now_utc : NULL);
+  /* Dispatch SPAN_END to core 1.  The writer handles the barrier:
+   * seal active chunk, read actual packet counts from session state
+   * after sealing, write span_end record, sync. */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_SPAN_END;
+  logger_writer_span_end_t *se = &cmd.span_end;
+  se->boot_counter = boot_counter;
+  se->now_ms = now_ms;
+  se->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  logger_copy_string(se->session_id, sizeof(se->session_id),
+                     session->session_id);
+  logger_copy_string(se->span_id, sizeof(se->span_id), span->span_id);
+  logger_copy_string(se->end_reason, sizeof(se->end_reason), end_reason);
+  /* packet_count / seq fields are filled by core 1 after sealing */
 
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"span_end\",\"utc_ns\":%lld,"
-      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":"
-      "\"%s\",\"end_reason\":\"%s\",\"packet_count\":%lu,\"first_seq_in_span\":"
-      "%lu,\"last_seq_in_span\":%lu}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, span->span_id, end_reason,
-      (unsigned long)span->packet_count, (unsigned long)span->first_seq_in_span,
-      (unsigned long)span->last_seq_in_span);
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_SPAN_END,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
+  if (!session_dispatch(session, &cmd)) {
     return false;
   }
 
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
-
+  /* Control-plane state updated only on dispatch success. */
+  logger_copy_string(span->end_reason, sizeof(span->end_reason), end_reason);
+  logger_copy_string(span->end_utc, sizeof(span->end_utc),
+                     clock != NULL ? clock->now_utc : NULL);
   session->span_active = false;
   session->current_span_id[0] = '\0';
   session->current_span_index = 0xffffffffu;
@@ -483,30 +473,20 @@ static bool logger_session_append_gap(logger_session_state_t *session,
                                       const char *ended_span_id,
                                       const char *gap_reason,
                                       uint32_t boot_counter, uint32_t now_ms) {
-  /* Barrier: spec §6.7 lists gap as an explicit seal trigger */
-  if (!logger_session_seal_active_chunk(session)) {
-    return false;
-  }
-
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"gap\",\"utc_ns\":%lld,\"mono_"
-      "us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"ended_span_id\":"
-      "\"%s\",\"gap_reason\":\"%s\"}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, ended_span_id, gap_reason);
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_GAP,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
-    return false;
-  }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
-  return true;
+  /* Dispatch WRITE_GAP to core 1.  The writer handles the barrier
+   * (seal + write + sync) internally. */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_WRITE_GAP;
+  logger_writer_write_gap_t *g = &cmd.write_gap;
+  g->boot_counter = boot_counter;
+  g->now_ms = now_ms;
+  g->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  logger_copy_string(g->session_id, sizeof(g->session_id), session->session_id);
+  logger_copy_string(g->ended_span_id, sizeof(g->ended_span_id), ended_span_id);
+  logger_copy_string(g->gap_reason, sizeof(g->gap_reason),
+                     gap_reason != NULL ? gap_reason : "disconnect");
+  return session_dispatch(session, &cmd);
 }
 
 static bool logger_session_append_recovery(logger_session_state_t *session,
@@ -518,7 +498,6 @@ static bool logger_session_append_recovery(logger_session_state_t *session,
   memset(&cmd, 0, sizeof(cmd));
   cmd.type = LOGGER_WRITER_WRITE_RECOVERY;
   logger_writer_write_recovery_t *r = &cmd.write_recovery;
-  r->type = LOGGER_WRITER_WRITE_RECOVERY;
   r->boot_counter = boot_counter;
   r->now_ms = now_ms;
   r->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
@@ -530,10 +509,7 @@ static bool logger_session_append_recovery(logger_session_state_t *session,
 static bool logger_session_append_session_end(
     logger_session_state_t *session, const logger_clock_status_t *clock,
     const char *end_reason, uint32_t boot_counter, uint32_t now_ms) {
-  /* Barrier: spec §6.7 lists session_end as an explicit seal trigger */
-  if (!logger_session_seal_active_chunk(session)) {
-    return false;
-  }
+  /* No direct seal — writer_dispatch for SESSION_END handles the barrier. */
 
   /* Control-plane: capture session end metadata */
   logger_copy_string(session->session_end_utc, sizeof(session->session_end_utc),
@@ -550,7 +526,6 @@ static bool logger_session_append_session_end(
   memset(&cmd, 0, sizeof(cmd));
   cmd.type = LOGGER_WRITER_SESSION_END;
   logger_writer_session_end_t *se = &cmd.session_end;
-  se->type = LOGGER_WRITER_SESSION_END;
   se->boot_counter = boot_counter;
   se->now_ms = now_ms;
   se->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
@@ -565,8 +540,7 @@ static bool logger_session_append_session_end(
   if (!session_dispatch(session, &cmd)) {
     return false;
   }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
+  /* journal_size_bytes updated by dispatch (writer-side owns durable size). */
   return true;
 }
 
@@ -734,57 +708,75 @@ static bool logger_session_build_manifest(
 
 static bool logger_session_finalize_internal(
     logger_session_state_t *session, logger_system_log_t *system_log,
-    const char *hardware_id, const logger_persisted_state_t *persisted,
-    const logger_clock_status_t *clock, const logger_storage_status_t *storage,
-    const char *end_reason, bool debug_session, uint32_t boot_counter,
-    uint32_t now_ms) {
+    const logger_persisted_state_t *persisted,
+    const logger_clock_status_t *clock, const char *end_reason,
+    bool debug_session, uint32_t boot_counter, uint32_t now_ms) {
   if (!session->active) {
     return false;
   }
 
   logger_session_recompute_quarantine(session, clock);
 
+  /*
+   * Close span through the pipe — SPAN_END barrier.
+   * After this, span_active is false and span counters are finalized.
+   */
   if (!logger_session_control_close_span(session, clock, end_reason,
                                          boot_counter, now_ms, NULL)) {
     return false;
   }
+  /* Session end through the pipe — SESSION_END barrier. */
   if (!logger_session_append_session_end(session, clock, end_reason,
                                          boot_counter, now_ms)) {
     return false;
   }
 
-  /* Close the journal writer — sync + close the handle */
-  if (!logger_journal_writer_close(&session->journal_writer)) {
-    return false;
+  /*
+   * Dispatch FINALIZE_SESSION through the pipe.
+   *
+   * Core 1 will: close journal → compute SHA-256 → write manifest →
+   * remove live.json → refresh upload queue.
+   *
+   * Refresh config fields in manifest_ctx from the live persisted state
+   * so the manifest reflects the current config, not a stale snapshot
+   * from session creation.  If config changed mid-session via CLI
+   * (subject_id, timezone, etc.), the manifest gets the latest values.
+   *
+   * hardware_id is immutable (silicon identity) — no refresh needed.
+   * storage is refreshed by core 1 (SD owner) during dispatch.
+   * debug_session is a creation-time property — no refresh needed.
+   *
+   * The ring fence in the command transport guarantees core 1 sees
+   * these writes before it reads manifest_ctx during dispatch.
+   */
+  {
+    logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
+    logger_copy_string(mc->logger_id, sizeof(mc->logger_id),
+                       persisted->config.logger_id);
+    logger_copy_string(mc->subject_id, sizeof(mc->subject_id),
+                       persisted->config.subject_id);
+    logger_copy_string(mc->timezone, sizeof(mc->timezone),
+                       persisted->config.timezone);
+    logger_copy_string(mc->bound_h10_address, sizeof(mc->bound_h10_address),
+                       persisted->config.bound_h10_address);
+    mc->system_log = system_log;
   }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
 
-  char journal_sha256[LOGGER_SHA256_HEX_LEN + 1];
-  uint64_t journal_size_bytes = 0u;
-  if (!logger_session_compute_file_sha256(session->journal_path, journal_sha256,
-                                          &journal_size_bytes)) {
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_FINALIZE_SESSION;
+  logger_writer_finalize_session_t *fs = &cmd.finalize_session;
+  fs->boot_counter = boot_counter;
+  fs->now_ms = now_ms;
+  if (clock != NULL && clock->now_utc[0] != '\0') {
+    logger_copy_string(fs->now_utc, sizeof(fs->now_utc), clock->now_utc);
+  }
+
+  if (!session_dispatch(session, &cmd)) {
     return false;
   }
 
-  static char manifest[LOGGER_SESSION_MANIFEST_MAX];
-  size_t manifest_len = 0u;
-  if (!logger_session_build_manifest(
-          session, hardware_id, persisted, storage, journal_sha256,
-          journal_size_bytes, manifest, sizeof(manifest), &manifest_len)) {
-    return false;
-  }
-  if (!logger_storage_write_file_atomic(session->manifest_path, manifest,
-                                        manifest_len)) {
-    return false;
-  }
-
-  (void)logger_storage_remove_file(session->live_path);
-  if (!logger_upload_queue_refresh_file(
-          system_log, clock != NULL ? clock->now_utc : NULL, NULL)) {
-    return false;
-  }
-
+  /* System log on core 0 (internal flash, not SD) */
   char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
   logger_json_object_writer_t writer;
   logger_json_object_writer_init(&writer, details, sizeof(details));
@@ -814,7 +806,7 @@ static void logger_session_set_error(const char **error_code_out,
 
 static bool logger_session_start_new_active_internal(
     logger_session_state_t *session, logger_system_log_t *system_log,
-    const logger_persisted_state_t *persisted,
+    const char *hardware_id, const logger_persisted_state_t *persisted,
     const logger_clock_status_t *clock, const logger_storage_status_t *storage,
     const char *span_start_reason, const char *h10_address, bool encrypted,
     bool bonded, bool clock_jump_at_session_start, bool debug_session,
@@ -850,6 +842,11 @@ static bool logger_session_start_new_active_internal(
                      "first_span_of_session");
   session->next_chunk_seq_in_session = 0u;
   session->next_packet_seq_in_span = 0u;
+  /*
+   * Set paths in session state so the writer (core 1) can read them
+   * when it handles SESSION_START.  No FatFS I/O here — directory
+   * creation and journal file creation happen on core 1.
+   */
   if (!logger_session_set_paths(session)) {
     logger_session_set_error(error_code_out, error_message_out,
                              "storage_unavailable",
@@ -857,24 +854,36 @@ static bool logger_session_start_new_active_internal(
     logger_session_init(session);
     return false;
   }
-  if (!logger_storage_ensure_dir(session->session_dir_path)) {
-    logger_session_set_error(error_code_out, error_message_out,
-                             "storage_unavailable",
-                             "failed to create session directory");
-    logger_session_init(session);
-    return false;
+
+  /*
+   * Snapshot manifest context: config/storage fields that core 1
+   * will need at finalize time.  Written here by core 0, read by
+   * core 1 during FINALIZE_SESSION dispatch.  The ring fences
+   * in the command transport provide the ordering guarantee.
+   */
+  {
+    logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
+    memset(mc, 0, sizeof(*mc));
+    logger_copy_string(mc->hardware_id, sizeof(mc->hardware_id), hardware_id);
+    logger_copy_string(mc->logger_id, sizeof(mc->logger_id),
+                       persisted->config.logger_id);
+    logger_copy_string(mc->subject_id, sizeof(mc->subject_id),
+                       persisted->config.subject_id);
+    logger_copy_string(mc->timezone, sizeof(mc->timezone),
+                       persisted->config.timezone);
+    logger_copy_string(mc->bound_h10_address, sizeof(mc->bound_h10_address),
+                       persisted->config.bound_h10_address);
+    mc->storage = *storage;
+    mc->debug_session = debug_session;
+    mc->system_log = system_log;
   }
-  if (!logger_journal_writer_create(
-          &session->journal_writer, session->journal_path, session->session_id,
-          boot_counter, logger_session_observed_utc_ns_or_zero(clock))) {
-    logger_session_set_error(error_code_out, error_message_out,
-                             "storage_unavailable",
-                             "failed to create journal.bin");
-    logger_session_init(session);
-    return false;
-  }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
+
+  /*
+   * SESSION_START barrier creates the directory and journal file on
+   * core 1 before writing the session_start record.  Paths and IDs
+   * are already in session state; the acquire fence in dequeue
+   * guarantees core 1 sees them.
+   */
   if (!logger_session_append_session_start(session, persisted, clock,
                                            boot_counter, now_ms) ||
       !logger_session_begin_span(session, clock, span_start_reason, h10_address,
@@ -887,9 +896,9 @@ static bool logger_session_start_new_active_internal(
   }
 
   session->active = true;
-  if (!logger_session_write_live_internal(session,
-                                          clock != NULL ? clock->now_utc : NULL,
-                                          boot_counter, now_ms)) {
+
+  /* Write live.json through the pipe (core 1 owns FatFS). */
+  if (!logger_session_refresh_live(session, clock, boot_counter, now_ms)) {
     logger_session_set_error(error_code_out, error_message_out,
                              "storage_unavailable",
                              "failed to write live.json");
@@ -1006,10 +1015,39 @@ void logger_session_init(logger_session_state_t *session) {
   if (session != NULL) {
     pipe = session->pipe;
   }
-  /* Force-close any open writer handle before zeroing the struct */
+  /*
+   * Force-close any open journal handle before zeroing the struct.
+   *
+   * When the pipe is attached, the journal handle is owned by core 1.
+   * Core 1 opens it during SESSION_START dispatch and closes it during
+   * FINALIZE_SESSION dispatch.  By the time we reach this reinit,
+   * core 1 has already closed the handle, so is_open returns false
+   * and no FatFS call occurs.
+   *
+   * When the pipe is NULL (boot recovery, unit tests), we're on the
+   * same core that opened the handle, so force_close is safe.
+   *
+   * Do NOT call force_close when the pipe is attached and the handle
+   * appears open — that would be a FatFS call from the wrong core.
+   */
   if (session != NULL &&
       logger_journal_writer_is_open(&session->journal_writer)) {
-    logger_journal_writer_force_close(&session->journal_writer);
+    /*
+     * Pipe attached + journal open = split-ownership violation.
+     * This should not happen in normal operation: either
+     *   - core 1 closed the handle (finalize path), or
+     *   - the handle was never opened (early failure path).
+     *
+     * If it does happen, it means core 1 still has an open handle
+     * and core 0 is about to memset the struct.  Skip the close
+     * to avoid a wrong-core FatFS call; the handle leaks but
+     * the system is already in an error path.
+     */
+    if (pipe == NULL) {
+      /* No pipe — we own the handle, safe to close */
+      logger_journal_writer_force_close(&session->journal_writer);
+    }
+    /* else: pipe attached — core 1 owns the handle, do not touch */
   }
   memset(session, 0, sizeof(*session));
   session->pipe = pipe;
@@ -1033,7 +1071,6 @@ bool logger_session_start_debug(
     const logger_storage_status_t *storage, logger_fault_code_t current_fault,
     uint32_t boot_counter, uint32_t now_ms, const char **error_code_out,
     const char **error_message_out) {
-  (void)hardware_id;
   (void)battery;
   (void)current_fault;
 
@@ -1044,9 +1081,9 @@ bool logger_session_start_debug(
     return false;
   }
   return logger_session_start_new_active_internal(
-      session, system_log, persisted, clock, storage, "session_start",
-      persisted->config.bound_h10_address, false, false, false, true,
-      boot_counter, now_ms, error_code_out, error_message_out);
+      session, system_log, hardware_id, persisted, clock, storage,
+      "session_start", persisted->config.bound_h10_address, false, false, false,
+      true, boot_counter, now_ms, error_code_out, error_message_out);
 }
 
 bool logger_session_refresh_live(logger_session_state_t *session,
@@ -1060,7 +1097,6 @@ bool logger_session_refresh_live(logger_session_state_t *session,
   logger_writer_cmd_t cmd;
   memset(&cmd, 0, sizeof(cmd));
   cmd.type = LOGGER_WRITER_REFRESH_LIVE;
-  cmd.refresh_live.type = LOGGER_WRITER_REFRESH_LIVE;
   cmd.refresh_live.boot_counter = boot_counter;
   cmd.refresh_live.now_ms = now_ms;
   if (clock != NULL && clock->now_utc[0] != '\0') {
@@ -1090,7 +1126,6 @@ bool logger_session_write_status_snapshot(
   memset(&cmd, 0, sizeof(cmd));
   cmd.type = LOGGER_WRITER_WRITE_STATUS_SNAPSHOT;
   logger_writer_write_status_snapshot_t *s = &cmd.write_status_snapshot;
-  s->type = LOGGER_WRITER_WRITE_STATUS_SNAPSHOT;
   s->boot_counter = boot_counter;
   s->now_ms = now_ms;
   s->utc_ns = utc_ns;
@@ -1128,7 +1163,6 @@ bool logger_session_write_marker(logger_session_state_t *session,
   memset(&cmd, 0, sizeof(cmd));
   cmd.type = LOGGER_WRITER_WRITE_MARKER;
   logger_writer_write_marker_t *m = &cmd.write_marker;
-  m->type = LOGGER_WRITER_WRITE_MARKER;
   m->boot_counter = boot_counter;
   m->now_ms = now_ms;
   m->utc_ns = utc_ns;
@@ -1146,16 +1180,16 @@ bool logger_session_ensure_active_span(
     bool bonded, bool clock_jump_at_session_start, uint32_t boot_counter,
     uint32_t now_ms, const char **error_code_out,
     const char **error_message_out) {
-  (void)hardware_id;
 
   if (session->active && session->span_active) {
     return true;
   }
   if (!session->active) {
     return logger_session_start_new_active_internal(
-        session, system_log, persisted, clock, storage, start_reason,
-        h10_address, encrypted, bonded, clock_jump_at_session_start, false,
-        boot_counter, now_ms, error_code_out, error_message_out);
+        session, system_log, hardware_id, persisted, clock, storage,
+        start_reason, h10_address, encrypted, bonded,
+        clock_jump_at_session_start, false, boot_counter, now_ms,
+        error_code_out, error_message_out);
   }
   if (!logger_storage_ready_for_logging(storage)) {
     logger_session_set_error(error_code_out, error_message_out,
@@ -1167,9 +1201,8 @@ bool logger_session_ensure_active_span(
   logger_session_recompute_quarantine(session, clock);
   if (!logger_session_begin_span(session, clock, start_reason, h10_address,
                                  encrypted, bonded, boot_counter, now_ms) ||
-      !logger_session_write_live_internal(session,
-                                          clock != NULL ? clock->now_utc : NULL,
-                                          boot_counter, now_ms)) {
+      /* live.json through the pipe (core 1 owns FatFS) */
+      !logger_session_refresh_live(session, clock, boot_counter, now_ms)) {
     logger_session_set_error(error_code_out, error_message_out,
                              "storage_unavailable",
                              "failed to write reconnect span records");
@@ -1190,7 +1223,6 @@ void logger_session_pmd_cmd_init(logger_session_state_t *session,
   memset(cmd, 0, sizeof(*cmd));
   cmd->type = LOGGER_WRITER_APPEND_PMD_PACKET;
   logger_writer_append_pmd_packet_t *p = &cmd->append_pmd_packet;
-  p->type = LOGGER_WRITER_APPEND_PMD_PACKET;
   p->now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
   (void)logger_clock_observed_utc_ns(clock, &p->utc_ns);
   memcpy(p->span_id_raw, session->current_span_id_raw, 16);
@@ -1272,7 +1304,6 @@ bool logger_session_seal_chunk_if_needed(logger_session_state_t *session,
     logger_writer_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = LOGGER_WRITER_FLUSH_BARRIER;
-    cmd.flush_barrier.type = LOGGER_WRITER_FLUSH_BARRIER;
     cmd.flush_barrier.now_ms = now_ms;
     return session_dispatch(session, &cmd);
   }
@@ -1282,16 +1313,12 @@ bool logger_session_seal_chunk_if_needed(logger_session_state_t *session,
 /*
  * handle_disconnect and handle_clock_event are compound operations
  * (span_end + gap + live_refresh, or span_end + clock_event + live_refresh)
- * that need atomicity across multiple journal writes.  Splitting them
- * into individual writer dispatches creates partial-update risk: if
- * SPAN_END dispatch succeeds but WRITE_GAP fails, control-plane state
- * (span closed, IDs cleared) is already committed but the gap record
- * is missing.  The old static functions provide this atomicity
- * naturally because each function is a self-contained barrier.
+ * that need atomicity across multiple writer commands.  Each sub-command
+ * is dispatched through the pipe in order, so core 1 processes them
+ * sequentially.  If any sub-command fails, the function returns false
+ * immediately so the caller can enter the sd_write_failed recovery path.
  *
- * These stay on the legacy path until the worker can handle compound
- * barriers as a single transaction.  They are cold-path operations
- * (disconnect, clock events) — no hot-path benefit from dispatch.
+ * Cold-path operations — no hot-path benefit from batching.
  */
 bool logger_session_handle_disconnect(logger_session_state_t *session,
                                       const logger_clock_status_t *clock,
@@ -1303,20 +1330,28 @@ bool logger_session_handle_disconnect(logger_session_state_t *session,
 
   char ended_span_id[LOGGER_SESSION_ID_HEX_LEN + 1];
   ended_span_id[0] = '\0';
+  /* close_span dispatches SPAN_END through the pipe */
   if (!logger_session_control_close_span(session, clock, "disconnect",
                                          boot_counter, now_ms, ended_span_id)) {
     return false;
   }
+  /* gap dispatches WRITE_GAP through the pipe */
   if (!logger_session_append_gap(session, clock, ended_span_id,
                                  gap_reason != NULL ? gap_reason : "disconnect",
                                  boot_counter, now_ms)) {
     return false;
   }
-  return logger_session_write_live_internal(
-      session, clock != NULL ? clock->now_utc : NULL, boot_counter, now_ms);
+  /* live.json through the pipe */
+  return logger_session_refresh_live(session, clock, boot_counter, now_ms);
 }
 
-/* See handle_disconnect comment on compound operations and atomicity. */
+/*
+ * Clock event: dispatch WRITE_CLOCK_EVENT through the pipe.
+ *
+ * The writer (core 1) handles the barrier (seal + write + sync).
+ * If split_span is true, the SPAN_END dispatch happens first.
+ * Both are cold-path operations that now route through core 1.
+ */
 bool logger_session_handle_clock_event(logger_session_state_t *session,
                                        const logger_clock_status_t *clock,
                                        uint32_t boot_counter, uint32_t now_ms,
@@ -1328,11 +1363,6 @@ bool logger_session_handle_clock_event(logger_session_state_t *session,
     return true;
   }
 
-  /* Barrier: seal any in-flight chunk data before clock_event */
-  if (!logger_session_seal_active_chunk(session)) {
-    return false;
-  }
-
   if (strcmp(event_kind, "clock_fixed") == 0) {
     session->quarantine_clock_fixed_mid_session = true;
   } else if (strcmp(event_kind, "clock_jump") == 0) {
@@ -1340,6 +1370,7 @@ bool logger_session_handle_clock_event(logger_session_state_t *session,
   }
   logger_session_recompute_quarantine(session, clock);
 
+  /* Close span through the pipe if requested */
   if (split_span && session->span_active) {
     if (!logger_session_control_close_span(
             session, clock,
@@ -1349,29 +1380,26 @@ bool logger_session_handle_clock_event(logger_session_state_t *session,
     }
   }
 
-  char payload[LOGGER_SESSION_JSON_MAX];
-  const int n = snprintf(
-      payload, sizeof(payload),
-      "{\"schema_version\":1,\"record_type\":\"clock_event\",\"utc_ns\":%lld,"
-      "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"event_"
-      "kind\":\"%s\",\"delta_ns\":%lld,\"old_utc_ns\":%lld,\"new_utc_ns\":%"
-      "lld}",
-      (long long)logger_session_observed_utc_ns_or_zero(clock),
-      (unsigned long long)now_ms * 1000ull, (unsigned long)boot_counter,
-      session->session_id, event_kind, (long long)delta_ns,
-      (long long)old_utc_ns, (long long)new_utc_ns);
-  if (!(n > 0 && (size_t)n < sizeof(payload)) ||
-      !logger_journal_writer_append_json(&session->journal_writer,
-                                         LOGGER_JOURNAL_RECORD_CLOCK_EVENT,
-                                         session->next_record_seq++, payload) ||
-      !logger_journal_writer_sync(&session->journal_writer)) {
+  /* Dispatch WRITE_CLOCK_EVENT to core 1 */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_WRITE_CLOCK_EVENT;
+  logger_writer_write_clock_event_t *ce = &cmd.write_clock_event;
+  ce->boot_counter = boot_counter;
+  ce->now_ms = now_ms;
+  ce->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  logger_copy_string(ce->session_id, sizeof(ce->session_id),
+                     session->session_id);
+  logger_copy_string(ce->event_kind, sizeof(ce->event_kind), event_kind);
+  ce->delta_ns = delta_ns;
+  ce->old_utc_ns = old_utc_ns;
+  ce->new_utc_ns = new_utc_ns;
+  if (!session_dispatch(session, &cmd)) {
     return false;
   }
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
 
-  return logger_session_write_live_internal(
-      session, clock != NULL ? clock->now_utc : NULL, boot_counter, now_ms);
+  /* live.json through the pipe */
+  return logger_session_refresh_live(session, clock, boot_counter, now_ms);
 }
 
 bool logger_session_append_h10_battery(logger_session_state_t *session,
@@ -1389,7 +1417,6 @@ bool logger_session_append_h10_battery(logger_session_state_t *session,
   memset(&cmd, 0, sizeof(cmd));
   cmd.type = LOGGER_WRITER_WRITE_H10_BATTERY;
   logger_writer_write_h10_battery_t *b = &cmd.write_h10_battery;
-  b->type = LOGGER_WRITER_WRITE_H10_BATTERY;
   b->boot_counter = boot_counter;
   b->now_ms = now_ms;
   b->utc_ns = utc_ns;
@@ -1405,27 +1432,26 @@ bool logger_session_append_h10_battery(logger_session_state_t *session,
   return session_dispatch(session, &cmd);
 }
 
-bool logger_session_finalize(
-    logger_session_state_t *session, logger_system_log_t *system_log,
-    const char *hardware_id, const logger_persisted_state_t *persisted,
-    const logger_clock_status_t *clock, const logger_storage_status_t *storage,
-    const char *end_reason, uint32_t boot_counter, uint32_t now_ms) {
-  return logger_session_finalize_internal(
-      session, system_log, hardware_id, persisted, clock, storage,
-      end_reason != NULL ? end_reason : "manual_stop", false, boot_counter,
-      now_ms);
+bool logger_session_finalize(logger_session_state_t *session,
+                             logger_system_log_t *system_log,
+                             const logger_persisted_state_t *persisted,
+                             const logger_clock_status_t *clock,
+                             const char *end_reason, uint32_t boot_counter,
+                             uint32_t now_ms) {
+  return logger_session_finalize_internal(session, system_log, persisted, clock,
+                                          end_reason != NULL ? end_reason
+                                                             : "manual_stop",
+                                          false, boot_counter, now_ms);
 }
 
 bool logger_session_stop_debug(logger_session_state_t *session,
                                logger_system_log_t *system_log,
-                               const char *hardware_id,
                                const logger_persisted_state_t *persisted,
                                const logger_clock_status_t *clock,
-                               const logger_storage_status_t *storage,
                                uint32_t boot_counter, uint32_t now_ms) {
-  return logger_session_finalize_internal(
-      session, system_log, hardware_id, persisted, clock, storage,
-      "manual_stop", true, boot_counter, now_ms);
+  return logger_session_finalize_internal(session, system_log, persisted, clock,
+                                          "manual_stop", true, boot_counter,
+                                          now_ms);
 }
 
 bool logger_session_recover_on_boot(
@@ -1555,10 +1581,34 @@ bool logger_session_recover_on_boot(
       scan.quarantine_recovery_after_reset;
   logger_session_recompute_quarantine(session, clock);
 
+  /*
+   * Populate manifest context for the recovered session.
+   * Needed if this session is later finalized (either the !resume_allowed
+   * path below, or deferred finalization from step_boot after the worker
+   * is live).  hardware_id is silicon identity; config may have changed
+   * since the session was created, so we snapshot the current values.
+   */
+  {
+    logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
+    memset(mc, 0, sizeof(*mc));
+    logger_copy_string(mc->hardware_id, sizeof(mc->hardware_id), hardware_id);
+    logger_copy_string(mc->logger_id, sizeof(mc->logger_id),
+                       persisted->config.logger_id);
+    logger_copy_string(mc->subject_id, sizeof(mc->subject_id),
+                       persisted->config.subject_id);
+    logger_copy_string(mc->timezone, sizeof(mc->timezone),
+                       persisted->config.timezone);
+    logger_copy_string(mc->bound_h10_address, sizeof(mc->bound_h10_address),
+                       persisted->config.bound_h10_address);
+    mc->storage = *storage;
+    mc->debug_session = false;
+    mc->system_log = system_log;
+  }
+
   if (!resume_allowed) {
-    if (!logger_session_finalize_internal(
-            session, system_log, hardware_id, persisted, clock, storage,
-            "unexpected_reboot", false, boot_counter, now_ms)) {
+    if (!logger_session_finalize_internal(session, system_log, persisted, clock,
+                                          "unexpected_reboot", false,
+                                          boot_counter, now_ms)) {
       return false;
     }
     if (closed_session_out != NULL) {
@@ -1591,9 +1641,7 @@ bool logger_session_recover_on_boot(
                                  false, boot_counter, now_ms)) {
     return false;
   }
-  if (!logger_session_write_live_internal(session,
-                                          clock != NULL ? clock->now_utc : NULL,
-                                          boot_counter, now_ms)) {
+  if (!logger_session_refresh_live(session, clock, boot_counter, now_ms)) {
     return false;
   }
 
@@ -1621,6 +1669,9 @@ bool logger_session_recover_on_boot(
  *   - record_seq: incremented only in this function (writer-side)
  *   - chunk_seq_in_session: incremented only in this function
  *   - journal_size_bytes: updated only from writer results here
+ *     (seal_active_chunk and each dispatch case that emits records)
+ *   - callers MUST NOT re-read durable_size after dispatch returns;
+ *     the value is already current
  *   - next_packet_seq_in_span: NEVER touched here (control-core owns)
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -1920,11 +1971,32 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
   logger_session_state_t *const session = (logger_session_state_t *)ctx;
 
   switch (cmd->type) {
-  case LOGGER_WRITER_SESSION_START:
-    return writer_emit_session_start(session, &cmd->session_start);
+  case LOGGER_WRITER_SESSION_START: {
+    /*
+     * SESSION_START is the first SD I/O for a new session.
+     * Create the session directory and journal file here on core 1
+     * before writing the session_start record.
+     */
+    if (!logger_storage_ensure_dir(session->session_dir_path))
+      return false;
+    if (!logger_journal_writer_create(
+            &session->journal_writer, session->journal_path,
+            session->session_id, cmd->session_start.boot_counter,
+            cmd->session_start.utc_ns))
+      return false;
+    if (!writer_emit_session_start(session, &cmd->session_start))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
+  }
 
   case LOGGER_WRITER_SPAN_START:
-    return writer_emit_span_start(session, &cmd->span_start);
+    if (!writer_emit_span_start(session, &cmd->span_start))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+    return true;
 
   case LOGGER_WRITER_APPEND_PMD_PACKET:
     return writer_append_pmd_packet(session, &cmd->append_pmd_packet);
@@ -1993,15 +2065,27 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
         logger_journal_writer_durable_size(&session->journal_writer);
     return true;
 
-  case LOGGER_WRITER_SPAN_END:
+  case LOGGER_WRITER_SPAN_END: {
     /* Barrier: seal before span_end */
     if (!logger_session_seal_active_chunk(session))
       return false;
-    if (!writer_emit_span_end(session, &cmd->span_end))
+    /*
+     * After sealing, read the actual durable span counters that were
+     * updated by seal_active_chunk.  These reflect all PMD data that
+     * landed in the journal before this record.
+     */
+    const logger_journal_span_summary_t *span =
+        &session->spans[session->current_span_index];
+    logger_writer_span_end_t real = cmd->span_end;
+    real.packet_count = span->packet_count;
+    real.first_seq_in_span = span->first_seq_in_span;
+    real.last_seq_in_span = span->last_seq_in_span;
+    if (!writer_emit_span_end(session, &real))
       return false;
     session->journal_size_bytes =
         logger_journal_writer_durable_size(&session->journal_writer);
     return true;
+  }
 
   case LOGGER_WRITER_SESSION_END:
     /* Barrier: seal before session_end */
@@ -2013,17 +2097,90 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
         logger_journal_writer_durable_size(&session->journal_writer);
     return true;
 
-  /*
-   * FINALIZE_SESSION is not yet wired through dispatch.
-   * Finalize needs the full persisted config and storage state for
-   * manifest generation, which the command struct can't carry yet.
-   * The finalize path still goes through
-   * logger_session_finalize_internal() directly.
-   *
-   * This case exists so the enum is handled; it must not be reached.
-   */
-  case LOGGER_WRITER_FINALIZE_SESSION:
-    return false;
+  case LOGGER_WRITER_FINALIZE_SESSION: {
+    /*
+     * Finalize: close journal → SHA-256 → write manifest →
+     * remove live.json → refresh upload queue.
+     *
+     * All on core 1.  Config fields in manifest_ctx (logger_id,
+     * subject_id, timezone, bound_h10_address) were refreshed by
+     * core 0 immediately before dispatching this command, so they
+     * reflect current config at finalize time, not a stale snapshot
+     * from session creation.
+     *
+     * hardware_id is immutable (silicon identity) — creation snapshot
+     * is correct.  storage identity fields are stable; volatile fields
+     * (free_bytes, etc.) are refreshed below.
+     */
+    const logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
+
+    /* Close the journal writer — sync + close the handle */
+    if (!logger_journal_writer_close(&session->journal_writer))
+      return false;
+    session->journal_size_bytes =
+        logger_journal_writer_durable_size(&session->journal_writer);
+
+    /*
+     * Refresh volatile storage fields (free_bytes, capacity_bytes)
+     * at finalize time rather than using the stale snapshot from
+     * session creation.  Identity fields (manufacturer_id, serial, etc.)
+     * are stable, so we overlay only the live counters.
+     *
+     * This runs on core 1 which owns SD/FatFS.
+     */
+    logger_storage_status_t storage_now = mc->storage;
+    (void)logger_storage_refresh(&storage_now);
+
+    /* Compute journal SHA-256 and size */
+    char journal_sha256[LOGGER_SHA256_HEX_LEN + 1];
+    uint64_t journal_size_bytes = 0u;
+    if (!logger_session_compute_file_sha256(
+            session->journal_path, journal_sha256, &journal_size_bytes))
+      return false;
+
+    /* Build and write manifest.json.
+     * Uses the session-struct buffer instead of static storage:
+     * avoids reentrancy issues and keeps 8 KiB off core 1's
+     * 2 KiB stack. */
+    char *manifest = session->manifest_buf;
+    size_t manifest_len = 0u;
+    logger_persisted_state_t persisted_for_manifest;
+    memset(&persisted_for_manifest, 0, sizeof(persisted_for_manifest));
+    logger_copy_string(persisted_for_manifest.config.logger_id,
+                       sizeof(persisted_for_manifest.config.logger_id),
+                       mc->logger_id);
+    logger_copy_string(persisted_for_manifest.config.subject_id,
+                       sizeof(persisted_for_manifest.config.subject_id),
+                       mc->subject_id);
+    logger_copy_string(persisted_for_manifest.config.timezone,
+                       sizeof(persisted_for_manifest.config.timezone),
+                       mc->timezone);
+    logger_copy_string(persisted_for_manifest.config.bound_h10_address,
+                       sizeof(persisted_for_manifest.config.bound_h10_address),
+                       mc->bound_h10_address);
+    if (!logger_session_build_manifest(
+            session, mc->hardware_id, &persisted_for_manifest, &storage_now,
+            journal_sha256, journal_size_bytes, manifest,
+            sizeof(session->manifest_buf), &manifest_len))
+      return false;
+    if (!logger_storage_write_file_atomic(session->manifest_path, manifest,
+                                          manifest_len))
+      return false;
+
+    /* Remove live.json */
+    (void)logger_storage_remove_file(session->live_path);
+
+    /* Refresh upload queue — use system_log and now_utc from manifest
+     * context (snapshotted at session creation) for error logging and
+     * queue entry timestamps. */
+    const char *queue_utc = cmd->finalize_session.now_utc[0] != '\0'
+                                ? cmd->finalize_session.now_utc
+                                : NULL;
+    if (!logger_upload_queue_refresh_file(mc->system_log, queue_utc, NULL))
+      return false;
+
+    return true;
+  }
 
   case LOGGER_WRITER_REFRESH_LIVE:
     return logger_session_write_live_internal(

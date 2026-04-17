@@ -108,7 +108,7 @@ typedef struct {
   char span_id[33];
   uint32_t span_index_in_session;
   char start_reason[32];
-  char h10_address[18];
+  char h10_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
   bool encrypted;
   bool bonded;
 } logger_writer_span_start_t;
@@ -237,21 +237,19 @@ typedef struct {
   char quarantine_reasons[128]; /* pre-serialized JSON array */
 } logger_writer_session_end_t;
 
-/* ── FINALIZE_SESSION ──────────────────────────────────────────── */
-
+/*
+ * FINALIZE_SESSION: close journal, compute SHA-256, write manifest,
+ * remove live.json, refresh upload queue.
+ *
+ * All manifest data comes from session->manifest_ctx (snapshotted
+ * at session creation by core 0).  The command carries only the
+ * fields that core 0 decides at finalize time.
+ */
 typedef struct {
   logger_writer_cmd_type_t type; /* LOGGER_WRITER_FINALIZE_SESSION */
   uint32_t boot_counter;
   uint32_t now_ms;
-  /* Finalize needs everything required for manifest generation */
-  char hardware_id[33];
-  char end_reason[32];
-  bool debug_session;
-  /* Needed for manifest building */
-  char logger_id[LOGGER_CONFIG_LOGGER_ID_MAX];
-  char subject_id[LOGGER_CONFIG_SUBJECT_ID_MAX];
-  char timezone[LOGGER_CONFIG_TIMEZONE_MAX];
-  char bound_h10_address[18];
+  char now_utc[32]; /* RFC 3339 UTC for upload_queue.json updated_at_utc */
 } logger_writer_finalize_session_t;
 
 /* ── REFRESH_LIVE ──────────────────────────────────────────────── */
