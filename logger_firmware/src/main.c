@@ -8,6 +8,7 @@
 #include "logger/session.h"
 #include "logger/storage_worker.h"
 
+#include "logger/storage_service.h"
 /* Shared state for the core-1 storage worker.  Static so it survives
  * the lifetime of the boot.  Core 0 sets this up before launch;
  * core 1 reads it from the entry function via the FIFO mailbox. */
@@ -85,6 +86,10 @@ int main(void) {
   }
 
   printf("[logger] core 1 storage worker alive, entering main loop\n");
+
+  /* Wire the storage service to the shared context so that core 0's
+   * wrapper functions route through core 1 for all SD/FatFS access. */
+  logger_storage_svc_init(&g_storage_worker_shared);
 
   while (true) {
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());

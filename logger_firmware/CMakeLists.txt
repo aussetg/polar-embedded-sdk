@@ -79,6 +79,7 @@ add_executable(logger_appliance
     src/sha256.c
     src/storage.c
     src/storage_worker.c
+    src/storage_service.c
     src/system_log.c
     src/upload.c
     src/upload_bundle.c

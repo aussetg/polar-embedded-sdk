@@ -55,6 +55,7 @@ typedef enum {
   LOGGER_WRITER_FINALIZE_SESSION,
   LOGGER_WRITER_REFRESH_LIVE,
   LOGGER_WRITER_FLUSH_BARRIER,
+  LOGGER_WRITER_SERVICE_REQUEST,
 } logger_writer_cmd_type_t;
 
 /* ── Inline payload capacity ───────────────────────────────────── */
@@ -295,6 +296,8 @@ typedef union {
   logger_writer_finalize_session_t finalize_session;
   logger_writer_refresh_live_t refresh_live;
   logger_writer_flush_barrier_t flush_barrier;
+  logger_writer_cmd_type_t
+      service_request; /* no payload — uses shared struct */
 } logger_writer_cmd_t;
 
 /* ── Writer context ────────────────────────────────────────────── */
@@ -353,6 +356,8 @@ logger_writer_cmd_type_name(logger_writer_cmd_type_t t) {
     return "REFRESH_LIVE";
   case LOGGER_WRITER_FLUSH_BARRIER:
     return "FLUSH_BARRIER";
+  case LOGGER_WRITER_SERVICE_REQUEST:
+    return "SERVICE_REQUEST";
   default:
     return "UNKNOWN";
   }

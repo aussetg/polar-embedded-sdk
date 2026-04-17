@@ -8,6 +8,7 @@
 #include "logger/capture_stats.h"
 
 #define LOGGER_STORAGE_PATH_MAX 320
+#define LOGGER_RECOVERY_PROBE_PATH "0:/logger/state/.recovery_probe"
 
 typedef struct {
   bool initialized;

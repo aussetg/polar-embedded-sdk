@@ -17,6 +17,7 @@
 #include "logger/json_writer.h"
 #include "logger/net.h"
 #include "logger/queue.h"
+#include "logger/storage_service.h"
 #include "logger/upload.h"
 #include "logger/util.h"
 #include "logger/version.h"
@@ -32,7 +33,6 @@
 #define LOGGER_RECOVERY_USB_CLEAR_DWELL_MS 5000u
 #define LOGGER_RECOVERY_LOW_START_CLEAR_MV 3750u
 #define LOGGER_RECOVERY_CRITICAL_CLEAR_MV 3700u
-#define LOGGER_RECOVERY_PROBE_PATH "0:/logger/state/.recovery_probe"
 #define LOGGER_UPLOAD_BLOCKED_RECHECK_INTERVAL_MS 60000u
 
 static bool logger_app_try_finalize_no_session_day(logger_app_t *app,
@@ -124,7 +124,7 @@ static void logger_app_refresh_observations(logger_app_t *app,
     app->clock.valid = false;
     app->clock.now_utc[0] = '\0';
   }
-  (void)logger_storage_refresh(&app->storage);
+  (void)logger_storage_svc_refresh(&app->storage);
   switch (app->debug_storage_fault) {
   case LOGGER_DEBUG_STORAGE_FAULT_MISSING:
     app->storage.card_present = false;
@@ -571,10 +571,7 @@ static bool logger_app_storage_self_test(const logger_app_t *app) {
       app->debug_storage_fault == LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED) {
     return false;
   }
-  static const char probe_data[] = "ok\n";
-  return logger_storage_write_file_atomic(
-             LOGGER_RECOVERY_PROBE_PATH, probe_data, sizeof(probe_data) - 1u) &&
-         logger_storage_remove_file(LOGGER_RECOVERY_PROBE_PATH);
+  return logger_storage_svc_self_test();
 }
 
 static bool logger_app_validate_storage_missing_recovery(logger_app_t *app,
@@ -624,9 +621,9 @@ static bool logger_app_validate_storage_write_recovery(logger_app_t *app,
     logger_app_recovery_set_status(app, "storage_self_test", "failed");
     return false;
   }
-  if (!logger_upload_queue_refresh_file(
+  if (!logger_storage_svc_queue_refresh(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock), NULL) ||
-      !logger_upload_queue_load(&queue)) {
+      !logger_storage_svc_queue_load(&queue)) {
     logger_app_recovery_set_status(app, "queue_refresh", "failed");
     return false;
   }
@@ -704,7 +701,7 @@ logger_app_prepare_upload_pass(logger_app_t *app,
   app->upload_pass_count = 0u;
   app->upload_pass_next_index = 0u;
 
-  if (!logger_upload_queue_load(&queue)) {
+  if (!logger_storage_svc_queue_load(&queue)) {
     return false;
   }
   logger_upload_queue_compute_summary(&queue, summary_out);
@@ -751,7 +748,7 @@ static void logger_app_reconcile_upload_blocked_fault(logger_app_t *app,
   logger_upload_queue_summary_t summary;
   logger_upload_queue_init(&queue);
   logger_upload_queue_summary_init(&summary);
-  if (!logger_upload_queue_load(&queue)) {
+  if (!logger_storage_svc_queue_load(&queue)) {
     return;
   }
 
@@ -809,7 +806,7 @@ static bool logger_app_run_queue_maintenance(logger_app_t *app, uint32_t now_ms,
   size_t retention_pruned_count = 0u;
   size_t reserve_pruned_count = 0u;
   bool reserve_met = false;
-  if (!logger_upload_queue_prune_file(
+  if (!logger_storage_svc_queue_prune(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           LOGGER_SD_MIN_FREE_RESERVE_BYTES, &retention_pruned_count,
           &reserve_pruned_count, &reserve_met, NULL)) {
@@ -1813,7 +1810,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
 
   if (app->storage.mounted && app->storage.writable &&
       app->storage.logger_root_ready) {
-    if (!logger_upload_queue_refresh_file(
+    if (!logger_storage_svc_queue_refresh(
             &app->system_log, logger_clock_now_utc_or_null(&app->clock),
             NULL)) {
       logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
@@ -1822,7 +1819,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
       return;
     }
     if (app->boot_firmware_identity_changed) {
-      if (!logger_upload_queue_requeue_blocked_file(
+      if (!logger_storage_svc_queue_requeue_blocked(
               &app->system_log, logger_clock_now_utc_or_null(&app->clock),
               "firmware_changed", NULL, NULL)) {
         logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,

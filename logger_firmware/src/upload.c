@@ -22,6 +22,7 @@
 #include "logger/json_writer.h"
 #include "logger/net.h"
 #include "logger/storage.h"
+#include "logger/storage_service.h"
 #include "logger/upload_bundle.h"
 #include "logger/util.h"
 
@@ -67,7 +68,7 @@ typedef struct {
   size_t request_len;
   size_t request_offset;
   bool body_enabled;
-  logger_upload_bundle_stream_t *bundle_stream;
+  bool bundle_stream_active; /* true when service-based bundle stream is open */
   uint8_t body_chunk[512];
   size_t body_chunk_len;
   size_t body_chunk_offset;
@@ -481,9 +482,8 @@ logger_upload_http_fill_body_chunk(logger_upload_http_request_t *request) {
   }
 
   size_t chunk_len = 0u;
-  if (!logger_upload_bundle_stream_read(
-          request->bundle_stream, request->body_chunk,
-          sizeof(request->body_chunk), &chunk_len)) {
+  if (!logger_storage_svc_bundle_read(
+          request->body_chunk, sizeof(request->body_chunk), &chunk_len)) {
     request->transport_failed = true;
     request->transport_err = ERR_VAL;
     return false;
@@ -641,16 +641,16 @@ static bool logger_upload_http_connect(logger_upload_http_request_t *request,
 
 static bool logger_upload_http_execute(
     const logger_config_t *config, const logger_upload_url_t *url,
-    const char *request_text, logger_upload_bundle_stream_t *bundle_stream,
-    uint32_t timeout_ms, logger_upload_http_response_t *response) {
+    const char *request_text, bool use_bundle_stream, uint32_t timeout_ms,
+    logger_upload_http_response_t *response) {
   logger_upload_http_request_t request;
   logger_upload_http_request_init(&request);
   logger_upload_http_response_init(response);
   logger_copy_string(request.request, sizeof(request.request), request_text);
   request.request_len = strlen(request.request);
-  request.body_enabled = bundle_stream != NULL;
-  request.bundle_stream = bundle_stream;
-  request.body_eof = bundle_stream == NULL;
+  request.body_enabled = use_bundle_stream;
+  request.bundle_stream_active = use_bundle_stream;
+  request.body_eof = !use_bundle_stream;
 
   (void)logger_upload_http_resolve(&request, url);
   const uint32_t start_ms = to_ms_since_boot(get_absolute_time());
@@ -906,14 +906,14 @@ logger_upload_recompute_entry_bundle(logger_upload_queue_entry_t *entry,
     logger_copy_string(message, message_len, "session path too long");
     return false;
   }
-  if (!logger_storage_file_exists(manifest_path) ||
-      !logger_storage_file_exists(journal_path)) {
+  if (!logger_storage_svc_file_exists(manifest_path) ||
+      !logger_storage_svc_file_exists(journal_path)) {
     logger_copy_string(message, message_len, "session files missing");
     return false;
   }
-  if (!logger_upload_bundle_compute(entry->dir_name, manifest_path,
-                                    journal_path, entry->bundle_sha256,
-                                    &entry->bundle_size_bytes)) {
+  if (!logger_storage_svc_bundle_compute(entry->dir_name, manifest_path,
+                                         journal_path, entry->bundle_sha256,
+                                         &entry->bundle_size_bytes)) {
     logger_copy_string(message, message_len,
                        "failed to compute canonical bundle");
     return false;
@@ -1108,7 +1108,7 @@ static bool logger_upload_process_selected(
     return false;
   }
   logger_upload_queue_t queue;
-  if (!logger_upload_queue_load(&queue)) {
+  if (!logger_storage_svc_queue_load(&queue)) {
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "failed to load upload queue");
@@ -1140,7 +1140,7 @@ static bool logger_upload_process_selected(
     logger_copy_string(entry->last_attempt_utc, sizeof(entry->last_attempt_utc),
                        now_utc_or_null);
     entry->attempt_count += 1u;
-    (void)logger_upload_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(&queue);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
@@ -1175,7 +1175,7 @@ static bool logger_upload_process_selected(
   entry->last_failure_class[0] = '\0';
   entry->verified_upload_utc[0] = '\0';
   entry->receipt_id[0] = '\0';
-  if (!logger_upload_queue_write(&queue)) {
+  if (!logger_storage_svc_queue_write(&queue)) {
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "failed to persist uploading queue state");
@@ -1189,7 +1189,7 @@ static bool logger_upload_process_selected(
     logger_copy_string(entry->status, sizeof(entry->status), "failed");
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class), "wifi_join_failed");
-    (void)logger_upload_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(&queue);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
@@ -1255,15 +1255,14 @@ static bool logger_upload_process_selected(
     return false;
   }
 
-  logger_upload_bundle_stream_t bundle_stream;
-  if (!logger_upload_bundle_stream_open(&bundle_stream, entry->dir_name,
-                                        manifest_path, journal_path)) {
+  if (!logger_storage_svc_bundle_open(entry->dir_name, manifest_path,
+                                      journal_path)) {
     logger_net_wifi_leave();
     logger_copy_string(entry->status, sizeof(entry->status), "failed");
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class), "local_corrupt");
     logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
-    (void)logger_upload_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(&queue);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
@@ -1277,9 +1276,9 @@ static bool logger_upload_process_selected(
 
   logger_upload_http_response_t http_response;
   const bool http_ok = logger_upload_http_execute(
-      config, &url, request_text, &bundle_stream,
-      LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS, &http_response);
-  logger_upload_bundle_stream_close(&bundle_stream);
+      config, &url, request_text, true, LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS,
+      &http_response);
+  logger_storage_svc_bundle_close();
   logger_net_wifi_leave();
 
   if (!http_ok) {
@@ -1292,7 +1291,7 @@ static bool logger_upload_process_selected(
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class),
                        transport_failure_class);
-    (void)logger_upload_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(&queue);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
@@ -1316,7 +1315,7 @@ static bool logger_upload_process_selected(
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class),
                        "server_validation_failed");
-    (void)logger_upload_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(&queue);
     result->attempted = true;
     result->http_status = http_response.http_status;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
@@ -1346,7 +1345,7 @@ static bool logger_upload_process_selected(
       logger_copy_string(entry->status, sizeof(entry->status), "failed");
       logger_copy_string(entry->last_failure_class,
                          sizeof(entry->last_failure_class), "hash_mismatch");
-      (void)logger_upload_queue_write(&queue);
+      (void)logger_storage_svc_queue_write(&queue);
       result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
       logger_copy_string(result->final_status, sizeof(result->final_status),
                          entry->status);
@@ -1369,7 +1368,7 @@ static bool logger_upload_process_selected(
                                                      : now_utc_or_null);
     logger_copy_string(entry->receipt_id, sizeof(entry->receipt_id),
                        reply.receipt_id);
-    if (!logger_upload_queue_write(&queue)) {
+    if (!logger_storage_svc_queue_write(&queue)) {
       result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
       logger_copy_string(result->message, sizeof(result->message),
                          "upload succeeded but queue write failed");
@@ -1407,7 +1406,7 @@ static bool logger_upload_process_selected(
                      sizeof(entry->last_failure_class), failure_class);
   entry->verified_upload_utc[0] = '\0';
   entry->receipt_id[0] = '\0';
-  (void)logger_upload_queue_write(&queue);
+  (void)logger_storage_svc_queue_write(&queue);
 
   logger_copy_string(result->final_status, sizeof(result->final_status),
                      entry->status);

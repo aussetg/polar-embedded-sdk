@@ -19,6 +19,7 @@
 #include "logger/json_writer.h"
 #include "logger/queue.h"
 #include "logger/sha256.h"
+#include "logger/storage_service.h"
 #include "logger/upload.h"
 #include "logger/util.h"
 #include "logger/version.h"
@@ -1015,7 +1016,7 @@ static bool logger_cli_upload_blocked_fault_present(void) {
   logger_upload_queue_summary_t summary;
   logger_upload_queue_init(&queue);
   logger_upload_queue_summary_init(&summary);
-  if (!logger_upload_queue_load(&queue)) {
+  if (!logger_storage_svc_queue_load(&queue)) {
     return true;
   }
   logger_upload_queue_compute_summary(&queue, &summary);
@@ -1099,9 +1100,9 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   logger_upload_queue_summary_t queue_summary;
   logger_upload_queue_init(&queue);
   logger_upload_queue_summary_init(&queue_summary);
-  if (logger_upload_queue_load(&queue) ||
-      logger_upload_queue_scan(&queue, NULL,
-                               logger_clock_now_utc_or_null(&app->clock))) {
+  if (logger_storage_svc_queue_load(&queue) ||
+      logger_storage_svc_queue_scan(
+          &queue, NULL, logger_clock_now_utc_or_null(&app->clock))) {
     logger_upload_queue_compute_summary(&queue, &queue_summary);
   }
   const bool have_study_day =
@@ -1367,9 +1368,9 @@ static void logger_handle_provisioning_status_json(logger_app_t *app) {
 static void logger_handle_queue_json(logger_app_t *app) {
   logger_upload_queue_t queue;
   logger_upload_queue_init(&queue);
-  if (!logger_upload_queue_load(&queue)) {
-    (void)logger_upload_queue_scan(&queue, NULL,
-                                   logger_clock_now_utc_or_null(&app->clock));
+  if (!logger_storage_svc_queue_load(&queue)) {
+    (void)logger_storage_svc_queue_scan(
+        &queue, NULL, logger_clock_now_utc_or_null(&app->clock));
   }
 
   jsw w;
@@ -1919,8 +1920,8 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
   }
 
   logger_storage_status_t formatted;
-  if (!logger_storage_format(&formatted)) {
-    (void)logger_storage_refresh(&app->storage);
+  if (!logger_storage_svc_format(&formatted)) {
+    (void)logger_storage_svc_refresh(&app->storage);
     jsw w;
     jsw_err(&w, "sd format", logger_clock_now_utc_or_null(&app->clock),
             "storage_unavailable",
@@ -1929,10 +1930,10 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
   }
 
   logger_upload_queue_summary_t queue_summary;
-  if (!logger_upload_queue_refresh_file(
+  if (!logger_storage_svc_queue_refresh(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           &queue_summary)) {
-    (void)logger_storage_refresh(&app->storage);
+    (void)logger_storage_svc_refresh(&app->storage);
     jsw w;
     jsw_err(&w, "sd format", logger_clock_now_utc_or_null(&app->clock),
             "storage_unavailable",
@@ -1940,7 +1941,7 @@ static void logger_handle_sd_format(logger_service_cli_t *cli,
     return;
   }
 
-  (void)logger_storage_refresh(&app->storage);
+  (void)logger_storage_svc_refresh(&app->storage);
   (void)queue_summary;
   (void)logger_system_log_append(
       &app->system_log, logger_clock_now_utc_or_null(&app->clock),
@@ -3273,7 +3274,7 @@ static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli,
   }
 
   logger_upload_queue_summary_t summary;
-  if (!logger_upload_queue_rebuild_file(
+  if (!logger_storage_svc_queue_rebuild(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           &summary)) {
     jsw w;
@@ -3330,7 +3331,7 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
 
   size_t requeued_count = 0u;
   logger_upload_queue_summary_t summary;
-  if (!logger_upload_queue_requeue_blocked_file(
+  if (!logger_storage_svc_queue_requeue_blocked(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           "manual_requeue_blocked", &requeued_count, &summary)) {
     jsw w;
@@ -3389,7 +3390,7 @@ static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
   size_t reserve_pruned_count = 0u;
   bool reserve_met = false;
   logger_upload_queue_summary_t summary;
-  if (!logger_upload_queue_prune_file(
+  if (!logger_storage_svc_queue_prune(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock),
           LOGGER_SD_MIN_FREE_RESERVE_BYTES, &retention_pruned_count,
           &reserve_pruned_count, &reserve_met, &summary)) {

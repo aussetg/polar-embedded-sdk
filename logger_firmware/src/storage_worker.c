@@ -8,11 +8,189 @@
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 
+#include "logger/queue.h"
+#include "logger/storage.h"
+#include "logger/upload_bundle.h"
+
 /* The FIFO mailbox passes a pointer as a uint32_t word.
  * Safe on RP2350 (32-bit address space).  Static assert so the
  * build catches any future port to a 64-bit target. */
 static_assert(sizeof(uint32_t) == sizeof(storage_worker_shared_t *),
               "pointer does not fit in one FIFO word");
+
+/*
+ * Handle a storage service request from core 0.
+ *
+ * This runs on core 1, which owns SD/FatFS.
+ * Reads the request from shared->service, executes the requested
+ * operation using the same queue.c / upload_bundle.c / storage.c
+ * functions as before, writes results back to shared->service, and
+ * signals completion.
+ */
+static void
+logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
+  storage_service_t *svc = &shared->service;
+  const storage_service_kind_t kind = svc->kind;
+
+  switch (kind) {
+  case STORAGE_SVC_QUEUE_LOAD: {
+    if (svc->queue_out != NULL) {
+      svc->ok = logger_upload_queue_load(svc->queue_out);
+    } else {
+      svc->ok = false;
+    }
+    break;
+  }
+
+  case STORAGE_SVC_QUEUE_SCAN: {
+    const char *utc = svc->params.utc_only.updated_at_utc[0] != '\0'
+                          ? svc->params.utc_only.updated_at_utc
+                          : NULL;
+    if (svc->queue_out != NULL) {
+      svc->ok = logger_upload_queue_scan(svc->queue_out, svc->system_log, utc);
+    } else {
+      svc->ok = false;
+    }
+    break;
+  }
+
+  case STORAGE_SVC_QUEUE_WRITE: {
+    if (svc->queue_in != NULL) {
+      svc->ok = logger_upload_queue_write(svc->queue_in);
+    } else {
+      svc->ok = false;
+    }
+    break;
+  }
+
+  case STORAGE_SVC_QUEUE_REFRESH: {
+    const char *utc = svc->params.utc_only.updated_at_utc[0] != '\0'
+                          ? svc->params.utc_only.updated_at_utc
+                          : NULL;
+    svc->ok = logger_upload_queue_refresh_file(svc->system_log, utc,
+                                               svc->summary_out);
+    break;
+  }
+
+  case STORAGE_SVC_QUEUE_PRUNE: {
+    const char *utc = svc->params.prune.updated_at_utc[0] != '\0'
+                          ? svc->params.prune.updated_at_utc
+                          : NULL;
+    svc->ok = logger_upload_queue_prune_file(
+        svc->system_log, utc, svc->params.prune.reserve_bytes,
+        svc->retention_pruned_out, svc->reserve_pruned_out,
+        svc->reserve_met_out, svc->summary_out);
+    break;
+  }
+
+  case STORAGE_SVC_QUEUE_REBUILD: {
+    const char *utc = svc->params.utc_only.updated_at_utc[0] != '\0'
+                          ? svc->params.utc_only.updated_at_utc
+                          : NULL;
+    svc->ok = logger_upload_queue_rebuild_file(svc->system_log, utc,
+                                               svc->summary_out);
+    break;
+  }
+
+  case STORAGE_SVC_QUEUE_REQUEUE_BLOCKED: {
+    const char *utc = svc->params.requeue.updated_at_utc[0] != '\0'
+                          ? svc->params.requeue.updated_at_utc
+                          : NULL;
+    const char *reason = svc->params.requeue.reason[0] != '\0'
+                             ? svc->params.requeue.reason
+                             : NULL;
+    svc->ok = logger_upload_queue_requeue_blocked_file(
+        svc->system_log, utc, reason, svc->requeued_count_out,
+        svc->summary_out);
+    break;
+  }
+
+  case STORAGE_SVC_STORAGE_REFRESH: {
+    if (svc->storage_status_out != NULL) {
+      svc->ok = logger_storage_refresh(svc->storage_status_out);
+    } else {
+      svc->ok = false;
+    }
+    break;
+  }
+
+  case STORAGE_SVC_STORAGE_SELF_TEST: {
+    static const char probe_data[] = "ok\n";
+    svc->ok =
+        logger_storage_write_file_atomic(LOGGER_RECOVERY_PROBE_PATH, probe_data,
+                                         sizeof(probe_data) - 1u) &&
+        logger_storage_remove_file(LOGGER_RECOVERY_PROBE_PATH);
+    break;
+  }
+
+  case STORAGE_SVC_BUNDLE_COMPUTE: {
+    char sha256_buf[LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN + 1] = {0};
+    uint64_t size_val = 0u;
+    svc->ok = logger_upload_bundle_compute(
+        svc->params.bundle.dir_name, svc->params.bundle.manifest_path,
+        svc->params.bundle.journal_path,
+        svc->sha256_out != NULL ? svc->sha256_out : sha256_buf,
+        svc->bundle_size_out != NULL ? svc->bundle_size_out : &size_val);
+    break;
+  }
+
+  case STORAGE_SVC_BUNDLE_OPEN: {
+    shared->bundle_stream_open = logger_upload_bundle_stream_open(
+        &shared->bundle_stream, svc->params.bundle.dir_name,
+        svc->params.bundle.manifest_path, svc->params.bundle.journal_path);
+    svc->ok = shared->bundle_stream_open;
+    break;
+  }
+
+  case STORAGE_SVC_BUNDLE_READ: {
+    if (shared->bundle_stream_open) {
+      svc->ok = logger_upload_bundle_stream_read(
+          &shared->bundle_stream, svc->params.bundle_read.dst,
+          svc->params.bundle_read.cap, svc->params.bundle_read.len_out);
+    } else {
+      if (svc->params.bundle_read.len_out != NULL) {
+        *svc->params.bundle_read.len_out = 0u;
+      }
+      svc->ok = false;
+    }
+    break;
+  }
+
+  case STORAGE_SVC_BUNDLE_CLOSE: {
+    if (shared->bundle_stream_open) {
+      logger_upload_bundle_stream_close(&shared->bundle_stream);
+      shared->bundle_stream_open = false;
+    }
+    svc->ok = true;
+    break;
+  }
+
+  case STORAGE_SVC_STORAGE_FORMAT: {
+    svc->ok = logger_storage_format(svc->format_status_out);
+    break;
+  }
+
+  case STORAGE_SVC_FILE_EXISTS: {
+    const bool exists =
+        logger_storage_file_exists(svc->params.file_exists.path);
+    if (svc->file_exists_out != NULL) {
+      *svc->file_exists_out = exists;
+    }
+    svc->ok = true;
+    break;
+  }
+
+  case STORAGE_SVC_NONE:
+  default:
+    svc->ok = false;
+    break;
+  }
+
+  /* Signal completion to core 0 */
+  __mem_fence_release();
+  svc->done = true;
+  __sev();
+}
 
 /* ── Core-1 worker entry and loop ──────────────────────────────── */
 
@@ -59,6 +237,13 @@ void logger_storage_worker_drain(storage_worker_shared_t *shared) {
     logger_writer_cmd_t cmd;
     if (!capture_cmd_ring_dequeue(pipe, &cmd)) {
       break;
+    }
+
+    /* Service requests use the shared struct, not writer dispatch */
+    if (cmd.type == LOGGER_WRITER_SERVICE_REQUEST) {
+      logger_storage_worker_handle_service(shared);
+      processed += 1u;
+      continue;
     }
 
     const bool ok = logger_writer_dispatch(shared->session_ctx, &cmd);
