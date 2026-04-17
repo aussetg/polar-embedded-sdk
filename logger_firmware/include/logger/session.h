@@ -84,9 +84,9 @@ typedef struct logger_session_state {
   uint8_t current_span_id_raw[16];
   /*
    * Writer-side durable counters.  Assigned only when journal records
-   * are actually emitted.  For the current inline path these are
-   * incremented inside the writer dispatch; when the writer moves
-   * to core 1, core 0 never touches these.
+   * are actually emitted on core 1.  Core 0 never touches these —
+   * they are updated inside logger_writer_dispatch() and the seal
+   * helper it calls.
    */
   uint64_t next_record_seq;
   uint64_t journal_size_bytes;

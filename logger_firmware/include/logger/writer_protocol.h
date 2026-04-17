@@ -3,15 +3,16 @@
 
 /*
  * Writer protocol — the ordered command boundary between the control
- * plane (core 0) and the storage writer (currently inline, later core 1).
+ * plane (core 0) and the storage writer (core 1).
  *
  * Every durable action that produces journal records or mutates session
  * state flows through one of these commands.  The control side decides
  * *what happened*; the writer side decides *how it becomes durable*.
  *
- * For now, commands execute inline on the calling core.  The point is to
- * establish the API boundary cleanly so the later move to a core-1 worker
- * requires zero changes to the callers in app_main.c.
+ * Commands travel through the capture-pipe SPSC ring from core 0 to
+ * core 1, which owns SD/FatFS and executes all journal writes.
+ * During boot recovery (before the worker is launched), the same
+ * dispatch runs inline on core 0 with pipe == NULL.
  *
  * Ownership (from logger_capture_pipeline_v1.md §4.3):
  *
@@ -19,7 +20,7 @@
  *     session_id, span_id, study_day_local, packet timestamps,
  *     per-span seq_in_span
  *
- *   Writer side owns:
+ *   Writer side (core 1) owns:
  *     record_seq, chunk_seq_in_session, durable journal_size_bytes,
  *     actual durable emission order
  *
@@ -275,10 +276,6 @@ typedef struct {
 /*
  * One command slot.  Large enough for any single command.
  * No heap.  No pointers to ephemeral data.
- *
- * For the current inline execution path, commands are constructed
- * on the stack, dispatched, and discarded — the same pattern the
- * later SPSC-ring path will use, just without the ring.
  */
 typedef union {
   logger_writer_cmd_type_t type;
@@ -313,7 +310,8 @@ typedef struct logger_session_state logger_session_context_t;
  * Writer dispatch function.
  *
  * Executes one command against the session context.
- * For now this runs inline on the calling core.
+ * Runs on core 1 during normal operation (via the capture pipe),
+ * or inline on core 0 during boot recovery (pipe == NULL).
  * Returns true on success, false on storage/write failure.
  *
  * The dispatch function IS the API boundary.  Everything behind it

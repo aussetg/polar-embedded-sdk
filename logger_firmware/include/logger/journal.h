@@ -61,21 +61,11 @@ typedef enum {
   LOGGER_JOURNAL_RECORD_H10_BATTERY = 0x000B,
 } logger_journal_record_type_t;
 
-bool logger_journal_create(const char *path, const char *session_id_hex,
-                           uint32_t boot_counter, int64_t journal_open_utc_ns,
-                           uint64_t *size_bytes_out);
-
-bool logger_journal_append_json_record(const char *path,
-                                       logger_journal_record_type_t record_type,
-                                       uint64_t record_seq,
-                                       const char *json_payload,
-                                       uint64_t *size_bytes_out);
-
-bool logger_journal_append_binary_record(
-    const char *path, logger_journal_record_type_t record_type,
-    uint64_t record_seq, const void *payload, size_t payload_len,
-    uint64_t *size_bytes_out);
-
+/*
+ * Journal scan and truncate — used during boot recovery to validate
+ * an existing journal.bin and trim trailing incomplete records.
+ * The live write path uses journal_writer.h (open-handle append).
+ */
 bool logger_journal_scan(const char *path,
                          logger_journal_scan_result_t *result);
 bool logger_journal_truncate_to_valid(const char *path,

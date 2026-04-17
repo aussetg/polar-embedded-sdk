@@ -5,8 +5,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "logger/capture_stats.h"
-
 #define LOGGER_STORAGE_PATH_MAX 320
 #define LOGGER_RECOVERY_PROBE_PATH "0:/logger/state/.recovery_probe"
 
@@ -33,7 +31,6 @@ typedef struct {
 } logger_storage_status_t;
 
 void logger_storage_init(void);
-void logger_storage_set_capture_stats(logger_capture_stats_t *stats);
 bool logger_storage_refresh(logger_storage_status_t *status);
 bool logger_storage_format(logger_storage_status_t *status);
 bool logger_storage_ready_for_logging(const logger_storage_status_t *status);
@@ -41,8 +38,6 @@ bool logger_storage_ready_for_logging(const logger_storage_status_t *status);
 bool logger_storage_ensure_dir(const char *path);
 bool logger_storage_write_file_atomic(const char *path, const void *data,
                                       size_t len);
-bool logger_storage_append_file(const char *path, const void *data, size_t len,
-                                uint64_t *new_size_bytes);
 bool logger_storage_remove_file(const char *path);
 bool logger_storage_file_size(const char *path, uint64_t *size_bytes);
 bool logger_storage_file_exists(const char *path);

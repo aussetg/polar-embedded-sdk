@@ -1,6 +1,7 @@
 #include "logger/session.h"
 #include "logger/writer_protocol.h"
 
+#include <assert.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -1010,11 +1011,11 @@ static bool logger_session_load_live_session_id(
 }
 
 void logger_session_init(logger_session_state_t *session) {
+  assert(session != NULL);
+
   /* Preserve pipe pointer across reinit */
-  struct capture_pipe *pipe = NULL;
-  if (session != NULL) {
-    pipe = session->pipe;
-  }
+  struct capture_pipe *const pipe = session->pipe;
+
   /*
    * Force-close any open journal handle before zeroing the struct.
    *
@@ -1030,24 +1031,16 @@ void logger_session_init(logger_session_state_t *session) {
    * Do NOT call force_close when the pipe is attached and the handle
    * appears open — that would be a FatFS call from the wrong core.
    */
-  if (session != NULL &&
-      logger_journal_writer_is_open(&session->journal_writer)) {
-    /*
-     * Pipe attached + journal open = split-ownership violation.
-     * This should not happen in normal operation: either
-     *   - core 1 closed the handle (finalize path), or
-     *   - the handle was never opened (early failure path).
-     *
-     * If it does happen, it means core 1 still has an open handle
-     * and core 0 is about to memset the struct.  Skip the close
-     * to avoid a wrong-core FatFS call; the handle leaks but
-     * the system is already in an error path.
-     */
+  if (logger_journal_writer_is_open(&session->journal_writer)) {
     if (pipe == NULL) {
       /* No pipe — we own the handle, safe to close */
       logger_journal_writer_force_close(&session->journal_writer);
     }
-    /* else: pipe attached — core 1 owns the handle, do not touch */
+    /* else: pipe attached — core 1 owns the handle, do not touch.
+     * This should not happen in normal operation (core 1 closes
+     * before dispatching the completion that leads here), but if
+     * it does, skip the close to avoid a wrong-core FatFS call.
+     * The handle leaks; the system is already in an error path. */
   }
   memset(session, 0, sizeof(*session));
   session->pipe = pipe;
@@ -1660,10 +1653,9 @@ bool logger_session_recover_on_boot(
  * Writer protocol dispatch
  *
  * This is the boundary between control-plane decisions and
- * durable-storage actions.  For now it executes inline on the
- * calling core.  When the core-1 worker arrives, the same command
- * structs travel through an SPSC ring and this dispatch runs on
- * core 1 instead.
+ * durable-storage actions.  During normal operation it runs on
+ * core 1 (via the capture-pipe worker loop).  During boot recovery
+ * (pipe == NULL), it runs inline on core 0.
  *
  * Ownership rules encoded here:
  *   - record_seq: incremented only in this function (writer-side)

@@ -1686,7 +1686,6 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
   logger_h10_init(&app->h10);
   logger_h10_set_capture_stats(&app->h10, &app->capture_stats);
   logger_storage_init();
-  logger_storage_set_capture_stats(&app->capture_stats);
   logger_button_init(&app->button, now_ms);
   logger_service_cli_init(&app->cli);
   logger_session_init(&app->session);

@@ -34,24 +34,6 @@ static uint64_t logger_u64le(const uint8_t *src) {
   return value;
 }
 
-static void logger_put_u16le(uint8_t *dst, uint16_t value) {
-  dst[0] = (uint8_t)value;
-  dst[1] = (uint8_t)(value >> 8);
-}
-
-static void logger_put_u32le(uint8_t *dst, uint32_t value) {
-  dst[0] = (uint8_t)value;
-  dst[1] = (uint8_t)(value >> 8);
-  dst[2] = (uint8_t)(value >> 16);
-  dst[3] = (uint8_t)(value >> 24);
-}
-
-static void logger_put_u64le(uint8_t *dst, uint64_t value) {
-  for (size_t i = 0u; i < 8u; ++i) {
-    dst[i] = (uint8_t)(value >> (8u * i));
-  }
-}
-
 static void logger_bytes_to_hex_16(const uint8_t in[16],
                                    char out[LOGGER_JOURNAL_ID_HEX_LEN + 1]) {
   static const char hex[] = "0123456789abcdef";
@@ -260,90 +242,6 @@ logger_journal_apply_binary_record(logger_journal_scan_result_t *result,
       (last_seq_in_span + 1u) > result->next_packet_seq_in_span) {
     result->next_packet_seq_in_span = last_seq_in_span + 1u;
   }
-}
-
-bool logger_journal_create(const char *path, const char *session_id_hex,
-                           uint32_t boot_counter, int64_t journal_open_utc_ns,
-                           uint64_t *size_bytes_out) {
-  uint8_t header[LOGGER_JOURNAL_FILE_HEADER_BYTES];
-  memset(header, 0, sizeof(header));
-
-  memcpy(header + 0, "NOF1JNL1", 8u);
-  logger_put_u16le(header + 8, LOGGER_JOURNAL_FILE_HEADER_BYTES);
-  logger_put_u16le(header + 10, 1u);
-  logger_put_u32le(header + 12, 0u);
-
-  if (!logger_hex_to_bytes_16(session_id_hex, header + 16)) {
-    return false;
-  }
-
-  logger_put_u64le(header + 32, boot_counter);
-  logger_put_u64le(header + 40, (uint64_t)journal_open_utc_ns);
-  logger_put_u32le(header + 56, logger_crc32_ieee(header, 56u));
-
-  return logger_storage_write_file_atomic(path, header, sizeof(header)) &&
-         logger_storage_file_size(path, size_bytes_out);
-}
-
-bool logger_journal_append_json_record(const char *path,
-                                       logger_journal_record_type_t record_type,
-                                       uint64_t record_seq,
-                                       const char *json_payload,
-                                       uint64_t *size_bytes_out) {
-  if (json_payload == NULL) {
-    return false;
-  }
-
-  const size_t payload_len = strlen(json_payload);
-  uint8_t header[LOGGER_JOURNAL_RECORD_HEADER_BYTES];
-  memset(header, 0, sizeof(header));
-
-  memcpy(header + 0, "RCD1", 4u);
-  logger_put_u16le(header + 4, LOGGER_JOURNAL_RECORD_HEADER_BYTES);
-  logger_put_u16le(header + 6, (uint16_t)record_type);
-  logger_put_u32le(
-      header + 8, (uint32_t)(LOGGER_JOURNAL_RECORD_HEADER_BYTES + payload_len));
-  logger_put_u32le(header + 12, (uint32_t)payload_len);
-  logger_put_u32le(header + 16, LOGGER_JOURNAL_FLAG_JSON);
-  logger_put_u32le(header + 20, logger_crc32_ieee((const uint8_t *)json_payload,
-                                                  payload_len));
-  logger_put_u64le(header + 24, record_seq);
-
-  if (!logger_storage_append_file(path, header, sizeof(header),
-                                  size_bytes_out)) {
-    return false;
-  }
-  return logger_storage_append_file(path, json_payload, payload_len,
-                                    size_bytes_out);
-}
-
-bool logger_journal_append_binary_record(
-    const char *path, logger_journal_record_type_t record_type,
-    uint64_t record_seq, const void *payload, size_t payload_len,
-    uint64_t *size_bytes_out) {
-  if (payload == NULL || (uint32_t)payload_len != payload_len) {
-    return false;
-  }
-
-  uint8_t header[LOGGER_JOURNAL_RECORD_HEADER_BYTES];
-  memset(header, 0, sizeof(header));
-
-  memcpy(header + 0, "RCD1", 4u);
-  logger_put_u16le(header + 4, LOGGER_JOURNAL_RECORD_HEADER_BYTES);
-  logger_put_u16le(header + 6, (uint16_t)record_type);
-  logger_put_u32le(
-      header + 8, (uint32_t)(LOGGER_JOURNAL_RECORD_HEADER_BYTES + payload_len));
-  logger_put_u32le(header + 12, (uint32_t)payload_len);
-  logger_put_u32le(header + 16, LOGGER_JOURNAL_FLAG_BINARY);
-  logger_put_u32le(header + 20,
-                   logger_crc32_ieee((const uint8_t *)payload, payload_len));
-  logger_put_u64le(header + 24, record_seq);
-
-  if (!logger_storage_append_file(path, header, sizeof(header),
-                                  size_bytes_out)) {
-    return false;
-  }
-  return logger_storage_append_file(path, payload, payload_len, size_bytes_out);
 }
 
 bool logger_journal_scan(const char *path,

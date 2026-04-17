@@ -10,7 +10,7 @@
  *
  * Accumulates PMD packet entries in a caller-owned buffer.
  * On seal, produces the exact v1 data_chunk binary payload
- * ready for journal emission via logger_journal_append_binary_record.
+ * ready for journal emission via the journal writer.
  *
  * No heap allocation.  No I/O.  Pure computation.
  * Testable without hardware or FatFS.
