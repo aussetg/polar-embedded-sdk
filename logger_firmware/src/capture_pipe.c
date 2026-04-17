@@ -33,11 +33,73 @@ static uint8_t occ_pct(uint32_t occ, uint32_t cap) {
   return pct > 100u ? 100u : (uint8_t)pct;
 }
 
+/* ── Internal: set pipe health (primary + telemetry mirror) ──── */
+
+/*
+ * Every health transition MUST go through this helper so the
+ * primary field and its telemetry mirror never diverge.
+ */
+static void capture_pipe_set_health(capture_pipe_t *pipe,
+                                    capture_health_t health) {
+  pipe->health = health;
+  pipe->telemetry.health = health;
+}
+
 /* ── Lifecycle ─────────────────────────────────────────────────── */
 
 void capture_pipe_init(capture_pipe_t *pipe) {
   memset(pipe, 0, sizeof(*pipe));
-  pipe->health = CAPTURE_HEALTHY;
+  capture_pipe_set_health(pipe, CAPTURE_HEALTHY);
+  pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_NONE;
+}
+
+/* ── Writer failure classification ─────────────────────────────── */
+
+const char *capture_writer_failure_name(capture_writer_failure_t failure) {
+  switch (failure) {
+  case CAPTURE_WRITER_FAILURE_NONE:
+    return NULL;
+  case CAPTURE_WRITER_FAILURE_STAGE_OVERFLOW:
+    return "control_stage_overflow";
+  case CAPTURE_WRITER_FAILURE_ENQUEUE_TIMEOUT:
+    return "writer_enqueue_timeout";
+  case CAPTURE_WRITER_FAILURE_QUEUE_OVERFLOW:
+    return "writer_queue_overflow";
+  case CAPTURE_WRITER_FAILURE_BARRIER_FAILED:
+    return "writer_barrier_failed";
+  case CAPTURE_WRITER_FAILURE_FLUSH_FAILED:
+    return "writer_flush_failed";
+  case CAPTURE_WRITER_FAILURE_FINALIZE_FAILED:
+    return "writer_finalize_failed";
+  case CAPTURE_WRITER_FAILURE_PACKET_WRITE_FAILED:
+    return "session_packet_write_failed";
+  default:
+    return NULL;
+  }
+}
+
+capture_writer_failure_t
+capture_writer_classify_cmd_failure(logger_writer_cmd_type_t cmd_type) {
+  if (cmd_type == LOGGER_WRITER_FLUSH_BARRIER) {
+    return CAPTURE_WRITER_FAILURE_FLUSH_FAILED;
+  } else if (cmd_type == LOGGER_WRITER_FINALIZE_SESSION) {
+    return CAPTURE_WRITER_FAILURE_FINALIZE_FAILED;
+  } else if (cmd_type == LOGGER_WRITER_APPEND_PMD_PACKET) {
+    return CAPTURE_WRITER_FAILURE_PACKET_WRITE_FAILED;
+  } else {
+    /* All remaining journal-visible commands are barriers.
+     * REFRESH_LIVE and SERVICE_REQUEST are not classified:
+     *   - REFRESH_LIVE: non-critical, no journal durability impact
+     *   - SERVICE_REQUEST: uses the shared struct, handled by the
+     *     service infrastructure, not the writer dispatch path */
+    const bool is_classified_barrier =
+        cmd_type != LOGGER_WRITER_REFRESH_LIVE &&
+        cmd_type != LOGGER_WRITER_SERVICE_REQUEST;
+    if (is_classified_barrier) {
+      return CAPTURE_WRITER_FAILURE_BARRIER_FAILED;
+    }
+  }
+  return CAPTURE_WRITER_FAILURE_NONE;
 }
 
 /* ── Source staging ────────────────────────────────────────────── */
@@ -62,6 +124,10 @@ bool capture_staging_push_pmd(capture_pipe_t *pipe,
   if ((s->tail - s->head) >= CAPTURE_STAGING_CAPACITY) {
     s->overflow_count += 1u;
     pipe->telemetry.staging_overflow_count += 1u;
+    /* first-writer-wins: preserve an earlier, more specific classification */
+    if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
+      pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_STAGE_OVERFLOW;
+    }
     return false;
   }
 
@@ -299,6 +365,10 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
   if (!capture_cmd_ring_enqueue(pipe, cmd)) {
     /* Ring is full — barrier cannot be enqueued.
      * This is a hard failure condition. */
+    /* first-writer-wins: preserve an earlier, more specific classification */
+    if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
+      pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_QUEUE_OVERFLOW;
+    }
     capture_event_t event;
     memset(&event, 0, sizeof(event));
     event.kind = CAPTURE_EVENT_WRITE_FAILED;
@@ -343,6 +413,11 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
      * The acquire fence ensures we see the result flag. */
     if (pipe->barriers_done_seq != wait_seq) {
       __mem_fence_acquire();
+      /* first-writer-wins: preserve an earlier, more specific classification */
+      if (!pipe->barrier_last_ok &&
+          pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
+        pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_BARRIER_FAILED;
+      }
       return pipe->barrier_last_ok;
     }
 
@@ -354,6 +429,12 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
    * This is as serious as a write failure or a full ring.
    * Record it so the health/distress machinery and the caller
    * can see it through the normal sd_write_failed recovery path. */
+  /* first-writer-wins: core 1 may have already set a more specific
+   * classification (e.g. PACKET_WRITE_FAILED or FINALIZE_FAILED) before
+   * this 5-second timeout expired.  Don't erase it. */
+  if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
+    pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_ENQUEUE_TIMEOUT;
+  }
   capture_pipe_note_hard_failure(pipe, 0u);
   {
     capture_event_t event;
@@ -374,12 +455,43 @@ capture_health_t capture_pipe_evaluate_health(capture_pipe_t *pipe,
   }
   (void)now_ms;
 
-  /* Hard failure is a terminal latch — no transitions possible.
-   * Check first to avoid computing dead occupancy transitions
-   * and firing misleading telemetry counters. */
-  if (pipe->has_seen_hard_failure) {
-    pipe->health = CAPTURE_HARD_FAILURE;
-    pipe->telemetry.health = CAPTURE_HARD_FAILURE;
+  /* Hard failure state.
+   *
+   * hard_failure_active is set by note_hard_failure() and cleared
+   * by this function when recovery-before-deadline succeeds.
+   * It is NOT a cumulative historical counter — the telemetry
+   * field hard_failure_count serves that purpose.
+   *
+   * While active, the pipe stays in HARD_FAILURE unless ALL of
+   * these are true (recovery before deadline):
+   *   1. degraded deadline has NOT expired
+   *   2. no staging overflow during this degraded period
+   *   3. the command ring has drained below the recovered threshold
+   *
+   * This implements the spec requirement:
+   *   "recovery before deadline may clear degraded state if no
+   *    overflow occurred"
+   */
+  if (pipe->hard_failure_active) {
+    const bool overflow_during_degraded =
+        pipe->staging.overflow_count > pipe->staging_overflow_at_degraded_start;
+    if (!capture_pipe_degraded_deadline_expired(pipe, now_ms) &&
+        !overflow_during_degraded) {
+      const uint8_t pct = capture_cmd_ring_occupancy_pct(pipe);
+      if (pct < CAPTURE_RECOVERED_THRESHOLD_PCT) {
+        /* Recovered before deadline with no data loss during
+         * this degraded period. */
+        pipe->hard_failure_active = false;
+        pipe->degraded_deadline_active = false;
+        pipe->degraded_deadline_start_ms = 0u;
+        pipe->staging_overflow_at_degraded_start = 0u;
+        pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_NONE;
+        capture_pipe_set_health(pipe, CAPTURE_HEALTHY);
+        pipe->telemetry.distressed_exit_count += 1u;
+        return CAPTURE_HEALTHY;
+      }
+    }
+    capture_pipe_set_health(pipe, CAPTURE_HARD_FAILURE);
     return CAPTURE_HARD_FAILURE;
   }
 
@@ -398,16 +510,10 @@ capture_health_t capture_pipe_evaluate_health(capture_pipe_t *pipe,
       pipe->telemetry.distressed_enter_count += 1u;
     } else if (prev == CAPTURE_DISTRESSED && next == CAPTURE_HEALTHY) {
       pipe->telemetry.distressed_exit_count += 1u;
-      /* Recovery: clear degraded deadline if no overflow occurred */
-      if (pipe->staging.overflow_count == 0u) {
-        pipe->degraded_deadline_start_ms = 0u;
-        pipe->degraded_deadline_active = false;
-      }
     }
   }
 
-  pipe->health = next;
-  pipe->telemetry.health = next;
+  capture_pipe_set_health(pipe, next);
   return next;
 }
 
@@ -435,14 +541,17 @@ void capture_pipe_note_hard_failure(capture_pipe_t *pipe, uint32_t now_ms) {
   if (pipe == NULL) {
     return;
   }
-  pipe->has_seen_hard_failure = true;
-  pipe->health = CAPTURE_HARD_FAILURE;
-  pipe->telemetry.health = CAPTURE_HARD_FAILURE;
+  pipe->hard_failure_active = true;
+  capture_pipe_set_health(pipe, CAPTURE_HARD_FAILURE);
   pipe->telemetry.hard_failure_count += 1u;
 
   if (!pipe->degraded_deadline_active) {
     pipe->degraded_deadline_start_ms = now_ms;
     pipe->degraded_deadline_active = true;
+    /* Snapshot the cumulative staging overflow counter so we can
+     * distinguish "overflow during this degraded period" from
+     * "overflow at some earlier point in the session." */
+    pipe->staging_overflow_at_degraded_start = pipe->staging.overflow_count;
   }
 }
 
@@ -451,13 +560,24 @@ bool capture_pipe_needs_recovery(const capture_pipe_t *pipe, uint32_t now_ms) {
     return false;
   }
 
-  /* Staging overflow is an immediate recovery trigger */
-  if (pipe->staging.overflow_count > 0u) {
+  /* No degraded period active — nothing to recover from.
+   * The cumulative overflow counter may be nonzero from historical
+   * overflows, but that alone is not a recovery trigger outside
+   * an active degraded window. */
+  if (!pipe->degraded_deadline_active || !pipe->hard_failure_active) {
+    return false;
+  }
+
+  /* Staging overflow during this degraded period is an immediate
+   * recovery trigger.  Compare against the snapshot taken when the
+   * degraded period started so that only overflows that happened
+   * *during* the current degraded window count. */
+  if (pipe->staging.overflow_count > pipe->staging_overflow_at_degraded_start) {
     return true;
   }
 
   /* Hard failure with expired degraded deadline */
-  if (pipe->has_seen_hard_failure && pipe->degraded_deadline_active &&
+  if (pipe->hard_failure_active && pipe->degraded_deadline_active &&
       pipe->degraded_deadline_start_ms != 0u &&
       (now_ms - pipe->degraded_deadline_start_ms) >=
           CAPTURE_DEGRADED_DEADLINE_MS) {

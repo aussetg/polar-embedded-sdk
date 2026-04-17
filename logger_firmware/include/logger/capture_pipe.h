@@ -140,6 +140,48 @@ typedef enum {
   CAPTURE_HARD_FAILURE,
 } capture_health_t;
 
+/* ── Writer failure classification ─────────────────────────────── */
+
+/*
+ * Canonical subreasons for the sd_write_failed fault path.
+ *
+ * These match the tokens listed in logger_recovery_architecture_v1.md §8.7.
+ * They are for logs/telemetry and do not replace the primary visible
+ * fault code (which is always sd_write_failed).
+ *
+ * Set by the capture pipe and storage worker at the point of failure.
+ * Read by app_main when routing into the sd_write_failed recovery path
+ * and when logging fault telemetry.
+ */
+typedef enum {
+  CAPTURE_WRITER_FAILURE_NONE = 0,
+  CAPTURE_WRITER_FAILURE_STAGE_OVERFLOW,      /* control_stage_overflow */
+  CAPTURE_WRITER_FAILURE_ENQUEUE_TIMEOUT,     /* writer_enqueue_timeout */
+  CAPTURE_WRITER_FAILURE_QUEUE_OVERFLOW,      /* writer_queue_overflow */
+  CAPTURE_WRITER_FAILURE_BARRIER_FAILED,      /* writer_barrier_failed */
+  CAPTURE_WRITER_FAILURE_FLUSH_FAILED,        /* writer_flush_failed */
+  CAPTURE_WRITER_FAILURE_FINALIZE_FAILED,     /* writer_finalize_failed */
+  CAPTURE_WRITER_FAILURE_PACKET_WRITE_FAILED, /* session_packet_write_failed */
+} capture_writer_failure_t;
+
+const char *capture_writer_failure_name(capture_writer_failure_t failure);
+
+/*
+ * Classify a writer command failure by command type.
+ *
+ * Returns the canonical subreason for the sd_write_failed fault path
+ * given the command type that failed during dispatch on core 1.
+ * Returns CAPTURE_WRITER_FAILURE_NONE for non-classifiable commands
+ * (REFRESH_LIVE) and unknown types.
+ *
+ * This is the single source of truth for the worker-side failure
+ * classification — storage_worker.c calls it instead of maintaining
+ * its own if/else chain, so the logic is testable from the host-side
+ * test suite without pico-sdk dependencies.
+ */
+capture_writer_failure_t
+capture_writer_classify_cmd_failure(logger_writer_cmd_type_t cmd_type);
+
 /* ── Telemetry ─────────────────────────────────────────────────── */
 
 typedef struct {
@@ -204,9 +246,11 @@ typedef struct capture_pipe {
 
   /* Distress / degraded deadline */
   capture_health_t health;
+  capture_writer_failure_t last_writer_failure;
   uint32_t degraded_deadline_start_ms;
+  uint32_t staging_overflow_at_degraded_start;
   bool degraded_deadline_active;
-  bool has_seen_hard_failure;
+  bool hard_failure_active;
 
   /* Telemetry */
   capture_pipe_telemetry_t telemetry;

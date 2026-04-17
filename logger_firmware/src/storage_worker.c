@@ -255,6 +255,36 @@ void logger_storage_worker_drain(storage_worker_shared_t *shared) {
       shared->stats.write_failures += 1u;
       capture_pipe_note_hard_failure(pipe, 0u);
 
+      /* Classify the failure by command type for telemetry.
+       * first-writer-wins: only set if no earlier failure in this
+       * degraded period already classified it.  Classification
+       * logic lives in capture_pipe.c so it is testable without
+       * pico-sdk dependencies.  See logger_recovery_architecture_v1.md
+       * §8.7 canonical subreasons. */
+      if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
+        const capture_writer_failure_t classified =
+            capture_writer_classify_cmd_failure(cmd.type);
+        if (classified != CAPTURE_WRITER_FAILURE_NONE) {
+          pipe->last_writer_failure = classified;
+        }
+      }
+
+      /* Publish failure classification before barrier counter
+       * advancement or event ring push.
+       *
+       * For barrier commands, the release fence below before
+       * barriers_done_seq would suffice on its own — but for
+       * non-barrier failures (APPEND_PMD_PACKET) the only
+       * subsequent release is inside capture_event_ring_push(),
+       * which is best-effort and may silently fail.  Core 0 reads
+       * last_writer_failure in logger_app_drain_capture_pipe()
+       * without a per-field acquire fence, so we must ensure the
+       * store is published here.
+       *
+       * This fence also covers the hard_failure_active and
+       * health stores inside capture_pipe_note_hard_failure() above. */
+      __mem_fence_release();
+
       /* Even on failure, advance the barrier counter so core 0
        * doesn't spin for the full 5 s timeout.  Set the result
        * flag first, then advance the counter — core 0 reads the

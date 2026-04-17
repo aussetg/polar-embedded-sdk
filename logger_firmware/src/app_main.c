@@ -1361,12 +1361,15 @@ static bool logger_app_drain_capture_pipe(logger_app_t *app, uint32_t now_ms) {
   /* Evaluate health */
   (void)capture_pipe_evaluate_health(pipe, now_ms);
 
-  /* If a hard failure occurred during execution, check the deadline */
-  if (pipe->has_seen_hard_failure) {
+  /* If a hard failure is active, check the deadline */
+  if (pipe->hard_failure_active) {
     if (capture_pipe_needs_recovery(pipe, now_ms)) {
-      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                      LOGGER_RUNTIME_BOOT,
-                                      "writer_degraded_deadline", now_ms);
+      const char *failure_reason =
+          capture_writer_failure_name(pipe->last_writer_failure);
+      logger_app_route_blocking_fault(
+          app, LOGGER_FAULT_SD_WRITE_FAILED, LOGGER_RUNTIME_BOOT,
+          failure_reason != NULL ? failure_reason : "writer_degraded_deadline",
+          now_ms);
       return false;
     }
     return true;
@@ -1849,7 +1852,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
               "service_entry", app->persisted.boot_counter, now_ms)) {
         logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                         LOGGER_RUNTIME_BOOT,
-                                        "session_finalize_failed", now_ms);
+                                        "writer_finalize_failed", now_ms);
         return;
       }
     }
@@ -1872,7 +1875,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
             "unexpected_reboot", app->persisted.boot_counter, now_ms)) {
       logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                       LOGGER_RUNTIME_BOOT,
-                                      "session_finalize_failed", now_ms);
+                                      "writer_finalize_failed", now_ms);
       return;
     }
   }
@@ -2149,7 +2152,7 @@ static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
     if (!logger_session_seal_chunk_if_needed(&app->session, now_ms)) {
       logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                       LOGGER_RUNTIME_BOOT,
-                                      "session_chunk_seal_failed", now_ms);
+                                      "writer_flush_failed", now_ms);
       return;
     }
     app->last_chunk_seal_mono_ms = now_ms;
