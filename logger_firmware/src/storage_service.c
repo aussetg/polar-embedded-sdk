@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "hardware/sync.h"
+#include "hardware/watchdog.h"
 #include "pico/stdlib.h"
 
 #include "logger/capture_pipe.h"
@@ -109,6 +110,7 @@ static bool logger_storage_svc_submit(storage_service_kind_t kind) {
       timed_out = true;
       /* Fall through — keep waiting, don't return. */
     }
+    watchdog_update();
     __wfe();
   }
   __mem_fence_acquire();

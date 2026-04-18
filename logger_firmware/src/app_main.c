@@ -1720,7 +1720,23 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
                          app->persisted.boot_counter);
 
   logger_app_refresh_observations(app, now_ms);
+
+  /*
+   * Capture the watchdog reboot flag BEFORE any watchdog API call
+   * that might touch the scratch registers.  watchdog_enable() is
+   * called later in main.c; we read the flag here, early in init.
+   *
+   * watchdog_enable_caused_reboot() is true only when the watchdog
+   * timer expired after being armed by watchdog_enable().  It returns
+   * false after a deliberate watchdog_reboot() call (factory reset),
+   * a power cycle, or a RUN-pin reset.
+   */
+  const bool wdt_timeout_reboot = watchdog_enable_caused_reboot();
+
   logger_print_boot_banner(app);
+  if (wdt_timeout_reboot) {
+    printf("[logger] *** watchdog timeout caused last reboot ***\n");
+  }
   app->boot_banner_printed = true;
 
   char boot_details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
@@ -1737,10 +1753,13 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
       logger_json_object_writer_bool_field(
           &boot_writer, "firmware_changed",
           app->boot_firmware_identity_changed) &&
+      logger_json_object_writer_bool_field(
+          &boot_writer, "watchdog_reboot", wdt_timeout_reboot) &&
       logger_json_object_writer_finish(&boot_writer)) {
     (void)logger_system_log_append(
         &app->system_log, logger_clock_now_utc_or_null(&app->clock), "boot",
-        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        wdt_timeout_reboot ? LOGGER_SYSTEM_LOG_SEVERITY_WARN
+                           : LOGGER_SYSTEM_LOG_SEVERITY_INFO,
         logger_json_object_writer_data(&boot_writer));
   }
   if (app->clock.lost_power) {

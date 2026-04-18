@@ -1,6 +1,7 @@
 #include "logger/capture_pipe.h"
 
 #include "hardware/sync.h"
+#include "hardware/watchdog.h"
 #include "pico/stdlib.h"
 #include <string.h>
 
@@ -422,6 +423,7 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
     }
 
     /* Yield until core 1 makes progress. */
+    watchdog_update();
     __wfe();
   }
 

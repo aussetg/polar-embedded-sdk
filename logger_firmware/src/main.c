@@ -1,5 +1,6 @@
 #include <stdio.h>
 
+#include "hardware/watchdog.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 
@@ -91,7 +92,30 @@ int main(void) {
    * wrapper functions route through core 1 for all SD/FatFS access. */
   logger_storage_svc_init(&g_storage_worker_shared);
 
+  /*
+   * Arm the hardware watchdog.
+   *
+   * The 10-second timeout is the safety net for unattended operation.
+   * If the main loop stops iterating for any reason (hard hang in
+   * BLE/WiFi stack, deadlock, infinite loop in a fault path), the
+   * watchdog resets the device.
+   *
+   * watchdog_update() is called at the top of every main-loop
+   * iteration.  Long blocking waits inside logger_app_step()
+   * (barrier waits up to 5 s, storage-service calls up to 30 s)
+   * also kick the watchdog in their spin loops so that slow-but-
+   * progressing SD operations don't trigger a false reset.
+   *
+   * pause_on_debug = true so attaching a debugger doesn't trip it.
+   *
+   * Enabled AFTER all init succeeds so that init-time fatal errors
+   * (cyw43_arch_init failure, worker launch failure) produce a
+   * visible hang rather than a reboot loop that burns flash endurance.
+   */
+  watchdog_enable(10000, true);
+
   while (true) {
+    watchdog_update();
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     logger_app_step(&app, now_ms);
     cyw43_arch_poll();
