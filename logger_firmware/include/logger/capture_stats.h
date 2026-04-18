@@ -49,14 +49,6 @@ void logger_capture_stats_observe_queue_depth(logger_capture_stats_t *stats,
 void logger_capture_stats_record_session_append(logger_capture_stats_t *stats,
                                                 uint32_t elapsed_us, bool ok);
 
-/* Record outcome of one storage-level file append. */
-void logger_capture_stats_record_storage_append(logger_capture_stats_t *stats,
-                                                uint32_t elapsed_us, bool ok);
-
-/* Record one f_sync latency observation. */
-void logger_capture_stats_record_sync(logger_capture_stats_t *stats,
-                                      uint32_t elapsed_us);
-
 /* Record one journal record emission. */
 void logger_capture_stats_record_journal_append(logger_capture_stats_t *stats,
                                                 bool ok);

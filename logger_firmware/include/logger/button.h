@@ -28,6 +28,5 @@ void logger_button_init(logger_button_t *button, uint32_t now_ms);
 logger_button_event_t logger_button_poll(logger_button_t *button,
                                          uint32_t now_ms);
 logger_boot_gesture_t logger_button_detect_boot_gesture(uint32_t now_ms);
-bool logger_button_is_pressed_raw(void);
 
 #endif

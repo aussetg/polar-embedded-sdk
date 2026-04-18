@@ -224,7 +224,7 @@ static bool storage_worker_init_flash_safety(void) {
  * The release fence after dequeue guarantees core 0 sees the slot
  * as reclaimed before it observes the advanced head.
  */
-void logger_storage_worker_drain(storage_worker_shared_t *shared) {
+static void logger_storage_worker_drain(storage_worker_shared_t *shared) {
   if (shared == NULL || shared->pipe == NULL || shared->session_ctx == NULL) {
     return;
   }
@@ -343,7 +343,7 @@ void logger_storage_worker_drain(storage_worker_shared_t *shared) {
  *        - if no work, sleep with __wfe()
  *        - repeat forever
  */
-void logger_storage_worker_entry(void) {
+static void logger_storage_worker_entry(void) {
   /*
    * Receive the shared pointer from core 0 BEFORE initializing
    * flash-safe lockout.

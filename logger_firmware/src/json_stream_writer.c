@@ -44,12 +44,6 @@ void logger_json_stream_writer_object_end(logger_json_stream_writer_t *w) {
   w->needs_comma = true;
 }
 
-void logger_json_stream_writer_array_begin(logger_json_stream_writer_t *w) {
-  ljsw_comma(w);
-  fputc('[', w->stream);
-  w->needs_comma = false;
-}
-
 void logger_json_stream_writer_array_end(logger_json_stream_writer_t *w) {
   fputc(']', w->stream);
   w->needs_comma = true;
@@ -102,13 +96,6 @@ void logger_json_stream_writer_field_int64(logger_json_stream_writer_t *w,
                                            const char *key, int64_t value) {
   ljsw_key(w, key);
   fprintf(w->stream, "%lld", (long long)value);
-  w->needs_comma = true;
-}
-
-void logger_json_stream_writer_field_size(logger_json_stream_writer_t *w,
-                                          const char *key, size_t value) {
-  ljsw_key(w, key);
-  fprintf(w->stream, "%lu", (unsigned long)value);
   w->needs_comma = true;
 }
 

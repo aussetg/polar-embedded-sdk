@@ -24,6 +24,9 @@
 #include "logger/util.h"
 #include "logger/version.h"
 
+static bool logger_service_cli_is_unlocked(const logger_service_cli_t *cli,
+                                           uint32_t now_ms);
+
 static bool logger_parse_u8(const char *text, uint8_t *value_out) {
   if (text == NULL || value_out == NULL || text[0] == '\0') {
     return false;
@@ -3507,8 +3510,8 @@ void logger_service_cli_init(logger_service_cli_t *cli) {
   memset(cli, 0, sizeof(*cli));
 }
 
-bool logger_service_cli_is_unlocked(const logger_service_cli_t *cli,
-                                    uint32_t now_ms) {
+static bool logger_service_cli_is_unlocked(const logger_service_cli_t *cli,
+                                           uint32_t now_ms) {
   return cli->unlocked && now_ms < cli->unlock_deadline_mono_ms;
 }
 

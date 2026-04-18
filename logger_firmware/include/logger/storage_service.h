@@ -94,11 +94,4 @@ void logger_storage_svc_bundle_close(void);
  */
 void logger_storage_svc_init(storage_worker_shared_t *shared);
 
-/*
- * Returns true once the service is wired up (i.e., the worker is
- * launched and ready to accept service requests).  Before this
- * returns true, callers should use the underlying functions directly.
- */
-bool logger_storage_svc_available(void);
-
 #endif /* LOGGER_FIRMWARE_STORAGE_SERVICE_H */

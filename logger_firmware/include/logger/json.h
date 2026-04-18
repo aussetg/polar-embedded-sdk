@@ -22,7 +22,6 @@ bool logger_json_parse(logger_json_doc_t *doc, const char *json,
 void logger_json_escape_into(char *dst, size_t dst_len, const char *src);
 void logger_json_string_literal(char *dst, size_t dst_len, const char *src);
 void logger_json_fwrite_escaped(FILE *stream, const char *value);
-void logger_json_fwrite_string_or_null(FILE *stream, const char *value);
 
 const jsmntok_t *logger_json_root(const logger_json_doc_t *doc);
 const jsmntok_t *logger_json_object_get(const logger_json_doc_t *doc,

@@ -258,19 +258,6 @@ void logger_json_fwrite_escaped(FILE *stream, const char *value) {
   }
 }
 
-void logger_json_fwrite_string_or_null(FILE *stream, const char *value) {
-  if (stream == NULL) {
-    return;
-  }
-  if (value == NULL || value[0] == '\0') {
-    fputs("null", stream);
-    return;
-  }
-  fputc('"', stream);
-  logger_json_fwrite_escaped(stream, value);
-  fputc('"', stream);
-}
-
 bool logger_json_parse(logger_json_doc_t *doc, const char *json,
                        size_t json_len, jsmntok_t *tokens, size_t token_cap) {
   if (doc == NULL || json == NULL || tokens == NULL || token_cap == 0u) {

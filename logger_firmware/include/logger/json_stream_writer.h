@@ -46,8 +46,6 @@ void logger_json_stream_writer_object_begin(
     logger_json_stream_writer_t *w); /* writes { */
 void logger_json_stream_writer_object_end(
     logger_json_stream_writer_t *w); /* writes } */
-void logger_json_stream_writer_array_begin(
-    logger_json_stream_writer_t *w); /* writes [ */
 void logger_json_stream_writer_array_end(
     logger_json_stream_writer_t *w); /* writes ] */
 
@@ -64,8 +62,6 @@ void logger_json_stream_writer_field_int32(logger_json_stream_writer_t *w,
                                            const char *key, int32_t value);
 void logger_json_stream_writer_field_int64(logger_json_stream_writer_t *w,
                                            const char *key, int64_t value);
-void logger_json_stream_writer_field_size(logger_json_stream_writer_t *w,
-                                          const char *key, size_t value);
 void logger_json_stream_writer_field_null(logger_json_stream_writer_t *w,
                                           const char *key);
 /* Write "key":<raw_json> — raw_json must be valid JSON */

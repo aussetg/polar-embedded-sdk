@@ -40,33 +40,6 @@ void logger_capture_stats_record_session_append(logger_capture_stats_t *stats,
   }
 }
 
-void logger_capture_stats_record_storage_append(logger_capture_stats_t *stats,
-                                                uint32_t elapsed_us, bool ok) {
-  if (stats == NULL) {
-    return;
-  }
-  stats->storage_append_count += 1u;
-  if (!ok) {
-    stats->storage_append_fail_count += 1u;
-  }
-  stats->storage_append_last_us = elapsed_us;
-  if (elapsed_us > stats->storage_append_max_us) {
-    stats->storage_append_max_us = elapsed_us;
-  }
-}
-
-void logger_capture_stats_record_sync(logger_capture_stats_t *stats,
-                                      uint32_t elapsed_us) {
-  if (stats == NULL) {
-    return;
-  }
-  stats->sync_count += 1u;
-  stats->sync_last_us = elapsed_us;
-  if (elapsed_us > stats->sync_max_us) {
-    stats->sync_max_us = elapsed_us;
-  }
-}
-
 void logger_capture_stats_record_journal_append(logger_capture_stats_t *stats,
                                                 bool ok) {
   if (stats == NULL) {

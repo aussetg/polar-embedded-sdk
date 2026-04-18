@@ -321,44 +321,4 @@ typedef struct logger_session_state logger_session_context_t;
 bool logger_writer_dispatch(logger_session_context_t *ctx,
                             const logger_writer_cmd_t *cmd);
 
-/* ── Helper: command type name (for diagnostics) ───────────────── */
-
-static inline const char *
-logger_writer_cmd_type_name(logger_writer_cmd_type_t t) {
-  switch (t) {
-  case LOGGER_WRITER_SESSION_START:
-    return "SESSION_START";
-  case LOGGER_WRITER_SPAN_START:
-    return "SPAN_START";
-  case LOGGER_WRITER_APPEND_PMD_PACKET:
-    return "APPEND_PMD_PACKET";
-  case LOGGER_WRITER_WRITE_MARKER:
-    return "WRITE_MARKER";
-  case LOGGER_WRITER_WRITE_STATUS_SNAPSHOT:
-    return "WRITE_STATUS_SNAPSHOT";
-  case LOGGER_WRITER_WRITE_H10_BATTERY:
-    return "WRITE_H10_BATTERY";
-  case LOGGER_WRITER_WRITE_GAP:
-    return "WRITE_GAP";
-  case LOGGER_WRITER_WRITE_CLOCK_EVENT:
-    return "WRITE_CLOCK_EVENT";
-  case LOGGER_WRITER_WRITE_RECOVERY:
-    return "WRITE_RECOVERY";
-  case LOGGER_WRITER_SPAN_END:
-    return "SPAN_END";
-  case LOGGER_WRITER_SESSION_END:
-    return "SESSION_END";
-  case LOGGER_WRITER_FINALIZE_SESSION:
-    return "FINALIZE_SESSION";
-  case LOGGER_WRITER_REFRESH_LIVE:
-    return "REFRESH_LIVE";
-  case LOGGER_WRITER_FLUSH_BARRIER:
-    return "FLUSH_BARRIER";
-  case LOGGER_WRITER_SERVICE_REQUEST:
-    return "SERVICE_REQUEST";
-  default:
-    return "UNKNOWN";
-  }
-}
-
 #endif /* LOGGER_FIRMWARE_WRITER_PROTOCOL_H */

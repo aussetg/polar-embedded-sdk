@@ -26,7 +26,5 @@ void logger_service_cli_init(logger_service_cli_t *cli);
 void logger_service_cli_abort_mutable_session(logger_service_cli_t *cli);
 void logger_service_cli_poll(logger_service_cli_t *cli, logger_app_t *app,
                              uint32_t now_ms);
-bool logger_service_cli_is_unlocked(const logger_service_cli_t *cli,
-                                    uint32_t now_ms);
 
 #endif

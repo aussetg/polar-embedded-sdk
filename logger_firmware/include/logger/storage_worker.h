@@ -208,20 +208,4 @@ void logger_storage_worker_init(storage_worker_shared_t *shared,
  */
 bool logger_storage_worker_launch(storage_worker_shared_t *shared);
 
-/* ── API (called from core 1, internal) ────────────────────────── */
-
-/*
- * Core-1 entry point. Called by pico-sdk's multicore launch machinery.
- * Never returns.
- */
-void logger_storage_worker_entry(void);
-
-/*
- * The main worker loop body, separated for testability.
- * Processes commands from the ring until the pipe is empty,
- * then returns.  Callers should invoke this in a loop with
- * idle sleep between iterations.
- */
-void logger_storage_worker_drain(storage_worker_shared_t *shared);
-
 #endif /* LOGGER_FIRMWARE_STORAGE_WORKER_H */

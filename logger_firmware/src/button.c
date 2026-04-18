@@ -24,7 +24,7 @@ static void logger_button_gpio_init_once(void) {
   g_button_gpio_initialized = true;
 }
 
-bool logger_button_is_pressed_raw(void) {
+static bool logger_button_is_pressed_raw(void) {
   logger_button_gpio_init_once();
   const bool raw_level = gpio_get(LOGGER_BUTTON_PIN);
   return LOGGER_BUTTON_ACTIVE_LOW ? !raw_level : raw_level;

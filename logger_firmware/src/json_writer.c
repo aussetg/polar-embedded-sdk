@@ -224,12 +224,6 @@ bool logger_json_object_writer_uint32_field(logger_json_object_writer_t *writer,
                                                   (unsigned long long)value);
 }
 
-bool logger_json_object_writer_uint64_field(logger_json_object_writer_t *writer,
-                                            const char *key, uint64_t value) {
-  return logger_json_object_writer_unsigned_field(writer, key,
-                                                  (unsigned long long)value);
-}
-
 bool logger_json_object_writer_size_field(logger_json_object_writer_t *writer,
                                           const char *key, size_t value) {
   return logger_json_object_writer_unsigned_field(writer, key,
@@ -253,10 +247,6 @@ bool logger_json_object_writer_finish(logger_json_object_writer_t *writer) {
   }
   writer->closed = true;
   return true;
-}
-
-bool logger_json_object_writer_ok(const logger_json_object_writer_t *writer) {
-  return writer != NULL && writer->ok;
 }
 
 const char *

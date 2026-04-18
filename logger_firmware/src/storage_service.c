@@ -23,7 +23,7 @@ void logger_storage_svc_init(storage_worker_shared_t *shared) {
   g_svc_shared = shared;
 }
 
-bool logger_storage_svc_available(void) {
+static bool logger_storage_svc_available(void) {
   return g_svc_shared != NULL && g_svc_shared->stats.ready;
 }
 
@@ -258,7 +258,6 @@ bool logger_storage_svc_self_test(void) {
                                             sizeof(probe_data) - 1u) &&
            logger_storage_remove_file(LOGGER_RECOVERY_PROBE_PATH);
   }
-  storage_service_t *svc = &g_svc_shared->service;
   return logger_storage_svc_submit(STORAGE_SVC_STORAGE_SELF_TEST);
 }
 

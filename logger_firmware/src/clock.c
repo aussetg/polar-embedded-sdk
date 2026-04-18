@@ -773,16 +773,6 @@ static bool logger_clock_derive_study_day_from_fields(int year, int month,
   return true;
 }
 
-bool logger_clock_derive_study_day_local(const logger_clock_status_t *status,
-                                         const char *timezone,
-                                         char out_study_day[11]) {
-  if (!status->valid || !logger_timezone_is_utc_like(timezone)) {
-    return false;
-  }
-  return logger_clock_derive_study_day_from_fields(
-      status->year, status->month, status->day, status->hour, out_study_day);
-}
-
 bool logger_clock_derive_study_day_local_observed(
     const logger_clock_status_t *status, const char *timezone,
     char out_study_day[11]) {

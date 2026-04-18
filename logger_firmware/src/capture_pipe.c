@@ -576,9 +576,8 @@ bool capture_pipe_needs_recovery(const capture_pipe_t *pipe, uint32_t now_ms) {
     return true;
   }
 
-  /* Hard failure with expired degraded deadline */
-  if (pipe->hard_failure_active && pipe->degraded_deadline_active &&
-      pipe->degraded_deadline_start_ms != 0u &&
+  /* Active degraded window with expired deadline */
+  if (pipe->degraded_deadline_start_ms != 0u &&
       (now_ms - pipe->degraded_deadline_start_ms) >=
           CAPTURE_DEGRADED_DEADLINE_MS) {
     return true;

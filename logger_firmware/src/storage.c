@@ -91,10 +91,6 @@ static bool logger_sd_detect_pin_active(void) {
   return gpio_get(LOGGER_SD_DETECT_PIN) == 0;
 }
 
-static bool logger_sd_detect_known_present(void) {
-  return logger_sd_detect_pin_active();
-}
-
 static uint8_t logger_sd_spi_xfer(uint8_t tx) {
   uint8_t rx = 0xffu;
   (void)spi_write_read_blocking(logger_sd_spi_bus(), &tx, &rx, 1u);
@@ -530,16 +526,9 @@ bool logger_storage_refresh(logger_storage_status_t *status) {
   status->detect_pin_configured = true;
   status->detect_pin_asserted = logger_sd_detect_pin_active();
 
-#if !LOGGER_SD_DETECT_OPTIONAL
-  if (!status->detect_pin_asserted) {
-    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
-    return false;
-  }
-#endif
-
   if (!logger_storage_mount_if_needed()) {
     status->card_present =
-        logger_sd_detect_known_present() || g_sd.card_initialized;
+        logger_sd_detect_pin_active() || g_sd.card_initialized;
     return false;
   }
 
@@ -584,20 +573,6 @@ bool logger_storage_refresh(logger_storage_status_t *status) {
 
 bool logger_storage_format(logger_storage_status_t *status) {
   logger_storage_init();
-
-#if !LOGGER_SD_DETECT_OPTIONAL
-  if (!logger_sd_detect_pin_active()) {
-    if (status != NULL) {
-      logger_storage_zero_status(status);
-      status->initialized = true;
-      status->detect_pin_configured = true;
-      status->detect_pin_asserted = false;
-    }
-    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
-    logger_storage_reset_mount_state();
-    return false;
-  }
-#endif
 
   logger_storage_unmount();
 
@@ -789,12 +764,6 @@ DSTATUS disk_initialize(BYTE pdrv) {
   if (pdrv != 0u) {
     return STA_NOINIT;
   }
-#if !LOGGER_SD_DETECT_OPTIONAL
-  if (!logger_sd_detect_pin_active()) {
-    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
-    return g_sd.dstatus;
-  }
-#endif
   if (logger_sd_initialize_card()) {
     g_sd.dstatus = 0u;
   } else {
@@ -808,11 +777,6 @@ DSTATUS disk_status(BYTE pdrv) {
     return STA_NOINIT;
   }
   logger_storage_init();
-#if !LOGGER_SD_DETECT_OPTIONAL
-  if (!logger_sd_detect_pin_active()) {
-    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
-  }
-#endif
   return g_sd.dstatus;
 }
 
