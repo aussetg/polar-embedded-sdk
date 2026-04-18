@@ -1441,7 +1441,7 @@ static void logger_handle_system_log_export_json(logger_app_t *app) {
 
   for (uint32_t i = 0u; i < logger_system_log_count(&app->system_log); ++i) {
     logger_system_log_event_t event;
-    if (!logger_system_log_read_event(i, &event)) {
+    if (!logger_system_log_read_event(&app->system_log, i, &event)) {
       continue;
     }
     logger_json_stream_writer_elem_object_begin(&w);

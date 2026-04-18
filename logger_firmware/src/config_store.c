@@ -9,6 +9,7 @@
 #include "hardware/address_mapped.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "pico/flash.h"
 
 #include "logger/flash_layout.h"
 #include "logger/util.h"
@@ -479,17 +480,32 @@ bool logger_config_store_load(logger_persisted_state_t *state) {
   return have_config || have_metadata;
 }
 
-static void logger_flash_program_slot(uint32_t flash_offset, const void *record,
+struct flash_op_params {
+  uint32_t offset;
+  const uint8_t *data;
+  size_t len;
+};
+
+static void __not_in_flash_func(flash_op_erase_and_program)(void *user_data) {
+  struct flash_op_params *p = (struct flash_op_params *)user_data;
+  flash_range_erase(p->offset, FLASH_SECTOR_SIZE);
+  flash_range_program(p->offset, p->data, FLASH_SECTOR_SIZE);
+}
+
+static bool logger_flash_program_slot(uint32_t flash_offset, const void *record,
                                       size_t record_bytes) {
   static uint8_t sector_buf[FLASH_SECTOR_SIZE];
 
   memset(sector_buf, 0xff, sizeof(sector_buf));
   memcpy(sector_buf, record, record_bytes);
 
-  uint32_t ints = save_and_disable_interrupts();
-  flash_range_erase(flash_offset, FLASH_SECTOR_SIZE);
-  flash_range_program(flash_offset, sector_buf, FLASH_SECTOR_SIZE);
-  restore_interrupts(ints);
+  struct flash_op_params params = {
+      .offset = flash_offset,
+      .data = sector_buf,
+      .len = FLASH_SECTOR_SIZE,
+  };
+  return flash_safe_execute(flash_op_erase_and_program, &params, 1000) ==
+         PICO_OK;
 }
 
 static bool logger_config_store_write_metadata(
@@ -514,8 +530,10 @@ static bool logger_config_store_write_metadata(
 
   const unsigned target_slot = logger_flash_next_slot(
       g_store.metadata_slot, LOGGER_FLASH_METADATA_SLOT_COUNT);
-  logger_flash_program_slot(logger_flash_metadata_slot_offset(target_slot),
-                            &record, sizeof(record));
+  if (!logger_flash_program_slot(logger_flash_metadata_slot_offset(target_slot),
+                                 &record, sizeof(record))) {
+    return false;
+  }
 
   g_store.metadata_valid = true;
   g_store.metadata_sequence = record.sequence;
@@ -537,8 +555,10 @@ static bool logger_config_store_write_config(const logger_config_t *config) {
 
   const unsigned target_slot = logger_flash_next_slot(
       g_store.config_slot, LOGGER_FLASH_CONFIG_SLOT_COUNT);
-  logger_flash_program_slot(logger_flash_config_slot_offset(target_slot),
-                            &record, sizeof(record));
+  if (!logger_flash_program_slot(logger_flash_config_slot_offset(target_slot),
+                                 &record, sizeof(record))) {
+    return false;
+  }
 
   g_store.config_valid = true;
   g_store.config_sequence = record.sequence;

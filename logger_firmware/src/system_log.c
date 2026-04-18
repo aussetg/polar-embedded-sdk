@@ -1,27 +1,19 @@
 #include "logger/system_log.h"
 
+#include <assert.h>
 #include <stddef.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
-#include "hardware/address_mapped.h"
-#include "hardware/flash.h"
-#include "hardware/sync.h"
-
-#include "logger/flash_layout.h"
 #include "logger/util.h"
 
 #define LOGGER_SYSTEM_LOG_MAGIC 0x31474F4Cu
 #define LOGGER_SYSTEM_LOG_SCHEMA_VERSION 1u
 
-extern char __flash_binary_end;
-
-/* Packed deliberately: this struct is a direct flash-sector image.
- * It must be exactly 2 * FLASH_PAGE_SIZE (512 B) so it can be passed
- * verbatim to flash_range_program().  The natural alignment of the
- * uint32_t / char[] members would leave internal padding, so we pack
- * and let the static_assert below guard the exact size.  Compilers may
- * emit -Wpacked warnings — that is expected and benign here. */
+/* Packed deliberately: this struct is a direct storage image.  It must be
+ * exactly LOGGER_SYSTEM_LOG_RECORD_SIZE (512 B).  The natural alignment of
+ * the uint32_t / char[] members would leave internal padding, so we pack
+ * and let the static_assert below guard the exact size. */
 typedef struct __attribute__((packed)) {
   uint32_t magic;
   uint16_t schema_version;
@@ -37,24 +29,12 @@ typedef struct __attribute__((packed)) {
 } logger_system_log_record_t;
 
 static_assert(sizeof(logger_system_log_record_t) ==
-                  LOGGER_FLASH_SYSTEM_LOG_RECORD_SIZE,
+                  LOGGER_SYSTEM_LOG_RECORD_SIZE,
               "system log record size mismatch");
 static_assert((sizeof(logger_system_log_record_t) -
                sizeof(((logger_system_log_record_t *)0)->details_json)) ==
                   LOGGER_SYSTEM_LOG_RECORD_FIXED_BYTES,
               "system log fixed record bytes mismatch");
-
-static bool logger_flash_layout_is_safe(void) {
-  const uintptr_t binary_end_offset = (uintptr_t)&__flash_binary_end - XIP_BASE;
-  return binary_end_offset <= LOGGER_FLASH_PERSIST_REGION_OFFSET;
-}
-
-static const logger_system_log_record_t *
-logger_system_log_record_ptr(uint32_t index) {
-  return (const logger_system_log_record_t
-              *)(XIP_BASE + LOGGER_FLASH_SYSTEM_LOG_REGION_OFFSET +
-                 (index * LOGGER_FLASH_SYSTEM_LOG_RECORD_SIZE));
-}
 
 static bool
 logger_system_log_record_blank(const logger_system_log_record_t *record) {
@@ -84,20 +64,37 @@ static void logger_system_log_scan(logger_system_log_t *log) {
   log->next_record_index = 0u;
   log->next_event_seq = 1u;
 
-  for (uint32_t i = 0u; i < LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY; ++i) {
-    const logger_system_log_record_t *record = logger_system_log_record_ptr(i);
-    if (logger_system_log_record_blank(record)) {
+  const uint32_t capacity = log->backend->capacity;
+  logger_system_log_record_t record;
+
+  for (uint32_t i = 0u; i < capacity; ++i) {
+    log->backend->read_record(i, &record, sizeof(record));
+    if (logger_system_log_record_blank(&record)) {
       log->next_record_index = i;
       return;
     }
-    if (!logger_system_log_record_valid(record)) {
+    if (!logger_system_log_record_valid(&record)) {
       log->next_record_index = i;
       return;
     }
     log->event_count += 1u;
-    log->next_event_seq = record->event_seq + 1u;
+    log->next_event_seq = record.event_seq + 1u;
     log->next_record_index = i + 1u;
   }
+}
+
+void logger_system_log_init(logger_system_log_t *log,
+                            const system_log_backend_t *backend,
+                            uint32_t boot_counter) {
+  memset(log, 0, sizeof(*log));
+  log->initialized = true;
+  log->boot_counter = boot_counter;
+  log->backend = backend;
+  log->writable = (backend != NULL);
+  if (!log->writable) {
+    return;
+  }
+  logger_system_log_scan(log);
 }
 
 void logger_system_log_refresh(logger_system_log_t *log) {
@@ -105,24 +102,6 @@ void logger_system_log_refresh(logger_system_log_t *log) {
     return;
   }
   logger_system_log_scan(log);
-}
-
-void logger_system_log_init(logger_system_log_t *log, uint32_t boot_counter) {
-  memset(log, 0, sizeof(*log));
-  log->initialized = true;
-  log->boot_counter = boot_counter;
-  log->writable = logger_flash_layout_is_safe();
-  if (!log->writable) {
-    return;
-  }
-  logger_system_log_scan(log);
-}
-
-static void logger_system_log_erase_region(void) {
-  uint32_t ints = save_and_disable_interrupts();
-  flash_range_erase(LOGGER_FLASH_SYSTEM_LOG_REGION_OFFSET,
-                    LOGGER_FLASH_SYSTEM_LOG_REGION_SIZE);
-  restore_interrupts(ints);
 }
 
 bool logger_system_log_append(logger_system_log_t *log, const char *utc_or_null,
@@ -134,25 +113,24 @@ bool logger_system_log_append(logger_system_log_t *log, const char *utc_or_null,
     return false;
   }
 
-  if (log->next_event_seq == 0u ||
-      log->next_record_index > LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY ||
-      log->event_count > LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY) {
+  const uint32_t capacity = log->backend->capacity;
+
+  if (log->next_event_seq == 0u || log->next_record_index > capacity ||
+      log->event_count > capacity) {
     logger_system_log_scan(log);
   }
 
-  if (log->next_record_index >= LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY) {
-    logger_system_log_erase_region();
+  if (log->next_record_index >= capacity) {
+    log->backend->erase_all();
     log->event_count = 0u;
     log->next_record_index = 0u;
   }
 
-  const uint32_t target_offset =
-      LOGGER_FLASH_SYSTEM_LOG_REGION_OFFSET +
-      (log->next_record_index * LOGGER_FLASH_SYSTEM_LOG_RECORD_SIZE);
-  const logger_system_log_record_t *target =
-      (const logger_system_log_record_t *)(XIP_BASE + target_offset);
-  if (!logger_system_log_record_blank(target)) {
-    logger_system_log_erase_region();
+  /* Verify the target slot is blank. */
+  logger_system_log_record_t target;
+  log->backend->read_record(log->next_record_index, &target, sizeof(target));
+  if (!logger_system_log_record_blank(&target)) {
+    log->backend->erase_all();
     log->event_count = 0u;
     log->next_record_index = 0u;
   }
@@ -173,12 +151,10 @@ bool logger_system_log_append(logger_system_log_t *log, const char *utc_or_null,
   record.crc32 = 0u;
   record.crc32 = logger_crc32_ieee((const uint8_t *)&record, sizeof(record));
 
-  uint32_t ints = save_and_disable_interrupts();
-  flash_range_program(target_offset, (const uint8_t *)&record, sizeof(record));
-  restore_interrupts(ints);
+  log->backend->write_record(log->next_record_index, &record, sizeof(record));
 
   log->next_record_index += 1u;
-  if (log->event_count < LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY) {
+  if (log->event_count < capacity) {
     log->event_count += 1u;
   }
   log->next_event_seq += 1u;
@@ -189,26 +165,33 @@ uint32_t logger_system_log_count(const logger_system_log_t *log) {
   return log == NULL ? 0u : log->event_count;
 }
 
-bool logger_system_log_read_event(uint32_t index,
+bool logger_system_log_read_event(const logger_system_log_t *log,
+                                  uint32_t index,
                                   logger_system_log_event_t *event) {
-  if (event == NULL || index >= LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY) {
+  if (log == NULL || event == NULL || !log->initialized ||
+      log->backend == NULL) {
     return false;
   }
-  const logger_system_log_record_t *record =
-      logger_system_log_record_ptr(index);
-  if (!logger_system_log_record_valid(record)) {
+  if (index >= log->backend->capacity) {
+    return false;
+  }
+
+  logger_system_log_record_t record;
+  log->backend->read_record(index, &record, sizeof(record));
+
+  if (!logger_system_log_record_valid(&record)) {
     return false;
   }
 
   memset(event, 0, sizeof(*event));
-  event->event_seq = record->event_seq;
-  event->boot_counter = record->boot_counter;
-  event->severity = (logger_system_log_severity_t)record->severity;
-  logger_copy_string_fallback(event->utc, sizeof(event->utc), record->utc, "");
-  logger_copy_string_fallback(event->kind, sizeof(event->kind), record->kind,
+  event->event_seq = record.event_seq;
+  event->boot_counter = record.boot_counter;
+  event->severity = (logger_system_log_severity_t)record.severity;
+  logger_copy_string_fallback(event->utc, sizeof(event->utc), record.utc, "");
+  logger_copy_string_fallback(event->kind, sizeof(event->kind), record.kind,
                               "unknown");
   logger_copy_string_fallback(event->details_json, sizeof(event->details_json),
-                              record->details_json, "{}");
+                              record.details_json, "{}");
   return true;
 }
 

@@ -1,7 +1,10 @@
 #include "logger/app_main.h"
 
 #include "logger/faults.h"
+#include "logger/psram.h"
 #include "logger/storage_worker.h"
+#include "logger/system_log_backend.h"
+#include "logger/system_log_backend_psram.h"
 
 #include "hardware/sync.h"
 #include "pico/stdlib.h"
@@ -1699,7 +1702,22 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
    * FatFS exclusively during this window.
    */
   app->boot_recovery_done = false;
-  logger_system_log_init(&app->system_log, app->persisted.boot_counter);
+
+  /*
+   * Initialise PSRAM and wire the system log to the PSRAM backend.
+   * psram_init() must run after cyw43_arch_init() (CYW43 claims SPI
+   * pins first).  If PSRAM init fails, the system log falls back to
+   * read-only (all append calls become no-ops).
+   */
+  const system_log_backend_t *log_backend = NULL;
+  if (psram_init(PIMORONI_PICO_LIPO2XL_W_PSRAM_CS_PIN) > 0u) {
+    log_backend = &system_log_backend_psram;
+    printf("[logger] psram initialised, system log -> psram\n");
+  } else {
+    printf("[logger] psram init failed, system log disabled\n");
+  }
+  logger_system_log_init(&app->system_log, log_backend,
+                         app->persisted.boot_counter);
 
   logger_app_refresh_observations(app, now_ms);
   logger_print_boot_banner(app);

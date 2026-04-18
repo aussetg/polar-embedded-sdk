@@ -3,7 +3,7 @@
 
 #include "hardware/flash.h"
 
-#define LOGGER_FLASH_PERSIST_REGION_SIZE (64u * FLASH_SECTOR_SIZE)
+#define LOGGER_FLASH_PERSIST_REGION_SIZE (16u * FLASH_SECTOR_SIZE)
 
 #if PICO_RP2350 && PICO_RP2350_A2_SUPPORTED
 #define LOGGER_BTSTACK_STORAGE_OFFSET                                          \
@@ -27,17 +27,8 @@
 #define LOGGER_FLASH_METADATA_REGION_SIZE                                      \
   (LOGGER_FLASH_METADATA_SLOT_COUNT * LOGGER_FLASH_METADATA_SLOT_SIZE)
 
-#define LOGGER_FLASH_SYSTEM_LOG_RECORD_SIZE (2u * FLASH_PAGE_SIZE)
-#define LOGGER_FLASH_SYSTEM_LOG_REGION_OFFSET                                  \
-  (LOGGER_FLASH_CONFIG_REGION_OFFSET + LOGGER_FLASH_CONFIG_REGION_SIZE)
-#define LOGGER_FLASH_SYSTEM_LOG_REGION_SIZE                                    \
-  (LOGGER_FLASH_PERSIST_REGION_SIZE - LOGGER_FLASH_CONFIG_REGION_SIZE -        \
-   LOGGER_FLASH_METADATA_REGION_SIZE)
-#define LOGGER_FLASH_SYSTEM_LOG_RECORD_CAPACITY                                \
-  (LOGGER_FLASH_SYSTEM_LOG_REGION_SIZE / LOGGER_FLASH_SYSTEM_LOG_RECORD_SIZE)
-
 #define LOGGER_FLASH_METADATA_REGION_OFFSET                                    \
-  (LOGGER_FLASH_SYSTEM_LOG_REGION_OFFSET + LOGGER_FLASH_SYSTEM_LOG_REGION_SIZE)
+  (LOGGER_FLASH_CONFIG_REGION_OFFSET + LOGGER_FLASH_CONFIG_REGION_SIZE)
 
 /*
  * Reserve a roomier raw-flash journal area so config and hot metadata can use
@@ -45,7 +36,6 @@
  */
 
 _Static_assert(LOGGER_FLASH_CONFIG_REGION_SIZE +
-                       LOGGER_FLASH_SYSTEM_LOG_REGION_SIZE +
                        LOGGER_FLASH_METADATA_REGION_SIZE ==
                    LOGGER_FLASH_PERSIST_REGION_SIZE,
                "flash persistence regions must exactly fill the reserved area");
