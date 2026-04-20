@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "polar_sdk_btstack_config.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

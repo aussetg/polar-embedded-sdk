@@ -66,6 +66,7 @@ add_executable(logger_appliance
     src/faults.c
     src/h10.c
     src/identity.c
+    src/btstack_aes128_mbedtls.c
     src/mbedtls_platform.c
     src/net.c
     src/json.c

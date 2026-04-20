@@ -7,6 +7,11 @@
 
 #include "polar_sdk_transport_adapter.h"
 
+// Validate required btstack_config.h options for Polar SDK + BTstack.
+// This is the base header of the BTstack adapter layer; all other
+// polar_sdk_btstack_* headers include it transitively.
+#include "polar_sdk_btstack_config.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

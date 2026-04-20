@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "polar_sdk_btstack_config.h"
 #include "polar_sdk_runtime.h"
 
 #ifdef __cplusplus
