@@ -2,6 +2,7 @@
 
 #include "logger/faults.h"
 #include "logger/psram.h"
+#include "logger/psram_layout.h"
 #include "logger/storage_worker.h"
 #include "logger/system_log_backend.h"
 #include "logger/system_log_backend_psram.h"
@@ -36,6 +37,7 @@
 #define LOGGER_RECOVERY_USB_CLEAR_DWELL_MS 5000u
 #define LOGGER_RECOVERY_LOW_START_CLEAR_MV 3750u
 #define LOGGER_RECOVERY_CRITICAL_CLEAR_MV 3700u
+#define LOGGER_BOOT_QUEUE_REFRESH_DEFER_MS 5000u
 #define LOGGER_UPLOAD_BLOCKED_RECHECK_INTERVAL_MS 60000u
 
 static bool logger_app_try_finalize_no_session_day(logger_app_t *app,
@@ -52,6 +54,12 @@ static bool logger_app_run_queue_maintenance(logger_app_t *app, uint32_t now_ms,
 static void logger_app_reconcile_upload_blocked_fault(logger_app_t *app,
                                                       uint32_t now_ms,
                                                       bool force);
+static bool logger_app_state_allows_deferred_boot_queue_refresh(
+    logger_runtime_state_t state);
+static void logger_app_schedule_deferred_boot_queue_refresh(
+    logger_app_t *app, uint32_t now_ms);
+static void logger_app_maybe_run_deferred_boot_queue_refresh(
+    logger_app_t *app, uint32_t now_ms);
 
 static int64_t logger_app_i64_abs(int64_t value) {
   return value < 0 ? -(value + 1) + 1 : value;
@@ -186,6 +194,8 @@ static bool logger_app_recover_session_if_needed(logger_app_t *app,
 
 static uint8_t logger_app_fault_precedence(logger_fault_code_t code) {
   switch (code) {
+  case LOGGER_FAULT_PSRAM_INIT_FAILED:
+    return 0u;
   case LOGGER_FAULT_SD_WRITE_FAILED:
     return 1u;
   case LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE:
@@ -294,6 +304,8 @@ logger_app_recovery_reason_from_fault(logger_fault_code_t code) {
     return LOGGER_RECOVERY_SD_LOW_SPACE_RESERVE_UNMET;
   case LOGGER_FAULT_SD_WRITE_FAILED:
     return LOGGER_RECOVERY_SD_WRITE_FAILED;
+  case LOGGER_FAULT_PSRAM_INIT_FAILED:
+    return LOGGER_RECOVERY_PSRAM_INIT_FAILED;
   case LOGGER_FAULT_NONE:
   case LOGGER_FAULT_CLOCK_INVALID:
   case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
@@ -317,6 +329,8 @@ logger_app_fault_from_recovery_reason(logger_recovery_reason_t reason) {
     return LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET;
   case LOGGER_RECOVERY_SD_WRITE_FAILED:
     return LOGGER_FAULT_SD_WRITE_FAILED;
+  case LOGGER_RECOVERY_PSRAM_INIT_FAILED:
+    return LOGGER_FAULT_PSRAM_INIT_FAILED;
   case LOGGER_RECOVERY_NONE:
   default:
     return LOGGER_FAULT_NONE;
@@ -334,6 +348,8 @@ logger_app_recovery_initial_probe_interval_ms(logger_recovery_reason_t reason) {
     return LOGGER_RECOVERY_STORAGE_PROBE_INTERVAL_MS;
   case LOGGER_RECOVERY_SD_WRITE_FAILED:
     return LOGGER_RECOVERY_STORAGE_WRITE_PROBE_INTERVAL_MS;
+  case LOGGER_RECOVERY_PSRAM_INIT_FAILED:
+    return 0u; /* irrevocable hardware fault */
   case LOGGER_RECOVERY_CONFIG_INCOMPLETE:
   case LOGGER_RECOVERY_NONE:
   default:
@@ -431,6 +447,11 @@ static logger_runtime_state_t
 logger_app_select_unattended_target(const logger_app_t *app,
                                     logger_fault_code_t *fault_code_out) {
   logger_fault_code_t fault_code = LOGGER_FAULT_NONE;
+
+  /* Hardware fault: PSRAM is required for capture.  Irrevocable. */
+  if (app->persisted.current_fault_code == LOGGER_FAULT_PSRAM_INIT_FAILED) {
+    fault_code = LOGGER_FAULT_PSRAM_INIT_FAILED;
+  }
 
   if (app->persisted.current_fault_code == LOGGER_FAULT_SD_WRITE_FAILED) {
     fault_code = LOGGER_FAULT_SD_WRITE_FAILED;
@@ -611,8 +632,7 @@ static bool logger_app_validate_storage_low_space_recovery(logger_app_t *app,
 
 static bool logger_app_validate_storage_write_recovery(logger_app_t *app,
                                                        uint32_t now_ms) {
-  logger_upload_queue_t queue;
-  logger_upload_queue_init(&queue);
+  logger_upload_queue_t *queue = NULL;
 
   app->last_observation_mono_ms = 0u;
   logger_app_refresh_observations(app, now_ms);
@@ -624,12 +644,15 @@ static bool logger_app_validate_storage_write_recovery(logger_app_t *app,
     logger_app_recovery_set_status(app, "storage_self_test", "failed");
     return false;
   }
+  queue = logger_upload_queue_tmp_acquire();
   if (!logger_storage_svc_queue_refresh(
           &app->system_log, logger_clock_now_utc_or_null(&app->clock), NULL) ||
-      !logger_storage_svc_queue_load(&queue)) {
+      !logger_storage_svc_queue_load(queue)) {
+    logger_upload_queue_tmp_release(queue);
     logger_app_recovery_set_status(app, "queue_refresh", "failed");
     return false;
   }
+  logger_upload_queue_tmp_release(queue);
   logger_app_recovery_set_status(app, "queue_refresh", "passed");
   return true;
 }
@@ -698,24 +721,24 @@ static void logger_app_transition_idle_upload_complete(logger_app_t *app,
 static bool
 logger_app_prepare_upload_pass(logger_app_t *app,
                                logger_upload_queue_summary_t *summary_out) {
-  logger_upload_queue_t queue;
-  logger_upload_queue_init(&queue);
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
   logger_upload_queue_summary_init(summary_out);
   app->upload_pass_count = 0u;
   app->upload_pass_next_index = 0u;
 
-  if (!logger_storage_svc_queue_load(&queue)) {
+  if (!logger_storage_svc_queue_load(queue)) {
+    logger_upload_queue_tmp_release(queue);
     return false;
   }
-  logger_upload_queue_compute_summary(&queue, summary_out);
+  logger_upload_queue_compute_summary(queue, summary_out);
   if (summary_out->blocked_count == 0u &&
       app->persisted.current_fault_code ==
           LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE) {
     logger_app_clear_current_fault(app, "upload_queue_unblocked");
   }
 
-  for (size_t i = 0u; i < queue.session_count; ++i) {
-    const logger_upload_queue_entry_t *entry = &queue.sessions[i];
+  for (size_t i = 0u; i < queue->session_count; ++i) {
+    const logger_upload_queue_entry_t *entry = &queue->sessions[i];
     if (strcmp(entry->status, "pending") != 0 &&
         strcmp(entry->status, "failed") != 0) {
       continue;
@@ -728,6 +751,7 @@ logger_app_prepare_upload_pass(logger_app_t *app,
            sizeof(app->upload_pass_session_ids[app->upload_pass_count]));
     app->upload_pass_count += 1u;
   }
+  logger_upload_queue_tmp_release(queue);
   return true;
 }
 
@@ -747,17 +771,18 @@ static void logger_app_reconcile_upload_blocked_fault(logger_app_t *app,
     return;
   }
 
-  logger_upload_queue_t queue;
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
   logger_upload_queue_summary_t summary;
-  logger_upload_queue_init(&queue);
   logger_upload_queue_summary_init(&summary);
-  if (!logger_storage_svc_queue_load(&queue)) {
+  if (!logger_storage_svc_queue_load(queue)) {
+    logger_upload_queue_tmp_release(queue);
     return;
   }
 
   app->last_upload_blocked_recheck_mono_ms = now_ms;
-  logger_upload_queue_compute_summary(&queue, &summary);
+  logger_upload_queue_compute_summary(queue, &summary);
   if (summary.blocked_count == 0u) {
+    logger_upload_queue_tmp_release(queue);
     if (app->persisted.current_fault_code ==
         LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE) {
       logger_app_clear_current_fault(app, "upload_queue_unblocked");
@@ -765,6 +790,7 @@ static void logger_app_reconcile_upload_blocked_fault(logger_app_t *app,
     return;
   }
 
+  logger_upload_queue_tmp_release(queue);
   logger_app_maybe_latch_new_fault(app,
                                    LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE);
 }
@@ -1350,7 +1376,7 @@ static bool logger_app_drain_capture_pipe(logger_app_t *app, uint32_t now_ms) {
 
   /* Drain source staging into the command ring */
   if (capture_staging_has_data(pipe)) {
-    (void)capture_staging_drain(pipe, CAPTURE_STAGING_DUAL_CORE_CAPACITY);
+    (void)capture_staging_drain(pipe, pipe->staging.capacity);
   }
 
   /* Signal core 1 that work may be available. */
@@ -1694,7 +1720,52 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
   logger_session_init(&app->session);
   logger_capture_stats_init(&app->capture_stats);
   logger_session_set_capture_stats(&app->capture_stats);
-  capture_pipe_init(&app->capture_pipe);
+
+  /*
+   * Initialise PSRAM before any PSRAM-backed buffer touches.
+   * cyw43_arch_init() already ran in main.c, so the SPI pins are claimed.
+   *
+   * PSRAM failure is a hardware fault — the capture pipeline, chunk
+   * buffer, and queue scratch all require it.  Latch the fault and
+   * skip buffer init so no PSRAM addresses are dereferenced.
+   * step_boot will route to RECOVERY_HOLD.
+   */
+  const system_log_backend_t *log_backend = NULL;
+  if (psram_init(PIMORONI_PICO_LIPO2XL_W_PSRAM_CS_PIN) > 0u) {
+    log_backend = &system_log_backend_psram;
+    printf("[logger] psram initialised, system log -> psram\n");
+  } else {
+    printf("[logger] FATAL: psram init failed — hardware fault\n");
+    logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_PSRAM_INIT_FAILED);
+  }
+  logger_system_log_init(&app->system_log, log_backend,
+                         app->persisted.boot_counter);
+
+  /* Wire PSRAM-backed slot arrays from the static layout.
+   * Skip if PSRAM init failed — addresses would be unusable.
+   *
+   * Lifetime contract: after successful psram_init(), these fixed-layout
+   * PSRAM pointers are treated as valid for the remainder of the boot.
+   * capture_pipe_t stores them directly and does not track PSRAM liveness.
+   * This is acceptable in v1 because PSRAM failure is handled as an
+   * irrevocable hardware fault at boot; runtime PSRAM power-down/deinit is
+   * not a supported mode.
+   *
+   * Ordering matters: maybe_latch_new_fault() above sets
+   * current_fault_code, so this guard reads the fault that was
+   * just latched (not a stale value). */
+  if (app->persisted.current_fault_code != LOGGER_FAULT_PSRAM_INIT_FAILED) {
+    capture_pipe_init(&app->capture_pipe,
+                      &(capture_pipe_init_params_t){
+                          .staging_slots = PSRAM_STAGING_SLOTS,
+                          .staging_capacity = PSRAM_LAYOUT_STAGING_COUNT,
+                          .cmd_ring_slots = PSRAM_CMD_RING_SLOTS,
+                          .cmd_ring_capacity = PSRAM_LAYOUT_CMD_RING_COUNT,
+                      });
+    logger_session_init_buffers();
+    logger_queue_scratch_init();
+  }
+
   /*
    * Do NOT set the pipe yet.  The pipe is wired up in main.c AFTER
    * pre-worker recovery completes.  Until then, session->pipe == NULL
@@ -1702,22 +1773,6 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
    * FatFS exclusively during this window.
    */
   app->boot_recovery_done = false;
-
-  /*
-   * Initialise PSRAM and wire the system log to the PSRAM backend.
-   * psram_init() must run after cyw43_arch_init() (CYW43 claims SPI
-   * pins first).  If PSRAM init fails, the system log falls back to
-   * read-only (all append calls become no-ops).
-   */
-  const system_log_backend_t *log_backend = NULL;
-  if (psram_init(PIMORONI_PICO_LIPO2XL_W_PSRAM_CS_PIN) > 0u) {
-    log_backend = &system_log_backend_psram;
-    printf("[logger] psram initialised, system log -> psram\n");
-  } else {
-    printf("[logger] psram init failed, system log disabled\n");
-  }
-  logger_system_log_init(&app->system_log, log_backend,
-                         app->persisted.boot_counter);
 
   logger_app_refresh_observations(app, now_ms);
 
@@ -1831,6 +1886,106 @@ static logger_step_result_t logger_step_common_prologue(logger_app_t *app,
   return LOGGER_STEP_CONTINUE;
 }
 
+static bool logger_app_state_allows_deferred_boot_queue_refresh(
+    logger_runtime_state_t state) {
+  switch (state) {
+  case LOGGER_RUNTIME_SERVICE:
+  case LOGGER_RUNTIME_UPLOAD_PREP:
+  case LOGGER_RUNTIME_UPLOAD_RUNNING:
+  case LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER:
+  case LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE:
+    return true;
+
+  case LOGGER_RUNTIME_BOOT:
+  case LOGGER_RUNTIME_RECOVERY_HOLD:
+  case LOGGER_RUNTIME_LOG_WAIT_H10:
+  case LOGGER_RUNTIME_LOG_CONNECTING:
+  case LOGGER_RUNTIME_LOG_SECURING:
+  case LOGGER_RUNTIME_LOG_STARTING_STREAM:
+  case LOGGER_RUNTIME_LOG_STREAMING:
+  case LOGGER_RUNTIME_LOG_STOPPING:
+  default:
+    return false;
+  }
+}
+
+static void logger_app_schedule_deferred_boot_queue_refresh(
+    logger_app_t *app, uint32_t now_ms) {
+  if (app == NULL || app->deferred_boot_queue_refresh_pending) {
+    return;
+  }
+
+  app->deferred_boot_queue_refresh_pending = true;
+  app->deferred_boot_queue_refresh_skip_logged = false;
+  app->deferred_boot_queue_refresh_after_mono_ms =
+      now_ms + LOGGER_BOOT_QUEUE_REFRESH_DEFER_MS;
+  printf("[logger] deferring boot queue refresh by %lu ms\n",
+         (unsigned long)LOGGER_BOOT_QUEUE_REFRESH_DEFER_MS);
+}
+
+static void logger_app_maybe_run_deferred_boot_queue_refresh(
+    logger_app_t *app, uint32_t now_ms) {
+  if (app == NULL || !app->deferred_boot_queue_refresh_pending) {
+    return;
+  }
+  if ((int32_t)(now_ms - app->deferred_boot_queue_refresh_after_mono_ms) < 0) {
+    return;
+  }
+
+  if (!logger_app_state_allows_deferred_boot_queue_refresh(
+          app->runtime.current_state)) {
+    if ((app->runtime.current_state == LOGGER_RUNTIME_RECOVERY_HOLD ||
+         logger_runtime_state_is_logging(app->runtime.current_state)) &&
+        (!app->deferred_boot_queue_refresh_skip_logged ||
+         app->deferred_boot_queue_refresh_skip_state !=
+             app->runtime.current_state)) {
+      printf(
+          "[logger] deferred boot queue refresh still pending; waiting for "
+          "safe state (current_state=%s)\n",
+          logger_runtime_state_name(app->runtime.current_state));
+      app->deferred_boot_queue_refresh_skip_logged = true;
+      app->deferred_boot_queue_refresh_skip_state = app->runtime.current_state;
+    }
+    return;
+  }
+
+  if (!app->storage.mounted || !app->storage.writable ||
+      !app->storage.logger_root_ready) {
+    return;
+  }
+
+  app->deferred_boot_queue_refresh_pending = false;
+  app->deferred_boot_queue_refresh_skip_logged = false;
+
+  printf("[logger] running deferred boot queue refresh\n");
+
+  if (!logger_storage_svc_queue_refresh(
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+          NULL)) {
+    logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                    app->runtime.current_state,
+                                    "deferred_queue_refresh_failed", now_ms);
+    return;
+  }
+  if (app->boot_firmware_identity_changed) {
+    if (!logger_storage_svc_queue_requeue_blocked(
+            &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+            "firmware_changed", NULL, NULL)) {
+      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                      app->runtime.current_state,
+                                      "deferred_queue_rebuild_failed", now_ms);
+      return;
+    }
+  }
+  if (!logger_app_run_queue_maintenance(app, now_ms, true)) {
+    logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                    app->runtime.current_state,
+                                    "deferred_queue_prune_failed", now_ms);
+    return;
+  }
+  logger_app_reconcile_upload_blocked_fault(app, now_ms, true);
+}
+
 static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
   logger_app_refresh_observations(app, now_ms);
   logger_app_reconcile_clock_invalid_fault(app, now_ms);
@@ -1849,31 +2004,7 @@ static void logger_step_boot(logger_app_t *app, uint32_t now_ms) {
 
   if (app->storage.mounted && app->storage.writable &&
       app->storage.logger_root_ready) {
-    if (!logger_storage_svc_queue_refresh(
-            &app->system_log, logger_clock_now_utc_or_null(&app->clock),
-            NULL)) {
-      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                      LOGGER_RUNTIME_BOOT,
-                                      "queue_refresh_failed", now_ms);
-      return;
-    }
-    if (app->boot_firmware_identity_changed) {
-      if (!logger_storage_svc_queue_requeue_blocked(
-              &app->system_log, logger_clock_now_utc_or_null(&app->clock),
-              "firmware_changed", NULL, NULL)) {
-        logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                        LOGGER_RUNTIME_BOOT,
-                                        "queue_rebuild_failed", now_ms);
-        return;
-      }
-    }
-    if (!logger_app_run_queue_maintenance(app, now_ms, true)) {
-      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                      LOGGER_RUNTIME_BOOT, "queue_prune_failed",
-                                      now_ms);
-      return;
-    }
-    logger_app_reconcile_upload_blocked_fault(app, now_ms, true);
+    logger_app_schedule_deferred_boot_queue_refresh(app, now_ms);
   }
 
   if (app->boot_gesture == LOGGER_BOOT_GESTURE_SERVICE) {
@@ -2129,6 +2260,11 @@ static void logger_step_recovery_hold(logger_app_t *app, uint32_t now_ms) {
     logger_app_recovery_complete(app, "storage_validated", now_ms);
     return;
   }
+
+  case LOGGER_RECOVERY_PSRAM_INIT_FAILED:
+    /* Irrevocable hardware fault.  No recovery probe possible. */
+    logger_app_recovery_set_status(app, "psram", "irrevocable");
+    return;
 
   case LOGGER_RECOVERY_NONE:
   default:
@@ -2645,6 +2781,8 @@ void logger_app_step(logger_app_t *app, uint32_t now_ms) {
     logger_app_enter_service(app, "scaffold_unhandled_state", now_ms, false);
     break;
   }
+
+  logger_app_maybe_run_deferred_boot_queue_refresh(app, now_ms);
 
   logger_app_update_indicator(app, now_ms);
 

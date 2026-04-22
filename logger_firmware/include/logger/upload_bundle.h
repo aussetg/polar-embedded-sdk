@@ -12,6 +12,7 @@
 #include "logger/storage.h"
 
 #define LOGGER_UPLOAD_BUNDLE_MANIFEST_MAX 8192u
+#define LOGGER_UPLOAD_BUNDLE_STREAM_CHUNK_MAX 1024u
 
 typedef enum {
   LOGGER_UPLOAD_BUNDLE_STATE_ROOT_DIR = 0,
@@ -37,10 +38,10 @@ typedef struct {
   uint64_t journal_bytes_streamed;
   FIL journal_file;
   mtar_t tar;
-  uint8_t emit_buf[1024];
+  uint8_t emit_buf[LOGGER_UPLOAD_BUNDLE_STREAM_CHUNK_MAX];
   size_t emit_buf_offset;
   size_t emit_buf_len;
-  uint8_t io_buf[512];
+  uint8_t io_buf[LOGGER_UPLOAD_BUNDLE_STREAM_CHUNK_MAX];
 } logger_upload_bundle_stream_t;
 
 bool logger_upload_bundle_stream_open(logger_upload_bundle_stream_t *stream,

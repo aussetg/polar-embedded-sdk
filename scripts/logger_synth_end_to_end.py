@@ -951,6 +951,13 @@ def build_scenario(
                     timeout_s=90.0,
                     allow_error=name != "upload-verified",
                 ),
+                Step("unlock_4", "service unlock", "service unlock"),
+                Step(
+                    "queue_rebuild",
+                    "debug queue rebuild",
+                    "debug queue rebuild",
+                    timeout_s=180.0,
+                ),
                 Step("queue_after", "queue --json", "queue"),
                 Step("system_log", "system-log export --json", "system-log export"),
                 Step("status_after", "status --json", "status"),
@@ -1134,6 +1141,7 @@ def validate_upload_outcome(
     session_id = new_session_ids[0]
 
     upload_response = response_by_label(responses, "upload_once")
+    queue_rebuild = response_by_label(responses, "queue_rebuild")
     upload_entry = queue_entry_map_from_response(queue_after).get(session_id)
     if upload_entry is None:
         raise RuntimeError("uploaded session is missing from final queue --json output")
@@ -1150,6 +1158,12 @@ def validate_upload_outcome(
         )
     if upload_entry.get("attempt_count") != 1:
         raise RuntimeError("upload scenario expected attempt_count=1 for the new session")
+
+    rebuild_payload = payload_from_response(queue_rebuild)
+    if rebuild_payload.get("rebuilt") is not True:
+        raise RuntimeError("upload scenario expected debug queue rebuild to report rebuilt=true")
+    if int(rebuild_payload.get("session_count", 0)) < 1:
+        raise RuntimeError("upload scenario expected debug queue rebuild to report at least one session")
 
     expected_error = expected_upload_error_code(scenario)
     if scenario == "upload-verified":

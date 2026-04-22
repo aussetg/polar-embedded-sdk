@@ -1,11 +1,13 @@
 #include "logger/upload.h"
 
+#include <assert.h>
 #include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "hardware/watchdog.h"
 #include "pico/cyw43_arch.h"
 #include "pico/error.h"
 #include "pico/stdlib.h"
@@ -21,6 +23,7 @@
 #include "logger/json.h"
 #include "logger/json_writer.h"
 #include "logger/net.h"
+#include "logger/psram_layout.h"
 #include "logger/storage.h"
 #include "logger/storage_service.h"
 #include "logger/upload_bundle.h"
@@ -105,6 +108,129 @@ typedef struct {
   size_t ca_len;
   const char *anchor_sha256_or_null;
 } logger_upload_tls_trust_t;
+
+typedef struct {
+  logger_upload_http_request_t request;
+  bool in_use;
+} logger_upload_http_request_workspace_t;
+
+typedef struct {
+  logger_upload_http_response_t response;
+  bool in_use;
+} logger_upload_http_response_workspace_t;
+
+typedef struct {
+  logger_upload_url_t url;
+  logger_upload_server_reply_t reply;
+  char manifest_path[LOGGER_STORAGE_PATH_MAX];
+  char journal_path[LOGGER_STORAGE_PATH_MAX];
+  char request_text[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
+  char auth_header[LOGGER_CONFIG_UPLOAD_TOKEN_MAX + 32u];
+  char api_key_header[LOGGER_CONFIG_UPLOAD_API_KEY_MAX + 24u];
+  char host_header[LOGGER_UPLOAD_URL_HOST_MAX + 8u];
+  char ip_buf[48u];
+  bool in_use;
+} logger_upload_process_workspace_t;
+
+#define LOGGER_UPLOAD_PSRAM_WORKSPACE_BASE (PSRAM_UPLOAD_REGION_BASE)
+
+#define LOGGER_UPLOAD_HTTP_REQUEST_WORKSPACE_ADDR                             \
+  (LOGGER_UPLOAD_PSRAM_WORKSPACE_BASE)
+#define LOGGER_UPLOAD_HTTP_RESPONSE_WORKSPACE_ADDR                            \
+  (LOGGER_UPLOAD_HTTP_REQUEST_WORKSPACE_ADDR +                                \
+   sizeof(logger_upload_http_request_workspace_t))
+#define LOGGER_UPLOAD_PROCESS_WORKSPACE_ADDR                                  \
+  (LOGGER_UPLOAD_HTTP_RESPONSE_WORKSPACE_ADDR +                               \
+   sizeof(logger_upload_http_response_workspace_t))
+#define LOGGER_UPLOAD_PSRAM_WORKSPACE_END                                     \
+  (LOGGER_UPLOAD_PROCESS_WORKSPACE_ADDR +                                     \
+   sizeof(logger_upload_process_workspace_t))
+
+_Static_assert(
+    LOGGER_UPLOAD_PSRAM_WORKSPACE_END <=
+        PSRAM_UPLOAD_REGION_BASE + PSRAM_UPLOAD_REGION_SIZE,
+    "upload PSRAM workspace exceeds reserved upload region");
+
+static logger_upload_http_request_workspace_t *
+logger_upload_http_request_workspace_ptr(void) {
+  return (logger_upload_http_request_workspace_t *)
+      LOGGER_UPLOAD_HTTP_REQUEST_WORKSPACE_ADDR;
+}
+
+static logger_upload_http_response_workspace_t *
+logger_upload_http_response_workspace_ptr(void) {
+  return (logger_upload_http_response_workspace_t *)
+      LOGGER_UPLOAD_HTTP_RESPONSE_WORKSPACE_ADDR;
+}
+
+static logger_upload_process_workspace_t *logger_upload_process_workspace_ptr(
+    void) {
+  return (logger_upload_process_workspace_t *)LOGGER_UPLOAD_PROCESS_WORKSPACE_ADDR;
+}
+
+static void logger_upload_http_request_init(logger_upload_http_request_t *request);
+static void
+logger_upload_http_response_init(logger_upload_http_response_t *response);
+
+static logger_upload_http_request_t *
+logger_upload_http_request_workspace_acquire(void) {
+  logger_upload_http_request_workspace_t *workspace =
+      logger_upload_http_request_workspace_ptr();
+  assert(!workspace->in_use);
+  workspace->in_use = true;
+  logger_upload_http_request_init(&workspace->request);
+  return &workspace->request;
+}
+
+static void logger_upload_http_request_workspace_release(
+    logger_upload_http_request_t *request) {
+  (void)request;
+  logger_upload_http_request_workspace_t *workspace =
+      logger_upload_http_request_workspace_ptr();
+  assert(request == &workspace->request);
+  assert(workspace->in_use);
+  workspace->in_use = false;
+}
+
+static logger_upload_http_response_t *
+logger_upload_http_response_workspace_acquire(void) {
+  logger_upload_http_response_workspace_t *workspace =
+      logger_upload_http_response_workspace_ptr();
+  assert(!workspace->in_use);
+  workspace->in_use = true;
+  logger_upload_http_response_init(&workspace->response);
+  return &workspace->response;
+}
+
+static void logger_upload_http_response_workspace_release(
+    logger_upload_http_response_t *response) {
+  (void)response;
+  logger_upload_http_response_workspace_t *workspace =
+      logger_upload_http_response_workspace_ptr();
+  assert(response == &workspace->response);
+  assert(workspace->in_use);
+  workspace->in_use = false;
+}
+
+static logger_upload_process_workspace_t *
+logger_upload_process_workspace_acquire(void) {
+  logger_upload_process_workspace_t *workspace =
+      logger_upload_process_workspace_ptr();
+  assert(!workspace->in_use);
+  memset(workspace, 0, sizeof(*workspace));
+  workspace->in_use = true;
+  return workspace;
+}
+
+static void logger_upload_process_workspace_release(
+    logger_upload_process_workspace_t *workspace) {
+  (void)workspace;
+  logger_upload_process_workspace_t *const expected =
+      logger_upload_process_workspace_ptr();
+  assert(workspace == expected);
+  assert(expected->in_use);
+  expected->in_use = false;
+}
 
 static bool logger_upload_auth_configured(const logger_config_t *config) {
   return config != NULL && logger_string_present(config->upload_api_key) &&
@@ -643,89 +769,93 @@ static bool logger_upload_http_execute(
     const logger_config_t *config, const logger_upload_url_t *url,
     const char *request_text, bool use_bundle_stream, uint32_t timeout_ms,
     logger_upload_http_response_t *response) {
-  logger_upload_http_request_t request;
-  logger_upload_http_request_init(&request);
+  logger_upload_http_request_t *request =
+      logger_upload_http_request_workspace_acquire();
   logger_upload_http_response_init(response);
-  logger_copy_string(request.request, sizeof(request.request), request_text);
-  request.request_len = strlen(request.request);
-  request.body_enabled = use_bundle_stream;
-  request.bundle_stream_active = use_bundle_stream;
-  request.body_eof = !use_bundle_stream;
+  logger_copy_string(request->request, sizeof(request->request), request_text);
+  request->request_len = strlen(request->request);
+  request->body_enabled = use_bundle_stream;
+  request->bundle_stream_active = use_bundle_stream;
+  request->body_eof = !use_bundle_stream;
 
-  (void)logger_upload_http_resolve(&request, url);
+  (void)logger_upload_http_resolve(request, url);
   const uint32_t start_ms = to_ms_since_boot(get_absolute_time());
   const uint32_t dns_deadline = start_ms + LOGGER_UPLOAD_DNS_TIMEOUT_MS;
   const uint32_t connect_deadline = start_ms + LOGGER_UPLOAD_CONNECT_TIMEOUT_MS;
   const uint32_t deadline = start_ms + timeout_ms;
 
-  while (!request.response_complete && !request.transport_failed) {
+  while (!request->response_complete && !request->transport_failed) {
+    watchdog_update();
     cyw43_arch_poll();
 
     const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    if (!request.dns_done && now_ms >= dns_deadline) {
-      request.transport_failed = true;
-      request.transport_err = ERR_TIMEOUT;
+    if (!request->dns_done && now_ms >= dns_deadline) {
+      request->transport_failed = true;
+      request->transport_err = ERR_TIMEOUT;
       break;
     }
-    if (request.dns_done && request.dns_err != ERR_OK) {
-      request.transport_failed = true;
-      request.transport_err = request.dns_err;
+    if (request->dns_done && request->dns_err != ERR_OK) {
+      request->transport_failed = true;
+      request->transport_err = request->dns_err;
       break;
     }
-    if (request.dns_done && !request.connect_started) {
-      (void)logger_upload_http_connect(&request, url, config);
+    if (request->dns_done && !request->connect_started) {
+      (void)logger_upload_http_connect(request, url, config);
     }
-    if (request.connect_started && !request.connected &&
+    if (request->connect_started && !request->connected &&
         now_ms >= connect_deadline) {
-      request.transport_failed = true;
-      request.transport_err = ERR_TIMEOUT;
+      request->transport_failed = true;
+      request->transport_err = ERR_TIMEOUT;
       break;
     }
-    if (request.connected) {
-      (void)logger_upload_http_send_more(&request);
+    if (request->connected) {
+      (void)logger_upload_http_send_more(request);
     }
     if (now_ms >= deadline) {
-      request.transport_failed = true;
-      request.transport_err = ERR_TIMEOUT;
+      request->transport_failed = true;
+      request->transport_err = ERR_TIMEOUT;
       break;
     }
     sleep_ms(2);
   }
 
-  if (request.dns_done && request.dns_err == ERR_OK) {
-    ipaddr_ntoa_r(&request.remote_addr, response->remote_address,
+  if (request->dns_done && request->dns_err == ERR_OK) {
+    ipaddr_ntoa_r(&request->remote_addr, response->remote_address,
                   sizeof(response->remote_address));
   }
 
-  if (!request.response_complete && request.transport_failed) {
+  if (!request->response_complete && request->transport_failed) {
     logger_copy_string(response->transport_failure_class,
                        sizeof(response->transport_failure_class),
-                       (request.dns_done && request.dns_err != ERR_OK)
+                       (request->dns_done && request->dns_err != ERR_OK)
                            ? "dns_failed"
                            : (url->https ? "tls_failed" : "tcp_failed"));
-    logger_upload_http_cleanup(&request);
+    logger_upload_http_cleanup(request);
+    logger_upload_http_request_workspace_release(request);
     return false;
   }
 
-  if (request.header_len == 0u || request.http_status < 0) {
+  if (request->header_len == 0u || request->http_status < 0) {
     logger_copy_string(response->transport_failure_class,
                        sizeof(response->transport_failure_class),
                        url->https ? "tls_failed" : "tcp_failed");
-    logger_upload_http_cleanup(&request);
+    logger_upload_http_cleanup(request);
+    logger_upload_http_request_workspace_release(request);
     return false;
   }
 
-  response->http_status = request.http_status;
-  response->body_truncated = request.response_truncated;
-  if (request.header_len < request.response_len) {
-    const size_t body_len = request.response_len - request.header_len;
+  response->http_status = request->http_status;
+  response->body_truncated = request->response_truncated;
+  if (request->header_len < request->response_len) {
+    const size_t body_len = request->response_len - request->header_len;
     const size_t copy_len = body_len < sizeof(response->body) - 1u
                                 ? body_len
                                 : sizeof(response->body) - 1u;
-    memcpy(response->body, request.response + request.header_len, copy_len);
+    memcpy(response->body, request->response + request->header_len, copy_len);
     response->body[copy_len] = '\0';
   }
-  logger_upload_http_cleanup(&request);
+  logger_upload_http_cleanup(request);
+  logger_upload_http_request_workspace_release(request);
   return true;
 }
 
@@ -941,8 +1071,11 @@ bool logger_upload_net_test(const logger_config_t *config,
     return false;
   }
 
-  logger_upload_url_t url;
-  if (!logger_upload_parse_url(config->upload_url, &url)) {
+  logger_upload_process_workspace_t *process_workspace =
+      logger_upload_process_workspace_acquire();
+
+  if (!logger_upload_parse_url(config->upload_url, &process_workspace->url)) {
+    logger_upload_process_workspace_release(process_workspace);
     logger_upload_net_test_result_fail_all(
         result, "upload URL is not a valid absolute http(s) URL");
     return false;
@@ -950,26 +1083,30 @@ bool logger_upload_net_test(const logger_config_t *config,
 
   logger_upload_tls_trust_t tls_trust;
   char tls_select_message[LOGGER_UPLOAD_MESSAGE_MAX + 1u] = {0};
-  if (url.https &&
+  if (process_workspace->url.https &&
       !logger_upload_select_tls_trust(config, &tls_trust, tls_select_message,
                                       sizeof(tls_select_message))) {
+    logger_upload_process_workspace_release(process_workspace);
     logger_upload_net_test_result_fail_all(result, tls_select_message);
     return false;
   }
 
-  char ip_buf[48] = {0};
+  process_workspace->ip_buf[0] = '\0';
   int wifi_rc = 0;
-  if (!logger_net_wifi_join(config, &wifi_rc, ip_buf)) {
+  if (!logger_net_wifi_join(config, &wifi_rc, process_workspace->ip_buf)) {
+    logger_upload_process_workspace_release(process_workspace);
     result->wifi_join_result = "fail";
     snprintf(result->wifi_join_details, sizeof(result->wifi_join_details),
              "ssid=%s rc=%d", config->wifi_ssid, wifi_rc);
     result->dns_result = "fail";
     logger_copy_string(result->dns_details, sizeof(result->dns_details),
                        "DNS not attempted because Wi-Fi join failed");
-    result->tls_result = url.https ? "fail" : "not_applicable";
+    result->tls_result = process_workspace->url.https ? "fail"
+                                                      : "not_applicable";
     logger_copy_string(result->tls_details, sizeof(result->tls_details),
-                       url.https ? "TLS not attempted because Wi-Fi join failed"
-                                 : "HTTP URL does not require TLS");
+                       process_workspace->url.https
+                           ? "TLS not attempted because Wi-Fi join failed"
+                           : "HTTP URL does not require TLS");
     result->upload_endpoint_reachable_result = "fail";
     logger_copy_string(
         result->upload_endpoint_reachable_details,
@@ -980,60 +1117,68 @@ bool logger_upload_net_test(const logger_config_t *config,
 
   result->wifi_join_result = "pass";
   snprintf(result->wifi_join_details, sizeof(result->wifi_join_details),
-           "ssid=%s ip=%s", config->wifi_ssid, ip_buf);
+           "ssid=%s ip=%s", config->wifi_ssid, process_workspace->ip_buf);
 
-  result->tls_result = url.https ? "fail" : "not_applicable";
+  result->tls_result = process_workspace->url.https ? "fail"
+                                                    : "not_applicable";
   logger_copy_string(result->tls_details, sizeof(result->tls_details),
-                     url.https ? "TLS handshake not attempted yet"
-                               : "HTTP upload URL does not use TLS");
+                     process_workspace->url.https
+                         ? "TLS handshake not attempted yet"
+                         : "HTTP upload URL does not use TLS");
 
-  char probe_request[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
-  char host_header[LOGGER_UPLOAD_URL_HOST_MAX + 8];
-  if (!logger_upload_format_host_header(&url, host_header,
-                                        sizeof(host_header))) {
+  if (!logger_upload_format_host_header(&process_workspace->url,
+                                        process_workspace->host_header,
+                                        sizeof(process_workspace->host_header))) {
     logger_net_wifi_leave();
+    logger_upload_process_workspace_release(process_workspace);
     logger_upload_net_test_result_fail_all(result,
                                            "Host header buffer overflow");
     return false;
   }
-  const int n = snprintf(probe_request, sizeof(probe_request),
+  const int n = snprintf(process_workspace->request_text,
+                         sizeof(process_workspace->request_text),
                          "GET %s HTTP/1.1\r\n"
                          "Host: %s\r\n"
                          "Connection: close\r\n"
                          "\r\n",
-                         url.path, host_header);
-  if (n <= 0 || (size_t)n >= sizeof(probe_request)) {
+                         process_workspace->url.path,
+                         process_workspace->host_header);
+  if (n <= 0 ||
+      (size_t)n >= sizeof(process_workspace->request_text)) {
     logger_net_wifi_leave();
+    logger_upload_process_workspace_release(process_workspace);
     logger_upload_net_test_result_fail_all(result,
                                            "probe request buffer overflow");
     return false;
   }
 
-  logger_upload_http_response_t probe_response;
+  logger_upload_http_response_t *probe_response =
+      logger_upload_http_response_workspace_acquire();
   const bool reachable = logger_upload_http_execute(
-      config, &url, probe_request, NULL, LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS,
-      &probe_response);
-  if (url.host_is_literal) {
+      config, &process_workspace->url, process_workspace->request_text, NULL,
+      LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS,
+      probe_response);
+  if (process_workspace->url.host_is_literal) {
     result->dns_result = "pass";
     snprintf(result->dns_details, sizeof(result->dns_details), "literal=%s",
-             url.host);
-  } else if (logger_string_present(probe_response.remote_address)) {
+             process_workspace->url.host);
+  } else if (logger_string_present(probe_response->remote_address)) {
     result->dns_result = "pass";
     snprintf(result->dns_details, sizeof(result->dns_details), "resolved=%s",
-             probe_response.remote_address);
+             probe_response->remote_address);
   } else {
     result->dns_result = "fail";
     logger_copy_string(result->dns_details, sizeof(result->dns_details),
                        "failed to resolve or connect to upload host");
   }
 
-  if (url.https) {
+  if (process_workspace->url.https) {
     if (reachable) {
       result->tls_result = "pass";
       char suffix[96];
       snprintf(suffix, sizeof(suffix), "verified peer via TLS remote=%s",
-               logger_string_present(probe_response.remote_address)
-                   ? probe_response.remote_address
+               logger_string_present(probe_response->remote_address)
+                   ? probe_response->remote_address
                    : "unknown");
       logger_upload_format_tls_details(&tls_trust, suffix, result->tls_details,
                                        sizeof(result->tls_details));
@@ -1041,7 +1186,7 @@ bool logger_upload_net_test(const logger_config_t *config,
       result->tls_result = "fail";
       logger_upload_format_tls_details(
           &tls_trust,
-          strcmp(probe_response.transport_failure_class, "dns_failed") == 0
+          strcmp(probe_response->transport_failure_class, "dns_failed") == 0
               ? "TLS handshake was not attempted because DNS resolution failed"
               : "TLS handshake or certificate verification failed",
           result->tls_details, sizeof(result->tls_details));
@@ -1052,18 +1197,21 @@ bool logger_upload_net_test(const logger_config_t *config,
     result->upload_endpoint_reachable_result = "pass";
     snprintf(result->upload_endpoint_reachable_details,
              sizeof(result->upload_endpoint_reachable_details),
-             "%s_status=%d remote=%s", url.https ? "https" : "http",
-             probe_response.http_status, probe_response.remote_address);
+             "%s_status=%d remote=%s",
+             process_workspace->url.https ? "https" : "http",
+             probe_response->http_status, probe_response->remote_address);
   } else {
     result->upload_endpoint_reachable_result = "fail";
     logger_copy_string(
         result->upload_endpoint_reachable_details,
         sizeof(result->upload_endpoint_reachable_details),
-        url.https
+        process_workspace->url.https
             ? "failed to receive an HTTPS response from the upload endpoint"
             : "failed to receive an HTTP response from the upload endpoint");
   }
 
+  logger_upload_http_response_workspace_release(probe_response);
+  logger_upload_process_workspace_release(process_workspace);
   logger_net_wifi_leave();
   return reachable;
 }
@@ -1100,15 +1248,20 @@ static bool logger_upload_process_selected(
     return false;
   }
 
-  logger_upload_url_t url;
-  if (!logger_upload_parse_url(config->upload_url, &url)) {
+  logger_upload_process_workspace_t *process_workspace =
+      logger_upload_process_workspace_acquire();
+
+  if (!logger_upload_parse_url(config->upload_url, &process_workspace->url)) {
+    logger_upload_process_workspace_release(process_workspace);
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "upload URL is invalid");
     return false;
   }
-  logger_upload_queue_t queue;
-  if (!logger_storage_svc_queue_load(&queue)) {
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
+  if (!logger_storage_svc_queue_load(queue)) {
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "failed to load upload queue");
@@ -1116,9 +1269,11 @@ static bool logger_upload_process_selected(
   }
 
   logger_upload_queue_entry_t *entry =
-      logger_upload_queue_find_eligible_session(&queue,
+      logger_upload_queue_find_eligible_session(queue,
                                                 target_session_id_or_null);
   if (entry == NULL) {
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     logger_copy_string(result->session_id, sizeof(result->session_id),
                        target_session_id_or_null);
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NO_WORK;
@@ -1133,14 +1288,16 @@ static bool logger_upload_process_selected(
 
   if (!logger_upload_recompute_entry_bundle(entry, result->message,
                                             sizeof(result->message))) {
-    logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
+    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
     logger_copy_string(entry->status, sizeof(entry->status), "failed");
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class), "local_corrupt");
     logger_copy_string(entry->last_attempt_utc, sizeof(entry->last_attempt_utc),
                        now_utc_or_null);
     entry->attempt_count += 1u;
-    (void)logger_storage_svc_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(queue);
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
@@ -1153,21 +1310,23 @@ static bool logger_upload_process_selected(
     return false;
   }
 
-  char manifest_path[LOGGER_STORAGE_PATH_MAX];
-  char journal_path[LOGGER_STORAGE_PATH_MAX];
-  if (!logger_path_join3(manifest_path, sizeof(manifest_path),
+  if (!logger_path_join3(process_workspace->manifest_path,
+                         sizeof(process_workspace->manifest_path),
                          "0:/logger/sessions/", entry->dir_name,
                          "/manifest.json") ||
-      !logger_path_join3(journal_path, sizeof(journal_path),
+      !logger_path_join3(process_workspace->journal_path,
+                         sizeof(process_workspace->journal_path),
                          "0:/logger/sessions/", entry->dir_name,
                          "/journal.bin")) {
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "session path is too long");
     return false;
   }
 
-  logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
+  logger_upload_queue_set_updated_at(queue, now_utc_or_null);
   logger_copy_string(entry->status, sizeof(entry->status), "uploading");
   entry->attempt_count += 1u;
   logger_copy_string(entry->last_attempt_utc, sizeof(entry->last_attempt_utc),
@@ -1175,21 +1334,25 @@ static bool logger_upload_process_selected(
   entry->last_failure_class[0] = '\0';
   entry->verified_upload_utc[0] = '\0';
   entry->receipt_id[0] = '\0';
-  if (!logger_storage_svc_queue_write(&queue)) {
+  if (!logger_storage_svc_queue_write(queue)) {
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "failed to persist uploading queue state");
     return false;
   }
 
-  char ip_buf[48] = {0};
+  process_workspace->ip_buf[0] = '\0';
   int wifi_rc = 0;
-  if (!logger_net_wifi_join(config, &wifi_rc, ip_buf)) {
-    logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
+  if (!logger_net_wifi_join(config, &wifi_rc, process_workspace->ip_buf)) {
+    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
     logger_copy_string(entry->status, sizeof(entry->status), "failed");
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class), "wifi_join_failed");
-    (void)logger_storage_svc_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(queue);
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
@@ -1204,20 +1367,21 @@ static bool logger_upload_process_selected(
     return false;
   }
 
-  char auth_header[LOGGER_CONFIG_UPLOAD_TOKEN_MAX + 32];
-  char api_key_header[LOGGER_CONFIG_UPLOAD_API_KEY_MAX + 24];
-  auth_header[0] = '\0';
-  api_key_header[0] = '\0';
-  snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s\r\n",
-           config->upload_token);
-  snprintf(api_key_header, sizeof(api_key_header), "x-api-key: %s\r\n",
+  process_workspace->auth_header[0] = '\0';
+  process_workspace->api_key_header[0] = '\0';
+  snprintf(process_workspace->auth_header,
+           sizeof(process_workspace->auth_header),
+           "Authorization: Bearer %s\r\n", config->upload_token);
+  snprintf(process_workspace->api_key_header,
+           sizeof(process_workspace->api_key_header), "x-api-key: %s\r\n",
            config->upload_api_key);
 
-  char request_text[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
-  char host_header[LOGGER_UPLOAD_URL_HOST_MAX + 8];
-  if (!logger_upload_format_host_header(&url, host_header,
-                                        sizeof(host_header))) {
+  if (!logger_upload_format_host_header(&process_workspace->url,
+                                        process_workspace->host_header,
+                                        sizeof(process_workspace->host_header))) {
     logger_net_wifi_leave();
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "Host header buffer overflow");
@@ -1225,7 +1389,7 @@ static bool logger_upload_process_selected(
   }
 
   const int request_n = snprintf(
-      request_text, sizeof(request_text),
+      process_workspace->request_text, sizeof(process_workspace->request_text),
       "POST %s HTTP/1.1\r\n"
       "Host: %s\r\n"
       "Content-Type: application/x-tar\r\n"
@@ -1243,26 +1407,33 @@ static bool logger_upload_process_selected(
       "%s"
       "Connection: close\r\n"
       "\r\n",
-      url.path, host_header, (unsigned long long)entry->bundle_size_bytes,
+      process_workspace->url.path, process_workspace->host_header,
+      (unsigned long long)entry->bundle_size_bytes,
       entry->session_id, hardware_id, config->logger_id, config->subject_id,
-      entry->study_day_local, entry->bundle_sha256, auth_header,
-      api_key_header);
-  if (request_n <= 0 || (size_t)request_n >= sizeof(request_text)) {
+      entry->study_day_local, entry->bundle_sha256,
+      process_workspace->auth_header, process_workspace->api_key_header);
+  if (request_n <= 0 ||
+      (size_t)request_n >= sizeof(process_workspace->request_text)) {
     logger_net_wifi_leave();
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "HTTP request buffer overflow");
     return false;
   }
 
-  if (!logger_storage_svc_bundle_open(entry->dir_name, manifest_path,
-                                      journal_path)) {
+  if (!logger_storage_svc_bundle_open(entry->dir_name,
+                                      process_workspace->manifest_path,
+                                      process_workspace->journal_path)) {
     logger_net_wifi_leave();
     logger_copy_string(entry->status, sizeof(entry->status), "failed");
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class), "local_corrupt");
-    logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
-    (void)logger_storage_svc_queue_write(&queue);
+    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
+    (void)logger_storage_svc_queue_write(queue);
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
@@ -1274,24 +1445,29 @@ static bool logger_upload_process_selected(
     return false;
   }
 
-  logger_upload_http_response_t http_response;
+  logger_upload_http_response_t *http_response =
+      logger_upload_http_response_workspace_acquire();
   const bool http_ok = logger_upload_http_execute(
-      config, &url, request_text, true, LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS,
-      &http_response);
+      config, &process_workspace->url, process_workspace->request_text, true,
+      LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS,
+      http_response);
   logger_storage_svc_bundle_close();
   logger_net_wifi_leave();
 
   if (!http_ok) {
     const char *transport_failure_class =
-        logger_string_present(http_response.transport_failure_class)
-            ? http_response.transport_failure_class
-            : (url.https ? "tls_failed" : "tcp_failed");
-    logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
+        logger_string_present(http_response->transport_failure_class)
+            ? http_response->transport_failure_class
+            : (process_workspace->url.https ? "tls_failed" : "tcp_failed");
+    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
     logger_copy_string(entry->status, sizeof(entry->status), "failed");
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class),
                        transport_failure_class);
-    (void)logger_storage_svc_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(queue);
+    logger_upload_http_response_workspace_release(http_response);
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
@@ -1299,8 +1475,9 @@ static bool logger_upload_process_selected(
     logger_copy_string(result->failure_class, sizeof(result->failure_class),
                        entry->last_failure_class);
     logger_copy_string(result->message, sizeof(result->message),
-                       url.https ? "HTTPS upload transport failed"
-                                 : "HTTP upload transport failed");
+                       process_workspace->url.https
+                           ? "HTTPS upload transport failed"
+                           : "HTTP upload transport failed");
     logger_upload_append_failure_event(
         system_log, now_utc_or_null, "upload_failed",
         LOGGER_SYSTEM_LOG_SEVERITY_WARN, entry->session_id,
@@ -1308,23 +1485,26 @@ static bool logger_upload_process_selected(
     return false;
   }
 
-  logger_upload_server_reply_t reply;
-  if (!logger_upload_parse_server_reply(&http_response, &reply)) {
-    logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
+  if (!logger_upload_parse_server_reply(http_response,
+                                        &process_workspace->reply)) {
+    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
     logger_copy_string(entry->status, sizeof(entry->status), "failed");
     logger_copy_string(entry->last_failure_class,
                        sizeof(entry->last_failure_class),
                        "server_validation_failed");
-    (void)logger_storage_svc_queue_write(&queue);
+    (void)logger_storage_svc_queue_write(queue);
+    logger_upload_http_response_workspace_release(http_response);
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     result->attempted = true;
-    result->http_status = http_response.http_status;
+    result->http_status = http_response->http_status;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),
                        entry->status);
     logger_copy_string(result->failure_class, sizeof(result->failure_class),
                        entry->last_failure_class);
     snprintf(result->message, sizeof(result->message),
-             "server reply parse failed: %.104s", http_response.body);
+             "server reply parse failed: %.104s", http_response->body);
     logger_upload_append_failure_event(
         system_log, now_utc_or_null, "upload_failed",
         LOGGER_SYSTEM_LOG_SEVERITY_WARN, entry->session_id,
@@ -1333,19 +1513,24 @@ static bool logger_upload_process_selected(
   }
 
   result->attempted = true;
-  result->http_status = http_response.http_status;
-  if (http_response.http_status >= 200 && http_response.http_status < 300) {
-    if ((logger_string_present(reply.session_id) &&
-         strcmp(reply.session_id, entry->session_id) != 0) ||
-        (logger_string_present(reply.sha256) &&
-         strcmp(reply.sha256, entry->bundle_sha256) != 0) ||
-        (reply.size_bytes != 0u &&
-         reply.size_bytes != entry->bundle_size_bytes)) {
-      logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
+  result->http_status = http_response->http_status;
+  if (http_response->http_status >= 200 && http_response->http_status < 300) {
+    if ((logger_string_present(process_workspace->reply.session_id) &&
+         strcmp(process_workspace->reply.session_id, entry->session_id) !=
+             0) ||
+        (logger_string_present(process_workspace->reply.sha256) &&
+         strcmp(process_workspace->reply.sha256, entry->bundle_sha256) !=
+             0) ||
+        (process_workspace->reply.size_bytes != 0u &&
+         process_workspace->reply.size_bytes != entry->bundle_size_bytes)) {
+      logger_upload_queue_set_updated_at(queue, now_utc_or_null);
       logger_copy_string(entry->status, sizeof(entry->status), "failed");
       logger_copy_string(entry->last_failure_class,
                          sizeof(entry->last_failure_class), "hash_mismatch");
-      (void)logger_storage_svc_queue_write(&queue);
+      (void)logger_storage_svc_queue_write(queue);
+      logger_upload_http_response_workspace_release(http_response);
+      logger_upload_process_workspace_release(process_workspace);
+      logger_upload_queue_tmp_release(queue);
       result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
       logger_copy_string(result->final_status, sizeof(result->final_status),
                          entry->status);
@@ -1359,16 +1544,20 @@ static bool logger_upload_process_selected(
       return false;
     }
 
-    logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
+    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
     logger_copy_string(entry->status, sizeof(entry->status), "verified");
     entry->last_failure_class[0] = '\0';
     logger_copy_string(
         entry->verified_upload_utc, sizeof(entry->verified_upload_utc),
-        logger_string_present(reply.received_at_utc) ? reply.received_at_utc
-                                                     : now_utc_or_null);
+        logger_string_present(process_workspace->reply.received_at_utc)
+            ? process_workspace->reply.received_at_utc
+            : now_utc_or_null);
     logger_copy_string(entry->receipt_id, sizeof(entry->receipt_id),
-                       reply.receipt_id);
-    if (!logger_storage_svc_queue_write(&queue)) {
+                       process_workspace->reply.receipt_id);
+    if (!logger_storage_svc_queue_write(queue)) {
+      logger_upload_http_response_workspace_release(http_response);
+      logger_upload_process_workspace_release(process_workspace);
+      logger_upload_queue_tmp_release(queue);
       result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
       logger_copy_string(result->message, sizeof(result->message),
                          "upload succeeded but queue write failed");
@@ -1384,16 +1573,21 @@ static bool logger_upload_process_selected(
                        sizeof(result->verified_upload_utc),
                        entry->verified_upload_utc);
     snprintf(result->message, sizeof(result->message), "verified via %s",
-             reply.deduplicated ? "deduplicated ack" : "server ack");
+             process_workspace->reply.deduplicated ? "deduplicated ack"
+                                                   : "server ack");
     logger_upload_append_verified_event(system_log, now_utc_or_null,
                                         entry->session_id, entry->receipt_id,
-                                        reply.deduplicated);
+                                        process_workspace->reply.deduplicated);
+    logger_upload_http_response_workspace_release(http_response);
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     return true;
   }
 
   const char *failure_class =
-      logger_upload_failure_class_for_http(http_response.http_status, &reply);
-  logger_upload_queue_set_updated_at(&queue, now_utc_or_null);
+      logger_upload_failure_class_for_http(http_response->http_status,
+                                           &process_workspace->reply);
+  logger_upload_queue_set_updated_at(queue, now_utc_or_null);
   if (strcmp(failure_class, "min_firmware_rejected") == 0) {
     logger_copy_string(entry->status, sizeof(entry->status),
                        "blocked_min_firmware");
@@ -1406,15 +1600,15 @@ static bool logger_upload_process_selected(
                      sizeof(entry->last_failure_class), failure_class);
   entry->verified_upload_utc[0] = '\0';
   entry->receipt_id[0] = '\0';
-  (void)logger_storage_svc_queue_write(&queue);
+  (void)logger_storage_svc_queue_write(queue);
 
   logger_copy_string(result->final_status, sizeof(result->final_status),
                      entry->status);
   logger_copy_string(result->failure_class, sizeof(result->failure_class),
                      entry->last_failure_class);
   logger_copy_string(result->message, sizeof(result->message),
-                     logger_string_present(reply.error_message)
-                         ? reply.error_message
+                     logger_string_present(process_workspace->reply.error_message)
+                         ? process_workspace->reply.error_message
                          : "server rejected upload");
   logger_upload_append_failure_event(
       system_log, now_utc_or_null,
@@ -1425,6 +1619,9 @@ static bool logger_upload_process_selected(
       result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE
           ? "min_firmware_rejected"
           : "http_rejected");
+  logger_upload_http_response_workspace_release(http_response);
+  logger_upload_process_workspace_release(process_workspace);
+  logger_upload_queue_tmp_release(queue);
   return result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE;
 }
 

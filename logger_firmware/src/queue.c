@@ -1,13 +1,16 @@
 #include "logger/queue.h"
 #include "logger/civil_date.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "ff.h"
+#include "pico/stdlib.h"
 
 #include "logger/json.h"
 #include "logger/json_writer.h"
+#include "logger/psram_layout.h"
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
 #include "logger/util.h"
@@ -37,8 +40,8 @@ typedef struct {
 
 /* Scratch arena for JSON parsing — queue-load and manifest-scan paths
  * are mutually exclusive in the call graph, so they share via union.
- * Frees ~44 KB vs. separate static locals. */
-static union {
+ * PSRAM-backed to free ~70 KiB of SRAM. */
+typedef union {
   struct {
     char json[LOGGER_QUEUE_READ_MAX + 1u];
     jsmntok_t tokens[LOGGER_QUEUE_JSON_TOKEN_MAX];
@@ -47,15 +50,176 @@ static union {
     char json[LOGGER_MANIFEST_READ_MAX + 1u];
     jsmntok_t tokens[LOGGER_MANIFEST_JSON_TOKEN_MAX];
   } manifest;
-} queue_scratch;
+} queue_scratch_t;
+
+typedef struct {
+  logger_upload_queue_t queue;
+  bool in_use;
+} queue_tmp_workspace_t;
+
+typedef struct {
+  logger_upload_queue_t scanned;
+  logger_upload_queue_t previous;
+  logger_upload_queue_t merged;
+  bool previous_seen[LOGGER_UPLOAD_QUEUE_MAX_SESSIONS];
+  bool in_use;
+} queue_op_workspace_t;
+
+typedef struct {
+  char manifest_path[LOGGER_STORAGE_PATH_MAX];
+  char journal_path[LOGGER_STORAGE_PATH_MAX];
+  char live_path[LOGGER_STORAGE_PATH_MAX];
+  FILINFO info;
+  bool in_use;
+} queue_scan_workspace_t;
+
+typedef struct {
+  char dir_path[LOGGER_STORAGE_PATH_MAX];
+  char child_path[LOGGER_STORAGE_PATH_MAX];
+  DIR dir;
+  FILINFO info;
+  bool in_use;
+} queue_delete_workspace_t;
+
+#define LOGGER_QUEUE_SCRATCH_ADDR (PSRAM_QUEUE_REGION_BASE)
+
+#define LOGGER_QUEUE_PSRAM_WORKSPACE_BASE                                     \
+  (LOGGER_QUEUE_SCRATCH_ADDR + sizeof(queue_scratch_t))
+#define LOGGER_QUEUE_TMP_WORKSPACE_ADDR                                       \
+  (LOGGER_QUEUE_PSRAM_WORKSPACE_BASE)
+#define LOGGER_QUEUE_OP_WORKSPACE_ADDR                                        \
+  (LOGGER_QUEUE_TMP_WORKSPACE_ADDR + sizeof(queue_tmp_workspace_t))
+#define LOGGER_QUEUE_SCAN_WORKSPACE_ADDR                                      \
+  (LOGGER_QUEUE_OP_WORKSPACE_ADDR + sizeof(queue_op_workspace_t))
+#define LOGGER_QUEUE_DELETE_WORKSPACE_ADDR                                    \
+  (LOGGER_QUEUE_SCAN_WORKSPACE_ADDR + sizeof(queue_scan_workspace_t))
+#define LOGGER_QUEUE_PSRAM_WORKSPACE_END                                      \
+  (LOGGER_QUEUE_DELETE_WORKSPACE_ADDR + sizeof(queue_delete_workspace_t))
+
+_Static_assert(
+    LOGGER_QUEUE_PSRAM_WORKSPACE_END <=
+        PSRAM_QUEUE_REGION_BASE + PSRAM_QUEUE_REGION_SIZE,
+    "queue PSRAM workspace exceeds reserved queue region");
+
+static queue_scratch_t *g_queue_scratch;
+
+static queue_tmp_workspace_t *logger_queue_tmp_workspace_ptr(void) {
+  return (queue_tmp_workspace_t *)LOGGER_QUEUE_TMP_WORKSPACE_ADDR;
+}
+
+static queue_op_workspace_t *logger_queue_op_workspace_ptr(void) {
+  return (queue_op_workspace_t *)LOGGER_QUEUE_OP_WORKSPACE_ADDR;
+}
+
+static queue_scan_workspace_t *logger_queue_scan_workspace_ptr(void) {
+  return (queue_scan_workspace_t *)LOGGER_QUEUE_SCAN_WORKSPACE_ADDR;
+}
+
+static queue_delete_workspace_t *logger_queue_delete_workspace_ptr(void) {
+  return (queue_delete_workspace_t *)LOGGER_QUEUE_DELETE_WORKSPACE_ADDR;
+}
+
+/* Debug/contract tripwire for the shared core-0 temporary queue workspace.
+ * This is NOT a lock. Correctness comes from the ownership invariant:
+ * status/CLI/upload-control callers on core 0 may borrow it; core-1 storage
+ * worker code must never touch it. Any violation is a programmer error and
+ * must fail fast rather than silently serialize wrong-core access.
+ */
+static void logger_queue_tmp_assert_context(void) {
+  hard_assert(__get_current_exception() == 0u);
+  hard_assert(get_core_num() == 0u);
+}
+
+logger_upload_queue_t *logger_upload_queue_tmp_acquire(void) {
+  logger_queue_tmp_assert_context();
+  queue_tmp_workspace_t *workspace = logger_queue_tmp_workspace_ptr();
+  assert(!workspace->in_use);
+  workspace->in_use = true;
+  logger_upload_queue_init(&workspace->queue);
+  return &workspace->queue;
+}
+
+void logger_upload_queue_tmp_release(logger_upload_queue_t *queue) {
+  logger_queue_tmp_assert_context();
+  (void)queue;
+  queue_tmp_workspace_t *workspace = logger_queue_tmp_workspace_ptr();
+  assert(queue == &workspace->queue);
+  assert(workspace->in_use);
+  workspace->in_use = false;
+}
+
+static queue_op_workspace_t *logger_queue_op_workspace_acquire(void) {
+  queue_op_workspace_t *workspace = logger_queue_op_workspace_ptr();
+  assert(!workspace->in_use);
+  workspace->in_use = true;
+  logger_upload_queue_init(&workspace->scanned);
+  logger_upload_queue_init(&workspace->previous);
+  logger_upload_queue_init(&workspace->merged);
+  memset(workspace->previous_seen, 0, sizeof(workspace->previous_seen));
+  return workspace;
+}
+
+static void logger_queue_op_workspace_release(queue_op_workspace_t *workspace) {
+  (void)workspace;
+  queue_op_workspace_t *const expected = logger_queue_op_workspace_ptr();
+  assert(workspace == expected);
+  assert(expected->in_use);
+  expected->in_use = false;
+}
+
+static queue_scan_workspace_t *logger_queue_scan_workspace_acquire(void) {
+  queue_scan_workspace_t *workspace = logger_queue_scan_workspace_ptr();
+  assert(!workspace->in_use);
+  memset(workspace, 0, sizeof(*workspace));
+  workspace->in_use = true;
+  return workspace;
+}
+
+static void logger_queue_scan_workspace_release(
+    queue_scan_workspace_t *workspace) {
+  (void)workspace;
+  queue_scan_workspace_t *const expected = logger_queue_scan_workspace_ptr();
+  assert(workspace == expected);
+  assert(expected->in_use);
+  expected->in_use = false;
+}
+
+static queue_delete_workspace_t *logger_queue_delete_workspace_acquire(void) {
+  queue_delete_workspace_t *workspace = logger_queue_delete_workspace_ptr();
+  assert(!workspace->in_use);
+  memset(workspace, 0, sizeof(*workspace));
+  workspace->in_use = true;
+  return workspace;
+}
+
+static void logger_queue_delete_workspace_release(
+    queue_delete_workspace_t *workspace) {
+  (void)workspace;
+  queue_delete_workspace_t *const expected =
+      logger_queue_delete_workspace_ptr();
+  assert(workspace == expected);
+  assert(expected->in_use);
+  expected->in_use = false;
+}
+
+void logger_queue_scratch_init(void) {
+  g_queue_scratch = (queue_scratch_t *)LOGGER_QUEUE_SCRATCH_ADDR;
+  memset(g_queue_scratch, 0, sizeof(queue_scratch_t));
+  memset(logger_queue_tmp_workspace_ptr(), 0, sizeof(queue_tmp_workspace_t));
+  memset(logger_queue_op_workspace_ptr(), 0, sizeof(queue_op_workspace_t));
+  memset(logger_queue_scan_workspace_ptr(), 0, sizeof(queue_scan_workspace_t));
+  memset(logger_queue_delete_workspace_ptr(), 0,
+         sizeof(queue_delete_workspace_t));
+}
 
 static bool logger_parse_manifest_summary(const char *json,
                                           logger_manifest_summary_t *summary) {
+  assert(g_queue_scratch != NULL);
   memset(summary, 0, sizeof(*summary));
 
   logger_json_doc_t doc;
   if (!logger_json_parse(&doc, json, strlen(json),
-                         queue_scratch.manifest.tokens,
+                         g_queue_scratch->manifest.tokens,
                          LOGGER_MANIFEST_JSON_TOKEN_MAX)) {
     return false;
   }
@@ -420,63 +584,158 @@ static bool logger_remove_closed_session_dir(const char *dir_name) {
     return false;
   }
 
-  char dir_path[LOGGER_STORAGE_PATH_MAX];
-  if (!logger_path_join2(dir_path, sizeof(dir_path), LOGGER_SESSIONS_DIR "/",
-                         dir_name)) {
+  queue_delete_workspace_t *workspace = logger_queue_delete_workspace_acquire();
+
+  if (!logger_path_join2(workspace->dir_path, sizeof(workspace->dir_path),
+                         LOGGER_SESSIONS_DIR "/", dir_name)) {
+    logger_queue_delete_workspace_release(workspace);
     return false;
   }
 
-  DIR dir;
-  if (f_opendir(&dir, dir_path) != FR_OK) {
+  if (f_opendir(&workspace->dir, workspace->dir_path) != FR_OK) {
+    logger_queue_delete_workspace_release(workspace);
     return false;
   }
 
   bool ok = true;
   for (;;) {
-    FILINFO info;
-    memset(&info, 0, sizeof(info));
-    const FRESULT fr = f_readdir(&dir, &info);
+    memset(&workspace->info, 0, sizeof(workspace->info));
+    const FRESULT fr = f_readdir(&workspace->dir, &workspace->info);
     if (fr != FR_OK) {
       ok = false;
       break;
     }
-    if (info.fname[0] == '\0') {
+    if (workspace->info.fname[0] == '\0') {
       break;
     }
-    if (strcmp(info.fname, ".") == 0 || strcmp(info.fname, "..") == 0) {
+    if (strcmp(workspace->info.fname, ".") == 0 ||
+        strcmp(workspace->info.fname, "..") == 0) {
       continue;
     }
-    if ((info.fattrib & AM_DIR) != 0u) {
+    if ((workspace->info.fattrib & AM_DIR) != 0u) {
       ok = false;
       break;
     }
 
-    char child_path[LOGGER_STORAGE_PATH_MAX];
-    if (!logger_path_join3(child_path, sizeof(child_path), dir_path, "/",
-                           info.fname) ||
-        f_unlink(child_path) != FR_OK) {
+    if (!logger_path_join3(workspace->child_path,
+                           sizeof(workspace->child_path),
+                           workspace->dir_path, "/", workspace->info.fname) ||
+        f_unlink(workspace->child_path) != FR_OK) {
       ok = false;
       break;
     }
   }
-  (void)f_closedir(&dir);
+  (void)f_closedir(&workspace->dir);
   if (!ok) {
+    logger_queue_delete_workspace_release(workspace);
     return false;
   }
-  return f_unlink(dir_path) == FR_OK;
+  const bool removed = f_unlink(workspace->dir_path) == FR_OK;
+  logger_queue_delete_workspace_release(workspace);
+  return removed;
 }
 
-static bool logger_file_write_all(FIL *file, const void *data, size_t len) {
+static void __attribute__((noinline))
+logger_upload_queue_merge_scanned_entries(
+    logger_upload_queue_t *merged, const logger_upload_queue_t *scanned,
+    const logger_upload_queue_t *previous, bool loaded_previous,
+    bool *previous_seen, logger_system_log_t *system_log,
+    const char *updated_at_utc_or_null) {
+  for (size_t i = 0u; i < scanned->session_count; ++i) {
+    if (merged->session_count >= LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
+      break;
+    }
+
+    logger_upload_queue_entry_t *entry =
+        &merged->sessions[merged->session_count];
+    *entry = scanned->sessions[i];
+
+    if (loaded_previous) {
+      for (size_t j = 0u; j < previous->session_count; ++j) {
+        if (strcmp(previous->sessions[j].session_id, entry->session_id) == 0) {
+          previous_seen[j] = true;
+          if (logger_queue_entry_immutable_match(entry,
+                                                 &previous->sessions[j])) {
+            logger_queue_copy_mutable_fields(entry, &previous->sessions[j]);
+            if (strcmp(entry->status, "uploading") == 0) {
+              logger_copy_string(entry->status, sizeof(entry->status),
+                                 "failed");
+              logger_copy_string(entry->last_failure_class,
+                                 sizeof(entry->last_failure_class),
+                                 "interrupted");
+              logger_log_upload_interrupted(system_log, updated_at_utc_or_null,
+                                            entry);
+            }
+          } else {
+            logger_log_local_corrupt(system_log, updated_at_utc_or_null,
+                                     entry->dir_name,
+                                     "queue_entry_identity_changed");
+          }
+          break;
+        }
+      }
+    }
+
+    merged->session_count += 1u;
+  }
+}
+
+static void __attribute__((noinline))
+logger_upload_queue_log_unreconciled_previous(
+    const logger_upload_queue_t *previous, const bool *previous_seen,
+    logger_system_log_t *system_log, const char *updated_at_utc_or_null) {
+  for (size_t i = 0u; i < previous->session_count; ++i) {
+    if (previous_seen[i]) {
+      continue;
+    }
+    if (logger_queue_entry_dir_exists(&previous->sessions[i])) {
+      logger_log_local_corrupt(system_log, updated_at_utc_or_null,
+                               previous->sessions[i].dir_name,
+                               "queue_entry_unreconciled");
+    } else {
+      logger_log_queue_missing_local(system_log, updated_at_utc_or_null,
+                                     &previous->sessions[i]);
+    }
+  }
+}
+
+static bool logger_upload_queue_merge_scan_with_previous(
+    logger_upload_queue_t *merged, const logger_upload_queue_t *scanned,
+    logger_upload_queue_t *previous, bool *previous_seen,
+    logger_system_log_t *system_log, const char *updated_at_utc_or_null) {
+  const bool queue_file_present = logger_storage_file_exists(LOGGER_QUEUE_PATH);
+  const bool loaded_previous = logger_upload_queue_load(previous);
+  if (!loaded_previous && queue_file_present) {
+    logger_log_queue_rebuilt(system_log, updated_at_utc_or_null, "load_failed");
+  }
+
+  logger_copy_string(merged->updated_at_utc, sizeof(merged->updated_at_utc),
+                     updated_at_utc_or_null);
+  logger_upload_queue_merge_scanned_entries(
+      merged, scanned, previous, loaded_previous, previous_seen, system_log,
+      updated_at_utc_or_null);
+  if (loaded_previous) {
+    logger_upload_queue_log_unreconciled_previous(
+        previous, previous_seen, system_log, updated_at_utc_or_null);
+  }
+
+  logger_upload_queue_sort(merged);
+  return logger_upload_queue_write(merged);
+}
+
+static bool __attribute__((noinline))
+logger_file_write_all(FIL *file, const void *data, size_t len) {
   UINT written = 0u;
   return f_write(file, data, len, &written) == FR_OK && written == len;
 }
 
-static bool logger_file_write_cstr(FIL *file, const char *text) {
+static bool __attribute__((noinline)) logger_file_write_cstr(FIL *file,
+                                                             const char *text) {
   return logger_file_write_all(file, text, strlen(text));
 }
 
-static bool logger_file_write_json_string_or_null(FIL *file,
-                                                  const char *value) {
+static bool __attribute__((noinline))
+logger_file_write_json_string_or_null(FIL *file, const char *value) {
   char quoted[544];
   logger_json_string_literal(quoted, sizeof(quoted), value);
   return logger_file_write_cstr(file, quoted);
@@ -563,15 +822,16 @@ bool logger_upload_queue_load(logger_upload_queue_t *queue) {
   }
 
   size_t len = 0u;
-  if (!logger_storage_read_file(LOGGER_QUEUE_PATH, queue_scratch.load.json,
+  assert(g_queue_scratch != NULL);
+  if (!logger_storage_read_file(LOGGER_QUEUE_PATH, g_queue_scratch->load.json,
                                 LOGGER_QUEUE_READ_MAX, &len)) {
     return false;
   }
-  queue_scratch.load.json[len] = '\0';
+  g_queue_scratch->load.json[len] = '\0';
 
   logger_json_doc_t doc;
-  if (!logger_json_parse(&doc, queue_scratch.load.json, len,
-                         queue_scratch.load.tokens,
+  if (!logger_json_parse(&doc, g_queue_scratch->load.json, len,
+                         g_queue_scratch->load.tokens,
                          LOGGER_QUEUE_JSON_TOKEN_MAX)) {
     return false;
   }
@@ -624,11 +884,15 @@ bool logger_upload_queue_load(logger_upload_queue_t *queue) {
 bool logger_upload_queue_scan(logger_upload_queue_t *queue,
                               logger_system_log_t *system_log,
                               const char *updated_at_utc_or_null) {
+  assert(g_queue_scratch != NULL);
+  queue_scan_workspace_t *scan_workspace =
+      logger_queue_scan_workspace_acquire();
   logger_upload_queue_init(queue);
 
   logger_storage_status_t storage;
   (void)logger_storage_refresh(&storage);
   if (!storage.mounted) {
+    logger_queue_scan_workspace_release(scan_workspace);
     return false;
   }
 
@@ -637,66 +901,74 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
 
   DIR dir;
   if (f_opendir(&dir, LOGGER_SESSIONS_DIR) != FR_OK) {
+    logger_queue_scan_workspace_release(scan_workspace);
     return false;
   }
 
   for (;;) {
-    FILINFO info;
-    memset(&info, 0, sizeof(info));
-    const FRESULT fr = f_readdir(&dir, &info);
-    if (fr != FR_OK || info.fname[0] == '\0') {
+    memset(&scan_workspace->info, 0, sizeof(scan_workspace->info));
+    const FRESULT fr = f_readdir(&dir, &scan_workspace->info);
+    if (fr != FR_OK || scan_workspace->info.fname[0] == '\0') {
       break;
     }
-    if ((info.fattrib & AM_DIR) == 0u || strcmp(info.fname, ".") == 0 ||
-        strcmp(info.fname, "..") == 0) {
+    if ((scan_workspace->info.fattrib & AM_DIR) == 0u ||
+        strcmp(scan_workspace->info.fname, ".") == 0 ||
+        strcmp(scan_workspace->info.fname, "..") == 0) {
       continue;
     }
-    if (strstr(info.fname, ".tmp") != NULL) {
+    if (strstr(scan_workspace->info.fname, ".tmp") != NULL) {
       continue;
     }
 
-    char manifest_path[LOGGER_STORAGE_PATH_MAX];
-    char journal_path[LOGGER_STORAGE_PATH_MAX];
-    char live_path[LOGGER_STORAGE_PATH_MAX];
-    if (!logger_path_join3(manifest_path, sizeof(manifest_path),
-                           LOGGER_SESSIONS_DIR "/", info.fname,
+    if (!logger_path_join3(scan_workspace->manifest_path,
+                           sizeof(scan_workspace->manifest_path),
+                           LOGGER_SESSIONS_DIR "/",
+                           scan_workspace->info.fname,
                            "/manifest.json") ||
-        !logger_path_join3(journal_path, sizeof(journal_path),
-                           LOGGER_SESSIONS_DIR "/", info.fname,
+        !logger_path_join3(scan_workspace->journal_path,
+                           sizeof(scan_workspace->journal_path),
+                           LOGGER_SESSIONS_DIR "/",
+                           scan_workspace->info.fname,
                            "/journal.bin") ||
-        !logger_path_join3(live_path, sizeof(live_path),
-                           LOGGER_SESSIONS_DIR "/", info.fname, "/live.json")) {
-      logger_log_local_corrupt(system_log, updated_at_utc_or_null, info.fname,
-                               "path_too_long");
+        !logger_path_join3(scan_workspace->live_path,
+                           sizeof(scan_workspace->live_path),
+                           LOGGER_SESSIONS_DIR "/",
+                           scan_workspace->info.fname, "/live.json")) {
+      logger_log_local_corrupt(system_log, updated_at_utc_or_null,
+                               scan_workspace->info.fname, "path_too_long");
       continue;
     }
 
-    if (logger_storage_file_exists(live_path)) {
+    if (logger_storage_file_exists(scan_workspace->live_path)) {
       continue;
     }
-    if (!logger_storage_file_exists(manifest_path) ||
-        !logger_storage_file_exists(journal_path)) {
+    if (!logger_storage_file_exists(scan_workspace->manifest_path) ||
+        !logger_storage_file_exists(scan_workspace->journal_path)) {
       continue;
     }
     if (queue->session_count >= LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
-      logger_log_local_corrupt(system_log, updated_at_utc_or_null, info.fname,
+      logger_log_local_corrupt(system_log, updated_at_utc_or_null,
+                               scan_workspace->info.fname,
                                "queue_capacity_exhausted");
       break;
     }
 
     size_t manifest_len = 0u;
-    if (!logger_storage_read_file(manifest_path, queue_scratch.manifest.json,
+    if (!logger_storage_read_file(scan_workspace->manifest_path,
+                                  g_queue_scratch->manifest.json,
                                   LOGGER_MANIFEST_READ_MAX, &manifest_len)) {
-      logger_log_local_corrupt(system_log, updated_at_utc_or_null, info.fname,
+      logger_log_local_corrupt(system_log, updated_at_utc_or_null,
+                               scan_workspace->info.fname,
                                "manifest_read_failed");
       continue;
     }
-    queue_scratch.manifest.json[manifest_len] = '\0';
+    g_queue_scratch->manifest.json[manifest_len] = '\0';
 
     logger_manifest_summary_t manifest;
-    if (!logger_parse_manifest_summary(queue_scratch.manifest.json,
+    if (!logger_parse_manifest_summary(g_queue_scratch->manifest.json,
                                        &manifest)) {
-      logger_log_local_corrupt(system_log, updated_at_utc_or_null, info.fname,
+      logger_log_local_corrupt(system_log, updated_at_utc_or_null,
+                               scan_workspace->info.fname,
                                "manifest_parse_failed");
       continue;
     }
@@ -707,7 +979,8 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
                        manifest.session_id);
     logger_copy_string(entry->study_day_local, sizeof(entry->study_day_local),
                        manifest.study_day_local);
-    logger_copy_string(entry->dir_name, sizeof(entry->dir_name), info.fname);
+    logger_copy_string(entry->dir_name, sizeof(entry->dir_name),
+                       scan_workspace->info.fname);
     logger_copy_string(entry->session_start_utc,
                        sizeof(entry->session_start_utc),
                        manifest.session_start_utc);
@@ -716,10 +989,13 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
     entry->quarantined = manifest.quarantined;
     logger_copy_string(entry->status, sizeof(entry->status), "pending");
 
-    if (!logger_upload_bundle_compute(info.fname, manifest_path, journal_path,
+    if (!logger_upload_bundle_compute(scan_workspace->info.fname,
+                                      scan_workspace->manifest_path,
+                                      scan_workspace->journal_path,
                                       entry->bundle_sha256,
                                       &entry->bundle_size_bytes)) {
-      logger_log_local_corrupt(system_log, updated_at_utc_or_null, info.fname,
+      logger_log_local_corrupt(system_log, updated_at_utc_or_null,
+                               scan_workspace->info.fname,
                                "bundle_hash_failed");
       continue;
     }
@@ -728,6 +1004,7 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
   }
 
   (void)f_closedir(&dir);
+  logger_queue_scan_workspace_release(scan_workspace);
   logger_upload_queue_sort(queue);
   return true;
 }
@@ -822,16 +1099,24 @@ bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
 bool logger_upload_queue_rebuild_file(
     logger_system_log_t *system_log, const char *updated_at_utc_or_null,
     logger_upload_queue_summary_t *summary_out) {
-  logger_upload_queue_t rebuilt;
-  if (!logger_upload_queue_scan(&rebuilt, system_log, updated_at_utc_or_null)) {
+  queue_op_workspace_t *workspace = logger_queue_op_workspace_acquire();
+  logger_upload_queue_t *const scanned = &workspace->scanned;
+  logger_upload_queue_t *const previous = &workspace->previous;
+  logger_upload_queue_t *const rebuilt = &workspace->merged;
+  bool *const previous_seen = workspace->previous_seen;
+
+  if (!logger_upload_queue_scan(scanned, system_log, updated_at_utc_or_null)) {
+    logger_queue_op_workspace_release(workspace);
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
     }
     return false;
   }
 
-  logger_upload_queue_sort(&rebuilt);
-  if (!logger_upload_queue_write(&rebuilt)) {
+  if (!logger_upload_queue_merge_scan_with_previous(
+          rebuilt, scanned, previous, previous_seen, system_log,
+          updated_at_utc_or_null)) {
+    logger_queue_op_workspace_release(workspace);
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
     }
@@ -841,8 +1126,9 @@ bool logger_upload_queue_rebuild_file(
   logger_log_queue_rebuilt(system_log, updated_at_utc_or_null,
                            "manual_rebuild");
   if (summary_out != NULL) {
-    logger_upload_queue_compute_summary(&rebuilt, summary_out);
+    logger_upload_queue_compute_summary(rebuilt, summary_out);
   }
+  logger_queue_op_workspace_release(workspace);
   return true;
 }
 
@@ -854,8 +1140,11 @@ bool logger_upload_queue_requeue_blocked_file(
     *requeued_count_out = 0u;
   }
 
-  logger_upload_queue_t queue;
-  if (!logger_upload_queue_load(&queue)) {
+  queue_op_workspace_t *workspace = logger_queue_op_workspace_acquire();
+  logger_upload_queue_t *const queue = &workspace->scanned;
+
+  if (!logger_upload_queue_load(queue)) {
+    logger_queue_op_workspace_release(workspace);
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
     }
@@ -863,8 +1152,8 @@ bool logger_upload_queue_requeue_blocked_file(
   }
 
   size_t requeued_count = 0u;
-  for (size_t i = 0u; i < queue.session_count; ++i) {
-    logger_upload_queue_entry_t *entry = &queue.sessions[i];
+  for (size_t i = 0u; i < queue->session_count; ++i) {
+    logger_upload_queue_entry_t *entry = &queue->sessions[i];
     if (strcmp(entry->status, "blocked_min_firmware") != 0) {
       continue;
     }
@@ -876,10 +1165,11 @@ bool logger_upload_queue_requeue_blocked_file(
   }
 
   if (requeued_count > 0u) {
-    logger_copy_string(queue.updated_at_utc, sizeof(queue.updated_at_utc),
+    logger_copy_string(queue->updated_at_utc, sizeof(queue->updated_at_utc),
                        updated_at_utc_or_null);
-    logger_upload_queue_sort(&queue);
-    if (!logger_upload_queue_write(&queue)) {
+    logger_upload_queue_sort(queue);
+    if (!logger_upload_queue_write(queue)) {
+      logger_queue_op_workspace_release(workspace);
       if (summary_out != NULL) {
         logger_upload_queue_summary_init(summary_out);
       }
@@ -895,8 +1185,9 @@ bool logger_upload_queue_requeue_blocked_file(
     *requeued_count_out = requeued_count;
   }
   if (summary_out != NULL) {
-    logger_upload_queue_compute_summary(&queue, summary_out);
+    logger_upload_queue_compute_summary(queue, summary_out);
   }
+  logger_queue_op_workspace_release(workspace);
   return true;
 }
 
@@ -924,8 +1215,11 @@ bool logger_upload_queue_prune_file(
     return false;
   }
 
-  logger_upload_queue_t queue;
-  if (!logger_upload_queue_load(&queue)) {
+  queue_op_workspace_t *workspace = logger_queue_op_workspace_acquire();
+  logger_upload_queue_t *const queue = &workspace->scanned;
+
+  if (!logger_upload_queue_load(queue)) {
+    logger_queue_op_workspace_release(workspace);
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
     }
@@ -936,15 +1230,16 @@ bool logger_upload_queue_prune_file(
   size_t reserve_pruned_count = 0u;
   bool changed = false;
 
-  for (size_t i = 0u; i < queue.session_count;) {
-    if (!logger_queue_entry_retention_expired(&queue.sessions[i],
+  for (size_t i = 0u; i < queue->session_count;) {
+    if (!logger_queue_entry_retention_expired(&queue->sessions[i],
                                               updated_at_utc_or_null)) {
       ++i;
       continue;
     }
 
-    logger_upload_queue_entry_t pruned = queue.sessions[i];
+    logger_upload_queue_entry_t pruned = queue->sessions[i];
     if (!logger_remove_closed_session_dir(pruned.dir_name)) {
+      logger_queue_op_workspace_release(workspace);
       if (summary_out != NULL) {
         logger_upload_queue_summary_init(summary_out);
       }
@@ -952,12 +1247,13 @@ bool logger_upload_queue_prune_file(
     }
     logger_log_session_pruned(system_log, updated_at_utc_or_null, &pruned,
                               "retention_expired");
-    logger_upload_queue_remove_at(&queue, i);
+    logger_upload_queue_remove_at(queue, i);
     retention_pruned_count += 1u;
     changed = true;
   }
 
   if (!logger_storage_refresh(&storage)) {
+    logger_queue_op_workspace_release(workspace);
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
     }
@@ -966,14 +1262,15 @@ bool logger_upload_queue_prune_file(
 
   while (storage.free_bytes < reserve_bytes) {
     const int oldest_verified_index =
-        logger_upload_queue_find_oldest_verified(&queue);
+        logger_upload_queue_find_oldest_verified(queue);
     if (oldest_verified_index < 0) {
       break;
     }
 
     const size_t index = (size_t)oldest_verified_index;
-    logger_upload_queue_entry_t pruned = queue.sessions[index];
+    logger_upload_queue_entry_t pruned = queue->sessions[index];
     if (!logger_remove_closed_session_dir(pruned.dir_name)) {
+      logger_queue_op_workspace_release(workspace);
       if (summary_out != NULL) {
         logger_upload_queue_summary_init(summary_out);
       }
@@ -981,11 +1278,12 @@ bool logger_upload_queue_prune_file(
     }
     logger_log_session_pruned(system_log, updated_at_utc_or_null, &pruned,
                               "reserve_protection");
-    logger_upload_queue_remove_at(&queue, index);
+    logger_upload_queue_remove_at(queue, index);
     reserve_pruned_count += 1u;
     changed = true;
 
     if (!logger_storage_refresh(&storage)) {
+      logger_queue_op_workspace_release(workspace);
       if (summary_out != NULL) {
         logger_upload_queue_summary_init(summary_out);
       }
@@ -994,10 +1292,11 @@ bool logger_upload_queue_prune_file(
   }
 
   if (changed) {
-    logger_copy_string(queue.updated_at_utc, sizeof(queue.updated_at_utc),
+    logger_copy_string(queue->updated_at_utc, sizeof(queue->updated_at_utc),
                        updated_at_utc_or_null);
-    logger_upload_queue_sort(&queue);
-    if (!logger_upload_queue_write(&queue)) {
+    logger_upload_queue_sort(queue);
+    if (!logger_upload_queue_write(queue)) {
+      logger_queue_op_workspace_release(workspace);
       if (summary_out != NULL) {
         logger_upload_queue_summary_init(summary_out);
       }
@@ -1015,88 +1314,35 @@ bool logger_upload_queue_prune_file(
     *reserve_met_out = storage.free_bytes >= reserve_bytes;
   }
   if (summary_out != NULL) {
-    logger_upload_queue_compute_summary(&queue, summary_out);
+    logger_upload_queue_compute_summary(queue, summary_out);
   }
+  logger_queue_op_workspace_release(workspace);
   return true;
 }
 
 bool logger_upload_queue_refresh_file(
     logger_system_log_t *system_log, const char *updated_at_utc_or_null,
     logger_upload_queue_summary_t *summary_out) {
-  logger_upload_queue_t scanned;
-  if (!logger_upload_queue_scan(&scanned, system_log, updated_at_utc_or_null)) {
+  queue_op_workspace_t *workspace = logger_queue_op_workspace_acquire();
+  logger_upload_queue_t *const scanned = &workspace->scanned;
+  logger_upload_queue_t *const previous = &workspace->previous;
+  logger_upload_queue_t *const merged = &workspace->merged;
+  bool *const previous_seen = workspace->previous_seen;
+
+  if (!logger_upload_queue_scan(scanned, system_log, updated_at_utc_or_null)) {
+    logger_queue_op_workspace_release(workspace);
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
     }
     return false;
   }
 
-  logger_upload_queue_t previous;
-  logger_upload_queue_init(&previous);
-  const bool queue_file_present = logger_storage_file_exists(LOGGER_QUEUE_PATH);
-  const bool loaded_previous = logger_upload_queue_load(&previous);
-  if (!loaded_previous && queue_file_present) {
-    logger_log_queue_rebuilt(system_log, updated_at_utc_or_null, "load_failed");
-  }
-
-  logger_upload_queue_t merged;
-  logger_upload_queue_init(&merged);
-  logger_copy_string(merged.updated_at_utc, sizeof(merged.updated_at_utc),
-                     updated_at_utc_or_null);
-
-  bool previous_seen[LOGGER_UPLOAD_QUEUE_MAX_SESSIONS];
-  memset(previous_seen, 0, sizeof(previous_seen));
-
-  for (size_t i = 0u; i < scanned.session_count; ++i) {
-    logger_upload_queue_entry_t entry = scanned.sessions[i];
-    if (loaded_previous) {
-      for (size_t j = 0u; j < previous.session_count; ++j) {
-        if (strcmp(previous.sessions[j].session_id, entry.session_id) == 0) {
-          previous_seen[j] = true;
-          if (logger_queue_entry_immutable_match(&entry,
-                                                 &previous.sessions[j])) {
-            logger_queue_copy_mutable_fields(&entry, &previous.sessions[j]);
-            if (strcmp(entry.status, "uploading") == 0) {
-              logger_copy_string(entry.status, sizeof(entry.status), "failed");
-              logger_copy_string(entry.last_failure_class,
-                                 sizeof(entry.last_failure_class),
-                                 "interrupted");
-              logger_log_upload_interrupted(system_log, updated_at_utc_or_null,
-                                            &entry);
-            }
-          } else {
-            logger_log_local_corrupt(system_log, updated_at_utc_or_null,
-                                     entry.dir_name,
-                                     "queue_entry_identity_changed");
-          }
-          break;
-        }
-      }
-    }
-    if (merged.session_count < LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
-      merged.sessions[merged.session_count++] = entry;
-    }
-  }
-
-  if (loaded_previous) {
-    for (size_t i = 0u; i < previous.session_count; ++i) {
-      if (previous_seen[i]) {
-        continue;
-      }
-      if (logger_queue_entry_dir_exists(&previous.sessions[i])) {
-        logger_log_local_corrupt(system_log, updated_at_utc_or_null,
-                                 previous.sessions[i].dir_name,
-                                 "queue_entry_unreconciled");
-      } else {
-        logger_log_queue_missing_local(system_log, updated_at_utc_or_null,
-                                       &previous.sessions[i]);
-      }
-    }
-  }
-
-  logger_upload_queue_sort(&merged);
+  const bool ok = logger_upload_queue_merge_scan_with_previous(
+      merged, scanned, previous, previous_seen, system_log,
+      updated_at_utc_or_null);
   if (summary_out != NULL) {
-    logger_upload_queue_compute_summary(&merged, summary_out);
+    logger_upload_queue_compute_summary(merged, summary_out);
   }
-  return logger_upload_queue_write(&merged);
+  logger_queue_op_workspace_release(workspace);
+  return ok;
 }

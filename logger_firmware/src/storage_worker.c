@@ -12,6 +12,13 @@
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
 
+static bool g_storage_worker_owns_fatfs;
+
+bool logger_storage_worker_owns_fatfs(void) {
+  __mem_fence_acquire();
+  return g_storage_worker_owns_fatfs;
+}
+
 /* The FIFO mailbox passes a pointer as a uint32_t word.
  * Safe on RP2350 (32-bit address space).  Static assert so the
  * build catches any future port to a 64-bit target. */
@@ -212,6 +219,20 @@ static bool storage_worker_init_flash_safety(void) {
   return true;
 }
 
+static void storage_worker_idle_wait_poll(capture_pipe_t *pipe,
+                                         uint32_t max_wait_us) {
+  if (pipe == NULL || max_wait_us == 0u) {
+    return;
+  }
+
+  const uint64_t deadline = time_us_64() + (uint64_t)max_wait_us;
+  while (capture_cmd_ring_occupancy(pipe) == 0u && time_us_64() < deadline) {
+    /* Safe on core 1: no default alarm-pool dependency, no FIFO side effects,
+     * bounded latency to notice newly enqueued work. */
+    busy_wait_us_32(1000u);
+  }
+}
+
 /*
  * Drain all available commands from the pipe and execute them.
  *
@@ -399,11 +420,14 @@ static void logger_storage_worker_entry(void) {
     if (capture_cmd_ring_occupancy(shared->pipe) == 0u) {
       shared->stats.idle_iterations += 1u;
       /*
-       * Timed wait: wake on __sev() from core 0 (fast path) or
-       * after 100 ms (safety net).  The timeout protects against
-       * future regressions where a path enqueues without __sev().
+       * Bounded core-1 idle wait without using the default alarm pool.
+       *
+       * core 0 still issues __sev() after enqueueing work, but we do not rely
+       * on WFE + alarm-pool wakeups here because that path proved fragile on
+       * the worker core.  Polling at 1 ms keeps wake latency low enough for
+       * command dispatch while remaining simple and robust.
        */
-      best_effort_wfe_or_timeout(make_timeout_time_ms(100));
+      storage_worker_idle_wait_poll(shared->pipe, 100000u);
       shared->stats.wakeups += 1u;
     }
   }
@@ -414,6 +438,7 @@ static void logger_storage_worker_entry(void) {
 void logger_storage_worker_init(storage_worker_shared_t *shared,
                                 capture_pipe_t *pipe,
                                 logger_session_context_t *session_ctx) {
+  g_storage_worker_owns_fatfs = false;
   memset(shared, 0, sizeof(*shared));
   shared->pipe = pipe;
   shared->session_ctx = session_ctx;
@@ -488,5 +513,8 @@ bool logger_storage_worker_launch(storage_worker_shared_t *shared) {
   printf("[storage_worker] core 0 flash-safe init done\n");
 
   shared->stats.ready = true;
+  __mem_fence_release();
+  g_storage_worker_owns_fatfs = true;
+  __mem_fence_release();
   return true;
 }

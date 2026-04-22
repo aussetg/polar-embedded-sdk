@@ -27,6 +27,40 @@
 static bool logger_service_cli_is_unlocked(const logger_service_cli_t *cli,
                                            uint32_t now_ms);
 
+static logger_persisted_state_t g_service_cli_imported_state;
+static uint8_t
+    g_service_cli_anchor_der_buf[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX];
+static char
+    g_service_cli_anchor_der_base64_buf[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX +
+                                        1u];
+static char
+    g_service_cli_config_change_details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1u];
+
+typedef struct {
+  char imported_bound_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
+  char normalized_bound_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
+  char rollover_local[16];
+  char upload_start_local[16];
+  char upload_end_local[16];
+  char allowed_ssid[LOGGER_CONFIG_WIFI_SSID_MAX];
+  char network_ssid[LOGGER_CONFIG_WIFI_SSID_MAX];
+  char network_psk[LOGGER_CONFIG_WIFI_PSK_MAX];
+  char upload_url[LOGGER_CONFIG_UPLOAD_URL_MAX];
+  char auth_type[24];
+  char auth_api_key[LOGGER_CONFIG_UPLOAD_API_KEY_MAX];
+  char auth_token[LOGGER_CONFIG_UPLOAD_TOKEN_MAX];
+  char anchor_format[32];
+  char anchor_der_base64[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX + 1u];
+  char anchor_subject[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SUBJECT_MAX];
+  char anchor_sha256_hex[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u];
+  char anchor_expected_sha256
+      [LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u];
+  char anchor_expected_subject[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SUBJECT_MAX];
+} logger_service_cli_config_import_workspace_t;
+
+static logger_service_cli_config_import_workspace_t
+    g_service_cli_config_import_workspace;
+
 static bool logger_parse_u8(const char *text, uint8_t *value_out) {
   if (text == NULL || value_out == NULL || text[0] == '\0') {
     return false;
@@ -204,27 +238,32 @@ static bool logger_extract_ca_subject(const uint8_t *der, size_t der_len,
 static bool logger_parse_config_import_provisioned_anchor(
     const logger_json_doc_t *doc, const jsmntok_t *anchor_tok,
     logger_config_t *config_out, const char **error_message_out) {
+  logger_service_cli_config_import_workspace_t *const workspace =
+      &g_service_cli_config_import_workspace;
+
   if (anchor_tok == NULL || anchor_tok->type != JSMN_OBJECT) {
     *error_message_out = "config import upload.tls.anchor is invalid";
     return false;
   }
 
-  char anchor_format[32] = {0};
-  if (!logger_json_object_copy_string(doc, anchor_tok, "format", anchor_format,
-                                      sizeof(anchor_format))) {
+  workspace->anchor_format[0] = '\0';
+  if (!logger_json_object_copy_string(doc, anchor_tok, "format",
+                                      workspace->anchor_format,
+                                      sizeof(workspace->anchor_format))) {
     *error_message_out = "config import upload.tls.anchor.format is invalid";
     return false;
   }
-  if (strcmp(anchor_format, LOGGER_UPLOAD_TLS_ANCHOR_FORMAT_X509_DER_BASE64) !=
-      0) {
+  if (strcmp(workspace->anchor_format,
+             LOGGER_UPLOAD_TLS_ANCHOR_FORMAT_X509_DER_BASE64) != 0) {
     *error_message_out =
         "config import upload.tls.anchor.format is unsupported";
     return false;
   }
 
-  static char der_base64[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX + 1u];
-  if (!logger_json_object_copy_string(doc, anchor_tok, "der_base64", der_base64,
-                                      sizeof(der_base64))) {
+  workspace->anchor_der_base64[0] = '\0';
+  if (!logger_json_object_copy_string(doc, anchor_tok, "der_base64",
+                                      workspace->anchor_der_base64,
+                                      sizeof(workspace->anchor_der_base64))) {
     *error_message_out =
         "config import upload.tls.anchor.der_base64 is invalid";
     return false;
@@ -232,8 +271,8 @@ static bool logger_parse_config_import_provisioned_anchor(
 
   size_t der_len = 0u;
   int rc = mbedtls_base64_decode(NULL, 0u, &der_len,
-                                 (const unsigned char *)der_base64,
-                                 strlen(der_base64));
+                                 (const unsigned char *)workspace->anchor_der_base64,
+                                 strlen(workspace->anchor_der_base64));
   if (!(rc == 0 || rc == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) ||
       der_len == 0u || der_len > LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX) {
     *error_message_out = "config import upload.tls.anchor.der_base64 does not "
@@ -241,63 +280,68 @@ static bool logger_parse_config_import_provisioned_anchor(
     return false;
   }
 
-  uint8_t der_buf[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX];
-  rc = mbedtls_base64_decode(der_buf, sizeof(der_buf), &der_len,
-                             (const unsigned char *)der_base64,
-                             strlen(der_base64));
+  rc = mbedtls_base64_decode(g_service_cli_anchor_der_buf,
+                             sizeof(g_service_cli_anchor_der_buf), &der_len,
+                             (const unsigned char *)workspace->anchor_der_base64,
+                             strlen(workspace->anchor_der_base64));
   if (rc != 0 || der_len == 0u) {
     *error_message_out =
         "config import upload.tls.anchor.der_base64 is invalid";
     return false;
   }
 
-  char subject[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SUBJECT_MAX] = {0};
-  if (!logger_extract_ca_subject(der_buf, der_len, subject, sizeof(subject))) {
+  workspace->anchor_subject[0] = '\0';
+  if (!logger_extract_ca_subject(g_service_cli_anchor_der_buf, der_len,
+                                 workspace->anchor_subject,
+                                 sizeof(workspace->anchor_subject))) {
     *error_message_out =
         "config import upload.tls.anchor must be a valid CA certificate";
     return false;
   }
 
-  char sha256_hex[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u] = {0};
-  if (!logger_compute_sha256_hex(der_buf, der_len, sha256_hex)) {
+  workspace->anchor_sha256_hex[0] = '\0';
+  if (!logger_compute_sha256_hex(g_service_cli_anchor_der_buf, der_len,
+                                 workspace->anchor_sha256_hex)) {
     *error_message_out =
         "config import upload.tls.anchor SHA-256 computation failed";
     return false;
   }
 
-  char expected_sha256[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u] = {
-      0};
+  workspace->anchor_expected_sha256[0] = '\0';
   if (logger_json_object_has_key(doc, anchor_tok, "sha256") &&
       !logger_json_object_copy_string_or_null(doc, anchor_tok, "sha256",
-                                              expected_sha256,
-                                              sizeof(expected_sha256))) {
+                                              workspace->anchor_expected_sha256,
+                                              sizeof(workspace->anchor_expected_sha256))) {
     *error_message_out = "config import upload.tls.anchor.sha256 is invalid";
     return false;
   }
-  if (logger_string_present(expected_sha256) &&
-      strcmp(expected_sha256, sha256_hex) != 0) {
+  if (logger_string_present(workspace->anchor_expected_sha256) &&
+      strcmp(workspace->anchor_expected_sha256,
+             workspace->anchor_sha256_hex) != 0) {
     *error_message_out =
         "config import upload.tls.anchor.sha256 does not match der_base64";
     return false;
   }
 
-  char expected_subject[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SUBJECT_MAX] = {0};
+  workspace->anchor_expected_subject[0] = '\0';
   if (logger_json_object_has_key(doc, anchor_tok, "subject") &&
       !logger_json_object_copy_string_or_null(doc, anchor_tok, "subject",
-                                              expected_subject,
-                                              sizeof(expected_subject))) {
+                                              workspace->anchor_expected_subject,
+                                              sizeof(workspace->anchor_expected_subject))) {
     *error_message_out = "config import upload.tls.anchor.subject is invalid";
     return false;
   }
-  if (logger_string_present(expected_subject) &&
-      strcmp(expected_subject, subject) != 0) {
+  if (logger_string_present(workspace->anchor_expected_subject) &&
+      strcmp(workspace->anchor_expected_subject,
+             workspace->anchor_subject) != 0) {
     *error_message_out =
         "config import upload.tls.anchor.subject does not match der_base64";
     return false;
   }
 
   if (!logger_config_set_provisioned_anchor_in_memory(
-          config_out, der_buf, der_len, sha256_hex, subject)) {
+          config_out, g_service_cli_anchor_der_buf, der_len,
+          workspace->anchor_sha256_hex, workspace->anchor_subject)) {
     *error_message_out = "config import upload.tls.anchor could not be stored";
     return false;
   }
@@ -423,8 +467,11 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
                                     logger_persisted_state_t *state_out,
                                     bool *bond_cleared_out,
                                     const char **error_message_out) {
+  logger_service_cli_config_import_workspace_t *const workspace =
+      &g_service_cli_config_import_workspace;
   static jsmntok_t tokens[LOGGER_CONFIG_IMPORT_JSON_TOKEN_MAX];
   logger_json_doc_t doc;
+  memset(workspace, 0, sizeof(*workspace));
   if (!logger_json_parse(&doc, json, strlen(json), tokens,
                          LOGGER_CONFIG_IMPORT_JSON_TOKEN_MAX)) {
     *error_message_out = "config import JSON parse failed";
@@ -486,67 +533,70 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     return false;
   }
 
-  logger_persisted_state_t imported = app->persisted;
-  logger_config_init(&imported.config);
+  *state_out = app->persisted;
+  logger_config_init(&state_out->config);
 
   if (!logger_json_object_copy_string_or_empty_required(
-          &doc, identity_tok, "logger_id", imported.config.logger_id,
-          sizeof(imported.config.logger_id)) ||
+          &doc, identity_tok, "logger_id", state_out->config.logger_id,
+          sizeof(state_out->config.logger_id)) ||
       !logger_json_object_copy_string_or_empty_required(
-          &doc, identity_tok, "subject_id", imported.config.subject_id,
-          sizeof(imported.config.subject_id))) {
+          &doc, identity_tok, "subject_id", state_out->config.subject_id,
+          sizeof(state_out->config.subject_id))) {
     *error_message_out = "config import identity section is invalid";
     return false;
   }
 
-  char imported_bound_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX] = {0};
   if (!logger_json_object_copy_string_or_empty_required(
-          &doc, recording_tok, "bound_h10_address", imported_bound_address,
-          sizeof(imported_bound_address))) {
+          &doc, recording_tok, "bound_h10_address",
+          workspace->imported_bound_address,
+          sizeof(workspace->imported_bound_address))) {
     *error_message_out = "config import recording.bound_h10_address is invalid";
     return false;
   }
-  if (logger_string_present(imported_bound_address)) {
-    char normalized_bound_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
-    if (!logger_normalize_h10_address_local(imported_bound_address,
-                                            normalized_bound_address)) {
+  if (logger_string_present(workspace->imported_bound_address)) {
+    if (!logger_normalize_h10_address_local(
+            workspace->imported_bound_address,
+            workspace->normalized_bound_address)) {
       *error_message_out =
           "config import recording.bound_h10_address is invalid";
       return false;
     }
-    logger_copy_string(imported.config.bound_h10_address,
-                       sizeof(imported.config.bound_h10_address),
-                       normalized_bound_address);
+    logger_copy_string(state_out->config.bound_h10_address,
+                       sizeof(state_out->config.bound_h10_address),
+                       workspace->normalized_bound_address);
   } else {
-    imported.config.bound_h10_address[0] = '\0';
+    state_out->config.bound_h10_address[0] = '\0';
   }
 
-  char rollover_local[16];
-  char upload_start_local[16];
-  char upload_end_local[16];
   if (!logger_json_object_copy_string(&doc, recording_tok,
                                       "study_day_rollover_local",
-                                      rollover_local, sizeof(rollover_local)) ||
+                                      workspace->rollover_local,
+                                      sizeof(workspace->rollover_local)) ||
       !logger_json_object_copy_string(
           &doc, recording_tok, "overnight_upload_window_start_local",
-          upload_start_local, sizeof(upload_start_local)) ||
+          workspace->upload_start_local,
+          sizeof(workspace->upload_start_local)) ||
       !logger_json_object_copy_string(
           &doc, recording_tok, "overnight_upload_window_end_local",
-          upload_end_local, sizeof(upload_end_local))) {
+          workspace->upload_end_local,
+          sizeof(workspace->upload_end_local))) {
     *error_message_out = "config import recording policy fields are invalid";
     return false;
   }
-  if (!logger_validate_fixed_policy_string(rollover_local, "04:00:00") ||
-      !logger_validate_fixed_policy_string(upload_start_local, "22:00:00") ||
-      !logger_validate_fixed_policy_string(upload_end_local, "06:00:00")) {
+  if (!logger_validate_fixed_policy_string(workspace->rollover_local,
+                                           "04:00:00") ||
+      !logger_validate_fixed_policy_string(workspace->upload_start_local,
+                                           "22:00:00") ||
+      !logger_validate_fixed_policy_string(workspace->upload_end_local,
+                                           "06:00:00")) {
     *error_message_out = "config import contains unsupported non-default "
                          "recording policy values";
     return false;
   }
 
   if (!logger_json_object_copy_string_or_empty_required(
-          &doc, time_tok, "timezone", imported.config.timezone,
-          sizeof(imported.config.timezone))) {
+          &doc, time_tok, "timezone", state_out->config.timezone,
+          sizeof(state_out->config.timezone))) {
     *error_message_out = "config import time.timezone is invalid";
     return false;
   }
@@ -584,24 +634,23 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     return false;
   }
 
-  char allowed_ssid[LOGGER_CONFIG_WIFI_SSID_MAX] = {0};
   if (!logger_json_array_copy_single_string(
-          &doc, allowed_ssids_tok, allowed_ssid, sizeof(allowed_ssid)) ||
+          &doc, allowed_ssids_tok, workspace->allowed_ssid,
+          sizeof(workspace->allowed_ssid)) ||
       networks_tok->size > 1) {
     *error_message_out =
         "config import currently supports at most one Wi-Fi network";
     return false;
   }
 
-  char network_ssid[LOGGER_CONFIG_WIFI_SSID_MAX] = {0};
-  char network_psk[LOGGER_CONFIG_WIFI_PSK_MAX] = {0};
   bool network_psk_present_marker = false;
   if (networks_tok->size == 1) {
     const jsmntok_t *network_tok =
         logger_json_array_get(&doc, networks_tok, 0u);
     if (network_tok == NULL || network_tok->type != JSMN_OBJECT ||
-        !logger_json_object_copy_string(&doc, network_tok, "ssid", network_ssid,
-                                        sizeof(network_ssid))) {
+        !logger_json_object_copy_string(&doc, network_tok, "ssid",
+                                        workspace->network_ssid,
+                                        sizeof(workspace->network_ssid))) {
       *error_message_out = "config import wifi.networks[0].ssid is invalid";
       return false;
     }
@@ -625,7 +674,8 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     }
     if (logger_json_object_has_key(&doc, network_tok, "psk") &&
         !logger_json_object_copy_string_or_empty_required(
-            &doc, network_tok, "psk", network_psk, sizeof(network_psk))) {
+            &doc, network_tok, "psk", workspace->network_psk,
+            sizeof(workspace->network_psk))) {
       *error_message_out = "config import wifi.networks[0].psk is invalid";
       return false;
     }
@@ -639,21 +689,23 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     (void)network_psk_present_marker;
   }
 
-  if ((logger_string_present(allowed_ssid) ||
-       logger_string_present(network_ssid)) &&
-      strcmp(allowed_ssid, network_ssid) != 0) {
+  if ((logger_string_present(workspace->allowed_ssid) ||
+       logger_string_present(workspace->network_ssid)) &&
+      strcmp(workspace->allowed_ssid, workspace->network_ssid) != 0) {
     *error_message_out = "config import requires allowed_ssids[0] to match "
                          "wifi.networks[0].ssid";
     return false;
   }
-  if (logger_string_present(network_ssid)) {
-    logger_copy_string(imported.config.wifi_ssid,
-                       sizeof(imported.config.wifi_ssid), network_ssid);
+  if (logger_string_present(workspace->network_ssid)) {
+    logger_copy_string(state_out->config.wifi_ssid,
+                       sizeof(state_out->config.wifi_ssid),
+                       workspace->network_ssid);
     if (secrets_included) {
-      logger_copy_string(imported.config.wifi_psk,
-                         sizeof(imported.config.wifi_psk), network_psk);
+      logger_copy_string(state_out->config.wifi_psk,
+                         sizeof(state_out->config.wifi_psk),
+                         workspace->network_psk);
     } else {
-      imported.config.wifi_psk[0] = '\0';
+      state_out->config.wifi_psk[0] = '\0';
     }
   }
 
@@ -664,9 +716,9 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     return false;
   }
 
-  char upload_url[LOGGER_CONFIG_UPLOAD_URL_MAX] = {0};
   if (!logger_json_object_copy_string_or_empty_required(
-          &doc, upload_tok, "url", upload_url, sizeof(upload_url))) {
+          &doc, upload_tok, "url", workspace->upload_url,
+          sizeof(workspace->upload_url))) {
     *error_message_out = "config import upload.url is invalid";
     return false;
   }
@@ -676,31 +728,31 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     return false;
   }
 
-  char auth_type[24];
-  char auth_api_key[LOGGER_CONFIG_UPLOAD_API_KEY_MAX] = {0};
-  char auth_token[LOGGER_CONFIG_UPLOAD_TOKEN_MAX] = {0};
   bool api_key_present_marker = false;
   bool token_present_marker = false;
-  if (!logger_json_object_copy_string(&doc, auth_tok, "type", auth_type,
-                                      sizeof(auth_type))) {
+  if (!logger_json_object_copy_string(&doc, auth_tok, "type",
+                                      workspace->auth_type,
+                                      sizeof(workspace->auth_type))) {
     *error_message_out = "config import upload.auth.type is invalid";
     return false;
   }
-  if (strcmp(auth_type, "none") != 0 &&
-      strcmp(auth_type, "api_key_and_bearer") != 0) {
+  if (strcmp(workspace->auth_type, "none") != 0 &&
+      strcmp(workspace->auth_type, "api_key_and_bearer") != 0) {
     *error_message_out =
         "config import upload.auth.type must be none or api_key_and_bearer";
     return false;
   }
   if (logger_json_object_has_key(&doc, auth_tok, "api_key") &&
       !logger_json_object_copy_string_or_empty_required(
-          &doc, auth_tok, "api_key", auth_api_key, sizeof(auth_api_key))) {
+          &doc, auth_tok, "api_key", workspace->auth_api_key,
+          sizeof(workspace->auth_api_key))) {
     *error_message_out = "config import upload.auth.api_key is invalid";
     return false;
   }
   if (logger_json_object_has_key(&doc, auth_tok, "token") &&
       !logger_json_object_copy_string_or_empty_required(
-          &doc, auth_tok, "token", auth_token, sizeof(auth_token))) {
+          &doc, auth_tok, "token", workspace->auth_token,
+          sizeof(workspace->auth_token))) {
     *error_message_out = "config import upload.auth.token is invalid";
     return false;
   }
@@ -720,35 +772,38 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
   (void)token_present_marker;
 
   if (upload_enabled) {
-    if (!logger_upload_url_supported(upload_url)) {
+    if (!logger_upload_url_supported(workspace->upload_url)) {
       *error_message_out = "config import requires upload.url to be an "
                            "absolute http:// or https:// URL";
       return false;
     }
-    logger_copy_string(imported.config.upload_url,
-                       sizeof(imported.config.upload_url), upload_url);
+    logger_copy_string(state_out->config.upload_url,
+                       sizeof(state_out->config.upload_url),
+                       workspace->upload_url);
     if (!logger_parse_config_import_upload_tls(&doc, upload_tok, upload_enabled,
-                                               upload_url, &imported.config,
+                                               workspace->upload_url,
+                                               &state_out->config,
                                                error_message_out)) {
       return false;
     }
-    if (strcmp(auth_type, "api_key_and_bearer") == 0) {
+    if (strcmp(workspace->auth_type, "api_key_and_bearer") == 0) {
       if (secrets_included) {
-        if (!logger_string_present(auth_api_key)) {
+        if (!logger_string_present(workspace->auth_api_key)) {
           *error_message_out = "config import api_key_and_bearer auth requires "
                                "api_key when secrets_included is true";
           return false;
         }
-        if (!logger_string_present(auth_token)) {
+        if (!logger_string_present(workspace->auth_token)) {
           *error_message_out = "config import api_key_and_bearer auth requires "
                                "token when secrets_included is true";
           return false;
         }
-        logger_copy_string(imported.config.upload_api_key,
-                           sizeof(imported.config.upload_api_key),
-                           auth_api_key);
-        logger_copy_string(imported.config.upload_token,
-                           sizeof(imported.config.upload_token), auth_token);
+        logger_copy_string(state_out->config.upload_api_key,
+                           sizeof(state_out->config.upload_api_key),
+                           workspace->auth_api_key);
+        logger_copy_string(state_out->config.upload_token,
+                           sizeof(state_out->config.upload_token),
+                           workspace->auth_token);
       } else {
         if (!logger_json_object_has_key(&doc, auth_tok, "api_key_present")) {
           *error_message_out = "config import api_key_and_bearer auth requires "
@@ -760,8 +815,8 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
                                "token_present when secrets_included is false";
           return false;
         }
-        imported.config.upload_api_key[0] = '\0';
-        imported.config.upload_token[0] = '\0';
+        state_out->config.upload_api_key[0] = '\0';
+        state_out->config.upload_token[0] = '\0';
       }
     } else {
       *error_message_out =
@@ -769,11 +824,12 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
       return false;
     }
   } else {
-    imported.config.upload_url[0] = '\0';
-    imported.config.upload_api_key[0] = '\0';
-    imported.config.upload_token[0] = '\0';
+    state_out->config.upload_url[0] = '\0';
+    state_out->config.upload_api_key[0] = '\0';
+    state_out->config.upload_token[0] = '\0';
     if (!logger_parse_config_import_upload_tls(&doc, upload_tok, upload_enabled,
-                                               upload_url, &imported.config,
+                                               workspace->upload_url,
+                                               &state_out->config,
                                                error_message_out)) {
       return false;
     }
@@ -781,9 +837,8 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
 
   if (bond_cleared_out != NULL) {
     *bond_cleared_out = strcmp(app->persisted.config.bound_h10_address,
-                               imported.config.bound_h10_address) != 0;
+                               state_out->config.bound_h10_address) != 0;
   }
-  *state_out = imported;
   return true;
 }
 
@@ -1015,14 +1070,15 @@ static bool logger_cli_is_upload_mode(const logger_app_t *app) {
 }
 
 static bool logger_cli_upload_blocked_fault_present(void) {
-  logger_upload_queue_t queue;
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
   logger_upload_queue_summary_t summary;
-  logger_upload_queue_init(&queue);
   logger_upload_queue_summary_init(&summary);
-  if (!logger_storage_svc_queue_load(&queue)) {
+  if (!logger_storage_svc_queue_load(queue)) {
+    logger_upload_queue_tmp_release(queue);
     return true;
   }
-  logger_upload_queue_compute_summary(&queue, &summary);
+  logger_upload_queue_compute_summary(queue, &summary);
+  logger_upload_queue_tmp_release(queue);
   return summary.blocked_count > 0u;
 }
 
@@ -1099,14 +1155,13 @@ logger_recovery_resume_mode_name(logger_runtime_state_t state) {
 static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   char study_day_local[11] = {0};
   const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-  logger_upload_queue_t queue;
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
   logger_upload_queue_summary_t queue_summary;
-  logger_upload_queue_init(&queue);
   logger_upload_queue_summary_init(&queue_summary);
-  if (logger_storage_svc_queue_load(&queue) ||
+  if (logger_storage_svc_queue_load(queue) ||
       logger_storage_svc_queue_scan(
-          &queue, NULL, logger_clock_now_utc_or_null(&app->clock))) {
-    logger_upload_queue_compute_summary(&queue, &queue_summary);
+          queue, NULL, logger_clock_now_utc_or_null(&app->clock))) {
+    logger_upload_queue_compute_summary(queue, &queue_summary);
   }
   const bool have_study_day =
       app->session.active
@@ -1338,6 +1393,8 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   logger_json_stream_writer_field_string_or_null(w, "build_id",
                                                  LOGGER_BUILD_ID);
   logger_json_stream_writer_object_end(w);
+
+  logger_upload_queue_tmp_release(queue);
 }
 
 static void logger_handle_status_json(const logger_app_t *app) {
@@ -1369,11 +1426,10 @@ static void logger_handle_provisioning_status_json(logger_app_t *app) {
 }
 
 static void logger_handle_queue_json(logger_app_t *app) {
-  logger_upload_queue_t queue;
-  logger_upload_queue_init(&queue);
-  if (!logger_storage_svc_queue_load(&queue)) {
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
+  if (!logger_storage_svc_queue_load(queue)) {
     (void)logger_storage_svc_queue_scan(
-        &queue, NULL, logger_clock_now_utc_or_null(&app->clock));
+        queue, NULL, logger_clock_now_utc_or_null(&app->clock));
   }
 
   jsw w;
@@ -1382,11 +1438,11 @@ static void logger_handle_queue_json(logger_app_t *app) {
                                                  "upload_queue.json");
   logger_json_stream_writer_field_string_or_null(
       &w, "updated_at_utc",
-      logger_string_present(queue.updated_at_utc) ? queue.updated_at_utc
-                                                  : NULL);
+      logger_string_present(queue->updated_at_utc) ? queue->updated_at_utc
+                                                   : NULL);
   logger_json_stream_writer_field_array_begin(&w, "sessions");
-  for (size_t i = 0u; i < queue.session_count; ++i) {
-    const logger_upload_queue_entry_t *entry = &queue.sessions[i];
+  for (size_t i = 0u; i < queue->session_count; ++i) {
+    const logger_upload_queue_entry_t *entry = &queue->sessions[i];
     logger_json_stream_writer_elem_object_begin(&w);
     logger_json_stream_writer_field_string_or_null(&w, "session_id",
                                                    entry->session_id);
@@ -1427,6 +1483,7 @@ static void logger_handle_queue_json(logger_app_t *app) {
   }
   logger_json_stream_writer_array_end(&w);
   jsw_end(&w);
+  logger_upload_queue_tmp_release(queue);
 }
 
 static void logger_handle_system_log_export_json(logger_app_t *app) {
@@ -1484,22 +1541,24 @@ static void logger_write_upload_tls_json(jsw *w,
     return;
   }
 
-  char der_base64[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX + 1u];
   size_t der_base64_len = 0u;
-  if (mbedtls_base64_encode((unsigned char *)der_base64, sizeof(der_base64),
-                            &der_base64_len, config->upload_tls_anchor_der,
-                            config->upload_tls_anchor_der_len) != 0 ||
-      der_base64_len >= sizeof(der_base64)) {
+  if (mbedtls_base64_encode(
+          (unsigned char *)g_service_cli_anchor_der_base64_buf,
+          sizeof(g_service_cli_anchor_der_base64_buf), &der_base64_len,
+          config->upload_tls_anchor_der,
+          config->upload_tls_anchor_der_len) != 0 ||
+      der_base64_len >= sizeof(g_service_cli_anchor_der_base64_buf)) {
     logger_json_stream_writer_field_null(w, "anchor");
     logger_json_stream_writer_object_end(w);
     return;
   }
-  der_base64[der_base64_len] = '\0';
+  g_service_cli_anchor_der_base64_buf[der_base64_len] = '\0';
 
   logger_json_stream_writer_field_object_begin(w, "anchor");
   logger_json_stream_writer_field_string_or_null(
       w, "format", LOGGER_UPLOAD_TLS_ANCHOR_FORMAT_X509_DER_BASE64);
-  logger_json_stream_writer_field_string_or_null(w, "der_base64", der_base64);
+  logger_json_stream_writer_field_string_or_null(
+      w, "der_base64", g_service_cli_anchor_der_base64_buf);
   logger_json_stream_writer_field_string_or_null(
       w, "sha256",
       logger_string_present(config->upload_tls_anchor_sha256)
@@ -2123,29 +2182,61 @@ static void logger_handle_debug_synth_storage_valid(logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+static void __attribute__((noinline))
+logger_service_cli_append_config_changed_event(logger_app_t *app,
+                                               bool bond_cleared) {
+  logger_json_object_writer_t writer;
+  logger_json_object_writer_init(&writer, g_service_cli_config_change_details,
+                                 sizeof(g_service_cli_config_change_details));
+  if (logger_json_object_writer_string_field(&writer, "source",
+                                             "config_import") &&
+      logger_json_object_writer_bool_field(&writer, "bond_cleared",
+                                           bond_cleared) &&
+      logger_json_object_writer_finish(&writer)) {
+    (void)logger_system_log_append(
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+        "config_changed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        logger_json_object_writer_data(&writer));
+  }
+}
+
+static void __attribute__((noinline))
+logger_service_cli_write_config_import_ok(const logger_app_t *app,
+                                          const char *command,
+                                          bool bond_cleared) {
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "applied", true);
+  logger_json_stream_writer_field_bool(
+      &w, "normal_logging_ready",
+      logger_config_normal_logging_ready(&app->persisted.config));
+  logger_json_stream_writer_field_bool(&w, "bond_cleared", bond_cleared);
+  jsw_end(&w);
+}
+
 static void logger_apply_config_import_json(logger_service_cli_t *cli,
                                             logger_app_t *app,
                                             const char *command,
                                             const char *json,
                                             bool clear_transfer_on_success) {
-  logger_persisted_state_t imported;
   bool bond_cleared = false;
   const char *error_message = "config import failed";
-  if (!logger_parse_config_import_document(app, json, &imported, &bond_cleared,
-                                           &error_message)) {
+  if (!logger_parse_config_import_document(app, json,
+                                           &g_service_cli_imported_state,
+                                           &bond_cleared, &error_message)) {
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
             "invalid_config", error_message);
     return;
   }
-  if (!logger_config_store_save(&imported)) {
+  if (!logger_config_store_save(&g_service_cli_imported_state)) {
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
             "storage_unavailable", "failed to persist imported config");
     return;
   }
 
-  app->persisted = imported;
+  app->persisted = g_service_cli_imported_state;
   if (bond_cleared) {
     app->h10.bonded = false;
     app->h10.connected = false;
@@ -2157,33 +2248,14 @@ static void logger_apply_config_import_json(logger_service_cli_t *cli,
   app->runtime.provisioning_complete =
       logger_config_normal_logging_ready(&app->persisted.config);
 
-  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
-  logger_json_object_writer_t writer;
-  logger_json_object_writer_init(&writer, details, sizeof(details));
-  if (logger_json_object_writer_string_field(&writer, "source",
-                                             "config_import") &&
-      logger_json_object_writer_bool_field(&writer, "bond_cleared",
-                                           bond_cleared) &&
-      logger_json_object_writer_finish(&writer)) {
-    (void)logger_system_log_append(
-        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
-        "config_changed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        logger_json_object_writer_data(&writer));
-  }
+  logger_service_cli_append_config_changed_event(app, bond_cleared);
 
   if (clear_transfer_on_success) {
     logger_config_import_transfer_reset(cli);
   }
   cli->unlocked = false;
 
-  jsw w;
-  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
-  logger_json_stream_writer_field_bool(&w, "applied", true);
-  logger_json_stream_writer_field_bool(
-      &w, "normal_logging_ready",
-      logger_config_normal_logging_ready(&app->persisted.config));
-  logger_json_stream_writer_field_bool(&w, "bond_cleared", bond_cleared);
-  jsw_end(&w);
+  logger_service_cli_write_config_import_ok(app, command, bond_cleared);
 }
 
 static void logger_handle_config_import(logger_service_cli_t *cli,

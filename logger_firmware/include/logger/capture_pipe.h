@@ -15,14 +15,13 @@
  * Core 1 owns the command ring consumer and executes all writer
  * dispatch.  Core 0 never calls logger_writer_dispatch() directly.
  *
- * Memory budget:
- *   - Command ring: 64 slots × sizeof(logger_writer_cmd_t) ≈ 20 KiB
- *   - Source staging: 128 slots × sizeof(logger_writer_cmd_t) ≈ 42 KiB
- *   - Event ring: 16 × 16 bytes = 256 bytes
- *   - Total ≈ 62 KiB
+ * Memory budget (PSRAM-backed, see psram_layout.h):
+ *   - Command ring: 256 slots × sizeof(logger_writer_cmd_t)
+ *   - Source staging: 4096 slots × sizeof(logger_writer_cmd_t)
+ *   - Event ring: 16 × 16 bytes = 256 bytes (SRAM)
  *
  * Constraints:
- *   - All structures are bounded, preallocated, static.
+ *   - All structures are bounded and preallocated from PSRAM at init.
  *   - No heap allocation anywhere in the hot path.
  *   - No multicore FIFO for PMD payload transport.
  *   - Max single enqueue wait on core 0: 1 ms.
@@ -40,18 +39,18 @@
 
 /* ── Ring sizing ───────────────────────────────────────────────── */
 
-#define CAPTURE_CMD_RING_CAPACITY 64u
+#define CAPTURE_CMD_RING_CAPACITY 256u
 #define CAPTURE_EVENT_RING_CAPACITY 16u
 
 /*
  * Source staging capacity.
  *
- * 128 slots (~0.5 s ECG+ACC at typical rates, power of 2).
+ * 4096 slots (~22 s at 180 pkt/s, power of 2).
+ * PSRAM-backed — large enough to absorb any SD card stall.
  * The BLE callback pushes into staging; the main loop drains
  * staging into the command ring that core 1 consumes.
  */
-#define CAPTURE_STAGING_DUAL_CORE_CAPACITY 128u
-#define CAPTURE_STAGING_CAPACITY CAPTURE_STAGING_DUAL_CORE_CAPACITY
+#define CAPTURE_STAGING_CAPACITY 4096u
 
 /* ── Distress thresholds ───────────────────────────────────────── */
 
@@ -83,7 +82,8 @@
  * order from the other core's perspective.
  */
 typedef struct {
-  logger_writer_cmd_t slots[CAPTURE_CMD_RING_CAPACITY];
+  logger_writer_cmd_t *slots; /* PSRAM-backed, set at init */
+  uint32_t capacity;         /* power of 2 */
   uint64_t head; /* consumer reads here (writer side) */
   uint64_t tail; /* producer writes here (control core) */
   uint64_t seq;  /* monotonically increasing command position */
@@ -126,7 +126,8 @@ typedef struct {
  * (which drains staging into the command ring that core 1 consumes).
  */
 typedef struct {
-  logger_writer_cmd_t slots[CAPTURE_STAGING_DUAL_CORE_CAPACITY];
+  logger_writer_cmd_t *slots; /* PSRAM-backed, set at init */
+  uint32_t capacity;         /* power of 2 */
   uint64_t head;
   uint64_t tail;
   uint32_t overflow_count;
@@ -189,8 +190,8 @@ typedef struct {
   uint32_t cmd_enqueue_count;
   uint32_t cmd_enqueue_reject_count;
   uint32_t cmd_dequeue_count;
-  uint8_t cmd_occupancy_hwm;
-  uint8_t cmd_occupancy_now;
+  uint16_t cmd_occupancy_hwm;
+  uint16_t cmd_occupancy_now;
 
   /* Event ring */
   uint32_t event_push_count;
@@ -209,8 +210,8 @@ typedef struct {
   uint32_t staging_enqueue_count;
   uint32_t staging_overflow_count;
   uint32_t staging_drain_count;
-  uint8_t staging_occupancy_hwm;
-  uint8_t staging_occupancy_now;
+  uint16_t staging_occupancy_hwm;
+  uint16_t staging_occupancy_now;
 
   /* Health / distress */
   capture_health_t health;
@@ -258,7 +259,30 @@ typedef struct capture_pipe {
 
 /* ── Lifecycle ─────────────────────────────────────────────────── */
 
-void capture_pipe_init(capture_pipe_t *pipe);
+typedef struct {
+  /* Caller-owned backing storage for the lifetime of the pipe.
+   *
+   * capture_pipe_t does not own these buffers and does not track
+   * liveness.  The caller must guarantee that both slot arrays remain
+   * valid and writable until the pipe is no longer used.
+   *
+   * In logger_firmware v1 these normally point into the fixed PSRAM
+   * layout after successful psram_init().  Runtime PSRAM deinit /
+   * power-down is not supported; if that ever changes, pipe users must
+   * be reworked before these raw pointers can remain safe.
+   *
+   * Both capacities must be non-zero powers of 2. capture_pipe_init()
+   * hard-asserts this invariant because the ring/staging index math uses
+   * mask indexing rather than modulo.
+   */
+  logger_writer_cmd_t *staging_slots;
+  uint32_t staging_capacity;
+  logger_writer_cmd_t *cmd_ring_slots;
+  uint32_t cmd_ring_capacity;
+} capture_pipe_init_params_t;
+
+void capture_pipe_init(capture_pipe_t *pipe,
+                       const capture_pipe_init_params_t *params);
 
 /* ── High-level submit (routes through staging → ring → execution) */
 

@@ -14,6 +14,7 @@ typedef enum {
   LOGGER_FAULT_SD_WRITE_FAILED,
   LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET,
   LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE,
+  LOGGER_FAULT_PSRAM_INIT_FAILED,
 } logger_fault_code_t;
 
 const char *logger_fault_code_name(logger_fault_code_t code);

@@ -16,6 +16,7 @@
 #include "logger/journal_writer.h"
 #include "logger/json.h"
 #include "logger/json_writer.h"
+#include "logger/psram_layout.h"
 #include "logger/queue.h"
 #include "logger/sha256.h"
 #include "logger/util.h"
@@ -24,14 +25,134 @@
 #define LOGGER_SESSION_JSON_MAX 1024
 #define LOGGER_SESSION_LIVE_JSON_TOKEN_MAX 64u
 
-/* Chunk assembly buffer: 64 KiB static, no heap in the hot path */
-#define LOGGER_SESSION_CHUNK_BUF_SIZE (64u * 1024u)
-static uint8_t g_chunk_buf[LOGGER_SESSION_CHUNK_BUF_SIZE];
+/* Chunk assembly buffer: 128 KiB from PSRAM, no heap in the hot path */
+#define LOGGER_SESSION_CHUNK_BUF_SIZE (128u * 1024u)
+static uint8_t *g_chunk_buf = PSRAM_CHUNK_BUF;
 
 static logger_capture_stats_t *g_session_stats = NULL;
 
+typedef struct {
+  char dir_name[64];
+  char dir_path[LOGGER_STORAGE_PATH_MAX];
+  char journal_path[LOGGER_STORAGE_PATH_MAX];
+  char live_path[LOGGER_STORAGE_PATH_MAX];
+  char manifest_path[LOGGER_STORAGE_PATH_MAX];
+  char live_session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+  logger_journal_scan_result_t scan;
+  bool in_use;
+} logger_session_recovery_workspace_t;
+
+typedef struct {
+  char buf[LOGGER_SESSION_JSON_MAX];
+  jsmntok_t tokens[LOGGER_SESSION_LIVE_JSON_TOKEN_MAX];
+  bool in_use;
+} logger_session_live_json_workspace_t;
+
+typedef struct {
+  char payload[640];
+  char current_span_id_json[64];
+  char current_span_index_json[24];
+  char last_flush_utc_json[64];
+  bool in_use;
+} logger_session_live_write_workspace_t;
+
+typedef struct {
+  FIL file;
+  logger_sha256_t sha;
+  uint8_t chunk[256];
+  bool in_use;
+} logger_session_sha256_workspace_t;
+
+static logger_session_recovery_workspace_t g_session_recovery_workspace;
+static logger_session_live_json_workspace_t g_session_live_json_workspace;
+static logger_session_live_write_workspace_t g_session_live_write_workspace;
+static logger_session_sha256_workspace_t g_session_sha256_workspace;
+static logger_persisted_state_t g_session_manifest_persisted;
+static bool g_session_manifest_persisted_in_use;
+
+static logger_session_recovery_workspace_t *
+logger_session_recovery_workspace_acquire(void) {
+  assert(!g_session_recovery_workspace.in_use);
+  memset(&g_session_recovery_workspace, 0, sizeof(g_session_recovery_workspace));
+  g_session_recovery_workspace.in_use = true;
+  return &g_session_recovery_workspace;
+}
+
+static void logger_session_recovery_workspace_release(
+    logger_session_recovery_workspace_t *workspace) {
+  assert(workspace == &g_session_recovery_workspace);
+  assert(g_session_recovery_workspace.in_use);
+  g_session_recovery_workspace.in_use = false;
+}
+
+static logger_session_live_json_workspace_t *
+logger_session_live_json_workspace_acquire(void) {
+  assert(!g_session_live_json_workspace.in_use);
+  memset(&g_session_live_json_workspace, 0,
+         sizeof(g_session_live_json_workspace));
+  g_session_live_json_workspace.in_use = true;
+  return &g_session_live_json_workspace;
+}
+
+static void logger_session_live_json_workspace_release(
+    logger_session_live_json_workspace_t *workspace) {
+  assert(workspace == &g_session_live_json_workspace);
+  assert(g_session_live_json_workspace.in_use);
+  g_session_live_json_workspace.in_use = false;
+}
+
+static logger_session_live_write_workspace_t *
+logger_session_live_write_workspace_acquire(void) {
+  assert(!g_session_live_write_workspace.in_use);
+  memset(&g_session_live_write_workspace, 0,
+         sizeof(g_session_live_write_workspace));
+  g_session_live_write_workspace.in_use = true;
+  return &g_session_live_write_workspace;
+}
+
+static void logger_session_live_write_workspace_release(
+    logger_session_live_write_workspace_t *workspace) {
+  assert(workspace == &g_session_live_write_workspace);
+  assert(g_session_live_write_workspace.in_use);
+  g_session_live_write_workspace.in_use = false;
+}
+
+static logger_session_sha256_workspace_t *
+logger_session_sha256_workspace_acquire(void) {
+  assert(!g_session_sha256_workspace.in_use);
+  memset(&g_session_sha256_workspace, 0, sizeof(g_session_sha256_workspace));
+  g_session_sha256_workspace.in_use = true;
+  return &g_session_sha256_workspace;
+}
+
+static void logger_session_sha256_workspace_release(
+    logger_session_sha256_workspace_t *workspace) {
+  assert(workspace == &g_session_sha256_workspace);
+  assert(g_session_sha256_workspace.in_use);
+  g_session_sha256_workspace.in_use = false;
+}
+
+static logger_persisted_state_t *logger_session_manifest_persisted_acquire(void) {
+  assert(!g_session_manifest_persisted_in_use);
+  g_session_manifest_persisted_in_use = true;
+  memset(&g_session_manifest_persisted, 0, sizeof(g_session_manifest_persisted));
+  return &g_session_manifest_persisted;
+}
+
+static void logger_session_manifest_persisted_release(
+    logger_persisted_state_t *persisted) {
+  assert(persisted == &g_session_manifest_persisted);
+  assert(g_session_manifest_persisted_in_use);
+  g_session_manifest_persisted_in_use = false;
+}
+
 void logger_session_set_capture_stats(logger_capture_stats_t *stats) {
   g_session_stats = stats;
+}
+
+void logger_session_init_buffers(void) {
+  /* Zero-initialise the PSRAM chunk buffer so session init sees clean memory. */
+  memset(g_chunk_buf, 0, LOGGER_SESSION_CHUNK_BUF_SIZE);
 }
 
 /*
@@ -281,39 +402,43 @@ static bool
 logger_session_write_live_internal(const logger_session_state_t *session,
                                    const char *now_utc, uint32_t boot_counter,
                                    uint32_t now_ms) {
-  char payload[640];
-  char current_span_id_json[64];
-  char current_span_index_json[24];
-  char last_flush_utc_json[64];
+  logger_session_live_write_workspace_t *workspace =
+      logger_session_live_write_workspace_acquire();
 
-  logger_json_string_literal(current_span_id_json, sizeof(current_span_id_json),
-                             session->span_active ? session->current_span_id
-                                                  : NULL);
+  logger_json_string_literal(
+      workspace->current_span_id_json,
+      sizeof(workspace->current_span_id_json),
+      session->span_active ? session->current_span_id : NULL);
   if (session->span_active) {
-    snprintf(current_span_index_json, sizeof(current_span_index_json), "%lu",
+    snprintf(workspace->current_span_index_json,
+             sizeof(workspace->current_span_index_json), "%lu",
              (unsigned long)session->current_span_index);
   } else {
-    logger_copy_string(current_span_index_json, sizeof(current_span_index_json),
-                       "null");
+    logger_copy_string(workspace->current_span_index_json,
+                       sizeof(workspace->current_span_index_json), "null");
   }
-  logger_json_string_literal(last_flush_utc_json, sizeof(last_flush_utc_json),
-                             now_utc);
+  logger_json_string_literal(workspace->last_flush_utc_json,
+                             sizeof(workspace->last_flush_utc_json), now_utc);
 
   const int n = snprintf(
-      payload, sizeof(payload),
+      workspace->payload, sizeof(workspace->payload),
       "{\"schema_version\":1,\"session_id\":\"%s\",\"study_day_local\":\"%s\","
       "\"session_dir\":\"%s\",\"state\":\"active\",\"journal_size_bytes\":%llu,"
       "\"last_flush_utc\":%s,\"last_flush_mono_us\":%llu,\"current_span_id\":%"
       "s,\"current_span_index\":%s,\"quarantined\":%s,\"clock_state\":\"%s\","
       "\"boot_counter\":%lu}",
       session->session_id, session->study_day_local, session->session_dir_name,
-      (unsigned long long)session->journal_size_bytes, last_flush_utc_json,
-      (unsigned long long)now_ms * 1000ull, current_span_id_json,
-      current_span_index_json, session->quarantined ? "true" : "false",
+      (unsigned long long)session->journal_size_bytes,
+      workspace->last_flush_utc_json, (unsigned long long)now_ms * 1000ull,
+      workspace->current_span_id_json, workspace->current_span_index_json,
+      session->quarantined ? "true" : "false",
       session->clock_state, (unsigned long)boot_counter);
-  return n > 0 && (size_t)n < sizeof(payload) &&
-         logger_storage_write_file_atomic(session->live_path, payload,
-                                          (size_t)n);
+  const bool ok =
+      n > 0 && (size_t)n < sizeof(workspace->payload) &&
+      logger_storage_write_file_atomic(session->live_path, workspace->payload,
+                                       (size_t)n);
+  logger_session_live_write_workspace_release(workspace);
+  return ok;
 }
 
 static bool
@@ -545,40 +670,44 @@ static bool logger_session_append_session_end(
   return true;
 }
 
-static bool
+static bool __attribute__((noinline))
 logger_session_compute_file_sha256(const char *path,
                                    char out_hex[LOGGER_SHA256_HEX_LEN + 1],
                                    uint64_t *size_bytes_out) {
-  FIL file;
-  if (f_open(&file, path, FA_READ) != FR_OK) {
+  logger_session_sha256_workspace_t *workspace =
+      logger_session_sha256_workspace_acquire();
+  if (f_open(&workspace->file, path, FA_READ) != FR_OK) {
+    logger_session_sha256_workspace_release(workspace);
     return false;
   }
-  logger_sha256_t sha;
-  logger_sha256_init(&sha);
+  logger_sha256_init(&workspace->sha);
   uint64_t total = 0u;
-  uint8_t chunk[256];
   UINT read_bytes = 0u;
   do {
-    if (f_read(&file, chunk, sizeof(chunk), &read_bytes) != FR_OK) {
-      f_close(&file);
+    if (f_read(&workspace->file, workspace->chunk, sizeof(workspace->chunk),
+               &read_bytes) != FR_OK) {
+      f_close(&workspace->file);
+      logger_session_sha256_workspace_release(workspace);
       return false;
     }
     if (read_bytes > 0u) {
-      logger_sha256_update(&sha, chunk, read_bytes);
+      logger_sha256_update(&workspace->sha, workspace->chunk, read_bytes);
       total += read_bytes;
     }
-  } while (read_bytes == sizeof(chunk));
-  if (f_close(&file) != FR_OK) {
+  } while (read_bytes == sizeof(workspace->chunk));
+  if (f_close(&workspace->file) != FR_OK) {
+    logger_session_sha256_workspace_release(workspace);
     return false;
   }
-  logger_sha256_final_hex(&sha, out_hex);
+  logger_sha256_final_hex(&workspace->sha, out_hex);
   if (size_bytes_out != NULL) {
     *size_bytes_out = total;
   }
+  logger_session_sha256_workspace_release(workspace);
   return true;
 }
 
-static bool logger_session_build_manifest(
+static bool __attribute__((noinline)) logger_session_build_manifest(
     const logger_session_state_t *session, const char *hardware_id,
     const logger_persisted_state_t *persisted,
     const logger_storage_status_t *storage, const char *journal_sha256,
@@ -985,29 +1114,35 @@ static bool logger_session_find_live_paths(
 
 static bool logger_session_load_live_session_id(
     const char *live_path, char session_id_out[LOGGER_SESSION_ID_HEX_LEN + 1]) {
-  char buf[1024];
+  logger_session_live_json_workspace_t *workspace =
+      logger_session_live_json_workspace_acquire();
   size_t len = 0u;
-  if (!logger_storage_read_file(live_path, buf, sizeof(buf) - 1u, &len)) {
+  if (!logger_storage_read_file(live_path, workspace->buf,
+                                sizeof(workspace->buf) - 1u, &len)) {
+    logger_session_live_json_workspace_release(workspace);
     return false;
   }
-  buf[len] = '\0';
+  workspace->buf[len] = '\0';
 
-  jsmntok_t tokens[LOGGER_SESSION_LIVE_JSON_TOKEN_MAX];
   logger_json_doc_t doc;
-  if (!logger_json_parse(&doc, buf, len, tokens,
+  if (!logger_json_parse(&doc, workspace->buf, len, workspace->tokens,
                          LOGGER_SESSION_LIVE_JSON_TOKEN_MAX)) {
+    logger_session_live_json_workspace_release(workspace);
     return false;
   }
 
   const jsmntok_t *root = logger_json_root(&doc);
   if (root == NULL || root->type != JSMN_OBJECT) {
+    logger_session_live_json_workspace_release(workspace);
     return false;
   }
 
-  return logger_json_object_copy_string(&doc, root, "session_id",
-                                        session_id_out,
-                                        LOGGER_SESSION_ID_HEX_LEN + 1) &&
-         strlen(session_id_out) == LOGGER_SESSION_ID_HEX_LEN;
+  const bool ok =
+      logger_json_object_copy_string(&doc, root, "session_id", session_id_out,
+                                     LOGGER_SESSION_ID_HEX_LEN + 1) &&
+      strlen(session_id_out) == LOGGER_SESSION_ID_HEX_LEN;
+  logger_session_live_json_workspace_release(workspace);
+  return ok;
 }
 
 void logger_session_init(logger_session_state_t *session) {
@@ -1453,6 +1588,8 @@ bool logger_session_recover_on_boot(
     const logger_clock_status_t *clock, const logger_storage_status_t *storage,
     uint32_t boot_counter, uint32_t now_ms, bool resume_allowed,
     bool *recovered_active_out, bool *closed_session_out) {
+  logger_session_recovery_workspace_t *workspace = NULL;
+
   if (recovered_active_out != NULL) {
     *recovered_active_out = false;
   }
@@ -1463,101 +1600,116 @@ bool logger_session_recover_on_boot(
     return true;
   }
 
-  char dir_name[64];
-  char dir_path[LOGGER_STORAGE_PATH_MAX];
-  char journal_path[LOGGER_STORAGE_PATH_MAX];
-  char live_path[LOGGER_STORAGE_PATH_MAX];
-  char manifest_path[LOGGER_STORAGE_PATH_MAX];
-  if (!logger_session_find_live_paths(dir_name, dir_path, journal_path,
-                                      live_path, manifest_path)) {
+  workspace = logger_session_recovery_workspace_acquire();
+
+  if (!logger_session_find_live_paths(workspace->dir_name, workspace->dir_path,
+                                      workspace->journal_path,
+                                      workspace->live_path,
+                                      workspace->manifest_path)) {
+    logger_session_recovery_workspace_release(workspace);
     return true;
   }
 
-  char live_session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
   const bool have_live_session_id =
-      logger_session_load_live_session_id(live_path, live_session_id);
+      logger_session_load_live_session_id(workspace->live_path,
+                                          workspace->live_session_id);
 
-  logger_journal_scan_result_t scan;
-  if (!logger_journal_scan(journal_path, &scan) || !scan.valid) {
+  if (!logger_journal_scan(workspace->journal_path, &workspace->scan) ||
+      !workspace->scan.valid) {
+    logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
         system_log, clock != NULL ? clock->now_utc : NULL,
         "session_recovery_failed", "{\"reason\":\"journal_scan_failed\"}");
     return false;
   }
   uint64_t actual_file_size = 0u;
-  if (!logger_storage_file_size(journal_path, &actual_file_size)) {
+  if (!logger_storage_file_size(workspace->journal_path, &actual_file_size)) {
+    logger_session_recovery_workspace_release(workspace);
     return false;
   }
-  if (actual_file_size > scan.valid_size_bytes &&
-      !logger_journal_truncate_to_valid(journal_path, scan.valid_size_bytes)) {
+  if (actual_file_size > workspace->scan.valid_size_bytes &&
+      !logger_journal_truncate_to_valid(workspace->journal_path,
+                                        workspace->scan.valid_size_bytes)) {
+    logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
         system_log, clock != NULL ? clock->now_utc : NULL,
         "session_recovery_failed", "{\"reason\":\"journal_truncate_failed\"}");
     return false;
   }
-  if (have_live_session_id && strcmp(live_session_id, scan.session_id) != 0) {
+  if (have_live_session_id &&
+      strcmp(workspace->live_session_id, workspace->scan.session_id) != 0) {
+    logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
         system_log, clock != NULL ? clock->now_utc : NULL,
         "session_recovery_failed", "{\"reason\":\"live_journal_id_mismatch\"}");
     return false;
   }
 
-  if (scan.session_closed || logger_storage_file_exists(manifest_path)) {
-    (void)logger_storage_remove_file(live_path);
+  if (workspace->scan.session_closed ||
+      logger_storage_file_exists(workspace->manifest_path)) {
+    (void)logger_storage_remove_file(workspace->live_path);
     (void)logger_upload_queue_refresh_file(
         system_log, clock != NULL ? clock->now_utc : NULL, NULL);
+    logger_session_recovery_workspace_release(workspace);
     return true;
   }
 
   logger_session_init(session);
   session->active = true;
   logger_copy_string(session->session_id, sizeof(session->session_id),
-                     scan.session_id);
+                     workspace->scan.session_id);
   logger_copy_string(session->study_day_local, sizeof(session->study_day_local),
-                     scan.study_day_local);
+                     workspace->scan.study_day_local);
   logger_copy_string(session->session_start_utc,
                      sizeof(session->session_start_utc),
-                     scan.session_start_utc);
+                     workspace->scan.session_start_utc);
   logger_copy_string(session->session_end_utc, sizeof(session->session_end_utc),
-                     scan.session_end_utc);
+                     workspace->scan.session_end_utc);
   logger_copy_string(session->session_start_reason,
                      sizeof(session->session_start_reason),
-                     scan.session_start_reason);
+                     workspace->scan.session_start_reason);
   logger_copy_string(session->session_end_reason,
                      sizeof(session->session_end_reason),
-                     scan.session_end_reason);
+                     workspace->scan.session_end_reason);
   logger_copy_string(session->session_dir_name,
-                     sizeof(session->session_dir_name), dir_name);
+                     sizeof(session->session_dir_name), workspace->dir_name);
   logger_copy_string(session->session_dir_path,
-                     sizeof(session->session_dir_path), dir_path);
+                     sizeof(session->session_dir_path), workspace->dir_path);
   logger_copy_string(session->journal_path, sizeof(session->journal_path),
-                     journal_path);
-  logger_copy_string(session->live_path, sizeof(session->live_path), live_path);
+                     workspace->journal_path);
+  logger_copy_string(session->live_path, sizeof(session->live_path),
+                     workspace->live_path);
   logger_copy_string(session->manifest_path, sizeof(session->manifest_path),
-                     manifest_path);
-  session->next_record_seq = scan.next_record_seq;
-  session->journal_size_bytes = scan.valid_size_bytes;
+                     workspace->manifest_path);
+  session->next_record_seq = workspace->scan.next_record_seq;
+  session->journal_size_bytes = workspace->scan.valid_size_bytes;
   /* Open the journal for appending through the writer */
   if (!logger_journal_writer_open_existing(
-          &session->journal_writer, journal_path, scan.valid_size_bytes)) {
+          &session->journal_writer, workspace->journal_path,
+          workspace->scan.valid_size_bytes)) {
+    logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
         system_log, clock != NULL ? clock->now_utc : NULL,
         "session_recovery_failed",
         "{\"reason\":\"journal_writer_open_failed\"}");
     return false;
   }
-  session->next_chunk_seq_in_session = scan.next_chunk_seq_in_session;
-  session->next_packet_seq_in_span = scan.next_packet_seq_in_span;
-  session->span_count = scan.span_count;
-  memcpy(session->spans, scan.spans, sizeof(session->spans));
-  session->span_active = scan.active_span_open;
+  session->next_chunk_seq_in_session = workspace->scan.next_chunk_seq_in_session;
+  session->next_packet_seq_in_span = workspace->scan.next_packet_seq_in_span;
+  session->span_count = workspace->scan.span_count;
+  memcpy(session->spans, workspace->scan.spans, sizeof(session->spans));
+  session->span_active = workspace->scan.active_span_open;
   session->current_span_index =
-      scan.active_span_open ? scan.active_span_index : 0xffffffffu;
+      workspace->scan.active_span_open ? workspace->scan.active_span_index
+                                       : 0xffffffffu;
   logger_copy_string(session->current_span_id, sizeof(session->current_span_id),
-                     scan.active_span_open ? scan.active_span_id : NULL);
-  if (scan.active_span_open &&
+                     workspace->scan.active_span_open
+                         ? workspace->scan.active_span_id
+                         : NULL);
+  if (workspace->scan.active_span_open &&
       !logger_hex_to_bytes_16(session->current_span_id,
                               session->current_span_id_raw)) {
+    logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
         system_log, clock != NULL ? clock->now_utc : NULL,
         "session_recovery_failed", "{\"reason\":\"span_id_parse_failed\"}");
@@ -1566,12 +1718,12 @@ bool logger_session_recover_on_boot(
   /* Initialize chunk builder for the recovered session */
   logger_chunk_builder_reset(&session->chunk_builder);
   session->quarantine_clock_invalid_at_start =
-      scan.quarantine_clock_invalid_at_start;
+      workspace->scan.quarantine_clock_invalid_at_start;
   session->quarantine_clock_fixed_mid_session =
-      scan.quarantine_clock_fixed_mid_session;
-  session->quarantine_clock_jump = scan.quarantine_clock_jump;
+      workspace->scan.quarantine_clock_fixed_mid_session;
+  session->quarantine_clock_jump = workspace->scan.quarantine_clock_jump;
   session->quarantine_recovery_after_reset =
-      scan.quarantine_recovery_after_reset;
+      workspace->scan.quarantine_recovery_after_reset;
   logger_session_recompute_quarantine(session, clock);
 
   /*
@@ -1602,11 +1754,13 @@ bool logger_session_recover_on_boot(
     if (!logger_session_finalize_internal(session, system_log, persisted, clock,
                                           "unexpected_reboot", false,
                                           boot_counter, now_ms)) {
+      logger_session_recovery_workspace_release(workspace);
       return false;
     }
     if (closed_session_out != NULL) {
       *closed_session_out = true;
     }
+    logger_session_recovery_workspace_release(workspace);
     return true;
   }
 
@@ -1616,10 +1770,12 @@ bool logger_session_recover_on_boot(
     if (!logger_session_control_close_span(session, clock, "unexpected_reboot",
                                            boot_counter, now_ms,
                                            ended_span_id)) {
+      logger_session_recovery_workspace_release(workspace);
       return false;
     }
     if (!logger_session_append_gap(session, clock, ended_span_id,
                                    "recovery_reboot", boot_counter, now_ms)) {
+      logger_session_recovery_workspace_release(workspace);
       return false;
     }
   }
@@ -1627,14 +1783,17 @@ bool logger_session_recover_on_boot(
   logger_session_recompute_quarantine(session, clock);
   if (!logger_session_append_recovery(session, clock, "unexpected_reboot",
                                       boot_counter, now_ms)) {
+    logger_session_recovery_workspace_release(workspace);
     return false;
   }
   if (!logger_session_begin_span(session, clock, "recovery_resume",
                                  persisted->config.bound_h10_address, false,
                                  false, boot_counter, now_ms)) {
+    logger_session_recovery_workspace_release(workspace);
     return false;
   }
   if (!logger_session_refresh_live(session, clock, boot_counter, now_ms)) {
+    logger_session_recovery_workspace_release(workspace);
     return false;
   }
 
@@ -1646,6 +1805,7 @@ bool logger_session_recover_on_boot(
   if (recovered_active_out != NULL) {
     *recovered_active_out = true;
   }
+  logger_session_recovery_workspace_release(workspace);
   return true;
 }
 
@@ -1671,7 +1831,7 @@ bool logger_session_recover_on_boot(
  * Writer-side helper: serialize and emit a session_start journal record.
  * All data comes from the command struct — no control-plane state needed.
  */
-static bool
+static bool __attribute__((noinline))
 writer_emit_session_start(logger_session_state_t *session,
                           const logger_writer_session_start_t *cmd) {
   char logger_id_escaped[LOGGER_CONFIG_LOGGER_ID_MAX * 2u];
@@ -1705,8 +1865,9 @@ writer_emit_session_start(logger_session_state_t *session,
 /*
  * Writer-side helper: serialize and emit a span_start journal record.
  */
-static bool writer_emit_span_start(logger_session_state_t *session,
-                                   const logger_writer_span_start_t *cmd) {
+static bool __attribute__((noinline))
+writer_emit_span_start(logger_session_state_t *session,
+                       const logger_writer_span_start_t *cmd) {
   char h10_escaped[18 * 2u];
   logger_json_escape_into(h10_escaped, sizeof(h10_escaped), cmd->h10_address);
 
@@ -1766,8 +1927,9 @@ writer_append_pmd_packet(logger_session_state_t *session,
  * Writer-side helper: emit a marker journal record.
  * Caller (dispatch) handles the barrier seal.
  */
-static bool writer_emit_marker(logger_session_state_t *session,
-                               const logger_writer_write_marker_t *cmd) {
+static bool __attribute__((noinline))
+writer_emit_marker(logger_session_state_t *session,
+                   const logger_writer_write_marker_t *cmd) {
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
       payload, sizeof(payload),
@@ -1786,7 +1948,7 @@ static bool writer_emit_marker(logger_session_state_t *session,
 /*
  * Writer-side helper: emit a status_snapshot journal record.
  */
-static bool
+static bool __attribute__((noinline))
 writer_emit_status_snapshot(logger_session_state_t *session,
                             const logger_writer_write_status_snapshot_t *cmd) {
   char active_span_id_json[64];
@@ -1823,7 +1985,7 @@ writer_emit_status_snapshot(logger_session_state_t *session,
 /*
  * Writer-side helper: emit an h10_battery journal record.
  */
-static bool
+static bool __attribute__((noinline))
 writer_emit_h10_battery(logger_session_state_t *session,
                         const logger_writer_write_h10_battery_t *cmd) {
   char span_id_json[64];
@@ -1849,8 +2011,9 @@ writer_emit_h10_battery(logger_session_state_t *session,
 /*
  * Writer-side helper: emit a gap journal record.
  */
-static bool writer_emit_gap(logger_session_state_t *session,
-                            const logger_writer_write_gap_t *cmd) {
+static bool __attribute__((noinline))
+writer_emit_gap(logger_session_state_t *session,
+                const logger_writer_write_gap_t *cmd) {
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
       payload, sizeof(payload),
@@ -1870,7 +2033,7 @@ static bool writer_emit_gap(logger_session_state_t *session,
 /*
  * Writer-side helper: emit a clock_event journal record.
  */
-static bool
+static bool __attribute__((noinline))
 writer_emit_clock_event(logger_session_state_t *session,
                         const logger_writer_write_clock_event_t *cmd) {
   char payload[LOGGER_SESSION_JSON_MAX];
@@ -1894,8 +2057,9 @@ writer_emit_clock_event(logger_session_state_t *session,
 /*
  * Writer-side helper: emit a recovery journal record.
  */
-static bool writer_emit_recovery(logger_session_state_t *session,
-                                 const logger_writer_write_recovery_t *cmd) {
+static bool __attribute__((noinline))
+writer_emit_recovery(logger_session_state_t *session,
+                     const logger_writer_write_recovery_t *cmd) {
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
       payload, sizeof(payload),
@@ -1914,8 +2078,9 @@ static bool writer_emit_recovery(logger_session_state_t *session,
 /*
  * Writer-side helper: emit a span_end journal record.
  */
-static bool writer_emit_span_end(logger_session_state_t *session,
-                                 const logger_writer_span_end_t *cmd) {
+static bool __attribute__((noinline))
+writer_emit_span_end(logger_session_state_t *session,
+                     const logger_writer_span_end_t *cmd) {
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
       payload, sizeof(payload),
@@ -1938,8 +2103,9 @@ static bool writer_emit_span_end(logger_session_state_t *session,
 /*
  * Writer-side helper: emit a session_end journal record.
  */
-static bool writer_emit_session_end(logger_session_state_t *session,
-                                    const logger_writer_session_end_t *cmd) {
+static bool __attribute__((noinline))
+writer_emit_session_end(logger_session_state_t *session,
+                        const logger_writer_session_end_t *cmd) {
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
       payload, sizeof(payload),
@@ -1956,6 +2122,82 @@ static bool writer_emit_session_end(logger_session_state_t *session,
              &session->journal_writer, LOGGER_JOURNAL_RECORD_SESSION_END,
              session->next_record_seq++, payload) &&
          logger_journal_writer_sync(&session->journal_writer);
+}
+
+static bool __attribute__((noinline))
+logger_writer_handle_span_end(logger_session_state_t *session,
+                              const logger_writer_span_end_t *cmd) {
+  if (!logger_session_seal_active_chunk(session))
+    return false;
+
+  const logger_journal_span_summary_t *span =
+      &session->spans[session->current_span_index];
+  logger_writer_span_end_t real = *cmd;
+  real.packet_count = span->packet_count;
+  real.first_seq_in_span = span->first_seq_in_span;
+  real.last_seq_in_span = span->last_seq_in_span;
+  if (!writer_emit_span_end(session, &real))
+    return false;
+  session->journal_size_bytes =
+      logger_journal_writer_durable_size(&session->journal_writer);
+  return true;
+}
+
+static bool __attribute__((noinline))
+logger_writer_handle_finalize_session(
+    logger_session_state_t *session,
+    const logger_writer_finalize_session_t *cmd) {
+  const logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
+
+  if (!logger_journal_writer_close(&session->journal_writer))
+    return false;
+  session->journal_size_bytes =
+      logger_journal_writer_durable_size(&session->journal_writer);
+
+  logger_storage_status_t storage_now = mc->storage;
+  (void)logger_storage_refresh(&storage_now);
+
+  char journal_sha256[LOGGER_SHA256_HEX_LEN + 1];
+  uint64_t journal_size_bytes = 0u;
+  if (!logger_session_compute_file_sha256(
+          session->journal_path, journal_sha256, &journal_size_bytes)) {
+    return false;
+  }
+
+  char *manifest = session->manifest_buf;
+  size_t manifest_len = 0u;
+  logger_persisted_state_t *persisted_for_manifest =
+      logger_session_manifest_persisted_acquire();
+  logger_copy_string(persisted_for_manifest->config.logger_id,
+                     sizeof(persisted_for_manifest->config.logger_id),
+                     mc->logger_id);
+  logger_copy_string(persisted_for_manifest->config.subject_id,
+                     sizeof(persisted_for_manifest->config.subject_id),
+                     mc->subject_id);
+  logger_copy_string(persisted_for_manifest->config.timezone,
+                     sizeof(persisted_for_manifest->config.timezone),
+                     mc->timezone);
+  logger_copy_string(persisted_for_manifest->config.bound_h10_address,
+                     sizeof(persisted_for_manifest->config.bound_h10_address),
+                     mc->bound_h10_address);
+  if (!logger_session_build_manifest(
+          session, mc->hardware_id, persisted_for_manifest, &storage_now,
+          journal_sha256, journal_size_bytes, manifest,
+          sizeof(session->manifest_buf), &manifest_len)) {
+    logger_session_manifest_persisted_release(persisted_for_manifest);
+    return false;
+  }
+  logger_session_manifest_persisted_release(persisted_for_manifest);
+
+  if (!logger_storage_write_file_atomic(session->manifest_path, manifest,
+                                        manifest_len)) {
+    return false;
+  }
+
+  (void)logger_storage_remove_file(session->live_path);
+
+  const char *queue_utc = cmd->now_utc[0] != '\0' ? cmd->now_utc : NULL;
+  return logger_upload_queue_refresh_file(mc->system_log, queue_utc, NULL);
 }
 
 bool logger_writer_dispatch(logger_session_context_t *ctx,
@@ -2057,27 +2299,8 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
         logger_journal_writer_durable_size(&session->journal_writer);
     return true;
 
-  case LOGGER_WRITER_SPAN_END: {
-    /* Barrier: seal before span_end */
-    if (!logger_session_seal_active_chunk(session))
-      return false;
-    /*
-     * After sealing, read the actual durable span counters that were
-     * updated by seal_active_chunk.  These reflect all PMD data that
-     * landed in the journal before this record.
-     */
-    const logger_journal_span_summary_t *span =
-        &session->spans[session->current_span_index];
-    logger_writer_span_end_t real = cmd->span_end;
-    real.packet_count = span->packet_count;
-    real.first_seq_in_span = span->first_seq_in_span;
-    real.last_seq_in_span = span->last_seq_in_span;
-    if (!writer_emit_span_end(session, &real))
-      return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
-    return true;
-  }
+  case LOGGER_WRITER_SPAN_END:
+    return logger_writer_handle_span_end(session, &cmd->span_end);
 
   case LOGGER_WRITER_SESSION_END:
     /* Barrier: seal before session_end */
@@ -2089,90 +2312,9 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
         logger_journal_writer_durable_size(&session->journal_writer);
     return true;
 
-  case LOGGER_WRITER_FINALIZE_SESSION: {
-    /*
-     * Finalize: close journal → SHA-256 → write manifest →
-     * remove live.json → refresh upload queue.
-     *
-     * All on core 1.  Config fields in manifest_ctx (logger_id,
-     * subject_id, timezone, bound_h10_address) were refreshed by
-     * core 0 immediately before dispatching this command, so they
-     * reflect current config at finalize time, not a stale snapshot
-     * from session creation.
-     *
-     * hardware_id is immutable (silicon identity) — creation snapshot
-     * is correct.  storage identity fields are stable; volatile fields
-     * (free_bytes, etc.) are refreshed below.
-     */
-    const logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
-
-    /* Close the journal writer — sync + close the handle */
-    if (!logger_journal_writer_close(&session->journal_writer))
-      return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
-
-    /*
-     * Refresh volatile storage fields (free_bytes, capacity_bytes)
-     * at finalize time rather than using the stale snapshot from
-     * session creation.  Identity fields (manufacturer_id, serial, etc.)
-     * are stable, so we overlay only the live counters.
-     *
-     * This runs on core 1 which owns SD/FatFS.
-     */
-    logger_storage_status_t storage_now = mc->storage;
-    (void)logger_storage_refresh(&storage_now);
-
-    /* Compute journal SHA-256 and size */
-    char journal_sha256[LOGGER_SHA256_HEX_LEN + 1];
-    uint64_t journal_size_bytes = 0u;
-    if (!logger_session_compute_file_sha256(
-            session->journal_path, journal_sha256, &journal_size_bytes))
-      return false;
-
-    /* Build and write manifest.json.
-     * Uses the session-struct buffer instead of static storage:
-     * avoids reentrancy issues and keeps 8 KiB off core 1's
-     * 2 KiB stack. */
-    char *manifest = session->manifest_buf;
-    size_t manifest_len = 0u;
-    logger_persisted_state_t persisted_for_manifest;
-    memset(&persisted_for_manifest, 0, sizeof(persisted_for_manifest));
-    logger_copy_string(persisted_for_manifest.config.logger_id,
-                       sizeof(persisted_for_manifest.config.logger_id),
-                       mc->logger_id);
-    logger_copy_string(persisted_for_manifest.config.subject_id,
-                       sizeof(persisted_for_manifest.config.subject_id),
-                       mc->subject_id);
-    logger_copy_string(persisted_for_manifest.config.timezone,
-                       sizeof(persisted_for_manifest.config.timezone),
-                       mc->timezone);
-    logger_copy_string(persisted_for_manifest.config.bound_h10_address,
-                       sizeof(persisted_for_manifest.config.bound_h10_address),
-                       mc->bound_h10_address);
-    if (!logger_session_build_manifest(
-            session, mc->hardware_id, &persisted_for_manifest, &storage_now,
-            journal_sha256, journal_size_bytes, manifest,
-            sizeof(session->manifest_buf), &manifest_len))
-      return false;
-    if (!logger_storage_write_file_atomic(session->manifest_path, manifest,
-                                          manifest_len))
-      return false;
-
-    /* Remove live.json */
-    (void)logger_storage_remove_file(session->live_path);
-
-    /* Refresh upload queue — use system_log and now_utc from manifest
-     * context (snapshotted at session creation) for error logging and
-     * queue entry timestamps. */
-    const char *queue_utc = cmd->finalize_session.now_utc[0] != '\0'
-                                ? cmd->finalize_session.now_utc
-                                : NULL;
-    if (!logger_upload_queue_refresh_file(mc->system_log, queue_utc, NULL))
-      return false;
-
-    return true;
-  }
+  case LOGGER_WRITER_FINALIZE_SESSION:
+    return logger_writer_handle_finalize_session(session,
+                                                 &cmd->finalize_session);
 
   case LOGGER_WRITER_REFRESH_LIVE:
     return logger_session_write_live_internal(

@@ -29,6 +29,7 @@ typedef enum {
   LOGGER_RECOVERY_SD_MISSING_OR_UNWRITABLE,
   LOGGER_RECOVERY_SD_LOW_SPACE_RESERVE_UNMET,
   LOGGER_RECOVERY_SD_WRITE_FAILED,
+  LOGGER_RECOVERY_PSRAM_INIT_FAILED,
 } logger_recovery_reason_t;
 
 typedef enum {
@@ -68,6 +69,8 @@ logger_recovery_reason_name(logger_recovery_reason_t reason) {
     return "sd_low_space_reserve_unmet";
   case LOGGER_RECOVERY_SD_WRITE_FAILED:
     return "sd_write_failed";
+  case LOGGER_RECOVERY_PSRAM_INIT_FAILED:
+    return "psram_init_failed";
   case LOGGER_RECOVERY_NONE:
   default:
     return NULL;
@@ -111,6 +114,7 @@ typedef struct logger_app {
   uint32_t last_clock_observation_mono_ms;
   uint32_t last_queue_maintenance_mono_ms;
   uint32_t last_upload_blocked_recheck_mono_ms;
+  uint32_t deferred_boot_queue_refresh_after_mono_ms;
   uint32_t recovery_next_attempt_mono_ms;
   uint32_t recovery_probe_interval_ms;
   uint32_t recovery_good_since_mono_ms;
@@ -139,8 +143,11 @@ typedef struct logger_app {
   bool indicator_led_on;
   bool boot_banner_printed;
   bool boot_firmware_identity_changed;
+  bool deferred_boot_queue_refresh_pending;
+  bool deferred_boot_queue_refresh_skip_logged;
   bool boot_recovery_done;
   bool reboot_pending;
+  logger_runtime_state_t deferred_boot_queue_refresh_skip_state;
   logger_runtime_state_t recovery_resume_state;
 } logger_app_t;
 

@@ -208,4 +208,17 @@ void logger_storage_worker_init(storage_worker_shared_t *shared,
  */
 bool logger_storage_worker_launch(storage_worker_shared_t *shared);
 
+/*
+ * True once BOOT has handed SD/FatFS ownership to the core-1 storage worker.
+ *
+ * This is a one-way lifecycle bit used for low-level ownership assertions in
+ * storage code:
+ *   - false: pre-worker BOOT window, direct core-0 storage access is allowed
+ *   - true:  post-launch steady state, core 1 exclusively owns SD/FatFS
+ *
+ * It is written once on core 0 after launch completes and then remains true
+ * until reboot.
+ */
+bool logger_storage_worker_owns_fatfs(void);
+
 #endif /* LOGGER_FIRMWARE_STORAGE_WORKER_H */

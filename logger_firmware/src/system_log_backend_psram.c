@@ -39,7 +39,7 @@
 /* System log lives at the start of PSRAM. */
 #define PSRAM_SYSTEM_LOG_OFFSET 0u
 #define PSRAM_SYSTEM_LOG_BASE (PSRAM_BASE + PSRAM_SYSTEM_LOG_OFFSET)
-#define PSRAM_SYSTEM_LOG_CAPACITY 1024u
+#define PSRAM_SYSTEM_LOG_CAPACITY (PSRAM_SYSTEM_LOG_BYTE_SIZE / 512u)
 
 static void psram_sl_write_record(uint32_t index, const void *record,
                                   size_t record_bytes) {

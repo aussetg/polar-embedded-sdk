@@ -1,5 +1,6 @@
 #include "logger/journal.h"
 
+#include <assert.h>
 #include <ctype.h>
 #include <string.h>
 
@@ -16,6 +17,31 @@
 #define LOGGER_JOURNAL_FLAG_BINARY 0x00000002u
 #define LOGGER_JOURNAL_SCAN_PAYLOAD_CAPTURE_MAX 1023u
 #define LOGGER_JOURNAL_JSON_TOKEN_MAX 64u
+
+typedef struct {
+  uint8_t header[LOGGER_JOURNAL_FILE_HEADER_BYTES];
+  uint8_t record_header[LOGGER_JOURNAL_RECORD_HEADER_BYTES];
+  uint8_t payload_capture[LOGGER_JOURNAL_SCAN_PAYLOAD_CAPTURE_MAX + 1u];
+  uint8_t chunk[128u];
+  jsmntok_t tokens[LOGGER_JOURNAL_JSON_TOKEN_MAX];
+  bool in_use;
+} logger_journal_scan_workspace_t;
+
+static logger_journal_scan_workspace_t g_journal_scan_workspace;
+
+static logger_journal_scan_workspace_t *logger_journal_scan_workspace_acquire(void) {
+  assert(!g_journal_scan_workspace.in_use);
+  memset(&g_journal_scan_workspace, 0, sizeof(g_journal_scan_workspace));
+  g_journal_scan_workspace.in_use = true;
+  return &g_journal_scan_workspace;
+}
+
+static void logger_journal_scan_workspace_release(
+    logger_journal_scan_workspace_t *workspace) {
+  assert(workspace == &g_journal_scan_workspace);
+  assert(g_journal_scan_workspace.in_use);
+  g_journal_scan_workspace.in_use = false;
+}
 
 static uint16_t logger_u16le(const uint8_t *src) {
   return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
@@ -251,62 +277,67 @@ bool logger_journal_scan(const char *path,
   }
 
   memset(result, 0, sizeof(*result));
+  logger_journal_scan_workspace_t *workspace =
+      logger_journal_scan_workspace_acquire();
 
   FIL file;
   if (f_open(&file, path, FA_READ) != FR_OK) {
+    logger_journal_scan_workspace_release(workspace);
     return false;
   }
 
-  uint8_t header[LOGGER_JOURNAL_FILE_HEADER_BYTES];
   UINT read_bytes = 0u;
-  if (f_read(&file, header, sizeof(header), &read_bytes) != FR_OK ||
-      read_bytes != sizeof(header)) {
+  if (f_read(&file, workspace->header, sizeof(workspace->header),
+             &read_bytes) != FR_OK ||
+      read_bytes != sizeof(workspace->header)) {
     f_close(&file);
+    logger_journal_scan_workspace_release(workspace);
     return false;
   }
-  if (memcmp(header + 0, "NOF1JNL1", 8u) != 0 ||
-      logger_u16le(header + 8) != LOGGER_JOURNAL_FILE_HEADER_BYTES ||
-      logger_u16le(header + 10) != 1u) {
+  if (memcmp(workspace->header + 0, "NOF1JNL1", 8u) != 0 ||
+      logger_u16le(workspace->header + 8) != LOGGER_JOURNAL_FILE_HEADER_BYTES ||
+      logger_u16le(workspace->header + 10) != 1u) {
     f_close(&file);
+    logger_journal_scan_workspace_release(workspace);
     return false;
   }
-  const uint32_t expect_header_crc = logger_crc32_ieee(header, 56u);
-  if (logger_u32le(header + 56) != expect_header_crc) {
+  const uint32_t expect_header_crc = logger_crc32_ieee(workspace->header, 56u);
+  if (logger_u32le(workspace->header + 56) != expect_header_crc) {
     f_close(&file);
+    logger_journal_scan_workspace_release(workspace);
     return false;
   }
 
-  logger_bytes_to_hex_16(header + 16, result->session_id);
+  logger_bytes_to_hex_16(workspace->header + 16, result->session_id);
   result->valid = true;
   result->valid_size_bytes = LOGGER_JOURNAL_FILE_HEADER_BYTES;
 
-  uint8_t record_header[LOGGER_JOURNAL_RECORD_HEADER_BYTES];
-  uint8_t payload_capture[LOGGER_JOURNAL_SCAN_PAYLOAD_CAPTURE_MAX + 1u];
   while (true) {
     read_bytes = 0u;
-    const FRESULT header_fr =
-        f_read(&file, record_header, sizeof(record_header), &read_bytes);
+    const FRESULT header_fr = f_read(&file, workspace->record_header,
+                                     sizeof(workspace->record_header),
+                                     &read_bytes);
     if (header_fr != FR_OK) {
       break;
     }
     if (read_bytes == 0u) {
       break;
     }
-    if (read_bytes != sizeof(record_header)) {
+    if (read_bytes != sizeof(workspace->record_header)) {
       break;
     }
-    if (memcmp(record_header + 0, "RCD1", 4u) != 0) {
+    if (memcmp(workspace->record_header + 0, "RCD1", 4u) != 0) {
       break;
     }
 
-    const uint16_t header_bytes = logger_u16le(record_header + 4);
+    const uint16_t header_bytes = logger_u16le(workspace->record_header + 4);
     const logger_journal_record_type_t record_type =
-        (logger_journal_record_type_t)logger_u16le(record_header + 6);
-    const uint32_t total_bytes = logger_u32le(record_header + 8);
-    const uint32_t payload_bytes = logger_u32le(record_header + 12);
-    const uint32_t flags = logger_u32le(record_header + 16);
-    const uint32_t payload_crc = logger_u32le(record_header + 20);
-    const uint64_t record_seq = logger_u64le(record_header + 24);
+        (logger_journal_record_type_t)logger_u16le(workspace->record_header + 6);
+    const uint32_t total_bytes = logger_u32le(workspace->record_header + 8);
+    const uint32_t payload_bytes = logger_u32le(workspace->record_header + 12);
+    const uint32_t flags = logger_u32le(workspace->record_header + 16);
+    const uint32_t payload_crc = logger_u32le(workspace->record_header + 20);
+    const uint64_t record_seq = logger_u64le(workspace->record_header + 24);
     if (header_bytes != LOGGER_JOURNAL_RECORD_HEADER_BYTES ||
         total_bytes < header_bytes ||
         total_bytes != (header_bytes + payload_bytes) ||
@@ -318,27 +349,27 @@ bool logger_journal_scan(const char *path,
     }
 
     uint32_t running_crc = logger_crc32_begin();
-    memset(payload_capture, 0, sizeof(payload_capture));
+    memset(workspace->payload_capture, 0, sizeof(workspace->payload_capture));
     uint32_t payload_remaining = payload_bytes;
     size_t capture_offset = 0u;
-    uint8_t chunk[128];
     while (payload_remaining > 0u) {
-      const UINT want = payload_remaining > sizeof(chunk)
-                            ? sizeof(chunk)
+      const UINT want = payload_remaining > sizeof(workspace->chunk)
+                            ? sizeof(workspace->chunk)
                             : (UINT)payload_remaining;
       read_bytes = 0u;
-      if (f_read(&file, chunk, want, &read_bytes) != FR_OK ||
+      if (f_read(&file, workspace->chunk, want, &read_bytes) != FR_OK ||
           read_bytes != want) {
         payload_remaining = UINT32_MAX;
         break;
       }
-      running_crc = logger_crc32_update(running_crc, chunk, want);
+      running_crc = logger_crc32_update(running_crc, workspace->chunk, want);
       const size_t capture_room =
           LOGGER_JOURNAL_SCAN_PAYLOAD_CAPTURE_MAX - capture_offset;
       const size_t capture_now =
           (capture_room < (size_t)want) ? capture_room : (size_t)want;
       if (capture_now > 0u) {
-        memcpy(payload_capture + capture_offset, chunk, capture_now);
+        memcpy(workspace->payload_capture + capture_offset,
+               workspace->chunk, capture_now);
         capture_offset += capture_now;
       }
       payload_remaining -= want;
@@ -350,26 +381,29 @@ bool logger_journal_scan(const char *path,
       break;
     }
 
-    payload_capture[capture_offset] = '\0';
+    workspace->payload_capture[capture_offset] = '\0';
     result->valid_size_bytes += total_bytes;
     result->next_record_seq = record_seq + 1u;
     if ((flags & LOGGER_JOURNAL_FLAG_JSON) != 0u) {
-      jsmntok_t tokens[LOGGER_JOURNAL_JSON_TOKEN_MAX];
       logger_json_doc_t doc;
-      if (logger_json_parse(&doc, (const char *)payload_capture, capture_offset,
-                            tokens, LOGGER_JOURNAL_JSON_TOKEN_MAX)) {
+      if (logger_json_parse(&doc, (const char *)workspace->payload_capture,
+                            capture_offset, workspace->tokens,
+                            LOGGER_JOURNAL_JSON_TOKEN_MAX)) {
         const jsmntok_t *root = logger_json_root(&doc);
         if (root != NULL && root->type == JSMN_OBJECT) {
           logger_journal_apply_json_record(result, record_type, &doc, root);
         }
       }
     } else if ((flags & LOGGER_JOURNAL_FLAG_BINARY) != 0u) {
-      logger_journal_apply_binary_record(result, record_type, payload_capture,
+      logger_journal_apply_binary_record(result, record_type,
+                                         workspace->payload_capture,
                                          capture_offset);
     }
   }
 
-  return f_close(&file) == FR_OK;
+  const bool ok = f_close(&file) == FR_OK;
+  logger_journal_scan_workspace_release(workspace);
+  return ok;
 }
 
 bool logger_journal_truncate_to_valid(const char *path,

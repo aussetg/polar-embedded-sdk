@@ -17,9 +17,49 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "logger/capture_pipe.h"
+
+/* ── Test ring sizing (matches the old pre-PSRAM capacities) ─── */
+
+#define TEST_STAGING_CAPACITY 128u
+#define TEST_CMD_RING_CAPACITY 64u
+
+/* ── Test helper: allocate and init a capture_pipe with host-heap slots ─ */
+
+static logger_writer_cmd_t *g_test_staging;
+static logger_writer_cmd_t *g_test_cmd_ring;
+
+static void test_capture_pipe_init(capture_pipe_t *pipe) {
+  /* Allocate once; reuse across tests. */
+  if (!g_test_staging) {
+    g_test_staging =
+        (logger_writer_cmd_t *)aligned_alloc(16u,
+            TEST_STAGING_CAPACITY * sizeof(logger_writer_cmd_t));
+    g_test_cmd_ring =
+        (logger_writer_cmd_t *)aligned_alloc(16u,
+            TEST_CMD_RING_CAPACITY * sizeof(logger_writer_cmd_t));
+    assert(g_test_staging != NULL && g_test_cmd_ring != NULL);
+  }
+  memset(g_test_staging, 0, TEST_STAGING_CAPACITY * sizeof(logger_writer_cmd_t));
+  memset(g_test_cmd_ring, 0, TEST_CMD_RING_CAPACITY * sizeof(logger_writer_cmd_t));
+  capture_pipe_init(pipe,
+                    &(capture_pipe_init_params_t){
+                        .staging_slots = g_test_staging,
+                        .staging_capacity = TEST_STAGING_CAPACITY,
+                        .cmd_ring_slots = g_test_cmd_ring,
+                        .cmd_ring_capacity = TEST_CMD_RING_CAPACITY,
+                    });
+}
+
+static void test_capture_pipe_cleanup(void) {
+  free(g_test_staging);
+  free(g_test_cmd_ring);
+  g_test_staging = NULL;
+  g_test_cmd_ring = NULL;
+}
 
 /* ── Writer dispatch stub ──────────────────────────────────────── */
 
@@ -67,7 +107,7 @@ static void test_init(void) {
   printf("  init...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   assert(pipe.health == CAPTURE_HEALTHY);
   assert(pipe.hard_failure_active == false);
@@ -90,7 +130,7 @@ static void test_cmd_ring_basic(void) {
   printf("  cmd_ring_basic...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   logger_writer_cmd_t cmd = make_packet_cmd(0);
   assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
@@ -115,13 +155,13 @@ static void test_cmd_ring_full(void) {
   printf("  cmd_ring_full...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
-  for (uint32_t i = 0; i < CAPTURE_CMD_RING_CAPACITY; i++) {
+  for (uint32_t i = 0; i < TEST_CMD_RING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
   }
-  assert(capture_cmd_ring_occupancy(&pipe) == CAPTURE_CMD_RING_CAPACITY);
+  assert(capture_cmd_ring_occupancy(&pipe) == TEST_CMD_RING_CAPACITY);
 
   logger_writer_cmd_t cmd = make_packet_cmd(999);
   assert(capture_cmd_ring_enqueue(&pipe, &cmd) == false);
@@ -140,10 +180,10 @@ static void test_cmd_ring_full(void) {
 static void test_staging_push_drain(void) {
   printf("  staging_push_drain...");
 
-  assert(CAPTURE_STAGING_CAPACITY > 0u && "test requires real staging buffer");
+  assert(TEST_STAGING_CAPACITY > 0u && "test requires real staging buffer");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Push via staging — lands in staging slots, not in command ring yet */
   logger_writer_cmd_t cmd = make_packet_cmd(42);
@@ -171,13 +211,13 @@ static void test_staging_push_drain(void) {
 static void test_staging_fill_and_drain(void) {
   printf("  staging_fill_and_drain...");
 
-  assert(CAPTURE_STAGING_CAPACITY > 0u);
+  assert(TEST_STAGING_CAPACITY > 0u);
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Fill staging to capacity */
-  for (uint32_t i = 0; i < CAPTURE_STAGING_CAPACITY; i++) {
+  for (uint32_t i = 0; i < TEST_STAGING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     assert(capture_staging_push_pmd(&pipe, &cmd) == true);
   }
@@ -193,7 +233,7 @@ static void test_staging_fill_and_drain(void) {
    * drain → dequeue-ring loop until staging is empty. */
   uint32_t total_dequeued = 0u;
   while (capture_staging_has_data(&pipe)) {
-    capture_staging_drain(&pipe, CAPTURE_STAGING_CAPACITY + 1u);
+    capture_staging_drain(&pipe, TEST_STAGING_CAPACITY + 1u);
     while (capture_cmd_ring_occupancy(&pipe) > 0u) {
       logger_writer_cmd_t out;
       assert(capture_cmd_ring_dequeue(&pipe, &out) == true);
@@ -201,7 +241,7 @@ static void test_staging_fill_and_drain(void) {
       total_dequeued += 1u;
     }
   }
-  assert(total_dequeued == CAPTURE_STAGING_CAPACITY);
+  assert(total_dequeued == TEST_STAGING_CAPACITY);
   assert(capture_staging_has_data(&pipe) == false);
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
 
@@ -213,13 +253,13 @@ static void test_staging_fill_and_drain(void) {
 static void test_staging_overflow(void) {
   printf("  staging_overflow...");
 
-  assert(CAPTURE_STAGING_CAPACITY > 0u);
+  assert(TEST_STAGING_CAPACITY > 0u);
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Fill staging to capacity */
-  for (uint32_t i = 0; i < CAPTURE_STAGING_CAPACITY; i++) {
+  for (uint32_t i = 0; i < TEST_STAGING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     assert(capture_staging_push_pmd(&pipe, &cmd) == true);
   }
@@ -246,13 +286,13 @@ static void test_health_transitions(void) {
   printf("  health_transitions...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   assert(pipe.health == CAPTURE_HEALTHY);
 
   /* Fill to 75% (distressed threshold) */
   const uint32_t distressed_count =
-      (CAPTURE_CMD_RING_CAPACITY * CAPTURE_DISTRESSED_THRESHOLD_PCT) / 100u;
+      (TEST_CMD_RING_CAPACITY * CAPTURE_DISTRESSED_THRESHOLD_PCT) / 100u;
   for (uint32_t i = 0; i < distressed_count; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
@@ -264,7 +304,7 @@ static void test_health_transitions(void) {
 
   /* Drain down to 49% (below recovered threshold of 50%) */
   const uint32_t keep_count =
-      (CAPTURE_CMD_RING_CAPACITY * (CAPTURE_RECOVERED_THRESHOLD_PCT - 1u)) /
+      (TEST_CMD_RING_CAPACITY * (CAPTURE_RECOVERED_THRESHOLD_PCT - 1u)) /
       100u;
   const uint32_t drain_count = distressed_count - keep_count;
   for (uint32_t i = 0; i < drain_count; i++) {
@@ -286,7 +326,7 @@ static void test_hard_failure_deadline(void) {
   printf("  hard_failure_deadline...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   capture_pipe_note_hard_failure(&pipe, 1000u);
   assert(pipe.hard_failure_active == true);
@@ -310,7 +350,7 @@ static void test_hard_failure_recovery_before_deadline(void) {
   printf("  hard_failure_recovery_before_deadline...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Simulate a hard failure (e.g. a barrier timeout) */
   capture_pipe_note_hard_failure(&pipe, 1000u);
@@ -338,7 +378,7 @@ static void test_hard_failure_no_recovery_with_overflow(void) {
   printf("  hard_failure_no_recovery_with_overflow...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Simulate a hard failure starting the degraded period */
   capture_pipe_note_hard_failure(&pipe, 1000u);
@@ -365,14 +405,14 @@ static void test_hard_failure_no_recovery_after_deadline(void) {
   printf("  hard_failure_no_recovery_after_deadline...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Hard failure with ring still occupied (so occupancy > recovered threshold)
    */
   capture_pipe_note_hard_failure(&pipe, 1000u);
 
   /* Fill ring to keep occupancy high */
-  for (uint32_t i = 0; i < CAPTURE_CMD_RING_CAPACITY; i++) {
+  for (uint32_t i = 0; i < TEST_CMD_RING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     capture_cmd_ring_enqueue(&pipe, &cmd);
   }
@@ -393,14 +433,14 @@ static void test_hard_failure_recovers_when_ring_drains(void) {
   printf("  hard_failure_recovers_when_ring_drains...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   capture_pipe_note_hard_failure(&pipe, 1000u);
 
   /* Fill the ring so occupancy stays above recovered threshold.
    * This prevents the recovery-before-deadline path from clearing
    * the hard failure. */
-  for (uint32_t i = 0; i < CAPTURE_CMD_RING_CAPACITY; i++) {
+  for (uint32_t i = 0; i < TEST_CMD_RING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     capture_cmd_ring_enqueue(&pipe, &cmd);
   }
@@ -424,7 +464,7 @@ static void test_clear_degraded_deadline(void) {
   printf("  clear_degraded_deadline...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   capture_pipe_note_hard_failure(&pipe, 1000u);
   assert(pipe.degraded_deadline_active == true);
@@ -442,7 +482,7 @@ static void test_event_ring(void) {
   printf("  event_ring...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   capture_event_t ev = {
       .kind = CAPTURE_EVENT_BARRIER_COMPLETE,
@@ -483,18 +523,18 @@ static void test_occupancy_pct(void) {
   printf("  occupancy_pct...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   assert(capture_cmd_ring_occupancy_pct(&pipe) == 0u);
 
-  for (uint32_t i = 0; i < CAPTURE_CMD_RING_CAPACITY / 2u; i++) {
+  for (uint32_t i = 0; i < TEST_CMD_RING_CAPACITY / 2u; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     capture_cmd_ring_enqueue(&pipe, &cmd);
   }
   assert(capture_cmd_ring_occupancy_pct(&pipe) == 50u);
 
-  for (uint32_t i = CAPTURE_CMD_RING_CAPACITY / 2u;
-       i < CAPTURE_CMD_RING_CAPACITY; i++) {
+  for (uint32_t i = TEST_CMD_RING_CAPACITY / 2u;
+       i < TEST_CMD_RING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     capture_cmd_ring_enqueue(&pipe, &cmd);
   }
@@ -509,7 +549,7 @@ static void test_process_events(void) {
   printf("  process_events...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   for (uint32_t i = 0; i < 5; i++) {
     capture_event_t ev = {
@@ -533,14 +573,14 @@ static void test_wrap_around(void) {
   printf("  wrap_around...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   for (uint32_t round = 0; round < 10; round++) {
-    for (uint32_t i = 0; i < CAPTURE_CMD_RING_CAPACITY; i++) {
+    for (uint32_t i = 0; i < TEST_CMD_RING_CAPACITY; i++) {
       logger_writer_cmd_t cmd = make_packet_cmd(round * 100 + i);
       assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
     }
-    for (uint32_t i = 0; i < CAPTURE_CMD_RING_CAPACITY; i++) {
+    for (uint32_t i = 0; i < TEST_CMD_RING_CAPACITY; i++) {
       logger_writer_cmd_t out;
       assert(capture_cmd_ring_dequeue(&pipe, &out) == true);
       assert(out.append_pmd_packet.seq_in_span == round * 100 + i);
@@ -548,8 +588,8 @@ static void test_wrap_around(void) {
   }
 
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
-  assert(pipe.telemetry.cmd_enqueue_count == 10u * CAPTURE_CMD_RING_CAPACITY);
-  assert(pipe.telemetry.cmd_dequeue_count == 10u * CAPTURE_CMD_RING_CAPACITY);
+  assert(pipe.telemetry.cmd_enqueue_count == 10u * TEST_CMD_RING_CAPACITY);
+  assert(pipe.telemetry.cmd_dequeue_count == 10u * TEST_CMD_RING_CAPACITY);
 
   printf(" ok\n");
 }
@@ -560,7 +600,7 @@ static void test_hwm(void) {
   printf("  hwm...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Fill ring to 32 entries */
   for (uint32_t i = 0; i < 32; i++) {
@@ -594,7 +634,7 @@ static void test_barrier_counter_and_events(void) {
   printf("  barrier_counter_and_events...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Push 4 packet commands and 1 barrier */
   for (uint32_t i = 0; i < 4; i++) {
@@ -684,12 +724,12 @@ static void test_staging_overflow_classifies(void) {
   printf("  staging_overflow_classifies...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   assert(pipe.last_writer_failure == CAPTURE_WRITER_FAILURE_NONE);
 
   /* Fill staging to capacity */
-  for (uint32_t i = 0; i < CAPTURE_STAGING_CAPACITY; i++) {
+  for (uint32_t i = 0; i < TEST_STAGING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     assert(capture_staging_push_pmd(&pipe, &cmd) == true);
   }
@@ -708,10 +748,10 @@ static void test_barrier_ring_full_classifies(void) {
   printf("  barrier_ring_full_classifies...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Fill command ring to capacity */
-  for (uint32_t i = 0; i < CAPTURE_CMD_RING_CAPACITY; i++) {
+  for (uint32_t i = 0; i < TEST_CMD_RING_CAPACITY; i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
   }
@@ -740,12 +780,12 @@ static void test_init_clears_failure(void) {
   printf("  init_clears_failure...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
   pipe.last_writer_failure = CAPTURE_WRITER_FAILURE_ENQUEUE_TIMEOUT;
   pipe.hard_failure_active = true;
 
   /* Re-init should clear everything */
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
   assert(pipe.last_writer_failure == CAPTURE_WRITER_FAILURE_NONE);
   assert(pipe.hard_failure_active == false);
 
@@ -758,7 +798,7 @@ static void test_historical_overflow_allows_recovery(void) {
   printf("  historical_overflow_allows_recovery...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* 1. A historical staging overflow happens (e.g. during a transient
    *    BLE burst early in the session). */
@@ -796,7 +836,7 @@ static void test_new_overflow_during_degraded_blocks_recovery(void) {
   printf("  new_overflow_during_degraded_blocks_recovery...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Start with a historical overflow already present */
   pipe.staging.overflow_count = 2u;
@@ -913,7 +953,7 @@ static void test_drain_classifies_flush_barrier(void) {
   printf("  drain_classifies_flush_barrier...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   logger_writer_cmd_t cmd = make_barrier_cmd(); /* FLUSH_BARRIER */
   assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
@@ -946,7 +986,7 @@ static void test_drain_classifies_packet_write(void) {
   printf("  drain_classifies_packet_write...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   logger_writer_cmd_t cmd = make_packet_cmd(0);
   assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
@@ -979,7 +1019,7 @@ static void test_drain_classifies_finalize(void) {
   printf("  drain_classifies_finalize...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   logger_writer_cmd_t cmd;
   memset(&cmd, 0, sizeof(cmd));
@@ -1015,7 +1055,7 @@ static void test_drain_first_writer_wins(void) {
   printf("  drain_first_writer_wins...");
 
   capture_pipe_t pipe;
-  capture_pipe_init(&pipe);
+  test_capture_pipe_init(&pipe);
 
   /* Enqueue a packet command, then a barrier command */
   logger_writer_cmd_t pkt = make_packet_cmd(0);
@@ -1054,9 +1094,9 @@ static void test_drain_first_writer_wins(void) {
 /* ── Main ──────────────────────────────────────────────────────── */
 
 int main(void) {
-  printf("capture_pipe tests (CAPTURE_STAGING_CAPACITY=%u,"
-         " CAPTURE_CMD_RING_CAPACITY=%u):\n",
-         CAPTURE_STAGING_CAPACITY, CAPTURE_CMD_RING_CAPACITY);
+  printf("capture_pipe tests (TEST_STAGING_CAPACITY=%u,"
+         " TEST_CMD_RING_CAPACITY=%u):\n",
+         TEST_STAGING_CAPACITY, TEST_CMD_RING_CAPACITY);
 
   test_init();
   test_cmd_ring_basic();
@@ -1094,6 +1134,7 @@ int main(void) {
   test_drain_classifies_finalize();
   test_drain_first_writer_wins();
 
+  test_capture_pipe_cleanup();
   printf("  all passed\n");
   return 0;
 }

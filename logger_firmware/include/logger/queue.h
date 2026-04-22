@@ -49,6 +49,18 @@ typedef struct {
 
 void logger_upload_queue_init(logger_upload_queue_t *queue);
 void logger_upload_queue_summary_init(logger_upload_queue_summary_t *summary);
+void logger_queue_scratch_init(void);
+/*
+ * Shared temporary queue workspace for core-0 control-plane callers.
+ *
+ * This avoids placing a 30 KiB logger_upload_queue_t on the stack for CLI,
+ * status, and upload-control paths. Correctness comes from the ownership
+ * invariant: this workspace is not a lock and must never be used from the
+ * core-1 storage worker. The acquire/release pair is intentionally simple:
+ * no nesting, no reentrancy.
+ */
+logger_upload_queue_t *logger_upload_queue_tmp_acquire(void);
+void logger_upload_queue_tmp_release(logger_upload_queue_t *queue);
 void logger_upload_queue_compute_summary(
     const logger_upload_queue_t *queue, logger_upload_queue_summary_t *summary);
 

@@ -36,6 +36,17 @@ bool logger_storage_format(logger_storage_status_t *status);
 bool logger_storage_ready_for_logging(const logger_storage_status_t *status);
 
 bool logger_storage_ensure_dir(const char *path);
+/* Atomic file replace via path.tmp + rename.
+ *
+ * Ownership invariant:
+ *   - before the core-1 storage worker launches, core 0 may call this
+ *     directly during BOOT-only recovery/provisioning work
+ *   - after SD/FatFS ownership transfers to the storage worker, calls must
+ *     run only on core 1
+ *
+ * The internal shared workspace is not a lock; wrong-core or concurrent
+ * cross-core callers are programmer error and must fail fast.
+ */
 bool logger_storage_write_file_atomic(const char *path, const void *data,
                                       size_t len);
 bool logger_storage_remove_file(const char *path);

@@ -114,6 +114,7 @@ typedef struct logger_session_state {
 void logger_session_init(logger_session_state_t *session);
 void logger_session_set_pipe(logger_session_state_t *session,
                              struct capture_pipe *pipe);
+void logger_session_init_buffers(void);
 
 bool logger_session_start_debug(
     logger_session_state_t *session, logger_system_log_t *system_log,

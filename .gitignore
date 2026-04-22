@@ -14,7 +14,7 @@ build/
 .cache
 docs/book/
 compile_commands.json
-build-strict
+build*
 
 # IDE
 .idea/

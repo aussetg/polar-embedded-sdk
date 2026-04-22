@@ -49,21 +49,43 @@ static bool logger_storage_svc_available(void) {
  */
 
 #define STORAGE_SVC_TIMEOUT_MS 30000u
+#define STORAGE_SVC_SLOW_QUEUE_TIMEOUT_MS (5u * 60u * 1000u)
+#define STORAGE_SVC_BUNDLE_COMPUTE_TIMEOUT_MS (5u * 60u * 1000u)
+#define STORAGE_SVC_WAIT_HEARTBEAT_MS 100u
 
-static bool logger_storage_svc_submit(storage_service_kind_t kind) {
-  storage_service_t *svc = &g_svc_shared->service;
+static uint32_t
+logger_storage_svc_timeout_ms(storage_service_kind_t kind) {
+  switch (kind) {
+  case STORAGE_SVC_QUEUE_SCAN:
+  case STORAGE_SVC_QUEUE_REFRESH:
+  case STORAGE_SVC_QUEUE_REBUILD:
+    return STORAGE_SVC_SLOW_QUEUE_TIMEOUT_MS;
+  case STORAGE_SVC_BUNDLE_COMPUTE:
+    return STORAGE_SVC_BUNDLE_COMPUTE_TIMEOUT_MS;
+  default:
+    return STORAGE_SVC_TIMEOUT_MS;
+  }
+}
 
-  /* Debug guard: catch re-entrancy or double-submit.  If done is
-   * false and kind is not NONE, a previous request is still in
-   * flight — a second submit would overwrite the pointer fields
-   * while core 1 is still using them. */
-  assert(svc->done || svc->kind == STORAGE_SVC_NONE);
+static void logger_storage_svc_wait_heartbeat(void) {
+  /* Core 0 wait strategy:
+   *
+   * - sleep in WFE so long storage operations do not burn a full core
+   * - wake promptly when core 1 completes and signals __sev()
+   * - also wake periodically via the core-0 default alarm pool so we can
+   *   feed the watchdog and notice a timeout even if core 1 wedges or an
+   *   expected completion event is missed
+   *
+   * We intentionally keep the alarm-pool dependency out of the core-1 worker
+   * (see storage_worker.c), but on core 0 the default alarm pool is already
+   * part of normal system operation and is the cleanest low-CPU heartbeat.
+   */
+  (void)best_effort_wfe_or_timeout(
+      make_timeout_time_ms(STORAGE_SVC_WAIT_HEARTBEAT_MS));
+}
 
-  svc->done = false;
-  svc->ok = false;
-
-  /* Clear all pointer fields so stale values from a previous request
-   * can't accidentally be dereferenced by the core 1 handler. */
+static void logger_storage_svc_prepare(storage_service_t *svc) {
+  memset(&svc->params, 0, sizeof(svc->params));
   svc->queue_out = NULL;
   svc->queue_in = NULL;
   svc->summary_out = NULL;
@@ -77,6 +99,19 @@ static bool logger_storage_svc_submit(storage_service_kind_t kind) {
   svc->system_log = NULL;
   svc->format_status_out = NULL;
   svc->file_exists_out = NULL;
+}
+
+static bool logger_storage_svc_submit(storage_service_kind_t kind) {
+  storage_service_t *svc = &g_svc_shared->service;
+
+  /* Debug guard: catch re-entrancy or double-submit.  If done is
+   * false and kind is not NONE, a previous request is still in
+   * flight — a second submit would overwrite the pointer fields
+   * while core 1 is still using them. */
+  assert(svc->done || svc->kind == STORAGE_SVC_NONE);
+
+  svc->done = false;
+  svc->ok = false;
 
   __mem_fence_release();
   svc->kind = kind;
@@ -102,7 +137,7 @@ static bool logger_storage_svc_submit(storage_service_kind_t kind) {
    * The timeout just means we report failure; the wait is mandatory.
    */
   const uint32_t deadline =
-      (uint32_t)(time_us_64() / 1000ull) + STORAGE_SVC_TIMEOUT_MS;
+      (uint32_t)(time_us_64() / 1000ull) + logger_storage_svc_timeout_ms(kind);
   bool timed_out = false;
   while (!svc->done) {
     if (!timed_out && (uint32_t)(time_us_64() / 1000ull) >= deadline) {
@@ -111,7 +146,7 @@ static bool logger_storage_svc_submit(storage_service_kind_t kind) {
       /* Fall through — keep waiting, don't return. */
     }
     watchdog_update();
-    __wfe();
+    logger_storage_svc_wait_heartbeat();
   }
   __mem_fence_acquire();
 
@@ -127,8 +162,8 @@ bool logger_storage_svc_queue_load(logger_upload_queue_t *queue) {
     return logger_upload_queue_load(queue);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->queue_out = queue;
-  svc->system_log = NULL;
   return logger_storage_svc_submit(STORAGE_SVC_QUEUE_LOAD);
 }
 
@@ -139,6 +174,7 @@ bool logger_storage_svc_queue_scan(logger_upload_queue_t *queue,
     return logger_upload_queue_scan(queue, system_log, updated_at_utc_or_null);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->queue_out = queue;
   svc->system_log = system_log;
   logger_copy_string(svc->params.utc_only.updated_at_utc,
@@ -153,8 +189,8 @@ bool logger_storage_svc_queue_write(const logger_upload_queue_t *queue) {
     return logger_upload_queue_write(queue);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->queue_in = queue;
-  svc->system_log = NULL;
   return logger_storage_svc_submit(STORAGE_SVC_QUEUE_WRITE);
 }
 
@@ -166,7 +202,7 @@ bool logger_storage_svc_queue_refresh(
                                             summary_out);
   }
   storage_service_t *svc = &g_svc_shared->service;
-  svc->queue_out = NULL;
+  logger_storage_svc_prepare(svc);
   svc->summary_out = summary_out;
   svc->system_log = system_log;
   logger_copy_string(svc->params.utc_only.updated_at_utc,
@@ -188,6 +224,7 @@ bool logger_storage_svc_queue_prune(
         summary_out);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->summary_out = summary_out;
   svc->retention_pruned_out = retention_pruned_count_out;
   svc->reserve_pruned_out = reserve_pruned_count_out;
@@ -209,6 +246,7 @@ bool logger_storage_svc_queue_rebuild(
                                             summary_out);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->summary_out = summary_out;
   svc->system_log = system_log;
   logger_copy_string(svc->params.utc_only.updated_at_utc,
@@ -228,6 +266,7 @@ bool logger_storage_svc_queue_requeue_blocked(
         summary_out);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->summary_out = summary_out;
   svc->requeued_count_out = requeued_count_out;
   svc->system_log = system_log;
@@ -248,6 +287,7 @@ bool logger_storage_svc_refresh(logger_storage_status_t *status) {
     return logger_storage_refresh(status);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->storage_status_out = status;
   return logger_storage_svc_submit(STORAGE_SVC_STORAGE_REFRESH);
 }
@@ -260,6 +300,7 @@ bool logger_storage_svc_self_test(void) {
                                             sizeof(probe_data) - 1u) &&
            logger_storage_remove_file(LOGGER_RECOVERY_PROBE_PATH);
   }
+  logger_storage_svc_prepare(&g_svc_shared->service);
   return logger_storage_svc_submit(STORAGE_SVC_STORAGE_SELF_TEST);
 }
 
@@ -268,6 +309,7 @@ bool logger_storage_svc_format(logger_storage_status_t *status) {
     return logger_storage_format(status);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->format_status_out = status;
   return logger_storage_svc_submit(STORAGE_SVC_STORAGE_FORMAT);
 }
@@ -277,6 +319,7 @@ bool logger_storage_svc_file_exists(const char *path) {
     return logger_storage_file_exists(path);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   logger_copy_string(svc->params.file_exists.path,
                      sizeof(svc->params.file_exists.path), path);
   bool exists = false;
@@ -298,6 +341,7 @@ bool logger_storage_svc_bundle_compute(
                                         out_sha256, bundle_size_out);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   logger_copy_string(svc->params.bundle.dir_name,
                      sizeof(svc->params.bundle.dir_name), dir_name);
   logger_copy_string(svc->params.bundle.manifest_path,
@@ -320,6 +364,7 @@ bool logger_storage_svc_bundle_open(const char *dir_name,
         &g_svc_shared->bundle_stream, dir_name, manifest_path, journal_path);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   logger_copy_string(svc->params.bundle.dir_name,
                      sizeof(svc->params.bundle.dir_name), dir_name);
   logger_copy_string(svc->params.bundle.manifest_path,
@@ -340,6 +385,7 @@ bool logger_storage_svc_bundle_read(void *dst, size_t cap, size_t *len_out) {
                                             cap, len_out);
   }
   storage_service_t *svc = &g_svc_shared->service;
+  logger_storage_svc_prepare(svc);
   svc->params.bundle_read.dst = dst;
   svc->params.bundle_read.cap = cap;
   svc->params.bundle_read.len_out = len_out;
@@ -354,5 +400,6 @@ void logger_storage_svc_bundle_close(void) {
     logger_upload_bundle_stream_close(&g_svc_shared->bundle_stream);
     return;
   }
+  logger_storage_svc_prepare(&g_svc_shared->service);
   (void)logger_storage_svc_submit(STORAGE_SVC_BUNDLE_CLOSE);
 }

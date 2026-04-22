@@ -9,13 +9,31 @@
 
 /*
  * Ring index convention: head and tail are uint64_t counters that grow
- * monotonically (never reset).  The actual slot index is (head % cap).
+ * monotonically (never reset).  The actual slot index is
+ * (head & (cap - 1)).
  * Occupancy is (tail - head) using unsigned arithmetic.
  *
  * The unsigned subtraction is correct across the uint64_t wrap boundary
  * as long as occupancy < 2^64, which is guaranteed since occupancy <= cap
- * (max 128).  At 280 pkt/s the counters wrap after ~2e9 years.
+ * and cap is finite.  At 280 pkt/s the counters wrap after ~2e9 years.
+ *
+ * Mask indexing is correct only for non-zero power-of-two capacities.
+ * capture_pipe_init() hard-asserts that invariant for both staging and the
+ * command ring.
  */
+static bool capture_pipe_capacity_is_power_of_two(uint32_t capacity) {
+  return capacity != 0u && (capacity & (capacity - 1u)) == 0u;
+}
+
+static void capture_pipe_assert_init_params(
+    const capture_pipe_init_params_t *params) {
+  hard_assert(params != NULL);
+  hard_assert(params->staging_slots != NULL);
+  hard_assert(params->cmd_ring_slots != NULL);
+  hard_assert(capture_pipe_capacity_is_power_of_two(params->staging_capacity));
+  hard_assert(capture_pipe_capacity_is_power_of_two(params->cmd_ring_capacity));
+}
+
 static bool ring_full(uint64_t head, uint64_t tail, uint32_t cap) {
   return (uint32_t)(tail - head) >= cap;
 }
@@ -48,8 +66,18 @@ static void capture_pipe_set_health(capture_pipe_t *pipe,
 
 /* ── Lifecycle ─────────────────────────────────────────────────── */
 
-void capture_pipe_init(capture_pipe_t *pipe) {
+void capture_pipe_init(capture_pipe_t *pipe,
+                       const capture_pipe_init_params_t *params) {
+  hard_assert(pipe != NULL);
+  capture_pipe_assert_init_params(params);
   memset(pipe, 0, sizeof(*pipe));
+
+  /* Wire PSRAM-backed slot arrays from caller. */
+  pipe->staging.slots = params->staging_slots;
+  pipe->staging.capacity = params->staging_capacity;
+  pipe->cmd_ring.slots = params->cmd_ring_slots;
+  pipe->cmd_ring.capacity = params->cmd_ring_capacity;
+
   capture_pipe_set_health(pipe, CAPTURE_HEALTHY);
   pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_NONE;
 }
@@ -120,9 +148,9 @@ bool capture_staging_push_pmd(capture_pipe_t *pipe,
 
   capture_source_staging_t *s = &pipe->staging;
   const uint32_t idx =
-      s->tail & (CAPTURE_STAGING_CAPACITY - 1u); /* power-of-2 mask */
+      s->tail & (s->capacity - 1u); /* power-of-2 mask */
 
-  if ((s->tail - s->head) >= CAPTURE_STAGING_CAPACITY) {
+  if ((s->tail - s->head) >= s->capacity) {
     s->overflow_count += 1u;
     pipe->telemetry.staging_overflow_count += 1u;
     /* first-writer-wins: preserve an earlier, more specific classification */
@@ -139,9 +167,9 @@ bool capture_staging_push_pmd(capture_pipe_t *pipe,
   pipe->telemetry.staging_enqueue_count += 1u;
   const uint32_t occ = (uint32_t)(s->tail - s->head);
   if (occ > pipe->telemetry.staging_occupancy_hwm) {
-    pipe->telemetry.staging_occupancy_hwm = (uint8_t)occ;
+    pipe->telemetry.staging_occupancy_hwm = (uint16_t)occ;
   }
-  pipe->telemetry.staging_occupancy_now = (uint8_t)occ;
+  pipe->telemetry.staging_occupancy_now = (uint16_t)occ;
 
   return true;
 }
@@ -163,7 +191,7 @@ uint32_t capture_staging_drain(capture_pipe_t *pipe, uint32_t max_entries) {
 
   while (drained < max_entries && s->head != s->tail) {
     const uint32_t idx =
-        s->head & (CAPTURE_STAGING_CAPACITY - 1u); /* power-of-2 mask */
+        s->head & (s->capacity - 1u); /* power-of-2 mask */
 
     if (!capture_cmd_ring_enqueue(pipe, &s->slots[idx])) {
       break;
@@ -178,7 +206,7 @@ uint32_t capture_staging_drain(capture_pipe_t *pipe, uint32_t max_entries) {
   if (drained > 0u) {
     pipe->telemetry.staging_drain_count += drained;
     const uint32_t occ = (uint32_t)(s->tail - s->head);
-    pipe->telemetry.staging_occupancy_now = (uint8_t)occ;
+    pipe->telemetry.staging_occupancy_now = (uint16_t)occ;
   }
 
   return drained;
@@ -193,12 +221,12 @@ bool capture_cmd_ring_enqueue(capture_pipe_t *pipe,
   }
 
   capture_cmd_ring_t *r = &pipe->cmd_ring;
-  if (ring_full(r->head, r->tail, CAPTURE_CMD_RING_CAPACITY)) {
+  if (ring_full(r->head, r->tail, r->capacity)) {
     pipe->telemetry.cmd_enqueue_reject_count += 1u;
     return false;
   }
 
-  const uint32_t idx = r->tail % CAPTURE_CMD_RING_CAPACITY;
+  const uint32_t idx = r->tail & (r->capacity - 1u);
   r->slots[idx] = *cmd;
   r->seq += 1u;
   __mem_fence_release(); /* publish slot data before tail */
@@ -207,9 +235,9 @@ bool capture_cmd_ring_enqueue(capture_pipe_t *pipe,
   pipe->telemetry.cmd_enqueue_count += 1u;
   const uint32_t occ = ring_occ(r->head, r->tail);
   if (occ > pipe->telemetry.cmd_occupancy_hwm) {
-    pipe->telemetry.cmd_occupancy_hwm = (uint8_t)occ;
+    pipe->telemetry.cmd_occupancy_hwm = (uint16_t)occ;
   }
-  pipe->telemetry.cmd_occupancy_now = (uint8_t)occ;
+  pipe->telemetry.cmd_occupancy_now = (uint16_t)occ;
 
   return true;
 }
@@ -226,7 +254,7 @@ bool capture_cmd_ring_dequeue(capture_pipe_t *pipe,
   }
   __mem_fence_acquire(); /* see slot data after reading tail */
 
-  const uint32_t idx = r->head % CAPTURE_CMD_RING_CAPACITY;
+  const uint32_t idx = r->head & (r->capacity - 1u);
   *cmd_out = r->slots[idx];
   memset(&r->slots[idx], 0, sizeof(r->slots[idx]));
   __mem_fence_release(); /* publish slot reuse before advancing head */
@@ -234,7 +262,7 @@ bool capture_cmd_ring_dequeue(capture_pipe_t *pipe,
 
   pipe->telemetry.cmd_dequeue_count += 1u;
   const uint32_t occ = ring_occ(r->head, r->tail);
-  pipe->telemetry.cmd_occupancy_now = (uint8_t)occ;
+  pipe->telemetry.cmd_occupancy_now = (uint16_t)occ;
 
   return true;
 }
@@ -255,7 +283,10 @@ uint32_t capture_cmd_ring_occupancy(const capture_pipe_t *pipe) {
 }
 
 uint8_t capture_cmd_ring_occupancy_pct(const capture_pipe_t *pipe) {
-  return occ_pct(capture_cmd_ring_occupancy(pipe), CAPTURE_CMD_RING_CAPACITY);
+  if (pipe == NULL) {
+    return 0u;
+  }
+  return occ_pct(capture_cmd_ring_occupancy(pipe), pipe->cmd_ring.capacity);
 }
 
 /* ── Event ring ────────────────────────────────────────────────── */
@@ -347,7 +378,7 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
 
   /* Drain any pending staging data first (ordering) */
   if (capture_staging_has_data(pipe)) {
-    (void)capture_staging_drain(pipe, CAPTURE_STAGING_DUAL_CORE_CAPACITY);
+    (void)capture_staging_drain(pipe, pipe->staging.capacity);
   }
 
   /* Enqueue the barrier command into the command ring.

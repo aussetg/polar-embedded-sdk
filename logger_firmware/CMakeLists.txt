@@ -27,7 +27,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-set(LOGGER_FIRMWARE_VERSION "0.1.0-dev" CACHE STRING "Semantic firmware version string")
+set(LOGGER_FIRMWARE_VERSION "0.1.0" CACHE STRING "Semantic firmware version string")
 set(LOGGER_BUILD_ID "logger-fw-dev" CACHE STRING "Opaque firmware build identifier")
 set(PICO_MBEDTLS_CONFIG_FILE "logger_mbedtls_config.h" CACHE STRING "Project-local Mbed TLS configuration header")
 
@@ -113,6 +113,15 @@ add_executable(logger_appliance
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ffunicode.c
 )
 
+option(LOGGER_USE_SRAM_LOCKED_LINKER
+    "Use the custom linker script that forces selected code/rodata into SRAM"
+    ON)
+
+if(LOGGER_USE_SRAM_LOCKED_LINKER)
+    pico_set_linker_script(logger_appliance
+        ${CMAKE_CURRENT_LIST_DIR}/ld/memmap_sram_locked.ld)
+endif()
+
 target_include_directories(logger_appliance PRIVATE
     ${LOGGER_GENERATED_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
@@ -148,6 +157,8 @@ target_link_libraries(logger_appliance PRIVATE
 target_compile_definitions(logger_appliance PRIVATE
     LOGGER_FIRMWARE_VERSION="${LOGGER_FIRMWARE_VERSION}"
     LOGGER_BUILD_ID="${LOGGER_BUILD_ID}"
+    PICO_STACK_SIZE=0x1000
+    PICO_CORE1_STACK_SIZE=0x1000
 )
 
 target_compile_options(logger_appliance PRIVATE

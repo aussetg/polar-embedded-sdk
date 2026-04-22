@@ -1,5 +1,6 @@
 #include "logger/storage.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -10,6 +11,7 @@
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "logger/util.h"
+#include "logger/storage_worker.h"
 #include "pico/stdlib.h"
 
 #include "board_config.h"
@@ -42,7 +44,15 @@ typedef struct {
   uint32_t sector_count;
 } logger_sd_driver_t;
 
+typedef struct {
+  char tmp_path[LOGGER_STORAGE_PATH_MAX];
+  FIL file;
+  bool in_use;
+} logger_storage_atomic_write_workspace_t;
+
 static logger_sd_driver_t g_sd;
+static logger_storage_atomic_write_workspace_t
+    g_storage_atomic_write_workspace;
 /* DMA channels for SPI bulk data phase.
  *   TX channel: memory → SPI TX FIFO, paced by DREQ_SPIx_TX
  *   RX channel: SPI RX FIFO → memory, paced by DREQ_SPIx_RX
@@ -85,6 +95,37 @@ static bool logger_storage_path_tmp(char out[LOGGER_STORAGE_PATH_MAX],
   memcpy(out, path, path_len);
   memcpy(out + path_len, suffix, suffix_len + 1u);
   return true;
+}
+
+static void logger_storage_assert_atomic_write_context(void) {
+  hard_assert(__get_current_exception() == 0u);
+
+  const bool worker_owns_fatfs = logger_storage_worker_owns_fatfs();
+  const uint core = get_core_num();
+  if (worker_owns_fatfs) {
+    hard_assert(core == 1u);
+  } else {
+    hard_assert(core == 0u);
+  }
+}
+
+static logger_storage_atomic_write_workspace_t *
+logger_storage_atomic_write_workspace_acquire(void) {
+  logger_storage_assert_atomic_write_context();
+  assert(!g_storage_atomic_write_workspace.in_use);
+  memset(&g_storage_atomic_write_workspace, 0,
+         sizeof(g_storage_atomic_write_workspace));
+  g_storage_atomic_write_workspace.in_use = true;
+  return &g_storage_atomic_write_workspace;
+}
+
+static void logger_storage_atomic_write_workspace_release(
+    logger_storage_atomic_write_workspace_t *workspace) {
+  (void)workspace;
+  logger_storage_assert_atomic_write_context();
+  assert(workspace == &g_storage_atomic_write_workspace);
+  assert(g_storage_atomic_write_workspace.in_use);
+  g_storage_atomic_write_workspace.in_use = false;
 }
 
 static bool logger_sd_detect_pin_active(void) {
@@ -633,37 +674,46 @@ bool logger_storage_ensure_dir(const char *path) {
 bool logger_storage_write_file_atomic(const char *path, const void *data,
                                       size_t len) {
   logger_storage_status_t status;
+  logger_storage_atomic_write_workspace_t *workspace =
+      logger_storage_atomic_write_workspace_acquire();
   (void)logger_storage_refresh(&status);
   if (!status.mounted || !status.writable) {
+    logger_storage_atomic_write_workspace_release(workspace);
     return false;
   }
 
-  char tmp_path[LOGGER_STORAGE_PATH_MAX];
-  if (!logger_storage_path_tmp(tmp_path, path)) {
+  if (!logger_storage_path_tmp(workspace->tmp_path, path)) {
+    logger_storage_atomic_write_workspace_release(workspace);
     return false;
   }
 
-  FIL file;
   UINT written = 0u;
-  if (f_open(&file, tmp_path, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+  if (f_open(&workspace->file, workspace->tmp_path,
+             FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+    logger_storage_atomic_write_workspace_release(workspace);
     return false;
   }
 
   const FRESULT write_fr =
-      (len == 0u) ? FR_OK : f_write(&file, data, (UINT)len, &written);
-  const FRESULT sync_fr = f_sync(&file);
-  const FRESULT close_fr = f_close(&file);
+      (len == 0u)
+          ? FR_OK
+          : f_write(&workspace->file, data, (UINT)len, &written);
+  const FRESULT sync_fr = f_sync(&workspace->file);
+  const FRESULT close_fr = f_close(&workspace->file);
   if ((len != 0u && (write_fr != FR_OK || written != (UINT)len)) ||
       sync_fr != FR_OK || close_fr != FR_OK) {
-    (void)f_unlink(tmp_path);
+    (void)f_unlink(workspace->tmp_path);
+    logger_storage_atomic_write_workspace_release(workspace);
     return false;
   }
 
   (void)f_unlink(path);
-  if (f_rename(tmp_path, path) != FR_OK) {
-    (void)f_unlink(tmp_path);
+  if (f_rename(workspace->tmp_path, path) != FR_OK) {
+    (void)f_unlink(workspace->tmp_path);
+    logger_storage_atomic_write_workspace_release(workspace);
     return false;
   }
+  logger_storage_atomic_write_workspace_release(workspace);
   return true;
 }
 

@@ -41,7 +41,7 @@ logger_system_log_record_blank(const logger_system_log_record_t *record) {
   return record->magic == 0xffffffffu;
 }
 
-static bool
+static bool __attribute__((noinline))
 logger_system_log_record_valid(const logger_system_log_record_t *record) {
   if (record->magic != LOGGER_SYSTEM_LOG_MAGIC) {
     return false;
@@ -127,15 +127,14 @@ bool logger_system_log_append(logger_system_log_t *log, const char *utc_or_null,
   }
 
   /* Verify the target slot is blank. */
-  logger_system_log_record_t target;
-  log->backend->read_record(log->next_record_index, &target, sizeof(target));
-  if (!logger_system_log_record_blank(&target)) {
+  logger_system_log_record_t record;
+  log->backend->read_record(log->next_record_index, &record, sizeof(record));
+  if (!logger_system_log_record_blank(&record)) {
     log->backend->erase_all();
     log->event_count = 0u;
     log->next_record_index = 0u;
   }
 
-  logger_system_log_record_t record;
   memset(&record, 0xff, sizeof(record));
   record.magic = LOGGER_SYSTEM_LOG_MAGIC;
   record.schema_version = LOGGER_SYSTEM_LOG_SCHEMA_VERSION;

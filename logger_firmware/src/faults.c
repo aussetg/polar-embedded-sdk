@@ -23,6 +23,8 @@ const char *logger_fault_code_name(logger_fault_code_t code) {
     return "sd_low_space_reserve_unmet";
   case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
     return "upload_blocked_min_firmware";
+  case LOGGER_FAULT_PSRAM_INIT_FAILED:
+    return "psram_init_failed";
   default:
     return "unknown_fault";
   }
@@ -43,6 +45,8 @@ uint8_t logger_fault_blink_count(logger_fault_code_t code) {
     return 4;
   case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
     return 5;
+  case LOGGER_FAULT_PSRAM_INIT_FAILED:
+    return 6;
   case LOGGER_FAULT_NONE:
   default:
     return 0;

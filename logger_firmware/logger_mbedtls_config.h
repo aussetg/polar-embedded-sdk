@@ -16,6 +16,7 @@
 #define MBEDTLS_HAVE_TIME
 #define MBEDTLS_HAVE_TIME_DATE
 #define MBEDTLS_PLATFORM_MS_TIME_ALT
+#define MBEDTLS_PLATFORM_MEMORY
 
 #define MBEDTLS_AES_C
 #define MBEDTLS_AES_FEWER_TABLES
@@ -90,7 +91,27 @@
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
 
-#define MBEDTLS_SSL_IN_CONTENT_LEN 8192
-#define MBEDTLS_SSL_OUT_CONTENT_LEN 4096
+/*
+ * TLS record buffers are intentionally smaller than the upstream/default
+ * mbedTLS sizes to fit the RP2350 + lwIP SRAM heap budget.
+ *
+ * Important: these buffers still come from the lwIP heap in SRAM via
+ * altcp_tls_mbedtls_mem.c (mem_malloc/mem_calloc), not from our PSRAM-backed
+ * upload/queue workspaces. We reduced them while fixing TLS OOM during
+ * handshake/setup, after moving our own large static workspaces into PSRAM.
+ *
+ * Compatibility note:
+ * MBEDTLS_SSL_IN_CONTENT_LEN is an endpoint-specific deployment tradeoff here,
+ * not a universally safe value for arbitrary TLS servers. The current upload
+ * endpoint / cert chain was verified on hardware to complete the handshake with
+ * a 6144-byte inbound record buffer. If the server, CDN, or certificate chain
+ * changes and starts emitting larger handshake records, TLS may fail with
+ * MBEDTLS_ERR_SSL_INVALID_RECORD and this value may need to increase again.
+ *
+ * MBEDTLS_SSL_OUT_CONTENT_LEN can be smaller because this client only sends a
+ * small request header and streams the request body in modest chunks.
+ */
+#define MBEDTLS_SSL_IN_CONTENT_LEN 6144
+#define MBEDTLS_SSL_OUT_CONTENT_LEN 2048
 
 #endif

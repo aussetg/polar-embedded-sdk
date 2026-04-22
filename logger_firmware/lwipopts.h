@@ -18,7 +18,7 @@
 #define ALTCP_MBEDTLS_AUTHMODE 2
 
 #define MEM_ALIGNMENT 4
-#define MEM_SIZE (96 * 1024)
+#define MEM_SIZE (128 * 1024)
 
 #define LWIP_TCP 1
 #define LWIP_UDP 1

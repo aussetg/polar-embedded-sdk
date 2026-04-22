@@ -1,13 +1,72 @@
 #include "logger/upload_bundle.h"
 
+#include <assert.h>
 #include <limits.h>
 #include <string.h>
 
+#include "pico/stdlib.h"
+
+#include "logger/psram_layout.h"
 #include "logger/sha256.h"
 #include "logger/storage.h"
+#include "logger/storage_worker.h"
 #include "logger/util.h"
 
 #define LOGGER_UPLOAD_BUNDLE_NAME_MAX 100u
+
+/* Queue refresh / bundle hashing is architecturally serialized:
+ *   - before the worker launches, core 0 may call compute() directly
+ *   - after the worker launches, compute() runs only through the synchronous
+ *     storage-service path on core 1
+ * so one shared workspace is sufficient and avoids blowing the 4 KiB scratch
+ * stacks with an 11 KiB stream object.
+ */
+#define LOGGER_UPLOAD_BUNDLE_PSRAM_STREAM_ADDR                                \
+  (PSRAM_UPLOAD_BUNDLE_REGION_BASE)
+
+_Static_assert(LOGGER_UPLOAD_BUNDLE_PSRAM_STREAM_ADDR +
+                       sizeof(logger_upload_bundle_stream_t) <=
+                   PSRAM_UPLOAD_BUNDLE_REGION_BASE +
+                       PSRAM_UPLOAD_BUNDLE_REGION_SIZE,
+               "upload bundle stream exceeds reserved bundle region");
+
+/* Debug/contract tripwire for the single shared PSRAM workspace.
+ * This is NOT a lock. Correctness comes from the ownership invariant enforced
+ * in logger_upload_bundle_assert_compute_context():
+ *   - before worker launch, direct compute is allowed only on core 0
+ *   - after worker launch, compute is allowed only on core 1
+ * Any violation is a programmer error and must fail fast rather than attempt
+ * to serialize wrong-core SD/FatFS access.
+ */
+static bool g_bundle_compute_active;
+
+static void logger_upload_bundle_assert_compute_context(void) {
+  hard_assert(__get_current_exception() == 0u);
+
+  const bool worker_owns_fatfs = logger_storage_worker_owns_fatfs();
+  const uint core = get_core_num();
+  if (worker_owns_fatfs) {
+    hard_assert(core == 1u);
+  } else {
+    hard_assert(core == 0u);
+  }
+}
+
+static void logger_upload_bundle_compute_begin(void) {
+  logger_upload_bundle_assert_compute_context();
+  assert(!g_bundle_compute_active);
+  g_bundle_compute_active = true;
+}
+
+static void logger_upload_bundle_compute_end(void) {
+  assert(g_bundle_compute_active);
+  g_bundle_compute_active = false;
+}
+
+static logger_upload_bundle_stream_t *logger_upload_bundle_stream_workspace_ptr(
+    void) {
+  return (logger_upload_bundle_stream_t *)LOGGER_UPLOAD_BUNDLE_PSRAM_STREAM_ADDR;
+}
 
 static bool
 logger_upload_bundle_copy_name(char dst[LOGGER_UPLOAD_BUNDLE_NAME_MAX],
@@ -287,20 +346,24 @@ bool logger_upload_bundle_compute(
     const char *dir_name, const char *manifest_path, const char *journal_path,
     char out_sha256[LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN + 1],
     uint64_t *bundle_size_out) {
-  logger_upload_bundle_stream_t stream;
-  if (!logger_upload_bundle_stream_open(&stream, dir_name, manifest_path,
+  logger_upload_bundle_compute_begin();
+
+  logger_upload_bundle_stream_t *stream =
+      logger_upload_bundle_stream_workspace_ptr();
+  if (!logger_upload_bundle_stream_open(stream, dir_name, manifest_path,
                                         journal_path)) {
+    logger_upload_bundle_compute_end();
     return false;
   }
 
   logger_sha256_t sha;
   logger_sha256_init(&sha);
   uint64_t total_size = 0u;
-  uint8_t chunk[256];
+  uint8_t chunk[LOGGER_UPLOAD_BUNDLE_STREAM_CHUNK_MAX];
   bool ok = true;
   for (;;) {
     size_t len = 0u;
-    if (!logger_upload_bundle_stream_read(&stream, chunk, sizeof(chunk),
+    if (!logger_upload_bundle_stream_read(stream, chunk, sizeof(chunk),
                                           &len)) {
       ok = false;
       break;
@@ -311,8 +374,9 @@ bool logger_upload_bundle_compute(
     logger_sha256_update(&sha, chunk, len);
     total_size += len;
   }
-  logger_upload_bundle_stream_close(&stream);
+  logger_upload_bundle_stream_close(stream);
   if (!ok) {
+    logger_upload_bundle_compute_end();
     return false;
   }
 
@@ -320,5 +384,6 @@ bool logger_upload_bundle_compute(
   if (bundle_size_out != NULL) {
     *bundle_size_out = total_size;
   }
+  logger_upload_bundle_compute_end();
   return true;
 }

@@ -46,6 +46,38 @@ The reserved internal-flash region is intentionally generous:
 - the system log uses larger fixed records so detail payloads do not have to be squeezed into tiny JSON fragments,
 - everything remains raw-flash and sequence/CRC based rather than pulling in a filesystem for a handful of structured records.
 
+## PSRAM layout
+
+The RP2-2 board gives us 8 MiB of PSRAM. The source of truth for the compile-time
+layout is `include/logger/psram_layout.h`.
+
+Current map:
+
+- `0x11000000 .. 0x1107ffff` — system log ring (`512 KiB`)
+- `0x11080000 .. 0x1120ffff` — fixed-layout writer buffers:
+  - staging slots
+  - command ring slots
+  - chunk buffer
+- `0x11210000 .. 0x1130ffff` — reserved queue region (`1 MiB`)
+  - queue scratch JSON arena
+  - queue tmp/op/scan/delete workspaces
+- `0x11310000 .. 0x1132ffff` — reserved upload region (`128 KiB`)
+  - HTTP request / response / process workspaces
+- `0x11330000 .. 0x1134ffff` — reserved upload-bundle region (`128 KiB`)
+  - shared bundle stream workspace
+
+Why this is centralized:
+
+- queue, upload, and bundle code all use PSRAM-backed scratch/workspace state;
+- those regions are reserved in one header so different translation units cannot
+  silently overlap by inventing their own offsets;
+- each user then proves locally with `_Static_assert(...)` that it stays inside
+  its assigned region.
+
+The layout is intentionally roomy. SRAM pressure, not raw PSRAM capacity, is the
+real constraint in the HTTPS/upload path, so we prefer simple fixed regions with
+slack over tight packing.
+
 ## Build
 
 The build defaults to the canonical RP2-2 board profile and reuses the existing pico-sdk board header from:

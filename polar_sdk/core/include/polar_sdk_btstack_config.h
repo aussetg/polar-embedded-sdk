@@ -21,7 +21,8 @@
 // Polar sensors set the LE Secure Connections bit in their pairing response.
 // Legacy pairing works as a downgrade but SC is the expected path.
 #if !defined(ENABLE_LE_SECURE_CONNECTIONS)
-#error "Polar SDK requires ENABLE_LE_SECURE_CONNECTIONS in btstack_config.h (the H10 expects SC pairing)"
+#error                                                                         \
+    "Polar SDK requires ENABLE_LE_SECURE_CONNECTIONS in btstack_config.h (the H10 expects SC pairing)"
 #endif
 
 // ── Crypto backend ──────────────────────────────────────────────────────
@@ -32,25 +33,30 @@
 //   ENABLE_MICRO_ECC_P256  — use bundled micro-ecc (alternative)
 //   ENABLE_MICRO_ECC_FOR_LE_SECURE_CONNECTIONS — legacy alias for above
 //
-#if !defined(HAVE_MBEDTLS_ECC_P256) && !defined(ENABLE_MICRO_ECC_P256) && !defined(ENABLE_MICRO_ECC_FOR_LE_SECURE_CONNECTIONS)
-#error "Polar SDK requires an ECC-P256 backend for LE Secure Connections. Define HAVE_MBEDTLS_ECC_P256 (recommended) or ENABLE_MICRO_ECC_FOR_LE_SECURE_CONNECTIONS in btstack_config.h."
+#if !defined(HAVE_MBEDTLS_ECC_P256) && !defined(ENABLE_MICRO_ECC_P256) &&      \
+    !defined(ENABLE_MICRO_ECC_FOR_LE_SECURE_CONNECTIONS)
+#error                                                                         \
+    "Polar SDK requires an ECC-P256 backend for LE Secure Connections. Define HAVE_MBEDTLS_ECC_P256 (recommended) or ENABLE_MICRO_ECC_FOR_LE_SECURE_CONNECTIONS in btstack_config.h."
 #endif
 
 // AES-128 is needed for CMAC (used by the Security Manager).  Either provide
 // your own via HAVE_AES128 or let BTstack bundle rijndael via
 // ENABLE_SOFTWARE_AES128.
 #if !defined(HAVE_AES128) && !defined(ENABLE_SOFTWARE_AES128)
-#error "Polar SDK requires an AES-128 backend for the BLE Security Manager. Define HAVE_AES128 or ENABLE_SOFTWARE_AES128 in btstack_config.h."
+#error                                                                         \
+    "Polar SDK requires an AES-128 backend for the BLE Security Manager. Define HAVE_AES128 or ENABLE_SOFTWARE_AES128 in btstack_config.h."
 #endif
 
 // Don't allow both — BTstack will also check but the error message here is
 // more discoverable.
 #if defined(HAVE_AES128) && defined(ENABLE_SOFTWARE_AES128)
-#error "HAVE_AES128 and ENABLE_SOFTWARE_AES128 are mutually exclusive in btstack_config.h."
+#error                                                                         \
+    "HAVE_AES128 and ENABLE_SOFTWARE_AES128 are mutually exclusive in btstack_config.h."
 #endif
 
 #if defined(HAVE_MBEDTLS_ECC_P256) && defined(ENABLE_MICRO_ECC_P256)
-#error "HAVE_MBEDTLS_ECC_P256 and ENABLE_MICRO_ECC_P256 are mutually exclusive in btstack_config.h."
+#error                                                                         \
+    "HAVE_MBEDTLS_ECC_P256 and ENABLE_MICRO_ECC_P256 are mutually exclusive in btstack_config.h."
 #endif
 
 #endif // POLAR_SDK_BTSTACK_CONFIG_H
