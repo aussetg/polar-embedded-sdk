@@ -1967,16 +1967,12 @@ static void logger_app_maybe_run_deferred_boot_queue_refresh(
                                     "deferred_queue_refresh_failed", now_ms);
     return;
   }
-  if (app->boot_firmware_identity_changed) {
-    if (!logger_storage_svc_queue_requeue_blocked(
-            &app->system_log, logger_clock_now_utc_or_null(&app->clock),
-            "firmware_changed", NULL, NULL)) {
-      logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
-                                      app->runtime.current_state,
-                                      "deferred_queue_rebuild_failed", now_ms);
-      return;
-    }
-  }
+  /* Do not auto-requeue blocked_min_firmware sessions on boot identity
+   * changes. Closed-session manifest.json files are immutable and remain the
+   * authoritative upload artifacts, so a later firmware/build flash does not
+   * change the firmware_version carried by already-closed sessions. Manual
+   * queue requeue/reset remains available for operator-driven retry after a
+   * server-side policy change. */
   if (!logger_app_run_queue_maintenance(app, now_ms, true)) {
     logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                     app->runtime.current_state,

@@ -1971,6 +1971,9 @@ def run_firmware_change_requeue_scenario(
             )
         cleanup_steps.extend(
             [
+                Step("manual_requeue_blocked", "debug queue requeue-blocked", "debug queue requeue-blocked", timeout_s=5.0),
+                Step("queue_after_manual_requeue", "queue --json", "queue", timeout_s=5.0),
+                Step("system_log_after_manual_requeue", "system-log export --json", "system-log export", timeout_s=5.0),
                 Step("upload_cleanup", "debug upload once", "debug upload once", timeout_s=90.0),
                 Step("queue_after_cleanup", "queue --json", "queue", timeout_s=5.0),
                 Step("system_log_after_cleanup", "system-log export --json", "system-log export", timeout_s=5.0),
@@ -1996,15 +1999,15 @@ def run_firmware_change_requeue_scenario(
         requeued_entry = queue_entry_map_from_response(response_by_label(responses, "queue_after_requeue_boot")).get(session_id)
         if requeued_entry is None:
             raise RuntimeError("firmware-change-requeue could not find the blocked session after reflashing")
-        if requeued_entry.get("status") != "pending":
+        if requeued_entry.get("status") != "blocked_min_firmware":
             raise RuntimeError(
-                "firmware-change-requeue expected the blocked session to become pending after reflashing, "
+                "firmware-change-requeue expected the blocked session to remain blocked after reflashing, "
                 f"got {requeued_entry.get('status')!r}"
             )
         if requeued_entry.get("attempt_count") != 1:
             raise RuntimeError("firmware-change-requeue expected attempt_count=1 to be preserved")
-        if requeued_entry.get("last_failure_class") is not None:
-            raise RuntimeError("firmware-change-requeue expected last_failure_class to be cleared after requeue")
+        if requeued_entry.get("last_failure_class") != "min_firmware_rejected":
+            raise RuntimeError("firmware-change-requeue expected last_failure_class=min_firmware_rejected to persist")
 
         requeue_system_log = response_by_label(responses, "system_log_after_requeue_boot")
         requeue_system_log_summary = validate_system_log_response(requeue_system_log)
@@ -2017,11 +2020,11 @@ def run_firmware_change_requeue_scenario(
             )
             if isinstance(event.get("details"), dict)
         ]
-        if not any(
+        if any(
             event["details"].get("reason") == "firmware_changed" and event["details"].get("count", 0) >= 1
             for event in requeue_events
         ):
-            raise RuntimeError("firmware-change-requeue expected an upload_queue_requeued event with reason=firmware_changed")
+            raise RuntimeError("firmware-change-requeue unexpectedly auto-requeued blocked entries after firmware change")
 
         restore_status = payload_from_response(response_by_label(responses, "status_after_restore_boot"))
         if restore_status.get("mode") != "logging":
@@ -2029,6 +2032,39 @@ def run_firmware_change_requeue_scenario(
         restore_firmware = restore_status.get("firmware") if isinstance(restore_status.get("firmware"), dict) else {}
         if restore_firmware.get("build_id") != current_build_id:
             raise RuntimeError("firmware-change-requeue did not restore the original firmware build_id")
+
+        manual_requeue = response_by_label(responses, "manual_requeue_blocked")
+        require_ok(manual_requeue, Step("manual_requeue_blocked", "debug queue requeue-blocked", "debug queue requeue-blocked"))
+        manual_requeue_payload = payload_from_response(manual_requeue)
+        if manual_requeue_payload.get("requeued_count", 0) < 1:
+            raise RuntimeError("firmware-change-requeue expected manual queue requeue-blocked to rewrite at least one entry")
+
+        manual_requeue_entry = queue_entry_map_from_response(response_by_label(responses, "queue_after_manual_requeue")).get(session_id)
+        if manual_requeue_entry is None:
+            raise RuntimeError("firmware-change-requeue could not find the session after manual requeue")
+        if manual_requeue_entry.get("status") != "pending":
+            raise RuntimeError("firmware-change-requeue expected manual requeue to restore pending status")
+        if manual_requeue_entry.get("attempt_count") != 1:
+            raise RuntimeError("firmware-change-requeue expected attempt_count=1 to be preserved across manual requeue")
+        if manual_requeue_entry.get("last_failure_class") is not None:
+            raise RuntimeError("firmware-change-requeue expected last_failure_class to be cleared after manual requeue")
+
+        manual_requeue_system_log = response_by_label(responses, "system_log_after_manual_requeue")
+        validate_system_log_response(manual_requeue_system_log)
+        manual_requeue_events = [
+            event
+            for event in find_events_by_kind_after_seq(
+                manual_requeue_system_log,
+                "upload_queue_requeued",
+                max_system_log_event_seq(requeue_system_log),
+            )
+            if isinstance(event.get("details"), dict)
+        ]
+        if not any(
+            event["details"].get("reason") == "manual_requeue_blocked" and event["details"].get("count", 0) >= 1
+            for event in manual_requeue_events
+        ):
+            raise RuntimeError("firmware-change-requeue expected an upload_queue_requeued event with reason=manual_requeue_blocked")
 
         cleanup_upload = response_by_label(responses, "upload_cleanup")
         require_ok(cleanup_upload, Step("upload_cleanup", "debug upload once", "debug upload once"))
@@ -2049,7 +2085,7 @@ def run_firmware_change_requeue_scenario(
         cleanup_events = find_events_by_kind_after_seq(
             cleanup_system_log,
             "upload_verified",
-            max_system_log_event_seq(requeue_system_log),
+            max_system_log_event_seq(manual_requeue_system_log),
         )
         if not any(
             isinstance(event.get("details"), dict) and event["details"].get("session_id") == session_id
@@ -2084,6 +2120,7 @@ def run_firmware_change_requeue_scenario(
             "system_log_validation": cleanup_system_log_summary,
             "final_queue_entry": cleanup_entry,
             "requeued_queue_entry": requeued_entry,
+            "manual_requeue_queue_entry": manual_requeue_entry,
             "ref_server_uploads": ref_server_uploads,
             "temp_build": temp_build,
             "flash_temp_result": flash_temp_result,

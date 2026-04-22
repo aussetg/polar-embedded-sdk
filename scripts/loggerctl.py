@@ -136,6 +136,119 @@ def print_json(document: dict[str, Any]) -> None:
     print(json.dumps(document, indent=2, sort_keys=True))
 
 
+def print_text(lines: list[str]) -> None:
+    print("\n".join(lines))
+
+
+def response_payload_object(response: dict[str, Any]) -> dict[str, Any] | None:
+    payload = response.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def format_nullable(value: Any) -> str:
+    return "-" if value is None else str(value)
+
+
+def format_status_summary(response: dict[str, Any]) -> list[str] | None:
+    payload = response_payload_object(response)
+    if payload is None:
+        return None
+
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    fault = payload.get("fault") if isinstance(payload.get("fault"), dict) else {}
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+    upload_queue = payload.get("upload_queue") if isinstance(payload.get("upload_queue"), dict) else {}
+    firmware = payload.get("firmware") if isinstance(payload.get("firmware"), dict) else {}
+
+    lines = [
+        f"mode: {format_nullable(payload.get('mode'))}",
+        f"runtime_state: {format_nullable(payload.get('runtime_state'))}",
+        f"hardware_id: {format_nullable(identity.get('hardware_id'))}",
+        f"logger_id: {format_nullable(identity.get('logger_id'))}",
+        f"subject_id: {format_nullable(identity.get('subject_id'))}",
+        f"firmware: {format_nullable(firmware.get('version'))} ({format_nullable(firmware.get('build_id'))})",
+        (
+            "fault: "
+            f"latched={format_nullable(fault.get('latched'))} "
+            f"current={format_nullable(fault.get('current_code'))} "
+            f"last_cleared={format_nullable(fault.get('last_cleared_code'))}"
+        ),
+        (
+            "session: "
+            f"active={format_nullable(session.get('active'))} "
+            f"session_id={format_nullable(session.get('session_id'))} "
+            f"study_day_local={format_nullable(session.get('study_day_local'))}"
+        ),
+        (
+            "upload_queue: "
+            f"pending={format_nullable(upload_queue.get('pending_count'))} "
+            f"blocked={format_nullable(upload_queue.get('blocked_count'))} "
+            f"last_failure={format_nullable(upload_queue.get('last_failure_class'))}"
+        ),
+    ]
+
+    blocked_reason = upload_queue.get("blocked_reason")
+    blocked_retry_hint = upload_queue.get("blocked_retry_hint")
+    if isinstance(blocked_reason, str) and blocked_reason:
+        lines.append(f"blocked_reason: {blocked_reason}")
+    if isinstance(blocked_retry_hint, str) and blocked_retry_hint:
+        lines.append(f"blocked_retry_hint: {blocked_retry_hint}")
+    return lines
+
+
+def format_queue_summary(response: dict[str, Any]) -> list[str] | None:
+    payload = response_payload_object(response)
+    if payload is None:
+        return None
+
+    sessions = payload.get("sessions") if isinstance(payload.get("sessions"), list) else []
+    lines = [
+        f"schema_source: {format_nullable(payload.get('schema_source'))}",
+        f"updated_at_utc: {format_nullable(payload.get('updated_at_utc'))}",
+        f"sessions: {len(sessions)}",
+    ]
+    for index, session in enumerate(sessions, start=1):
+        if not isinstance(session, dict):
+            continue
+        lines.append(
+            f"[{index}] {format_nullable(session.get('study_day_local'))} "
+            f"{format_nullable(session.get('session_id'))} "
+            f"status={format_nullable(session.get('status'))} "
+            f"attempts={format_nullable(session.get('attempt_count'))}"
+        )
+        lines.append(
+            f"    last_failure={format_nullable(session.get('last_failure_class'))} "
+            f"verified={format_nullable(session.get('verified_upload_utc'))}"
+        )
+        status_detail = session.get("status_detail")
+        retry_hint = session.get("retry_hint")
+        if isinstance(status_detail, str) and status_detail:
+            lines.append(f"    detail: {status_detail}")
+        if isinstance(retry_hint, str) and retry_hint:
+            lines.append(f"    retry: {retry_hint}")
+    return lines
+
+
+def print_device_command_response(args: argparse.Namespace, response: dict[str, Any]) -> None:
+    if args.json:
+        print_json(response)
+        return
+
+    formatter = {
+        "status": format_status_summary,
+        "queue": format_queue_summary,
+    }.get(args.command_spec.expected_command)
+    if formatter is None:
+        print_json(response)
+        return
+
+    lines = formatter(response)
+    if lines is None:
+        print_json(response)
+        return
+    print_text(lines)
+
+
 def read_json_file(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -466,7 +579,7 @@ def handle_device_command(args: argparse.Namespace) -> int:
             if not isinstance(payload, dict):
                 raise ValueError("device response did not include an object payload to export")
             write_json_file(args.output, payload)
-        print_json(response)
+        print_device_command_response(args, response)
         return 0 if response.get("ok") else 1
 
 
@@ -593,7 +706,7 @@ def handle_upload_configure(args: argparse.Namespace) -> int:
 
 
 def add_json_flag(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--json", action="store_true", help="JSON is always printed")
+    parser.add_argument("--json", action="store_true", help="print the raw JSON response envelope")
 
 
 def add_device_command_parser(

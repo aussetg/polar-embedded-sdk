@@ -61,6 +61,46 @@ typedef struct {
 static logger_service_cli_config_import_workspace_t
     g_service_cli_config_import_workspace;
 
+static const char *logger_upload_blocked_reason_hint(void) {
+  return "blocked by closed-session manifest firmware_version, not current running firmware";
+}
+
+static const char *logger_upload_blocked_retry_hint(void) {
+  return "reflash alone will not unblock old sessions; use debug queue requeue-blocked only after server-side minimum changes";
+}
+
+static const char *logger_upload_queue_summary_blocked_reason_hint(
+    const logger_upload_queue_summary_t *summary) {
+  if (summary == NULL || summary->blocked_count == 0u) {
+    return NULL;
+  }
+  return logger_upload_blocked_reason_hint();
+}
+
+static const char *logger_upload_queue_summary_blocked_retry_hint(
+    const logger_upload_queue_summary_t *summary) {
+  if (summary == NULL || summary->blocked_count == 0u) {
+    return NULL;
+  }
+  return logger_upload_blocked_retry_hint();
+}
+
+static const char *logger_upload_queue_entry_status_detail(
+    const logger_upload_queue_entry_t *entry) {
+  if (entry == NULL || strcmp(entry->status, "blocked_min_firmware") != 0) {
+    return NULL;
+  }
+  return logger_upload_blocked_reason_hint();
+}
+
+static const char *logger_upload_queue_entry_retry_hint(
+    const logger_upload_queue_entry_t *entry) {
+  if (entry == NULL || strcmp(entry->status, "blocked_min_firmware") != 0) {
+    return NULL;
+  }
+  return logger_upload_blocked_retry_hint();
+}
+
 static bool logger_parse_u8(const char *text, uint8_t *value_out) {
   if (text == NULL || value_out == NULL || text[0] == '\0') {
     return false;
@@ -1372,6 +1412,12 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
       logger_string_present(queue_summary.last_failure_class)
           ? queue_summary.last_failure_class
           : NULL);
+  logger_json_stream_writer_field_string_or_null(
+      w, "blocked_reason",
+      logger_upload_queue_summary_blocked_reason_hint(&queue_summary));
+  logger_json_stream_writer_field_string_or_null(
+      w, "blocked_retry_hint",
+      logger_upload_queue_summary_blocked_retry_hint(&queue_summary));
   logger_json_stream_writer_object_end(w);
 
   logger_json_stream_writer_field_object_begin(w, "last_day_outcome");
@@ -1479,6 +1525,10 @@ static void logger_handle_queue_json(logger_app_t *app) {
     logger_json_stream_writer_field_string_or_null(
         &w, "receipt_id",
         logger_string_present(entry->receipt_id) ? entry->receipt_id : NULL);
+    logger_json_stream_writer_field_string_or_null(
+        &w, "status_detail", logger_upload_queue_entry_status_detail(entry));
+    logger_json_stream_writer_field_string_or_null(
+        &w, "retry_hint", logger_upload_queue_entry_retry_hint(entry));
     logger_json_stream_writer_object_end(&w);
   }
   logger_json_stream_writer_array_end(&w);
