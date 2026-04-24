@@ -49,6 +49,7 @@ static bool logger_storage_svc_available(void) {
  */
 
 #define STORAGE_SVC_TIMEOUT_MS 30000u
+#define STORAGE_SVC_FORMAT_TIMEOUT_MS 120000u
 #define STORAGE_SVC_SLOW_QUEUE_TIMEOUT_MS (5u * 60u * 1000u)
 #define STORAGE_SVC_BUNDLE_COMPUTE_TIMEOUT_MS (5u * 60u * 1000u)
 #define STORAGE_SVC_WAIT_HEARTBEAT_MS 100u
@@ -62,6 +63,8 @@ logger_storage_svc_timeout_ms(storage_service_kind_t kind) {
     return STORAGE_SVC_SLOW_QUEUE_TIMEOUT_MS;
   case STORAGE_SVC_BUNDLE_COMPUTE:
     return STORAGE_SVC_BUNDLE_COMPUTE_TIMEOUT_MS;
+  case STORAGE_SVC_STORAGE_FORMAT:
+    return STORAGE_SVC_FORMAT_TIMEOUT_MS;
   default:
     return STORAGE_SVC_TIMEOUT_MS;
   }

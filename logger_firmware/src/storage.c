@@ -26,6 +26,8 @@
 #define LOGGER_SD_SPI_RUN_BAUD_HZ 12000000u
 #define LOGGER_SD_DATA_TIMEOUT_MS 500u
 #define LOGGER_SD_MKFS_WORK_BYTES 4096u
+#define LOGGER_SD_POST_MKFS_MOUNT_RETRIES 4u
+#define LOGGER_SD_POST_MKFS_RETRY_DELAY_MS 25u
 
 #define LOGGER_SD_TOKEN_START_BLOCK 0xfeu
 
@@ -506,6 +508,20 @@ static void logger_storage_reset_mount_state(void) {
   memset(&g_sd.fatfs, 0, sizeof(g_sd.fatfs));
 }
 
+static void logger_storage_reset_card_state(void) {
+  g_sd.card_initialized = false;
+  g_sd.high_capacity = false;
+  g_sd.sector_count = 0u;
+  g_sd.dstatus = (DSTATUS)STA_NOINIT;
+  memset(g_sd.cid, 0, sizeof(g_sd.cid));
+  memset(g_sd.csd, 0, sizeof(g_sd.csd));
+  memset(g_sd.ocr, 0, sizeof(g_sd.ocr));
+
+  spi_set_baudrate(logger_sd_spi_bus(), LOGGER_SD_SPI_INIT_BAUD_HZ);
+  logger_sd_deselect();
+  logger_sd_spi_write_ff(16u);
+}
+
 static void logger_storage_unmount(void) {
   if (g_sd.mounted) {
     (void)f_mount(NULL, LOGGER_SD_DRIVE_PATH, 1u);
@@ -632,13 +648,28 @@ bool logger_storage_format(logger_storage_status_t *status) {
     }
     return false;
   }
-  if (!logger_storage_mount_if_needed()) {
-    if (status != NULL) {
-      (void)logger_storage_refresh(status);
+
+  /* f_mkfs() leaves the card in an implementation-defined state.  A fresh
+   * card-level re-init before the first post-format mount avoids depending on
+   * whatever transfer state the formatter happened to leave behind. */
+  logger_storage_reset_mount_state();
+  logger_storage_reset_card_state();
+
+  bool ready = false;
+  for (uint32_t attempt = 0u; attempt < LOGGER_SD_POST_MKFS_MOUNT_RETRIES;
+       ++attempt) {
+    if (logger_storage_mount_if_needed() && g_sd.fatfs.fs_type == FS_FAT32 &&
+        logger_storage_prepare_root()) {
+      ready = true;
+      break;
     }
-    return false;
+
+    logger_storage_unmount();
+    logger_storage_reset_card_state();
+    sleep_ms(LOGGER_SD_POST_MKFS_RETRY_DELAY_MS);
   }
-  if (g_sd.fatfs.fs_type != FS_FAT32 || !logger_storage_prepare_root()) {
+
+  if (!ready) {
     if (status != NULL) {
       (void)logger_storage_refresh(status);
     }
@@ -900,7 +931,12 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
 
   switch (cmd) {
   case CTRL_SYNC:
-    return logger_sd_wait_ready(LOGGER_SD_DATA_TIMEOUT_MS) ? RES_OK : RES_ERROR;
+    logger_sd_select();
+    {
+      const bool ready = logger_sd_wait_ready(LOGGER_SD_DATA_TIMEOUT_MS);
+      logger_sd_deselect();
+      return ready ? RES_OK : RES_ERROR;
+    }
   case GET_SECTOR_COUNT:
     if (buff == NULL) {
       return RES_PARERR;
