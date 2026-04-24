@@ -44,11 +44,11 @@
 #define HCI_RESET_RESEND_TIMEOUT_MS 1000
 
 #define HAVE_AES128
-#define HAVE_MBEDTLS_ECC_P256
 #define ENABLE_LE_SECURE_CONNECTIONS
-/* Polar H10 requests LE Secure Connections (AuthReq SC bit set in pairing
- * response). Legacy pairing works as a fallback but we should match the
- * H10's preference. HAVE_MBEDTLS_ECC_P256 routes ECC operations through
- * mbedTLS (already linked for TLS) instead of the bundled micro-ecc. */
+#define ENABLE_MICRO_ECC_FOR_LE_SECURE_CONNECTIONS
+/* Use BTstack's micro-ecc backend for LE Secure Connections P-256.
+ * Do not define HAVE_MBEDTLS_ECC_P256 here: BTstack's current mbedTLS
+ * ECDH adapter calls mbedtls_ecp_mul() without an RNG and ignores its
+ * return value, which produces bad DHKeys with our vendored mbedTLS. */
 
 #endif

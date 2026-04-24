@@ -108,6 +108,7 @@ add_executable(logger_appliance
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_sm_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_transport_adapter.c
+    ${PICO_SDK_PATH}/lib/btstack/3rd-party/micro-ecc/uECC.c
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src/microtar.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ff.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ffunicode.c
@@ -128,6 +129,7 @@ target_include_directories(logger_appliance PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/boards/rp2_2
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/include
+    ${PICO_SDK_PATH}/lib/btstack/3rd-party/micro-ecc
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/jsmn
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src
