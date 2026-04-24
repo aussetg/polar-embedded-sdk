@@ -26,8 +26,22 @@ except ModuleNotFoundError:  # pragma: no cover - import path depends on invocat
 DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_IMPORT_TIMEOUT_S = 20.0
 DEFAULT_PORT_GLOBS = (
+    "/dev/serial/by-id/*",
     "/dev/ttyACM*",
     "/dev/ttyUSB*",
+)
+KNOWN_NON_LOGGER_BY_ID_MARKERS = (
+    "CMSIS-DAP",
+    "Debug_Probe",
+    "Pico_Probe",
+    "PicoProbe",
+    "proxmark",
+)
+LOGGER_BY_ID_MARKERS = (
+    "Raspberry_Pi_Pico",
+    "RP2350",
+    "RP2040",
+    "Pico",
 )
 
 
@@ -64,10 +78,39 @@ class LoggerPortProbe:
 
 
 def list_serial_port_candidates() -> list[Path]:
-    ports: list[Path] = []
+    candidates: list[Path] = []
     for pattern in DEFAULT_PORT_GLOBS:
-        ports.extend(Path(path) for path in glob.glob(pattern))
-    return sorted(set(ports))
+        candidates.extend(Path(path) for path in glob.glob(pattern))
+
+    ignored_devices: set[Path] = set()
+    for port in candidates:
+        if not port.is_symlink() or "/dev/serial/by-id/" not in str(port):
+            continue
+        name = port.name
+        if any(marker in name for marker in KNOWN_NON_LOGGER_BY_ID_MARKERS):
+            ignored_devices.add(port.resolve(strict=False))
+
+    ports_by_device: dict[Path, Path] = {}
+    for port in sorted(candidates, key=_serial_port_preference_key):
+        device = port.resolve(strict=False)
+        if device in ignored_devices:
+            continue
+        ports_by_device.setdefault(device, port)
+    return list(ports_by_device.values())
+
+
+def _serial_port_preference_key(port: Path) -> tuple[int, str]:
+    text = str(port)
+    name = port.name
+    if "/dev/serial/by-id/" in text:
+        if any(marker in name for marker in LOGGER_BY_ID_MARKERS):
+            return (0, text)
+        return (1, text)
+    if text.startswith("/dev/ttyACM"):
+        return (2, text)
+    if text.startswith("/dev/ttyUSB"):
+        return (3, text)
+    return (4, text)
 
 
 def probe_logger_port(port: Path, *, timeout_s: float = 4.0) -> LoggerPortProbe | None:
@@ -86,7 +129,7 @@ def probe_logger_port(port: Path, *, timeout_s: float = 4.0) -> LoggerPortProbe 
 def discover_logger_port(*, timeout_s: float = 4.0) -> Path:
     probes = [probe for port in list_serial_port_candidates() if (probe := probe_logger_port(port, timeout_s=timeout_s))]
     if not probes:
-        raise LoggerDiscoveryError("no logger device responded on /dev/ttyACM* or /dev/ttyUSB*")
+        raise LoggerDiscoveryError("no logger device responded on /dev/serial/by-id/*, /dev/ttyACM*, or /dev/ttyUSB*")
     if len(probes) > 1:
         ports = ", ".join(str(probe.port) for probe in probes)
         raise LoggerDiscoveryError(f"multiple logger devices responded; use --port to choose one: {ports}")
