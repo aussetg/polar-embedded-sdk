@@ -269,8 +269,20 @@ static void logger_storage_worker_drain(storage_worker_shared_t *shared) {
 
     const bool ok = logger_writer_dispatch(shared->session_ctx, &cmd);
 
-    const bool is_barrier = cmd.type != LOGGER_WRITER_APPEND_PMD_PACKET &&
-                            cmd.type != LOGGER_WRITER_REFRESH_LIVE;
+    /*
+     * Commands submitted through capture_pipe_submit_cmd() are synchronous:
+     * core 0 waits for barriers_done_seq to advance before returning to the
+     * session/app path.  That includes REFRESH_LIVE.  It is intentionally not
+     * classified as a journal-durability barrier, but it still needs an ACK;
+     * otherwise core 0 waits for a completion that core 1 will never publish
+     * and falsely escalates to sd_write_failed / writer_enqueue_timeout.
+     *
+     * APPEND_PMD_PACKET is asynchronous and must not ACK here.  SERVICE_REQUEST
+     * is handled above by the storage-service done/ok fields and must not share
+     * the barrier counter, because an unrelated service ACK could satisfy a
+     * concurrent synchronous writer wait before its command has run.
+     */
+    const bool needs_sync_ack = cmd.type != LOGGER_WRITER_APPEND_PMD_PACKET;
 
     if (!ok) {
       shared->stats.write_failures += 1u;
@@ -310,7 +322,7 @@ static void logger_storage_worker_drain(storage_worker_shared_t *shared) {
        * doesn't spin for the full 5 s timeout.  Set the result
        * flag first, then advance the counter — core 0 reads the
        * flag only after observing the counter change. */
-      if (is_barrier) {
+      if (needs_sync_ack) {
         pipe->barrier_last_ok = false;
         __mem_fence_release();
         pipe->barriers_done_seq += 1u;
@@ -325,7 +337,7 @@ static void logger_storage_worker_drain(storage_worker_shared_t *shared) {
       event.success = false;
       capture_event_ring_push(pipe, &event);
     } else {
-      if (is_barrier) {
+      if (needs_sync_ack) {
         /* Advance the completion counter so core 0 knows this
          * barrier was dispatched, then wake it. */
         pipe->barrier_last_ok = true;

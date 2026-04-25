@@ -381,21 +381,32 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
     (void)capture_staging_drain(pipe, pipe->staging.capacity);
   }
 
-  /* Enqueue the barrier command into the command ring.
+  /* Enqueue the synchronous command into the command ring.
    *
    * Core 1 will drain all queued commands (both PMD packets and
-   * this barrier) in order.  The ordering guarantee is that
-   * everything in the ring before this barrier is executed first.
+   * this command) in order.  The ordering guarantee is that everything in the
+   * ring before this command is executed first.
    *
-   * After enqueueing, wait for the ring to drain so the barrier
-   * is processed.  Core 1 signals __sev() after draining.
+   * After enqueueing, wait for core 1 to dispatch the command.  Core 1
+   * signals __sev() after publishing completion.
    *
-   * We poll the ring occupancy with a timeout rather than blocking
-   * indefinitely.  If the ring is stuck, the health/degraded
-   * deadline machinery in the caller will catch it.
+   * The completion counter MUST be snapshotted before publishing the
+   * synchronous command to core 1.  Core 1 can drain a one-deep command ring
+   * almost immediately after __sev(); if core 0 snapshots after
+   * enqueue/signal it can observe the already-advanced counter and then wait
+   * for a future completion that was never submitted.  That race was seen in
+   * the field as a false sd_write_failed / writer_enqueue_timeout even though
+   * core 1 had successfully processed the command.
+   *
+   * Acquire before the snapshot pairs with core 1's release after advancing
+   * barriers_done_seq, so the baseline is current before this command is made
+   * visible through the command-ring tail.
    */
+  __mem_fence_acquire();
+  const uint32_t wait_seq = pipe->barriers_done_seq;
+
   if (!capture_cmd_ring_enqueue(pipe, cmd)) {
-    /* Ring is full — barrier cannot be enqueued.
+    /* Ring is full — synchronous command cannot be enqueued.
      * This is a hard failure condition. */
     /* first-writer-wins: preserve an earlier, more specific classification */
     if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
@@ -414,20 +425,18 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
   __sev();
 
   /*
-   * Wait for core 1 to process the barrier.
+   * Wait for core 1 to process the synchronous command.
    *
-   * Snapshot the completion counter before the barrier was
+   * Snapshot the completion counter before the command was
    * enqueued, then spin until it advances — meaning core 1
    * has actually dispatched the command.
    *
-   * After the counter advances, read barrier_last_ok for the
-   * dispatch result.  This is reliable regardless of whether
-   * the event ring overflowed.
+   * After the counter advances, read barrier_last_ok for the dispatch result.
+   * This is reliable regardless of whether the event ring overflowed.
    *
    * Also drain any event ring entries for telemetry, but do
    * not rely on them for the barrier result.
    */
-  const uint32_t wait_seq = pipe->barriers_done_seq;
   const uint32_t barrier_deadline_us = 5000000u; /* 5 s */
   const uint64_t start_us = time_us_64();
 

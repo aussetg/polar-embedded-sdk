@@ -227,15 +227,18 @@ typedef struct capture_pipe {
   capture_event_ring_t event_ring;
   capture_source_staging_t staging;
 
-  /* Reliable barrier completion signal.
+  /* Reliable synchronous-command completion signal.
    *
-   * Core 1 advances barriers_done_seq after dispatching ANY
-   * barrier command — whether it succeeded or failed.
-   * Core 0 snapshots the counter before enqueueing, then
-   * spins until it advances.
+   * Core 1 advances barriers_done_seq after dispatching any command submitted
+   * through capture_pipe_submit_cmd() — whether it succeeded or failed.  PMD
+   * packets are asynchronous and do not advance it; storage-service requests
+   * use their own done/ok handshake and must not advance it.
    *
-   * barrier_last_ok holds the result of the most recent
-   * barrier dispatch.  Core 0 reads it only after seeing
+   * Core 0 snapshots the counter before enqueueing the synchronous command,
+   * then spins until it advances.
+   *
+   * barrier_last_ok holds the result of the most recent synchronous command
+   * dispatch.  Core 0 reads it only after seeing
    * the counter advance.
    *
    * These fields are immune to event-ring overflow.
