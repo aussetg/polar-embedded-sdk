@@ -1,6 +1,6 @@
 # Repository hooks
 
-These hooks enforce/warn on BTstack version alignment.
+These hooks format staged C/C++ files and enforce/warn on BTstack version alignment.
 
 ## Install once per clone
 
@@ -16,6 +16,8 @@ git config core.hooksPath .githooks
 
 ## Behavior
 
+- `pre-commit`: run `clang-format -i` on staged C/C++/Objective-C files, then re-stage them
+  - skips generated/build and vendored trees: `build/`, `vendors/`
 - `post-checkout` (branch checkouts): warn if BTstack trees are not aligned
 - `post-merge`: warn if BTstack trees are not aligned
 - `pre-push`:
@@ -38,5 +40,6 @@ Check commands used by hooks:
 Not recommended, but available for emergencies:
 
 ```bash
+SKIP_CLANG_FORMAT=1 git commit
 SKIP_BTSTACK_ALIGNMENT_CHECK=1 SKIP_BTSTACK_LICENSE_CHECK=1 git push
 ```

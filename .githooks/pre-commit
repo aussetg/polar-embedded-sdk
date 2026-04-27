@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+if [[ "${SKIP_CLANG_FORMAT:-0}" == "1" ]]; then
+  exit 0
+fi
+
+if ! command -v clang-format >/dev/null 2>&1; then
+  echo "pre-commit: clang-format not found" >&2
+  echo "Install clang-format or bypass once with SKIP_CLANG_FORMAT=1 git commit." >&2
+  exit 1
+fi
+
+mapfile -d '' files < <(
+  git -C "${REPO_ROOT}" diff --cached --name-only -z --diff-filter=ACMR -- \
+    '*.c' '*.cc' '*.cpp' '*.cxx' \
+    '*.h' '*.hh' '*.hpp' '*.hxx' \
+    '*.m' '*.mm' \
+  | grep -zEv '^(build/|vendors/)'
+)
+
+if (( ${#files[@]} == 0 )); then
+  exit 0
+fi
+
+echo "pre-commit: clang-format ${#files[@]} staged file(s)"
+
+for file in "${files[@]}"; do
+  clang-format -i -- "${REPO_ROOT}/${file}"
+  git -C "${REPO_ROOT}" add -- "${file}"
+done

@@ -11,6 +11,7 @@ fi
 chmod +x \
   "${REPO_ROOT}/patches/check_btstack_alignment.sh" \
   "${REPO_ROOT}/.githooks/_btstack_alignment_hook.sh" \
+  "${REPO_ROOT}/.githooks/pre-commit" \
   "${REPO_ROOT}/.githooks/post-checkout" \
   "${REPO_ROOT}/.githooks/post-merge" \
   "${REPO_ROOT}/.githooks/pre-push"
