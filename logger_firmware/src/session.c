@@ -74,7 +74,8 @@ static bool g_session_manifest_persisted_in_use;
 static logger_session_recovery_workspace_t *
 logger_session_recovery_workspace_acquire(void) {
   assert(!g_session_recovery_workspace.in_use);
-  memset(&g_session_recovery_workspace, 0, sizeof(g_session_recovery_workspace));
+  memset(&g_session_recovery_workspace, 0,
+         sizeof(g_session_recovery_workspace));
   g_session_recovery_workspace.in_use = true;
   return &g_session_recovery_workspace;
 }
@@ -137,15 +138,17 @@ static void logger_session_sha256_workspace_release(
   g_session_sha256_workspace.in_use = false;
 }
 
-static logger_persisted_state_t *logger_session_manifest_persisted_acquire(void) {
+static logger_persisted_state_t *
+logger_session_manifest_persisted_acquire(void) {
   assert(!g_session_manifest_persisted_in_use);
   g_session_manifest_persisted_in_use = true;
-  memset(&g_session_manifest_persisted, 0, sizeof(g_session_manifest_persisted));
+  memset(&g_session_manifest_persisted, 0,
+         sizeof(g_session_manifest_persisted));
   return &g_session_manifest_persisted;
 }
 
-static void logger_session_manifest_persisted_release(
-    logger_persisted_state_t *persisted) {
+static void
+logger_session_manifest_persisted_release(logger_persisted_state_t *persisted) {
   (void)persisted;
   assert(persisted == &g_session_manifest_persisted);
   assert(g_session_manifest_persisted_in_use);
@@ -157,7 +160,8 @@ void logger_session_set_capture_stats(logger_capture_stats_t *stats) {
 }
 
 void logger_session_init_buffers(void) {
-  /* Zero-initialise the PSRAM chunk buffer so session init sees clean memory. */
+  /* Zero-initialise the PSRAM chunk buffer so session init sees clean memory.
+   */
   memset(g_chunk_buf, 0, LOGGER_SESSION_CHUNK_BUF_SIZE);
 }
 
@@ -450,8 +454,7 @@ logger_session_write_live_internal(const logger_session_state_t *session,
       logger_session_live_write_workspace_acquire();
 
   logger_json_string_literal(
-      workspace->current_span_id_json,
-      sizeof(workspace->current_span_id_json),
+      workspace->current_span_id_json, sizeof(workspace->current_span_id_json),
       session->span_active ? session->current_span_id : NULL);
   if (session->span_active) {
     snprintf(workspace->current_span_index_json,
@@ -475,12 +478,11 @@ logger_session_write_live_internal(const logger_session_state_t *session,
       (unsigned long long)session->writer.journal_size_bytes,
       workspace->last_flush_utc_json, (unsigned long long)now_ms * 1000ull,
       workspace->current_span_id_json, workspace->current_span_index_json,
-      session->quarantined ? "true" : "false",
-      session->clock_state, (unsigned long)boot_counter);
-  const bool ok =
-      n > 0 && (size_t)n < sizeof(workspace->payload) &&
-      logger_storage_write_file_atomic(session->live_path, workspace->payload,
-                                       (size_t)n);
+      session->quarantined ? "true" : "false", session->clock_state,
+      (unsigned long)boot_counter);
+  const bool ok = n > 0 && (size_t)n < sizeof(workspace->payload) &&
+                  logger_storage_write_file_atomic(
+                      session->live_path, workspace->payload, (size_t)n);
   logger_session_live_write_workspace_release(workspace);
   return ok;
 }
@@ -881,6 +883,30 @@ static bool __attribute__((noinline)) logger_session_build_manifest(
   return true;
 }
 
+static void logger_session_manifest_ctx_refresh_from_config(
+    logger_session_manifest_ctx_t *mc,
+    const logger_persisted_state_t *persisted) {
+  if (mc == NULL || persisted == NULL) {
+    return;
+  }
+  if (logger_string_present(persisted->config.logger_id)) {
+    logger_copy_string(mc->logger_id, sizeof(mc->logger_id),
+                       persisted->config.logger_id);
+  }
+  if (logger_string_present(persisted->config.subject_id)) {
+    logger_copy_string(mc->subject_id, sizeof(mc->subject_id),
+                       persisted->config.subject_id);
+  }
+  if (logger_string_present(persisted->config.timezone)) {
+    logger_copy_string(mc->timezone, sizeof(mc->timezone),
+                       persisted->config.timezone);
+  }
+  if (logger_string_present(persisted->config.bound_h10_address)) {
+    logger_copy_string(mc->bound_h10_address, sizeof(mc->bound_h10_address),
+                       persisted->config.bound_h10_address);
+  }
+}
+
 static bool logger_session_finalize_internal(
     logger_session_state_t *session, logger_system_log_t *system_log,
     const logger_persisted_state_t *persisted,
@@ -926,14 +952,7 @@ static bool logger_session_finalize_internal(
    */
   {
     logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
-    logger_copy_string(mc->logger_id, sizeof(mc->logger_id),
-                       persisted->config.logger_id);
-    logger_copy_string(mc->subject_id, sizeof(mc->subject_id),
-                       persisted->config.subject_id);
-    logger_copy_string(mc->timezone, sizeof(mc->timezone),
-                       persisted->config.timezone);
-    logger_copy_string(mc->bound_h10_address, sizeof(mc->bound_h10_address),
-                       persisted->config.bound_h10_address);
+    logger_session_manifest_ctx_refresh_from_config(mc, persisted);
     mc->system_log = system_log;
   }
 
@@ -1647,17 +1666,15 @@ bool logger_session_recover_on_boot(
 
   workspace = logger_session_recovery_workspace_acquire();
 
-  if (!logger_session_find_live_paths(workspace->dir_name, workspace->dir_path,
-                                      workspace->journal_path,
-                                      workspace->live_path,
-                                      workspace->manifest_path)) {
+  if (!logger_session_find_live_paths(
+          workspace->dir_name, workspace->dir_path, workspace->journal_path,
+          workspace->live_path, workspace->manifest_path)) {
     logger_session_recovery_workspace_release(workspace);
     return true;
   }
 
-  const bool have_live_session_id =
-      logger_session_load_live_session_id(workspace->live_path,
-                                          workspace->live_session_id);
+  const bool have_live_session_id = logger_session_load_live_session_id(
+      workspace->live_path, workspace->live_session_id);
 
   if (!logger_journal_scan(workspace->journal_path, &workspace->scan) ||
       !workspace->scan.valid) {
@@ -1732,9 +1749,9 @@ bool logger_session_recover_on_boot(
    * writer-dispatch responsibilities. */
   logger_session_writer_restore_from_scan(&session->writer, &workspace->scan);
   /* Open the journal for appending through the writer */
-  if (!logger_journal_writer_open_existing(
-          &session->writer.journal_writer, workspace->journal_path,
-          workspace->scan.valid_size_bytes)) {
+  if (!logger_journal_writer_open_existing(&session->writer.journal_writer,
+                                           workspace->journal_path,
+                                           workspace->scan.valid_size_bytes)) {
     logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
         system_log, clock != NULL ? clock->now_utc : NULL,
@@ -1746,13 +1763,12 @@ bool logger_session_recover_on_boot(
   session->span_count = workspace->scan.span_count;
   memcpy(session->spans, workspace->scan.spans, sizeof(session->spans));
   session->span_active = workspace->scan.active_span_open;
-  session->current_span_index =
-      workspace->scan.active_span_open ? workspace->scan.active_span_index
-                                       : 0xffffffffu;
-  logger_copy_string(session->current_span_id, sizeof(session->current_span_id),
-                     workspace->scan.active_span_open
-                         ? workspace->scan.active_span_id
-                         : NULL);
+  session->current_span_index = workspace->scan.active_span_open
+                                    ? workspace->scan.active_span_index
+                                    : 0xffffffffu;
+  logger_copy_string(
+      session->current_span_id, sizeof(session->current_span_id),
+      workspace->scan.active_span_open ? workspace->scan.active_span_id : NULL);
   if (workspace->scan.active_span_open &&
       !logger_hex_to_bytes_16(session->current_span_id,
                               session->current_span_id_raw)) {
@@ -1783,13 +1799,12 @@ bool logger_session_recover_on_boot(
     memset(mc, 0, sizeof(*mc));
     logger_copy_string(mc->hardware_id, sizeof(mc->hardware_id), hardware_id);
     logger_copy_string(mc->logger_id, sizeof(mc->logger_id),
-                       persisted->config.logger_id);
+                       workspace->scan.logger_id);
     logger_copy_string(mc->subject_id, sizeof(mc->subject_id),
-                       persisted->config.subject_id);
+                       workspace->scan.subject_id);
     logger_copy_string(mc->timezone, sizeof(mc->timezone),
-                       persisted->config.timezone);
-    logger_copy_string(mc->bound_h10_address, sizeof(mc->bound_h10_address),
-                       persisted->config.bound_h10_address);
+                       workspace->scan.timezone);
+    logger_session_manifest_ctx_refresh_from_config(mc, persisted);
     mc->storage = *storage;
     mc->debug_session = false;
     mc->system_log = system_log;
@@ -1901,9 +1916,10 @@ writer_emit_session_start(logger_session_state_t *session,
       logger_id_escaped, subject_id_escaped, timezone_escaped, cmd->clock_state,
       cmd->session_start_reason);
   return n > 0 && (size_t)n < sizeof(payload) &&
-         logger_journal_writer_append_json(
-             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_SESSION_START,
-             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_append_json(&session->writer.journal_writer,
+                                           LOGGER_JOURNAL_RECORD_SESSION_START,
+                                           session->writer.next_record_seq++,
+                                           payload) &&
          logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
@@ -2022,7 +2038,8 @@ writer_emit_status_snapshot(logger_session_state_t *session,
       fault_code_json);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT,
+             &session->writer.journal_writer,
+             LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT,
              session->writer.next_record_seq++, payload) &&
          logger_journal_writer_sync(&session->writer.journal_writer);
 }
@@ -2217,15 +2234,14 @@ logger_writer_handle_span_end(logger_session_state_t *session,
       &session->writer.spans[cmd->span_index_in_session];
   logger_copy_string(mutable_span->end_utc, sizeof(mutable_span->end_utc),
                      cmd->end_utc);
-  logger_copy_string(mutable_span->end_reason,
-                     sizeof(mutable_span->end_reason), cmd->end_reason);
+  logger_copy_string(mutable_span->end_reason, sizeof(mutable_span->end_reason),
+                     cmd->end_reason);
   session->writer.journal_size_bytes =
       logger_journal_writer_durable_size(&session->writer.journal_writer);
   return true;
 }
 
-static bool __attribute__((noinline))
-logger_writer_handle_finalize_session(
+static bool __attribute__((noinline)) logger_writer_handle_finalize_session(
     logger_session_state_t *session,
     const logger_writer_finalize_session_t *cmd) {
   const logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
@@ -2240,8 +2256,8 @@ logger_writer_handle_finalize_session(
 
   char journal_sha256[LOGGER_SHA256_HEX_LEN + 1];
   uint64_t journal_size_bytes = 0u;
-  if (!logger_session_compute_file_sha256(
-          session->journal_path, journal_sha256, &journal_size_bytes)) {
+  if (!logger_session_compute_file_sha256(session->journal_path, journal_sha256,
+                                          &journal_size_bytes)) {
     return false;
   }
 

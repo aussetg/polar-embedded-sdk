@@ -29,7 +29,8 @@ typedef struct {
 
 static logger_journal_scan_workspace_t g_journal_scan_workspace;
 
-static logger_journal_scan_workspace_t *logger_journal_scan_workspace_acquire(void) {
+static logger_journal_scan_workspace_t *
+logger_journal_scan_workspace_acquire(void) {
   assert(!g_journal_scan_workspace.in_use);
   memset(&g_journal_scan_workspace, 0, sizeof(g_journal_scan_workspace));
   g_journal_scan_workspace.in_use = true;
@@ -117,6 +118,13 @@ logger_journal_apply_json_record(logger_journal_scan_result_t *result,
     (void)logger_json_object_copy_string(doc, root, "start_reason",
                                          result->session_start_reason,
                                          sizeof(result->session_start_reason));
+    (void)logger_json_object_copy_string(
+        doc, root, "logger_id", result->logger_id, sizeof(result->logger_id));
+    (void)logger_json_object_copy_string(doc, root, "subject_id",
+                                         result->subject_id,
+                                         sizeof(result->subject_id));
+    (void)logger_json_object_copy_string(
+        doc, root, "timezone", result->timezone, sizeof(result->timezone));
     logger_journal_capture_utc(doc, root, result->session_start_utc);
     char clock_state[16];
     if (logger_json_object_copy_string(doc, root, "clock_state", clock_state,
@@ -314,9 +322,9 @@ bool logger_journal_scan(const char *path,
 
   while (true) {
     read_bytes = 0u;
-    const FRESULT header_fr = f_read(&file, workspace->record_header,
-                                     sizeof(workspace->record_header),
-                                     &read_bytes);
+    const FRESULT header_fr =
+        f_read(&file, workspace->record_header,
+               sizeof(workspace->record_header), &read_bytes);
     if (header_fr != FR_OK) {
       break;
     }
@@ -332,7 +340,8 @@ bool logger_journal_scan(const char *path,
 
     const uint16_t header_bytes = logger_u16le(workspace->record_header + 4);
     const logger_journal_record_type_t record_type =
-        (logger_journal_record_type_t)logger_u16le(workspace->record_header + 6);
+        (logger_journal_record_type_t)logger_u16le(workspace->record_header +
+                                                   6);
     const uint32_t total_bytes = logger_u32le(workspace->record_header + 8);
     const uint32_t payload_bytes = logger_u32le(workspace->record_header + 12);
     const uint32_t flags = logger_u32le(workspace->record_header + 16);
@@ -368,8 +377,8 @@ bool logger_journal_scan(const char *path,
       const size_t capture_now =
           (capture_room < (size_t)want) ? capture_room : (size_t)want;
       if (capture_now > 0u) {
-        memcpy(workspace->payload_capture + capture_offset,
-               workspace->chunk, capture_now);
+        memcpy(workspace->payload_capture + capture_offset, workspace->chunk,
+               capture_now);
         capture_offset += capture_now;
       }
       payload_remaining -= want;
@@ -395,9 +404,8 @@ bool logger_journal_scan(const char *path,
         }
       }
     } else if ((flags & LOGGER_JOURNAL_FLAG_BINARY) != 0u) {
-      logger_journal_apply_binary_record(result, record_type,
-                                         workspace->payload_capture,
-                                         capture_offset);
+      logger_journal_apply_binary_record(
+          result, record_type, workspace->payload_capture, capture_offset);
     }
   }
 

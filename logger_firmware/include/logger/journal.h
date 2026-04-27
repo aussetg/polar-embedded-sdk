@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "logger/config_store.h"
+
 #define LOGGER_JOURNAL_ID_HEX_LEN 32
 #define LOGGER_JOURNAL_UTC_MAX 31
 #define LOGGER_JOURNAL_REASON_MAX 31
@@ -44,6 +46,9 @@ typedef struct {
   char session_end_utc[LOGGER_JOURNAL_UTC_MAX + 1];
   char session_start_reason[LOGGER_JOURNAL_REASON_MAX + 1];
   char session_end_reason[LOGGER_JOURNAL_REASON_MAX + 1];
+  char logger_id[LOGGER_CONFIG_LOGGER_ID_MAX];
+  char subject_id[LOGGER_CONFIG_SUBJECT_ID_MAX];
+  char timezone[LOGGER_CONFIG_TIMEZONE_MAX];
   logger_journal_span_summary_t spans[LOGGER_JOURNAL_MAX_SPANS];
 } logger_journal_scan_result_t;
 
