@@ -30,11 +30,27 @@ static bool logger_service_cli_is_unlocked(const logger_service_cli_t *cli,
 static logger_persisted_state_t g_service_cli_imported_state;
 static uint8_t
     g_service_cli_anchor_der_buf[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX];
+static char g_service_cli_anchor_der_base64_buf
+    [LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX + 1u];
 static char
-    g_service_cli_anchor_der_base64_buf[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX +
+    g_service_cli_config_change_details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX +
                                         1u];
-static char
-    g_service_cli_config_change_details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1u];
+
+#define LOGGER_SERVICE_BUNDLE_EXPORT_CHUNK_BYTES STORAGE_SVC_BUNDLE_READ_MAX
+
+typedef struct {
+  bool open;
+  char session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+  char dir_name[64];
+  uint64_t bundle_size_bytes;
+  uint64_t offset;
+  uint8_t chunk[LOGGER_SERVICE_BUNDLE_EXPORT_CHUNK_BYTES];
+  char
+      chunk_base64[((LOGGER_SERVICE_BUNDLE_EXPORT_CHUNK_BYTES + 2u) / 3u) * 4u +
+                   1u];
+} logger_service_bundle_export_t;
+
+static logger_service_bundle_export_t g_service_bundle_export;
 
 typedef struct {
   char imported_bound_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
@@ -53,8 +69,8 @@ typedef struct {
   char anchor_der_base64[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX + 1u];
   char anchor_subject[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SUBJECT_MAX];
   char anchor_sha256_hex[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u];
-  char anchor_expected_sha256
-      [LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN + 1u];
+  char anchor_expected_sha256[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SHA256_HEX_LEN +
+                              1u];
   char anchor_expected_subject[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_SUBJECT_MAX];
 } logger_service_cli_config_import_workspace_t;
 
@@ -62,11 +78,13 @@ static logger_service_cli_config_import_workspace_t
     g_service_cli_config_import_workspace;
 
 static const char *logger_upload_blocked_reason_hint(void) {
-  return "blocked by closed-session manifest firmware_version, not current running firmware";
+  return "blocked by closed-session manifest firmware_version, not current "
+         "running firmware";
 }
 
 static const char *logger_upload_blocked_retry_hint(void) {
-  return "reflash alone will not unblock old sessions; use debug queue requeue-blocked only after server-side minimum changes";
+  return "reflash alone will not unblock old sessions; use debug queue "
+         "requeue-blocked only after server-side minimum changes";
 }
 
 static const char *logger_upload_queue_summary_blocked_reason_hint(
@@ -93,8 +111,8 @@ static const char *logger_upload_queue_entry_status_detail(
   return logger_upload_blocked_reason_hint();
 }
 
-static const char *logger_upload_queue_entry_retry_hint(
-    const logger_upload_queue_entry_t *entry) {
+static const char *
+logger_upload_queue_entry_retry_hint(const logger_upload_queue_entry_t *entry) {
   if (entry == NULL || strcmp(entry->status, "blocked_min_firmware") != 0) {
     return NULL;
   }
@@ -310,9 +328,9 @@ static bool logger_parse_config_import_provisioned_anchor(
   }
 
   size_t der_len = 0u;
-  int rc = mbedtls_base64_decode(NULL, 0u, &der_len,
-                                 (const unsigned char *)workspace->anchor_der_base64,
-                                 strlen(workspace->anchor_der_base64));
+  int rc = mbedtls_base64_decode(
+      NULL, 0u, &der_len, (const unsigned char *)workspace->anchor_der_base64,
+      strlen(workspace->anchor_der_base64));
   if (!(rc == 0 || rc == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) ||
       der_len == 0u || der_len > LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX) {
     *error_message_out = "config import upload.tls.anchor.der_base64 does not "
@@ -320,10 +338,10 @@ static bool logger_parse_config_import_provisioned_anchor(
     return false;
   }
 
-  rc = mbedtls_base64_decode(g_service_cli_anchor_der_buf,
-                             sizeof(g_service_cli_anchor_der_buf), &der_len,
-                             (const unsigned char *)workspace->anchor_der_base64,
-                             strlen(workspace->anchor_der_base64));
+  rc = mbedtls_base64_decode(
+      g_service_cli_anchor_der_buf, sizeof(g_service_cli_anchor_der_buf),
+      &der_len, (const unsigned char *)workspace->anchor_der_base64,
+      strlen(workspace->anchor_der_base64));
   if (rc != 0 || der_len == 0u) {
     *error_message_out =
         "config import upload.tls.anchor.der_base64 is invalid";
@@ -349,15 +367,15 @@ static bool logger_parse_config_import_provisioned_anchor(
 
   workspace->anchor_expected_sha256[0] = '\0';
   if (logger_json_object_has_key(doc, anchor_tok, "sha256") &&
-      !logger_json_object_copy_string_or_null(doc, anchor_tok, "sha256",
-                                              workspace->anchor_expected_sha256,
-                                              sizeof(workspace->anchor_expected_sha256))) {
+      !logger_json_object_copy_string_or_null(
+          doc, anchor_tok, "sha256", workspace->anchor_expected_sha256,
+          sizeof(workspace->anchor_expected_sha256))) {
     *error_message_out = "config import upload.tls.anchor.sha256 is invalid";
     return false;
   }
   if (logger_string_present(workspace->anchor_expected_sha256) &&
-      strcmp(workspace->anchor_expected_sha256,
-             workspace->anchor_sha256_hex) != 0) {
+      strcmp(workspace->anchor_expected_sha256, workspace->anchor_sha256_hex) !=
+          0) {
     *error_message_out =
         "config import upload.tls.anchor.sha256 does not match der_base64";
     return false;
@@ -365,15 +383,15 @@ static bool logger_parse_config_import_provisioned_anchor(
 
   workspace->anchor_expected_subject[0] = '\0';
   if (logger_json_object_has_key(doc, anchor_tok, "subject") &&
-      !logger_json_object_copy_string_or_null(doc, anchor_tok, "subject",
-                                              workspace->anchor_expected_subject,
-                                              sizeof(workspace->anchor_expected_subject))) {
+      !logger_json_object_copy_string_or_null(
+          doc, anchor_tok, "subject", workspace->anchor_expected_subject,
+          sizeof(workspace->anchor_expected_subject))) {
     *error_message_out = "config import upload.tls.anchor.subject is invalid";
     return false;
   }
   if (logger_string_present(workspace->anchor_expected_subject) &&
-      strcmp(workspace->anchor_expected_subject,
-             workspace->anchor_subject) != 0) {
+      strcmp(workspace->anchor_expected_subject, workspace->anchor_subject) !=
+          0) {
     *error_message_out =
         "config import upload.tls.anchor.subject does not match der_base64";
     return false;
@@ -608,18 +626,16 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     state_out->config.bound_h10_address[0] = '\0';
   }
 
-  if (!logger_json_object_copy_string(&doc, recording_tok,
-                                      "study_day_rollover_local",
-                                      workspace->rollover_local,
-                                      sizeof(workspace->rollover_local)) ||
-      !logger_json_object_copy_string(
-          &doc, recording_tok, "overnight_upload_window_start_local",
-          workspace->upload_start_local,
-          sizeof(workspace->upload_start_local)) ||
+  if (!logger_json_object_copy_string(
+          &doc, recording_tok, "study_day_rollover_local",
+          workspace->rollover_local, sizeof(workspace->rollover_local)) ||
+      !logger_json_object_copy_string(&doc, recording_tok,
+                                      "overnight_upload_window_start_local",
+                                      workspace->upload_start_local,
+                                      sizeof(workspace->upload_start_local)) ||
       !logger_json_object_copy_string(
           &doc, recording_tok, "overnight_upload_window_end_local",
-          workspace->upload_end_local,
-          sizeof(workspace->upload_end_local))) {
+          workspace->upload_end_local, sizeof(workspace->upload_end_local))) {
     *error_message_out = "config import recording policy fields are invalid";
     return false;
   }
@@ -674,9 +690,9 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     return false;
   }
 
-  if (!logger_json_array_copy_single_string(
-          &doc, allowed_ssids_tok, workspace->allowed_ssid,
-          sizeof(workspace->allowed_ssid)) ||
+  if (!logger_json_array_copy_single_string(&doc, allowed_ssids_tok,
+                                            workspace->allowed_ssid,
+                                            sizeof(workspace->allowed_ssid)) ||
       networks_tok->size > 1) {
     *error_message_out =
         "config import currently supports at most one Wi-Fi network";
@@ -820,10 +836,9 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     logger_copy_string(state_out->config.upload_url,
                        sizeof(state_out->config.upload_url),
                        workspace->upload_url);
-    if (!logger_parse_config_import_upload_tls(&doc, upload_tok, upload_enabled,
-                                               workspace->upload_url,
-                                               &state_out->config,
-                                               error_message_out)) {
+    if (!logger_parse_config_import_upload_tls(
+            &doc, upload_tok, upload_enabled, workspace->upload_url,
+            &state_out->config, error_message_out)) {
       return false;
     }
     if (strcmp(workspace->auth_type, "api_key_and_bearer") == 0) {
@@ -867,10 +882,9 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     state_out->config.upload_url[0] = '\0';
     state_out->config.upload_api_key[0] = '\0';
     state_out->config.upload_token[0] = '\0';
-    if (!logger_parse_config_import_upload_tls(&doc, upload_tok, upload_enabled,
-                                               workspace->upload_url,
-                                               &state_out->config,
-                                               error_message_out)) {
+    if (!logger_parse_config_import_upload_tls(
+            &doc, upload_tok, upload_enabled, workspace->upload_url,
+            &state_out->config, error_message_out)) {
       return false;
     }
   }
@@ -2251,10 +2265,8 @@ logger_service_cli_append_config_changed_event(logger_app_t *app,
   }
 }
 
-static void __attribute__((noinline))
-logger_service_cli_write_config_import_ok(const logger_app_t *app,
-                                          const char *command,
-                                          bool bond_cleared) {
+static void __attribute__((noinline)) logger_service_cli_write_config_import_ok(
+    const logger_app_t *app, const char *command, bool bond_cleared) {
   jsw w;
   jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
   logger_json_stream_writer_field_bool(&w, "applied", true);
@@ -3487,6 +3499,174 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+static void logger_service_bundle_export_reset(void) {
+  if (g_service_bundle_export.open) {
+    logger_storage_svc_bundle_close();
+  }
+  memset(&g_service_bundle_export, 0, sizeof(g_service_bundle_export));
+}
+
+static bool logger_cli_require_service_unlocked_for_bundle(
+    logger_service_cli_t *cli, logger_app_t *app, const char *command) {
+  if (!logger_cli_require_service(app, command)) {
+    return false;
+  }
+  if (!logger_service_cli_is_unlocked(cli,
+                                      to_ms_since_boot(get_absolute_time()))) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "service_locked",
+            "service unlock is required before bundle export");
+    return false;
+  }
+  return true;
+}
+
+static void logger_handle_debug_bundle_open(logger_service_cli_t *cli,
+                                            logger_app_t *app,
+                                            const char *session_id) {
+  const char *command = "debug bundle open";
+  if (!logger_cli_require_service_unlocked_for_bundle(cli, app, command)) {
+    return;
+  }
+  uint8_t session_id_bytes[16];
+  if (!logger_hex_to_bytes_16(session_id, session_id_bytes)) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument", "expected 32 lowercase hexadecimal session_id");
+    return;
+  }
+
+  logger_service_bundle_export_reset();
+
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
+  if (!logger_storage_svc_queue_load(queue)) {
+    (void)logger_storage_svc_queue_scan(
+        queue, NULL, logger_clock_now_utc_or_null(&app->clock));
+  }
+  const logger_upload_queue_entry_t *entry =
+      logger_upload_queue_find_by_session_id(queue, session_id);
+  if (entry == NULL) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock), "not_found",
+            "session_id is not present in upload_queue.json");
+    return;
+  }
+
+  char manifest_path[LOGGER_STORAGE_PATH_MAX];
+  char journal_path[LOGGER_STORAGE_PATH_MAX];
+  const bool paths_ok =
+      logger_path_join3(manifest_path, sizeof(manifest_path),
+                        "0:/logger/sessions/", entry->dir_name,
+                        "/manifest.json") &&
+      logger_path_join3(journal_path, sizeof(journal_path),
+                        "0:/logger/sessions/", entry->dir_name, "/journal.bin");
+  if (paths_ok && logger_storage_svc_bundle_open(entry->dir_name, manifest_path,
+                                                 journal_path)) {
+    g_service_bundle_export.open = true;
+    logger_copy_string(g_service_bundle_export.session_id,
+                       sizeof(g_service_bundle_export.session_id),
+                       entry->session_id);
+    logger_copy_string(g_service_bundle_export.dir_name,
+                       sizeof(g_service_bundle_export.dir_name),
+                       entry->dir_name);
+    g_service_bundle_export.bundle_size_bytes = entry->bundle_size_bytes;
+  }
+  logger_upload_queue_tmp_release(queue);
+
+  if (!g_service_bundle_export.open) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to open canonical upload bundle");
+    return;
+  }
+
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "session_id", g_service_bundle_export.session_id);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "dir_name", g_service_bundle_export.dir_name);
+  logger_json_stream_writer_field_uint64(
+      &w, "bundle_size_bytes", g_service_bundle_export.bundle_size_bytes);
+  logger_json_stream_writer_field_uint32(
+      &w, "chunk_size_bytes", LOGGER_SERVICE_BUNDLE_EXPORT_CHUNK_BYTES);
+  jsw_end(&w);
+}
+
+static void logger_handle_debug_bundle_read(logger_service_cli_t *cli,
+                                            logger_app_t *app) {
+  const char *command = "debug bundle read";
+  if (!logger_cli_require_service_unlocked_for_bundle(cli, app, command)) {
+    return;
+  }
+  if (!g_service_bundle_export.open) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock), "not_open",
+            "open a bundle before reading it");
+    return;
+  }
+
+  size_t len = 0u;
+  if (!logger_storage_svc_bundle_read(g_service_bundle_export.chunk,
+                                      sizeof(g_service_bundle_export.chunk),
+                                      &len)) {
+    logger_service_bundle_export_reset();
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to read canonical upload bundle");
+    return;
+  }
+
+  size_t encoded_len = 0u;
+  if (mbedtls_base64_encode(
+          (unsigned char *)g_service_bundle_export.chunk_base64,
+          sizeof(g_service_bundle_export.chunk_base64), &encoded_len,
+          g_service_bundle_export.chunk, len) != 0) {
+    logger_service_bundle_export_reset();
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "internal_error", "failed to base64-encode bundle chunk");
+    return;
+  }
+  g_service_bundle_export.chunk_base64[encoded_len] = '\0';
+
+  const uint64_t offset = g_service_bundle_export.offset;
+  char session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+  logger_copy_string(session_id, sizeof(session_id),
+                     g_service_bundle_export.session_id);
+  g_service_bundle_export.offset += len;
+  const bool eof = len == 0u;
+
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "session_id", session_id);
+  logger_json_stream_writer_field_uint64(&w, "offset", offset);
+  logger_json_stream_writer_field_uint32(&w, "len", (uint32_t)len);
+  logger_json_stream_writer_field_bool(&w, "eof", eof);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "data_base64", g_service_bundle_export.chunk_base64);
+  jsw_end(&w);
+
+  if (eof) {
+    logger_service_bundle_export_reset();
+  }
+}
+
+static void logger_handle_debug_bundle_close(logger_service_cli_t *cli,
+                                             logger_app_t *app) {
+  const char *command = "debug bundle close";
+  if (!logger_cli_require_service_unlocked_for_bundle(cli, app, command)) {
+    return;
+  }
+  logger_service_bundle_export_reset();
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_bool(&w, "closed", true);
+  jsw_end(&w);
+}
+
 static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
                                            logger_app_t *app) {
   const bool allowed_in_wait_h10 =
@@ -3835,6 +4015,18 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strcmp(line, "debug queue requeue-blocked") == 0) {
     logger_handle_debug_queue_requeue_blocked(cli, app);
+    return;
+  }
+  if (strncmp(line, "debug bundle open ", 18) == 0) {
+    logger_handle_debug_bundle_open(cli, app, line + 18);
+    return;
+  }
+  if (strcmp(line, "debug bundle read") == 0) {
+    logger_handle_debug_bundle_read(cli, app);
+    return;
+  }
+  if (strcmp(line, "debug bundle close") == 0) {
+    logger_handle_debug_bundle_close(cli, app);
     return;
   }
   if (strcmp(line, "debug prune once") == 0) {
