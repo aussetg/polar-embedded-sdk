@@ -3491,6 +3491,111 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
+                                                    logger_app_t *app,
+                                                    const char *args) {
+  const char *command = "debug queue mark-verified";
+  if (!logger_cli_require_service_unlocked(cli, app, command)) {
+    return;
+  }
+
+  char session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+  char receipt_id[LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX + 1];
+  memset(session_id, 0, sizeof(session_id));
+  memset(receipt_id, 0, sizeof(receipt_id));
+
+  const char *space = args != NULL ? strchr(args, ' ') : NULL;
+  if (space == NULL || (size_t)(space - args) != LOGGER_SESSION_ID_HEX_LEN ||
+      strlen(space + 1u) == 0u ||
+      strlen(space + 1u) > LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument",
+            "expected: debug queue mark-verified <session_id> <receipt_id>");
+    return;
+  }
+  memcpy(session_id, args, LOGGER_SESSION_ID_HEX_LEN);
+  logger_copy_string(receipt_id, sizeof(receipt_id), space + 1u);
+
+  uint8_t session_id_bytes[16];
+  if (!logger_hex_to_bytes_16(session_id, session_id_bytes)) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument", "session_id must be 32 hexadecimal chars");
+    return;
+  }
+
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
+  if (!logger_storage_svc_queue_load(queue)) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to load upload_queue.json");
+    return;
+  }
+
+  logger_upload_queue_entry_t *entry = NULL;
+  for (size_t i = 0u; i < queue->session_count; ++i) {
+    if (strcmp(queue->sessions[i].session_id, session_id) == 0) {
+      entry = &queue->sessions[i];
+      break;
+    }
+  }
+  if (entry == NULL) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock), "not_found",
+            "session_id is not present in upload_queue.json");
+    return;
+  }
+
+  logger_copy_string(entry->status, sizeof(entry->status), "verified");
+  logger_copy_string(entry->receipt_id, sizeof(entry->receipt_id), receipt_id);
+  logger_copy_string(entry->verified_upload_utc,
+                     sizeof(entry->verified_upload_utc),
+                     logger_clock_now_utc_or_null(&app->clock));
+  entry->last_failure_class[0] = '\0';
+  logger_copy_string(queue->updated_at_utc, sizeof(queue->updated_at_utc),
+                     logger_clock_now_utc_or_null(&app->clock));
+
+  if (!logger_storage_svc_queue_write(queue)) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to write upload_queue.json");
+    return;
+  }
+
+  logger_upload_queue_summary_t summary;
+  logger_upload_queue_compute_summary(queue, &summary);
+  logger_upload_queue_tmp_release(queue);
+
+  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+  logger_json_object_writer_t writer;
+  logger_json_object_writer_init(&writer, details, sizeof(details));
+  if (logger_json_object_writer_string_field(&writer, "session_id",
+                                             session_id) &&
+      logger_json_object_writer_string_field(&writer, "receipt_id",
+                                             receipt_id) &&
+      logger_json_object_writer_string_field(&writer, "source",
+                                             "host_manual_upload") &&
+      logger_json_object_writer_finish(&writer)) {
+    (void)logger_system_log_append(
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+        "queue_mark_verified", LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+        logger_json_object_writer_data(&writer));
+  }
+
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "session_id", session_id);
+  logger_json_stream_writer_field_string_or_null(&w, "status", "verified");
+  logger_json_stream_writer_field_string_or_null(&w, "receipt_id", receipt_id);
+  logger_json_stream_writer_field_uint32(&w, "pending_count",
+                                         summary.pending_count);
+  jsw_end(&w);
+}
+
 static void logger_service_bundle_export_reset(void) {
   if (g_service_bundle_export.open) {
     logger_storage_svc_bundle_close();
@@ -4007,6 +4112,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strcmp(line, "debug queue requeue-blocked") == 0) {
     logger_handle_debug_queue_requeue_blocked(cli, app);
+    return;
+  }
+  if (strncmp(line, "debug queue mark-verified ", 26) == 0) {
+    logger_handle_debug_queue_mark_verified(cli, app, line + 26);
     return;
   }
   if (strncmp(line, "debug bundle open ", 18) == 0) {
