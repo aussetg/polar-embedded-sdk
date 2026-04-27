@@ -10,8 +10,9 @@
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
-#include "logger/util.h"
+#include "hardware/structs/dma_debug.h"
 #include "logger/storage_worker.h"
+#include "logger/util.h"
 #include "pico/stdlib.h"
 
 #include "board_config.h"
@@ -24,6 +25,10 @@
 
 #define LOGGER_SD_SPI_INIT_BAUD_HZ 100000u
 #define LOGGER_SD_SPI_RUN_BAUD_HZ 12000000u
+#define LOGGER_SD_SPI_BYTE_TIMEOUT_US 5000u
+#define LOGGER_SD_SPI_IDLE_TIMEOUT_US 5000u
+#define LOGGER_SD_DMA_TIMEOUT_US 100000u
+#define LOGGER_SD_DMA_ABORT_TIMEOUT_US 5000u
 #define LOGGER_SD_DATA_TIMEOUT_MS 500u
 #define LOGGER_SD_MKFS_WORK_BYTES 4096u
 #define LOGGER_SD_POST_MKFS_MOUNT_RETRIES 4u
@@ -53,8 +58,7 @@ typedef struct {
 } logger_storage_atomic_write_workspace_t;
 
 static logger_sd_driver_t g_sd;
-static logger_storage_atomic_write_workspace_t
-    g_storage_atomic_write_workspace;
+static logger_storage_atomic_write_workspace_t g_storage_atomic_write_workspace;
 /* DMA channels for SPI bulk data phase.
  *   TX channel: memory → SPI TX FIFO, paced by DREQ_SPIx_TX
  *   RX channel: SPI RX FIFO → memory, paced by DREQ_SPIx_RX
@@ -70,6 +74,105 @@ static spi_inst_t *logger_sd_spi_bus(void) {
 #else
   return spi1;
 #endif
+}
+
+static bool logger_deadline_elapsed_us(uint32_t start_us, uint32_t timeout_us) {
+  return (uint32_t)(time_us_32() - start_us) >= timeout_us;
+}
+
+static void logger_sd_spi_drain_rx(void) {
+  spi_inst_t *spi = logger_sd_spi_bus();
+  while (spi_is_readable(spi)) {
+    (void)spi_get_hw(spi)->dr;
+  }
+}
+
+static void logger_sd_invalidate_card_state(void) {
+  g_sd.card_initialized = false;
+  g_sd.mounted = false;
+  g_sd.logger_root_ready = false;
+  g_sd.writable = false;
+  g_sd.dstatus = (DSTATUS)STA_NOINIT;
+}
+
+static bool logger_sd_spi_wait_not_busy(uint32_t timeout_us) {
+  spi_inst_t *spi = logger_sd_spi_bus();
+  const uint32_t start_us = time_us_32();
+  while (spi_is_busy(spi)) {
+    if (logger_deadline_elapsed_us(start_us, timeout_us)) {
+      return false;
+    }
+    tight_loop_contents();
+  }
+  return true;
+}
+
+static void logger_sd_spi_reset_bus(void) {
+  spi_inst_t *spi = logger_sd_spi_bus();
+  const uint baud = spi_get_baudrate(spi);
+
+  gpio_put(LOGGER_SD_CS_PIN, 1);
+  spi_deinit(spi);
+  (void)spi_init(spi, baud != 0u ? baud : LOGGER_SD_SPI_INIT_BAUD_HZ);
+  spi_set_format(spi, 8u, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+  gpio_set_function(LOGGER_SD_MISO_PIN, GPIO_FUNC_SPI);
+  gpio_set_function(LOGGER_SD_SCK_PIN, GPIO_FUNC_SPI);
+  gpio_set_function(LOGGER_SD_MOSI_PIN, GPIO_FUNC_SPI);
+  gpio_pull_up(LOGGER_SD_MISO_PIN);
+  logger_sd_spi_drain_rx();
+}
+
+static void logger_sd_dma_channel_disable(uint channel) {
+  dma_channel_config_t cfg = dma_get_channel_config(channel);
+  channel_config_set_enable(&cfg, false);
+  channel_config_set_chain_to(&cfg, channel);
+  dma_channel_set_config(channel, &cfg, false);
+}
+
+static void logger_sd_dma_clear_dreq_counter(uint channel) {
+  dma_debug_hw->ch[channel].dbg_ctdreq = 0u;
+}
+
+static void logger_sd_dma_prepare_channel(uint channel) {
+  logger_sd_dma_channel_disable(channel);
+  logger_sd_dma_clear_dreq_counter(channel);
+  dma_channel_acknowledge_irq0(channel);
+  dma_channel_acknowledge_irq1(channel);
+  dma_hw->ch[channel].ctrl_trig =
+      DMA_CH0_CTRL_TRIG_READ_ERROR_BITS | DMA_CH0_CTRL_TRIG_WRITE_ERROR_BITS;
+}
+
+static bool logger_sd_dma_abort_pair(uint tx_ch, uint rx_ch) {
+  const uint32_t mask = (1u << tx_ch) | (1u << rx_ch);
+  logger_sd_dma_channel_disable(tx_ch);
+  logger_sd_dma_channel_disable(rx_ch);
+  dma_hw->abort = mask;
+
+  const uint32_t start_us = time_us_32();
+  while ((dma_hw->abort & mask) != 0u) {
+    if (logger_deadline_elapsed_us(start_us, LOGGER_SD_DMA_ABORT_TIMEOUT_US)) {
+      return false;
+    }
+    tight_loop_contents();
+  }
+
+  logger_sd_dma_clear_dreq_counter(tx_ch);
+  logger_sd_dma_clear_dreq_counter(rx_ch);
+  return true;
+}
+
+static bool logger_sd_dma_channel_ok(uint channel) {
+  const uint32_t ctrl = dma_hw->ch[channel].ctrl_trig;
+  return (ctrl & (DMA_CH0_CTRL_TRIG_AHB_ERROR_BITS |
+                  DMA_CH0_CTRL_TRIG_READ_ERROR_BITS |
+                  DMA_CH0_CTRL_TRIG_WRITE_ERROR_BITS)) == 0u;
+}
+
+static void logger_sd_dma_finish_pair(uint tx_ch, uint rx_ch) {
+  logger_sd_dma_channel_disable(tx_ch);
+  logger_sd_dma_channel_disable(rx_ch);
+  logger_sd_dma_clear_dreq_counter(tx_ch);
+  logger_sd_dma_clear_dreq_counter(rx_ch);
 }
 
 static void logger_format_hex(char *dst, size_t dst_len, const uint8_t *data,
@@ -134,9 +237,40 @@ static bool logger_sd_detect_pin_active(void) {
   return gpio_get(LOGGER_SD_DETECT_PIN) == 0;
 }
 
+static bool logger_sd_spi_xfer_byte(uint8_t tx, uint8_t *rx_out,
+                                    uint32_t timeout_us) {
+  if (rx_out == NULL) {
+    return false;
+  }
+
+  spi_inst_t *spi = logger_sd_spi_bus();
+  const uint32_t start_us = time_us_32();
+
+  while (!spi_is_writable(spi)) {
+    if (logger_deadline_elapsed_us(start_us, timeout_us)) {
+      logger_sd_invalidate_card_state();
+      logger_sd_spi_reset_bus();
+      return false;
+    }
+    tight_loop_contents();
+  }
+  spi_get_hw(spi)->dr = tx;
+
+  while (!spi_is_readable(spi)) {
+    if (logger_deadline_elapsed_us(start_us, timeout_us)) {
+      logger_sd_invalidate_card_state();
+      logger_sd_spi_reset_bus();
+      return false;
+    }
+    tight_loop_contents();
+  }
+  *rx_out = (uint8_t)spi_get_hw(spi)->dr;
+  return true;
+}
+
 static uint8_t logger_sd_spi_xfer(uint8_t tx) {
   uint8_t rx = 0xffu;
-  (void)spi_write_read_blocking(logger_sd_spi_bus(), &tx, &rx, 1u);
+  (void)logger_sd_spi_xfer_byte(tx, &rx, LOGGER_SD_SPI_BYTE_TIMEOUT_US);
   return rx;
 }
 
@@ -217,7 +351,7 @@ static void logger_sd_dma_init(void) {
  *
  * Both channels are paced by their respective SPI DREQs so the
  * transfer proceeds at the SPI clock rate without CPU intervention. */
-static void __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
+static bool __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
                                                     uint8_t *rx_dst,
                                                     size_t len) {
   hard_assert(g_sd_dma_ch_tx >= 0);
@@ -229,10 +363,30 @@ static void __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
   const uint dreq_tx = spi_get_dreq(spi, true);
   const uint dreq_rx = spi_get_dreq(spi, false);
 
-  /* Drain stale RX FIFO entries so the RX DMA channel starts clean. */
-  while (spi_is_readable(spi)) {
-    (void)spi_get_hw(spi)->dr;
+  if (len == 0u) {
+    return true;
   }
+
+  /*
+   * RP2350 DMA uses credit-based DREQ accounting.  The datasheet is explicit:
+   * software must not access a peripheral FIFO while a DMA channel is servicing
+   * it, or the DMA/peripheral credit state can desynchronise.  SD-over-SPI is a
+   * mixed-mode user of the PL022 FIFO: commands, response bytes, tokens, CRC
+   * and busy polls are CPU byte transfers; the 512-byte payload phase is DMA.
+   *
+   * Therefore every payload DMA transaction is a hard ownership boundary:
+   * disable the previous channels, clear their DREQ counters, drain stale RX,
+   * run the bounded transfer, then disable and clear again before byte-mode
+   * code is allowed to touch SSPDR.  Leaving channels enabled after completion
+   * is not benign on RP2350: DREQ counters can saturate while the CPU later
+   * talks to the same FIFO, and a subsequent byte transfer can wait forever for
+   * an RX byte that will never be produced.
+   */
+  logger_sd_dma_prepare_channel(tx_ch);
+  logger_sd_dma_prepare_channel(rx_ch);
+
+  /* Drain stale RX FIFO entries so the RX DMA channel starts clean. */
+  logger_sd_spi_drain_rx();
 
   /* TX DMA: memory → SPI TX FIFO */
   dma_channel_config_t tx_cfg = dma_channel_get_default_config(tx_ch);
@@ -266,13 +420,33 @@ static void __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
   dma_channel_start(rx_ch);
   dma_channel_start(tx_ch);
 
-  dma_channel_wait_for_finish_blocking(tx_ch);
-  dma_channel_wait_for_finish_blocking(rx_ch);
+  const uint32_t start_us = time_us_32();
+  while (dma_channel_is_busy(tx_ch) || dma_channel_is_busy(rx_ch)) {
+    if (logger_deadline_elapsed_us(start_us, LOGGER_SD_DMA_TIMEOUT_US)) {
+      (void)logger_sd_dma_abort_pair(tx_ch, rx_ch);
+      logger_sd_invalidate_card_state();
+      logger_sd_spi_reset_bus();
+      return false;
+    }
+    tight_loop_contents();
+  }
+  __compiler_memory_barrier();
+
+  if (!logger_sd_dma_channel_ok(tx_ch) || !logger_sd_dma_channel_ok(rx_ch)) {
+    (void)logger_sd_dma_abort_pair(tx_ch, rx_ch);
+    logger_sd_invalidate_card_state();
+    logger_sd_spi_reset_bus();
+    return false;
+  }
+
+  logger_sd_dma_finish_pair(tx_ch, rx_ch);
 
   /* SPI may still be shifting the last byte after DMA FIFO transfers complete.
    */
-  while (spi_is_busy(spi)) {
-    tight_loop_contents();
+  if (!logger_sd_spi_wait_not_busy(LOGGER_SD_SPI_IDLE_TIMEOUT_US)) {
+    logger_sd_invalidate_card_state();
+    logger_sd_spi_reset_bus();
+    return false;
   }
 
   /* Safety drain — if this fires, the RX DMA missed bytes. */
@@ -281,7 +455,12 @@ static void __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
     (void)spi_get_hw(spi)->dr;
     ++drain_count;
   }
-  assert(drain_count == 0u);
+  if (drain_count != 0u) {
+    logger_sd_invalidate_card_state();
+    logger_sd_spi_reset_bus();
+    return false;
+  }
+  return true;
 }
 
 static bool logger_sd_receive_data(uint8_t *buf, size_t len) {
@@ -299,7 +478,9 @@ static bool logger_sd_receive_data(uint8_t *buf, size_t len) {
   }
 
   /* Bulk data phase: DMA clocks out 0xFF while reading len bytes. */
-  logger_sd_dma_xfer(NULL, buf, len);
+  if (!logger_sd_dma_xfer(NULL, buf, len)) {
+    return false;
+  }
 
   (void)logger_sd_spi_xfer(0xffu); /* CRC byte 1 */
   (void)logger_sd_spi_xfer(0xffu); /* CRC byte 2 */
@@ -314,7 +495,9 @@ static bool logger_sd_send_data_block(const uint8_t *buf, size_t len) {
   (void)logger_sd_spi_xfer(LOGGER_SD_TOKEN_START_BLOCK);
 
   /* Bulk data phase: DMA clocks out buf while draining RX. */
-  logger_sd_dma_xfer(buf, NULL, len);
+  if (!logger_sd_dma_xfer(buf, NULL, len)) {
+    return false;
+  }
 
   (void)logger_sd_spi_xfer(0xffu); /* CRC byte 1 */
   (void)logger_sd_spi_xfer(0xffu); /* CRC byte 2 */
@@ -731,9 +914,8 @@ bool logger_storage_write_file_atomic(const char *path, const void *data,
   }
 
   const FRESULT write_fr =
-      (len == 0u)
-          ? FR_OK
-          : f_write(&workspace->file, data, (UINT)len, &written);
+      (len == 0u) ? FR_OK
+                  : f_write(&workspace->file, data, (UINT)len, &written);
   const FRESULT sync_fr = f_sync(&workspace->file);
   const FRESULT close_fr = f_close(&workspace->file);
   if ((len != 0u && (write_fr != FR_OK || written != (UINT)len)) ||
