@@ -12,7 +12,7 @@
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
 
-static bool g_storage_worker_owns_fatfs;
+static volatile bool g_storage_worker_owns_fatfs;
 
 bool logger_storage_worker_owns_fatfs(void) {
   __mem_fence_acquire();
@@ -37,15 +37,26 @@ static_assert(sizeof(uint32_t) == sizeof(storage_worker_shared_t *),
 static void
 logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
   storage_service_t *svc = &shared->service;
+  __mem_fence_acquire();
+  if (svc->state != STORAGE_SVC_STATE_SUBMITTED ||
+      svc->kind == STORAGE_SVC_NONE) {
+    svc->ok = false;
+    __mem_fence_release();
+    svc->done_seq = svc->request_seq;
+    svc->state = STORAGE_SVC_STATE_FAILED;
+    __sev();
+    return;
+  }
+
+  svc->state = STORAGE_SVC_STATE_RUNNING;
+  __mem_fence_release();
+
   const storage_service_kind_t kind = svc->kind;
+  const uint32_t request_seq = svc->request_seq;
 
   switch (kind) {
   case STORAGE_SVC_QUEUE_LOAD: {
-    if (svc->queue_out != NULL) {
-      svc->ok = logger_upload_queue_load(svc->queue_out);
-    } else {
-      svc->ok = false;
-    }
+    svc->ok = logger_upload_queue_load(&svc->response.queue);
     break;
   }
 
@@ -53,20 +64,13 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
     const char *utc = svc->params.utc_only.updated_at_utc[0] != '\0'
                           ? svc->params.utc_only.updated_at_utc
                           : NULL;
-    if (svc->queue_out != NULL) {
-      svc->ok = logger_upload_queue_scan(svc->queue_out, svc->system_log, utc);
-    } else {
-      svc->ok = false;
-    }
+    svc->ok = logger_upload_queue_scan(&svc->response.queue, svc->system_log,
+                                       utc);
     break;
   }
 
   case STORAGE_SVC_QUEUE_WRITE: {
-    if (svc->queue_in != NULL) {
-      svc->ok = logger_upload_queue_write(svc->queue_in);
-    } else {
-      svc->ok = false;
-    }
+    svc->ok = logger_upload_queue_write(&svc->response.queue);
     break;
   }
 
@@ -75,7 +79,7 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
                           ? svc->params.utc_only.updated_at_utc
                           : NULL;
     svc->ok = logger_upload_queue_refresh_file(svc->system_log, utc,
-                                               svc->summary_out);
+                                               &svc->response.summary);
     break;
   }
 
@@ -85,8 +89,9 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
                           : NULL;
     svc->ok = logger_upload_queue_prune_file(
         svc->system_log, utc, svc->params.prune.reserve_bytes,
-        svc->retention_pruned_out, svc->reserve_pruned_out,
-        svc->reserve_met_out, svc->summary_out);
+        &svc->response.retention_pruned_count,
+        &svc->response.reserve_pruned_count, &svc->response.reserve_met,
+        &svc->response.summary);
     break;
   }
 
@@ -95,7 +100,7 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
                           ? svc->params.utc_only.updated_at_utc
                           : NULL;
     svc->ok = logger_upload_queue_rebuild_file(svc->system_log, utc,
-                                               svc->summary_out);
+                                               &svc->response.summary);
     break;
   }
 
@@ -107,17 +112,13 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
                              ? svc->params.requeue.reason
                              : NULL;
     svc->ok = logger_upload_queue_requeue_blocked_file(
-        svc->system_log, utc, reason, svc->requeued_count_out,
-        svc->summary_out);
+        svc->system_log, utc, reason, &svc->response.requeued_count,
+        &svc->response.summary);
     break;
   }
 
   case STORAGE_SVC_STORAGE_REFRESH: {
-    if (svc->storage_status_out != NULL) {
-      svc->ok = logger_storage_refresh(svc->storage_status_out);
-    } else {
-      svc->ok = false;
-    }
+    svc->ok = logger_storage_refresh(&svc->response.storage_status);
     break;
   }
 
@@ -131,13 +132,10 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
   }
 
   case STORAGE_SVC_BUNDLE_COMPUTE: {
-    char sha256_buf[LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN + 1] = {0};
-    uint64_t size_val = 0u;
     svc->ok = logger_upload_bundle_compute(
         svc->params.bundle.dir_name, svc->params.bundle.manifest_path,
-        svc->params.bundle.journal_path,
-        svc->sha256_out != NULL ? svc->sha256_out : sha256_buf,
-        svc->bundle_size_out != NULL ? svc->bundle_size_out : &size_val);
+        svc->params.bundle.journal_path, svc->response.sha256,
+        &svc->response.bundle_size);
     break;
   }
 
@@ -152,12 +150,10 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
   case STORAGE_SVC_BUNDLE_READ: {
     if (shared->bundle_stream_open) {
       svc->ok = logger_upload_bundle_stream_read(
-          &shared->bundle_stream, svc->params.bundle_read.dst,
-          svc->params.bundle_read.cap, svc->params.bundle_read.len_out);
+          &shared->bundle_stream, svc->response.bundle_read_data,
+          svc->params.bundle_read.cap, &svc->response.bundle_read_len);
     } else {
-      if (svc->params.bundle_read.len_out != NULL) {
-        *svc->params.bundle_read.len_out = 0u;
-      }
+      svc->response.bundle_read_len = 0u;
       svc->ok = false;
     }
     break;
@@ -173,16 +169,13 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
   }
 
   case STORAGE_SVC_STORAGE_FORMAT: {
-    svc->ok = logger_storage_format(svc->format_status_out);
+    svc->ok = logger_storage_format(&svc->response.format_status);
     break;
   }
 
   case STORAGE_SVC_FILE_EXISTS: {
-    const bool exists =
+    svc->response.file_exists =
         logger_storage_file_exists(svc->params.file_exists.path);
-    if (svc->file_exists_out != NULL) {
-      *svc->file_exists_out = exists;
-    }
     svc->ok = true;
     break;
   }
@@ -195,7 +188,8 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
 
   /* Signal completion to core 0 */
   __mem_fence_release();
-  svc->done = true;
+  svc->done_seq = request_seq;
+  svc->state = STORAGE_SVC_STATE_DONE;
   __sev();
 }
 
@@ -286,37 +280,12 @@ static void logger_storage_worker_drain(storage_worker_shared_t *shared) {
 
     if (!ok) {
       shared->stats.write_failures += 1u;
-      capture_pipe_note_hard_failure(pipe, 0u);
-
-      /* Classify the failure by command type for telemetry.
-       * first-writer-wins: only set if no earlier failure in this
-       * degraded period already classified it.  Classification
-       * logic lives in capture_pipe.c so it is testable without
-       * pico-sdk dependencies.  See logger_recovery_architecture_v1.md
-       * §8.7 canonical subreasons. */
-      if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
-        const capture_writer_failure_t classified =
-            capture_writer_classify_cmd_failure(cmd.type);
-        if (classified != CAPTURE_WRITER_FAILURE_NONE) {
-          pipe->last_writer_failure = classified;
-        }
-      }
-
-      /* Publish failure classification before barrier counter
-       * advancement or event ring push.
-       *
-       * For barrier commands, the release fence below before
-       * barriers_done_seq would suffice on its own — but for
-       * non-barrier failures (APPEND_PMD_PACKET) the only
-       * subsequent release is inside capture_event_ring_push(),
-       * which is best-effort and may silently fail.  Core 0 reads
-       * last_writer_failure in logger_app_drain_capture_pipe()
-       * without a per-field acquire fence, so we must ensure the
-       * store is published here.
-       *
-       * This fence also covers the hard_failure_active and
-       * health stores inside capture_pipe_note_hard_failure() above. */
-      __mem_fence_release();
+      const capture_writer_failure_t classified =
+          capture_writer_classify_cmd_failure(cmd.type);
+      capture_pipe_publish_writer_failure(
+          pipe, classified != CAPTURE_WRITER_FAILURE_NONE
+                    ? classified
+                    : CAPTURE_WRITER_FAILURE_BARRIER_FAILED);
 
       /* Even on failure, advance the barrier counter so core 0
        * doesn't spin for the full 5 s timeout.  Set the result
@@ -499,14 +468,14 @@ bool logger_storage_worker_launch(storage_worker_shared_t *shared) {
    * initialization before we proceed.
    */
   const uint32_t launch_timeout_ms = 5000u;
-  const uint32_t deadline_ms =
-      (uint32_t)(time_us_64() / 1000ull) + launch_timeout_ms;
+  const uint32_t start_ms = (uint32_t)(time_us_64() / 1000ull);
   while (!shared->core1_lockout_ready) {
-    if ((uint32_t)(time_us_64() / 1000ull) >= deadline_ms) {
+    if (((uint32_t)(time_us_64() / 1000ull) - start_ms) >=
+        launch_timeout_ms) {
       printf("[storage_worker] core 1 lockout timed out\n");
       return false;
     }
-    __wfe();
+    (void)best_effort_wfe_or_timeout(make_timeout_time_ms(1u));
   }
   __mem_fence_acquire();
 
@@ -524,8 +493,7 @@ bool logger_storage_worker_launch(storage_worker_shared_t *shared) {
 
   printf("[storage_worker] core 0 flash-safe init done\n");
 
-  shared->stats.ready = true;
-  __mem_fence_release();
+  shared->storage_service_ready = true;
   g_storage_worker_owns_fatfs = true;
   __mem_fence_release();
   return true;

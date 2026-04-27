@@ -7,12 +7,13 @@
  *
  * After BOOT, core 0 MUST NOT call queue.c, upload_bundle.c, or
  * storage.c mutating functions directly.  Instead, core 0 calls the
- * storage_service wrappers below.  Each wrapper:
+ * storage_service wrappers below.  The underlying mailbox is asynchronous and
+ * single-flight:
  *
  *   1. fills in a shared request struct,
  *   2. enqueues a LOGGER_WRITER_SERVICE_REQUEST command,
- *   3. waits for core 1 to execute and signal completion,
- *   4. returns the result.
+ *   3. core 1 executes and publishes a monotonic completion sequence,
+ *   4. the synchronous convenience wrappers wait and copy typed results.
  *
  * The actual SD/FatFS work happens on core 1 using the same
  * queue.c / upload_bundle.c / storage.c functions as before.

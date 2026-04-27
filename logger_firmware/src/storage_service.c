@@ -1,6 +1,5 @@
 #include "logger/storage_service.h"
 
-#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,27 +24,24 @@ void logger_storage_svc_init(storage_worker_shared_t *shared) {
 }
 
 static bool logger_storage_svc_available(void) {
-  return g_svc_shared != NULL && g_svc_shared->stats.ready;
+  return g_svc_shared != NULL && g_svc_shared->storage_service_ready;
 }
 
-/* ── Submit a service request and wait for completion ────────────
+/* ── Submit service requests ─────────────────────────────────────
  *
  * CONTRACT — read this before modifying anything below:
  *
- *   Every wrapper below passes pointers to caller-owned stack or
- *   static storage (queue structs, summary buffers, SHA-256 arrays,
- *   etc.) into svc->*_out fields.  Core 1 dereferences these pointers
- *   while executing the requested operation.
+ *   Requests and responses live in the shared service mailbox.  Core 1 never
+ *   writes through caller-owned output buffers; wrappers copy response fields
+ *   back to caller storage after DONE is observed. system_log is app-lifetime
+ *   shared state, not a per-request result buffer.
  *
- *   This is safe ONLY because submit() is synchronous: core 0 blocks
- *   in the while-loop below until core 1 sets svc->done = true.
- *   The caller's stack frame is guaranteed to outlive core 1's
- *   access because the caller hasn't returned yet.
- *
- *   DO NOT make submit() non-blocking, async, or early-return.
- *   DO NOT queue multiple service requests concurrently.
- *   Every pointer passed through svc becomes a dangling pointer
- *   the instant the calling wrapper returns.
+ *   The mailbox is asynchronous and single-flight: submit_async() publishes a
+ *   request and returns once it is queued; wait() consumes the completion.
+ *   The public convenience wrappers below still submit+wait because their API
+ *   returns typed results synchronously. Do not queue multiple service
+ *   requests concurrently: the shared mailbox has one request slot and one
+ *   response slot.
  */
 
 #define STORAGE_SVC_TIMEOUT_MS 30000u
@@ -88,36 +84,29 @@ static void logger_storage_svc_wait_heartbeat(void) {
 }
 
 static void logger_storage_svc_prepare(storage_service_t *svc) {
+  hard_assert(svc->state == STORAGE_SVC_STATE_IDLE);
   memset(&svc->params, 0, sizeof(svc->params));
-  svc->queue_out = NULL;
-  svc->queue_in = NULL;
-  svc->summary_out = NULL;
-  svc->storage_status_out = NULL;
-  svc->retention_pruned_out = NULL;
-  svc->reserve_pruned_out = NULL;
-  svc->reserve_met_out = NULL;
-  svc->requeued_count_out = NULL;
-  svc->sha256_out = NULL;
-  svc->bundle_size_out = NULL;
   svc->system_log = NULL;
-  svc->format_status_out = NULL;
-  svc->file_exists_out = NULL;
+  memset(&svc->response, 0, sizeof(svc->response));
 }
 
-static bool logger_storage_svc_submit(storage_service_kind_t kind) {
+static bool logger_storage_svc_submit_async(storage_service_kind_t kind,
+                                            uint32_t *request_seq_out) {
   storage_service_t *svc = &g_svc_shared->service;
 
-  /* Debug guard: catch re-entrancy or double-submit.  If done is
-   * false and kind is not NONE, a previous request is still in
-   * flight — a second submit would overwrite the pointer fields
-   * while core 1 is still using them. */
-  assert(svc->done || svc->kind == STORAGE_SVC_NONE);
+  /* Debug guard: catch re-entrancy or double-submit. */
+  hard_assert(svc->state == STORAGE_SVC_STATE_IDLE);
 
-  svc->done = false;
   svc->ok = false;
+  const uint32_t request_seq = svc->request_seq + 1u;
+  svc->request_seq = request_seq;
+  if (request_seq_out != NULL) {
+    *request_seq_out = request_seq;
+  }
 
   __mem_fence_release();
   svc->kind = kind;
+  svc->state = STORAGE_SVC_STATE_SUBMITTED;
   __mem_fence_release();
 
   /* Enqueue a service-request command to wake core 1 */
@@ -125,76 +114,124 @@ static bool logger_storage_svc_submit(storage_service_kind_t kind) {
   memset(&cmd, 0, sizeof(cmd));
   cmd.type = LOGGER_WRITER_SERVICE_REQUEST;
 
+  /* Preserve the same ordering contract as synchronous writer commands:
+   * older PMD packets sitting in core-0 staging must reach the command ring
+   * before the service request is published to core 1. */
+  if (capture_staging_has_data(g_svc_shared->pipe)) {
+    (void)capture_staging_drain(g_svc_shared->pipe,
+                                g_svc_shared->pipe->staging.capacity);
+  }
+
   if (!capture_cmd_ring_enqueue(g_svc_shared->pipe, &cmd)) {
     printf("[storage_svc] enqueue failed for kind=%d\n", (int)kind);
     svc->kind = STORAGE_SVC_NONE;
+    svc->state = STORAGE_SVC_STATE_IDLE;
     return false;
   }
   __sev();
 
+  return true;
+}
+
+static bool logger_storage_svc_wait(storage_service_kind_t kind,
+                                    uint32_t request_seq) {
+  storage_service_t *svc = &g_svc_shared->service;
+
   /* Wait for core 1 to complete.
    *
-   * Even if the deadline fires we must not return until core 1
-   * finishes writing through the output pointers in svc — otherwise
-   * a new request could overwrite them while core 1 is still active.
-   * The timeout just means we report failure; the wait is mandatory.
+   * Even though service responses are mailbox-owned now, a timeout means the
+   * storage worker may be wedged inside FatFS/SD I/O. Reboot rather than
+   * continuing with an unknown worker/storage state.
    */
-  const uint32_t deadline =
-      (uint32_t)(time_us_64() / 1000ull) + logger_storage_svc_timeout_ms(kind);
+  const uint32_t start_ms = (uint32_t)(time_us_64() / 1000ull);
+  const uint32_t timeout_ms = logger_storage_svc_timeout_ms(kind);
   bool timed_out = false;
-  while (!svc->done) {
-    if (!timed_out && (uint32_t)(time_us_64() / 1000ull) >= deadline) {
+  while (svc->done_seq != request_seq ||
+         (svc->state != STORAGE_SVC_STATE_DONE &&
+          svc->state != STORAGE_SVC_STATE_FAILED)) {
+    const uint32_t now_ms = (uint32_t)(time_us_64() / 1000ull);
+    if (!timed_out && (now_ms - start_ms) >= timeout_ms) {
       printf("[storage_svc] timeout waiting for kind=%d\n", (int)kind);
       timed_out = true;
-      /* Fall through — keep waiting, don't return. */
+      /* Treat this as a fatal worker liveness failure and reboot instead of
+       * feeding the watchdog forever. */
+      watchdog_reboot(0, 0, 0);
+      while (true) {
+        tight_loop_contents();
+      }
     }
     watchdog_update();
     logger_storage_svc_wait_heartbeat();
   }
   __mem_fence_acquire();
 
-  const bool ok = !timed_out && svc->ok;
+  const bool ok = !timed_out &&
+                  svc->state == STORAGE_SVC_STATE_DONE && svc->ok;
   svc->kind = STORAGE_SVC_NONE;
+  svc->state = STORAGE_SVC_STATE_IDLE;
   return ok;
+}
+
+static bool logger_storage_svc_submit_and_wait(storage_service_kind_t kind) {
+  uint32_t request_seq = 0u;
+  if (!logger_storage_svc_submit_async(kind, &request_seq)) {
+    return false;
+  }
+  return logger_storage_svc_wait(kind, request_seq);
 }
 
 /* ── Queue wrappers ────────────────────────────────────────────── */
 
 bool logger_storage_svc_queue_load(logger_upload_queue_t *queue) {
+  if (queue == NULL) {
+    return false;
+  }
   if (!logger_storage_svc_available()) {
     return logger_upload_queue_load(queue);
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->queue_out = queue;
-  return logger_storage_svc_submit(STORAGE_SVC_QUEUE_LOAD);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_QUEUE_LOAD)) {
+    return false;
+  }
+  *queue = svc->response.queue;
+  return true;
 }
 
 bool logger_storage_svc_queue_scan(logger_upload_queue_t *queue,
                                    logger_system_log_t *system_log,
                                    const char *updated_at_utc_or_null) {
+  if (queue == NULL) {
+    return false;
+  }
   if (!logger_storage_svc_available()) {
     return logger_upload_queue_scan(queue, system_log, updated_at_utc_or_null);
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->queue_out = queue;
   svc->system_log = system_log;
   logger_copy_string(svc->params.utc_only.updated_at_utc,
                      sizeof(svc->params.utc_only.updated_at_utc),
                      updated_at_utc_or_null != NULL ? updated_at_utc_or_null
                                                     : "");
-  return logger_storage_svc_submit(STORAGE_SVC_QUEUE_SCAN);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_QUEUE_SCAN)) {
+    return false;
+  }
+  *queue = svc->response.queue;
+  return true;
 }
 
 bool logger_storage_svc_queue_write(const logger_upload_queue_t *queue) {
+  if (queue == NULL) {
+    return false;
+  }
   if (!logger_storage_svc_available()) {
     return logger_upload_queue_write(queue);
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->queue_in = queue;
-  return logger_storage_svc_submit(STORAGE_SVC_QUEUE_WRITE);
+  svc->response.queue = *queue;
+  return logger_storage_svc_submit_and_wait(STORAGE_SVC_QUEUE_WRITE);
 }
 
 bool logger_storage_svc_queue_refresh(
@@ -206,13 +243,18 @@ bool logger_storage_svc_queue_refresh(
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->summary_out = summary_out;
   svc->system_log = system_log;
   logger_copy_string(svc->params.utc_only.updated_at_utc,
                      sizeof(svc->params.utc_only.updated_at_utc),
                      updated_at_utc_or_null != NULL ? updated_at_utc_or_null
                                                     : "");
-  return logger_storage_svc_submit(STORAGE_SVC_QUEUE_REFRESH);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_QUEUE_REFRESH)) {
+    return false;
+  }
+  if (summary_out != NULL) {
+    *summary_out = svc->response.summary;
+  }
+  return true;
 }
 
 bool logger_storage_svc_queue_prune(
@@ -228,17 +270,28 @@ bool logger_storage_svc_queue_prune(
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->summary_out = summary_out;
-  svc->retention_pruned_out = retention_pruned_count_out;
-  svc->reserve_pruned_out = reserve_pruned_count_out;
-  svc->reserve_met_out = reserve_met_out;
   svc->system_log = system_log;
   logger_copy_string(svc->params.prune.updated_at_utc,
                      sizeof(svc->params.prune.updated_at_utc),
                      updated_at_utc_or_null != NULL ? updated_at_utc_or_null
                                                     : "");
   svc->params.prune.reserve_bytes = reserve_bytes;
-  return logger_storage_svc_submit(STORAGE_SVC_QUEUE_PRUNE);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_QUEUE_PRUNE)) {
+    return false;
+  }
+  if (retention_pruned_count_out != NULL) {
+    *retention_pruned_count_out = svc->response.retention_pruned_count;
+  }
+  if (reserve_pruned_count_out != NULL) {
+    *reserve_pruned_count_out = svc->response.reserve_pruned_count;
+  }
+  if (reserve_met_out != NULL) {
+    *reserve_met_out = svc->response.reserve_met;
+  }
+  if (summary_out != NULL) {
+    *summary_out = svc->response.summary;
+  }
+  return true;
 }
 
 bool logger_storage_svc_queue_rebuild(
@@ -250,13 +303,18 @@ bool logger_storage_svc_queue_rebuild(
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->summary_out = summary_out;
   svc->system_log = system_log;
   logger_copy_string(svc->params.utc_only.updated_at_utc,
                      sizeof(svc->params.utc_only.updated_at_utc),
                      updated_at_utc_or_null != NULL ? updated_at_utc_or_null
                                                     : "");
-  return logger_storage_svc_submit(STORAGE_SVC_QUEUE_REBUILD);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_QUEUE_REBUILD)) {
+    return false;
+  }
+  if (summary_out != NULL) {
+    *summary_out = svc->response.summary;
+  }
+  return true;
 }
 
 bool logger_storage_svc_queue_requeue_blocked(
@@ -270,8 +328,6 @@ bool logger_storage_svc_queue_requeue_blocked(
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->summary_out = summary_out;
-  svc->requeued_count_out = requeued_count_out;
   svc->system_log = system_log;
   logger_copy_string(svc->params.requeue.updated_at_utc,
                      sizeof(svc->params.requeue.updated_at_utc),
@@ -280,19 +336,34 @@ bool logger_storage_svc_queue_requeue_blocked(
   logger_copy_string(svc->params.requeue.reason,
                      sizeof(svc->params.requeue.reason),
                      reason != NULL ? reason : "");
-  return logger_storage_svc_submit(STORAGE_SVC_QUEUE_REQUEUE_BLOCKED);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_QUEUE_REQUEUE_BLOCKED)) {
+    return false;
+  }
+  if (requeued_count_out != NULL) {
+    *requeued_count_out = svc->response.requeued_count;
+  }
+  if (summary_out != NULL) {
+    *summary_out = svc->response.summary;
+  }
+  return true;
 }
 
 /* ── Storage wrappers ──────────────────────────────────────────── */
 
 bool logger_storage_svc_refresh(logger_storage_status_t *status) {
+  if (status == NULL) {
+    return false;
+  }
   if (!logger_storage_svc_available()) {
     return logger_storage_refresh(status);
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->storage_status_out = status;
-  return logger_storage_svc_submit(STORAGE_SVC_STORAGE_REFRESH);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_STORAGE_REFRESH)) {
+    return false;
+  }
+  *status = svc->response.storage_status;
+  return true;
 }
 
 bool logger_storage_svc_self_test(void) {
@@ -304,7 +375,7 @@ bool logger_storage_svc_self_test(void) {
            logger_storage_remove_file(LOGGER_RECOVERY_PROBE_PATH);
   }
   logger_storage_svc_prepare(&g_svc_shared->service);
-  return logger_storage_svc_submit(STORAGE_SVC_STORAGE_SELF_TEST);
+  return logger_storage_svc_submit_and_wait(STORAGE_SVC_STORAGE_SELF_TEST);
 }
 
 bool logger_storage_svc_format(logger_storage_status_t *status) {
@@ -313,11 +384,19 @@ bool logger_storage_svc_format(logger_storage_status_t *status) {
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->format_status_out = status;
-  return logger_storage_svc_submit(STORAGE_SVC_STORAGE_FORMAT);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_STORAGE_FORMAT)) {
+    return false;
+  }
+  if (status != NULL) {
+    *status = svc->response.format_status;
+  }
+  return true;
 }
 
 bool logger_storage_svc_file_exists(const char *path) {
+  if (path == NULL) {
+    return false;
+  }
   if (!logger_storage_svc_available()) {
     return logger_storage_file_exists(path);
   }
@@ -325,12 +404,10 @@ bool logger_storage_svc_file_exists(const char *path) {
   logger_storage_svc_prepare(svc);
   logger_copy_string(svc->params.file_exists.path,
                      sizeof(svc->params.file_exists.path), path);
-  bool exists = false;
-  svc->file_exists_out = &exists;
-  if (!logger_storage_svc_submit(STORAGE_SVC_FILE_EXISTS)) {
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_FILE_EXISTS)) {
     return false;
   }
-  return exists;
+  return svc->response.file_exists;
 }
 
 /* ── Bundle wrappers ───────────────────────────────────────────── */
@@ -351,9 +428,17 @@ bool logger_storage_svc_bundle_compute(
                      sizeof(svc->params.bundle.manifest_path), manifest_path);
   logger_copy_string(svc->params.bundle.journal_path,
                      sizeof(svc->params.bundle.journal_path), journal_path);
-  svc->sha256_out = out_sha256;
-  svc->bundle_size_out = bundle_size_out;
-  return logger_storage_svc_submit(STORAGE_SVC_BUNDLE_COMPUTE);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_BUNDLE_COMPUTE)) {
+    return false;
+  }
+  if (out_sha256 != NULL) {
+    logger_copy_string(out_sha256, LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN + 1,
+                       svc->response.sha256);
+  }
+  if (bundle_size_out != NULL) {
+    *bundle_size_out = svc->response.bundle_size;
+  }
+  return true;
 }
 
 bool logger_storage_svc_bundle_open(const char *dir_name,
@@ -374,7 +459,7 @@ bool logger_storage_svc_bundle_open(const char *dir_name,
                      sizeof(svc->params.bundle.manifest_path), manifest_path);
   logger_copy_string(svc->params.bundle.journal_path,
                      sizeof(svc->params.bundle.journal_path), journal_path);
-  return logger_storage_svc_submit(STORAGE_SVC_BUNDLE_OPEN);
+  return logger_storage_svc_submit_and_wait(STORAGE_SVC_BUNDLE_OPEN);
 }
 
 bool logger_storage_svc_bundle_read(void *dst, size_t cap, size_t *len_out) {
@@ -389,10 +474,26 @@ bool logger_storage_svc_bundle_read(void *dst, size_t cap, size_t *len_out) {
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);
-  svc->params.bundle_read.dst = dst;
+  if (len_out != NULL) {
+    *len_out = 0u;
+  }
+  if (dst == NULL || cap > STORAGE_SVC_BUNDLE_READ_MAX) {
+    return false;
+  }
   svc->params.bundle_read.cap = cap;
-  svc->params.bundle_read.len_out = len_out;
-  return logger_storage_svc_submit(STORAGE_SVC_BUNDLE_READ);
+  if (!logger_storage_svc_submit_and_wait(STORAGE_SVC_BUNDLE_READ)) {
+    return false;
+  }
+  if (svc->response.bundle_read_len > cap) {
+    return false;
+  }
+  if (svc->response.bundle_read_len != 0u) {
+    memcpy(dst, svc->response.bundle_read_data, svc->response.bundle_read_len);
+  }
+  if (len_out != NULL) {
+    *len_out = svc->response.bundle_read_len;
+  }
+  return true;
 }
 
 void logger_storage_svc_bundle_close(void) {
@@ -404,5 +505,5 @@ void logger_storage_svc_bundle_close(void) {
     return;
   }
   logger_storage_svc_prepare(&g_svc_shared->service);
-  (void)logger_storage_svc_submit(STORAGE_SVC_BUNDLE_CLOSE);
+  (void)logger_storage_svc_submit_and_wait(STORAGE_SVC_BUNDLE_CLOSE);
 }

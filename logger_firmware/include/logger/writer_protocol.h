@@ -109,6 +109,7 @@ typedef struct {
   char session_id[33];
   char span_id[33];
   uint32_t span_index_in_session;
+  char start_utc[32];
   char start_reason[32];
   char h10_address[LOGGER_CONFIG_BOUND_H10_ADDR_MAX];
   bool encrypted;
@@ -219,6 +220,8 @@ typedef struct {
   int64_t utc_ns;
   char session_id[33];
   char span_id[33];
+  uint32_t span_index_in_session;
+  char end_utc[32];
   char end_reason[32];
   uint32_t packet_count;
   uint32_t first_seq_in_span;
@@ -269,6 +272,7 @@ typedef struct {
   logger_writer_cmd_type_t type; /* LOGGER_WRITER_FLUSH_BARRIER */
   uint32_t boot_counter;
   uint32_t now_ms;
+  bool force; /* true = seal now; false = seal only when writer-side age says so */
 } logger_writer_flush_barrier_t;
 
 /* ── Tagged union ──────────────────────────────────────────────── */

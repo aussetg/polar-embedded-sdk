@@ -84,9 +84,9 @@
 typedef struct {
   logger_writer_cmd_t *slots; /* PSRAM-backed, set at init */
   uint32_t capacity;         /* power of 2 */
-  uint64_t head; /* consumer reads here (writer side) */
-  uint64_t tail; /* producer writes here (control core) */
-  uint64_t seq;  /* monotonically increasing command position */
+  uint32_t head; /* consumer reads here (writer side) */
+  uint32_t tail; /* producer writes here (control core) */
+  uint32_t seq;  /* monotonically increasing command position */
 } capture_cmd_ring_t;
 
 /* ── Event ring (writer → control core) ────────────────────────── */
@@ -111,8 +111,8 @@ typedef struct {
  */
 typedef struct {
   capture_event_t slots[CAPTURE_EVENT_RING_CAPACITY];
-  uint64_t head;
-  uint64_t tail;
+  uint32_t head;
+  uint32_t tail;
 } capture_event_ring_t;
 
 /* ── Source staging ────────────────────────────────────────────── */
@@ -128,8 +128,8 @@ typedef struct {
 typedef struct {
   logger_writer_cmd_t *slots; /* PSRAM-backed, set at init */
   uint32_t capacity;         /* power of 2 */
-  uint64_t head;
-  uint64_t tail;
+  uint32_t head;
+  uint32_t tail;
   uint32_t overflow_count;
 } capture_source_staging_t;
 
@@ -186,16 +186,13 @@ capture_writer_classify_cmd_failure(logger_writer_cmd_type_t cmd_type);
 /* ── Telemetry ─────────────────────────────────────────────────── */
 
 typedef struct {
-  /* Command ring */
+  /* Command ring producer side (core 0). */
   uint32_t cmd_enqueue_count;
   uint32_t cmd_enqueue_reject_count;
-  uint32_t cmd_dequeue_count;
   uint16_t cmd_occupancy_hwm;
-  uint16_t cmd_occupancy_now;
+  uint16_t cmd_occupancy_after_enqueue;
 
-  /* Event ring */
-  uint32_t event_push_count;
-  uint32_t event_push_overflow_count;
+  /* Event ring consumer side (core 0). */
   uint32_t event_pop_count;
 
   /* Per-kind event tally (core 0 side, from event ring drains).
@@ -213,11 +210,29 @@ typedef struct {
   uint16_t staging_occupancy_hwm;
   uint16_t staging_occupancy_now;
 
-  /* Health / distress */
-  capture_health_t health;
+  /* Health/distress telemetry. Correctness state lives directly on
+   * capture_pipe_t; these are counters only. */
   uint32_t distressed_enter_count;
   uint32_t distressed_exit_count;
   uint32_t hard_failure_count;
+} capture_pipe_control_telemetry_t;
+
+typedef struct {
+  /* Command ring consumer side (core 1). */
+  uint32_t cmd_dequeue_count;
+  uint16_t cmd_occupancy_after_dequeue;
+
+  /* Event ring producer side (core 1). */
+  uint32_t event_push_count;
+  uint32_t event_push_overflow_count;
+} capture_pipe_writer_telemetry_t;
+
+typedef struct {
+  /* Diagnostic-only counters split by writer core. Each sub-struct is written
+   * by exactly one core; reads from the other core are approximate status/CLI
+   * telemetry and must not drive control decisions. */
+  capture_pipe_control_telemetry_t control;
+  capture_pipe_writer_telemetry_t writer;
 } capture_pipe_telemetry_t;
 
 /* ── Top-level capture pipe ────────────────────────────────────── */
@@ -247,6 +262,15 @@ typedef struct capture_pipe {
    * a lock; the fences in the ring ops provide ordering. */
   volatile uint32_t barriers_done_seq;
   volatile bool barrier_last_ok;
+
+  /* Reliable writer-failure publication channel.
+   * Producer: core 1. Consumer/owner of health state: core 0.
+   * First unobserved failure wins: while writer_failure_seq differs from
+   * writer_failure_observed_seq, core 1 must not overwrite
+   * writer_failure_kind. */
+  volatile uint32_t writer_failure_seq;
+  volatile capture_writer_failure_t writer_failure_kind;
+  volatile uint32_t writer_failure_observed_seq;
 
   /* Distress / degraded deadline */
   capture_health_t health;
@@ -334,6 +358,8 @@ bool capture_event_ring_push(capture_pipe_t *pipe,
                              const capture_event_t *event);
 bool capture_event_ring_pop(capture_pipe_t *pipe, capture_event_t *out);
 bool capture_event_ring_has_data(const capture_pipe_t *pipe);
+void capture_pipe_publish_writer_failure(capture_pipe_t *pipe,
+                                         capture_writer_failure_t failure);
 
 /* ── Health / distress ─────────────────────────────────────────── */
 

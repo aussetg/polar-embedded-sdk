@@ -47,6 +47,20 @@ typedef struct {
   logger_system_log_t *system_log;
 } logger_session_manifest_ctx_t;
 
+/* Core-1-owned durable writer state.  Core 0 must not inspect these fields
+ * for control decisions; any core-0 diagnostics read them as approximate
+ * telemetry only, or after a synchronous writer barrier has completed. */
+typedef struct {
+  uint64_t next_record_seq;
+  uint64_t journal_size_bytes;
+  logger_journal_writer_t journal_writer;
+  uint32_t next_chunk_seq_in_session;
+  logger_journal_span_summary_t spans[LOGGER_JOURNAL_MAX_SPANS];
+  logger_chunk_builder_t chunk_builder;
+#define LOGGER_SESSION_MANIFEST_MAX 8192
+  char manifest_buf[LOGGER_SESSION_MANIFEST_MAX];
+} logger_session_writer_state_t;
+
 void logger_session_set_capture_stats(logger_capture_stats_t *stats);
 
 enum {
@@ -82,30 +96,17 @@ typedef struct logger_session_state {
    * Updated by the control core when span identity changes.
    */
   uint8_t current_span_id_raw[16];
-  /*
-   * Writer-side durable counters.  Assigned only when journal records
-   * are actually emitted on core 1.  Core 0 never touches these —
-   * they are updated inside logger_writer_dispatch() and the seal
-   * helper it calls.
-   */
-  uint64_t next_record_seq;
-  uint64_t journal_size_bytes;
-  logger_journal_writer_t journal_writer;
-  uint32_t next_chunk_seq_in_session;
   /* Control-core owned counters */
   uint32_t next_packet_seq_in_span;
   uint32_t span_count;
+  /* Control-plane span identity/lifecycle metadata.  Core 1 keeps a durable
+   * mirror in writer.spans for packet counts and manifest generation. */
   logger_journal_span_summary_t spans[LOGGER_JOURNAL_MAX_SPANS];
-  logger_chunk_builder_t chunk_builder;
+  logger_session_writer_state_t writer;
   /* Manifest snapshot — set at session creation, read at finalize.
    * Owned by core 0 until FINALIZE_SESSION is dispatched, after which
    * core 1 reads it.  Ring fences provide ordering. */
   logger_session_manifest_ctx_t manifest_ctx;
-  /* Manifest serialization buffer.  Used only during FINALIZE_SESSION
-   * on core 1.  Avoids static storage and keeps 8 KiB off core 1's
-   * 2 KiB stack.  Zeroed at session init. */
-#define LOGGER_SESSION_MANIFEST_MAX 8192
-  char manifest_buf[LOGGER_SESSION_MANIFEST_MAX];
   /* Capture pipe — when set, all writer dispatch routes through it.
    * NULL during init or unit tests that don't need the pipe. */
   struct capture_pipe *pipe;
@@ -115,6 +116,16 @@ void logger_session_init(logger_session_state_t *session);
 void logger_session_set_pipe(logger_session_state_t *session,
                              struct capture_pipe *pipe);
 void logger_session_init_buffers(void);
+
+/* Approximate cross-core telemetry accessor for writer-owned durable size.
+ *
+ * Core 1 owns session->writer.journal_size_bytes.  Core 0 may call this for
+ * CLI/status JSON, but the value is only telemetry while logging is active: it
+ * may lag pending staged packets/chunks and is exact only after a synchronous
+ * writer barrier/finalize/recovery lifecycle boundary has completed.
+ */
+uint64_t logger_session_writer_journal_size_approx(
+    const logger_session_state_t *session);
 
 bool logger_session_start_debug(
     logger_session_state_t *session, logger_system_log_t *system_log,

@@ -5,6 +5,7 @@
 
 #include "btstack.h"
 
+#include "hardware/sync.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 
@@ -427,6 +428,11 @@ static bool logger_h10_queue_push_packet(logger_h10_state_t *state,
                                          logger_h10_stream_kind_t stream_kind,
                                          uint64_t mono_us, const uint8_t *value,
                                          uint16_t value_len) {
+  /* The H10 packet queue is deliberately lock-free because both BTstack
+   * callbacks and app drains are expected to run synchronously on core 0 in
+   * pico_cyw43_arch_lwip_poll mode.  Fail fast if that invariant changes. */
+  hard_assert(get_core_num() == 0u);
+  hard_assert(__get_current_exception() == 0u);
   if (value == NULL || value_len == 0u ||
       value_len > LOGGER_H10_PACKET_MAX_BYTES ||
       (stream_kind != LOGGER_H10_STREAM_KIND_ECG &&
@@ -458,6 +464,8 @@ static bool logger_h10_queue_push_packet(logger_h10_state_t *state,
 
 bool logger_h10_pop_packet(logger_h10_state_t *state,
                            logger_h10_packet_t *out) {
+  hard_assert(get_core_num() == 0u);
+  hard_assert(__get_current_exception() == 0u);
   if (state == NULL || out == NULL || state->packet_count == 0u) {
     return false;
   }

@@ -135,7 +135,9 @@ static void logger_app_refresh_observations(logger_app_t *app,
     app->clock.valid = false;
     app->clock.now_utc[0] = '\0';
   }
-  (void)logger_storage_svc_refresh(&app->storage);
+  if (!logger_runtime_state_is_logging(app->runtime.current_state)) {
+    (void)logger_storage_svc_refresh(&app->storage);
+  }
   switch (app->debug_storage_fault) {
   case LOGGER_DEBUG_STORAGE_FAULT_MISSING:
     app->storage.card_present = false;
@@ -821,6 +823,10 @@ static void logger_app_schedule_upload_retry(logger_app_t *app,
 
 static bool logger_app_run_queue_maintenance(logger_app_t *app, uint32_t now_ms,
                                              bool force) {
+  if (app->session.active ||
+      logger_runtime_state_is_logging(app->runtime.current_state)) {
+    return true;
+  }
   if (!app->storage.mounted || !app->storage.writable ||
       !app->storage.logger_root_ready) {
     return true;

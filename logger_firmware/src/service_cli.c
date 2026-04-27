@@ -1390,8 +1390,9 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
       app->session.active ? app->session.clock_state
                           : logger_clock_state_name(&app->clock));
   if (app->session.active) {
-    logger_json_stream_writer_field_uint64(w, "journal_size_bytes",
-                                           app->session.journal_size_bytes);
+    logger_json_stream_writer_field_uint64(
+        w, "journal_size_bytes",
+        logger_session_writer_journal_size_approx(&app->session));
   } else {
     logger_json_stream_writer_field_null(w, "journal_size_bytes");
   }
@@ -2760,8 +2761,9 @@ static void logger_handle_debug_session_snapshot(logger_app_t *app,
   jsw_ok(&w, "debug session snapshot",
          logger_clock_now_utc_or_null(&app->clock));
   logger_json_stream_writer_field_bool(&w, "written", true);
-  logger_json_stream_writer_field_uint64(&w, "journal_size_bytes",
-                                         app->session.journal_size_bytes);
+  logger_json_stream_writer_field_uint64(
+      &w, "journal_size_bytes",
+      logger_session_writer_journal_size_approx(&app->session));
   jsw_end(&w);
 }
 
@@ -2868,6 +2870,7 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
   flush_cmd.flush_barrier.type = LOGGER_WRITER_FLUSH_BARRIER;
   flush_cmd.flush_barrier.boot_counter = app->persisted.boot_counter;
   flush_cmd.flush_barrier.now_ms = now_ms;
+  flush_cmd.flush_barrier.force = true;
   capture_pipe_submit_cmd(&app->capture_pipe,
                           (logger_session_context_t *)&app->session,
                           &flush_cmd);
@@ -2880,8 +2883,9 @@ static void logger_handle_debug_synth_ecg(logger_service_cli_t *cli,
   logger_json_stream_writer_field_string_or_null(
       &w, "span_id",
       app->session.span_active ? app->session.current_span_id : NULL);
-  logger_json_stream_writer_field_uint64(&w, "journal_size_bytes",
-                                         app->session.journal_size_bytes);
+  logger_json_stream_writer_field_uint64(
+      &w, "journal_size_bytes",
+      logger_session_writer_journal_size_approx(&app->session));
   jsw_end(&w);
 }
 

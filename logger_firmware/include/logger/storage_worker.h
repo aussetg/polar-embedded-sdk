@@ -46,32 +46,56 @@ typedef enum {
   STORAGE_SVC_FILE_EXISTS,
 } storage_service_kind_t;
 
+typedef enum {
+  STORAGE_SVC_STATE_IDLE = 0,
+  STORAGE_SVC_STATE_SUBMITTED,
+  STORAGE_SVC_STATE_RUNNING,
+  STORAGE_SVC_STATE_DONE,
+  STORAGE_SVC_STATE_FAILED,
+} storage_service_state_t;
+
+#define STORAGE_SVC_BUNDLE_READ_MAX 512u
+
+typedef struct {
+  logger_upload_queue_t queue;
+  logger_upload_queue_summary_t summary;
+  logger_storage_status_t storage_status;
+  logger_storage_status_t format_status;
+  size_t retention_pruned_count;
+  size_t reserve_pruned_count;
+  bool reserve_met;
+  size_t requeued_count;
+  char sha256[LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN + 1];
+  uint64_t bundle_size;
+  bool file_exists;
+  uint8_t bundle_read_data[STORAGE_SVC_BUNDLE_READ_MAX];
+  size_t bundle_read_len;
+} storage_service_response_t;
+
 /*
  * Shared service request/response struct.
  *
- * Core 0 fills in .kind and .params, then enqueues a
- * LOGGER_WRITER_SERVICE_REQUEST command.  Core 1 reads the request,
- * executes it, fills in .result, sets .done = true.
- *
- * The queue_out pointer lets core 1 write directly into a caller-
- * supplied queue struct on core 0's stack (safe because core 0 is
- * blocked waiting for .done).  Same pattern for storage_status_out.
- *
- * For BUNDLE_READ, core 0 provides dst/cap pointers; core 1 writes
- * the data and len_out.
+ * Core 0 fills in .kind/.params/.response request payloads, publishes a
+ * monotonic request_seq, marks the mailbox SUBMITTED, then enqueues a
+ * LOGGER_WRITER_SERVICE_REQUEST command.  Core 1 marks the request RUNNING,
+ * executes it, fills in .response, publishes done_seq, and marks it DONE.
+ * Core 1 never writes through caller-owned result buffers; core 0 copies
+ * response fields after completion. system_log is an app-lifetime service
+ * dependency, not a per-request output buffer.
  */
 typedef struct {
   /*
-   * No field is volatile — inter-core ordering relies entirely on
-   * explicit memory fences (__mem_fence_release / __mem_fence_acquire)
-   * paired with __sev() / __wfe().  This is the standard pattern for
-   * shared-memory IPC on single-issue ARM cores: fences are sufficient
-   * because volatile only prevents compiler reordering/reload
-   * elision, which the fences already guarantee.
+   * Cross-core ordering relies on explicit memory fences
+   * (__mem_fence_release / __mem_fence_acquire) paired with __sev()/waits.
+   * Completion/control flags are volatile because core 0 polls them while
+   * core 1 updates them.
    */
 
   /* Request fields — core 0 writes before enqueue, core 1 reads */
-  storage_service_kind_t kind;
+  volatile storage_service_kind_t kind;
+  volatile storage_service_state_t state;
+  volatile uint32_t request_seq;
+  volatile uint32_t done_seq;
 
   union {
     struct {
@@ -91,68 +115,37 @@ typedef struct {
       char journal_path[LOGGER_STORAGE_PATH_MAX];
     } bundle;
     struct {
-      void *dst;
       size_t cap;
-      size_t *len_out;
     } bundle_read;
     struct {
       char path[LOGGER_STORAGE_PATH_MAX];
     } file_exists;
   } params;
 
-  /* Pointers to caller-supplied output buffers.
-   *
-   * THESE ARE DANGLING POINTERS after the wrapper returns.
-   * Safe only because logger_storage_svc_submit() is synchronous
-   * and blocks core 0 until .done — see the CONTRACT comment in
-   * storage_service.c for the full invariant.
-   *
-   * All fields are cleared to NULL at the start of each submit()
-   * so stale pointers from a prior request can't be dereferenced.
-   */
-  logger_upload_queue_t *queue_out;
-  const logger_upload_queue_t *queue_in; /* for QUEUE_WRITE */
-  logger_upload_queue_summary_t *summary_out;
-  logger_storage_status_t *storage_status_out;
-  size_t *retention_pruned_out;
-  size_t *reserve_pruned_out;
-  bool *reserve_met_out;
-  size_t *requeued_count_out;
-  char *sha256_out;
-  uint64_t *bundle_size_out;
   logger_system_log_t *system_log;
-  logger_storage_status_t *format_status_out;
-  bool *file_exists_out;
 
-  /* Completion — core 1 sets done = true after filling results */
-  bool done;
-  bool ok;
+  /* Response fields — owned by the shared service mailbox.  Core 0 copies
+   * from here after DONE, so core 1 never writes through caller stack
+   * pointers.  QUEUE_WRITE also uses response.queue as its mailbox-owned
+   * request payload; it has no separate response body. */
+  storage_service_response_t response;
+
+  /* Completion — core 1 sets ok before publishing DONE/FAILED. */
+  volatile bool ok;
 } storage_service_t;
 
 /* ── Worker state (for diagnostics) ────────────────────────────── */
 
 /*
- * Cross-core access policy (no fences, by design):
- *
- *   counters_*  — written by core 1 only, read by core 0 for
- *                 host diagnostics.  Values may be stale when
- *                 read.  Acceptable: these are approximate
- *                 telemetry, never used for correctness decisions.
- *
- *   ready       — written by core 0 once after launch completes.
- *                 Core 1 never reads it.  The flag exists so
- *                 core 0 / host tooling can confirm the worker
- *                 reached steady state.
- *
- * Do not add fields that feed back into control decisions without
- * also adding acquire/release fences at the read/write sites.
+ * Approximate diagnostics only.  These counters are written by core 1 and may
+ * be read by core 0 for status/CLI output.  Values may be stale and must never
+ * drive control decisions.  Keep lifecycle/routing flags out of this struct.
  */
 typedef struct {
   uint32_t commands_processed; /* core 1 writes, core 0 reads (approximate) */
   uint32_t write_failures;     /* core 1 writes, core 0 reads (approximate) */
   uint32_t idle_iterations;    /* core 1 writes, core 0 reads (approximate) */
   uint32_t wakeups;            /* core 1 writes, core 0 reads (approximate) */
-  bool ready;                  /* core 0 writes once; core 1 must not read */
 } storage_worker_stats_t;
 
 /* ── Shared state between core 0 and core 1 ────────────────────── */
@@ -170,6 +163,13 @@ typedef struct {
 
   /* Worker statistics (core 1 writes, core 0 reads occasionally). */
   storage_worker_stats_t stats;
+
+  /* Core-0-owned lifecycle/routing bit.  False during the pre-worker BOOT
+   * window, when direct core-0 FatFS access is still allowed.  Set true by
+   * core 0 after the worker is launched and both cores are flash-lockout-ready;
+   * from then on, storage-service wrappers route post-boot SD/FatFS operations
+   * through core 1.  Core 1 never reads or writes this field. */
+  bool storage_service_ready;
 
   /* Service request channel for non-logging SD operations. */
   storage_service_t service;

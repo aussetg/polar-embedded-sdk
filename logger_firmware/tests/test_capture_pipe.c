@@ -112,8 +112,8 @@ static void test_init(void) {
   assert(pipe.health == CAPTURE_HEALTHY);
   assert(pipe.hard_failure_active == false);
   assert(pipe.degraded_deadline_active == false);
-  assert(pipe.telemetry.cmd_enqueue_count == 0u);
-  assert(pipe.telemetry.staging_overflow_count == 0u);
+  assert(pipe.telemetry.control.cmd_enqueue_count == 0u);
+  assert(pipe.telemetry.control.staging_overflow_count == 0u);
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
   assert(capture_cmd_ring_occupancy_pct(&pipe) == 0u);
 
@@ -135,14 +135,14 @@ static void test_cmd_ring_basic(void) {
   logger_writer_cmd_t cmd = make_packet_cmd(0);
   assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
   assert(capture_cmd_ring_occupancy(&pipe) == 1u);
-  assert(pipe.telemetry.cmd_enqueue_count == 1u);
+  assert(pipe.telemetry.control.cmd_enqueue_count == 1u);
 
   logger_writer_cmd_t out;
   assert(capture_cmd_ring_dequeue(&pipe, &out) == true);
   assert(out.type == LOGGER_WRITER_APPEND_PMD_PACKET);
   assert(out.append_pmd_packet.seq_in_span == 0u);
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
-  assert(pipe.telemetry.cmd_dequeue_count == 1u);
+  assert(pipe.telemetry.writer.cmd_dequeue_count == 1u);
 
   assert(capture_cmd_ring_dequeue(&pipe, &out) == false);
 
@@ -165,12 +165,12 @@ static void test_cmd_ring_full(void) {
 
   logger_writer_cmd_t cmd = make_packet_cmd(999);
   assert(capture_cmd_ring_enqueue(&pipe, &cmd) == false);
-  assert(pipe.telemetry.cmd_enqueue_reject_count == 1u);
+  assert(pipe.telemetry.control.cmd_enqueue_reject_count == 1u);
 
   logger_writer_cmd_t out;
   assert(capture_cmd_ring_dequeue(&pipe, &out) == true);
   assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
-  assert(pipe.telemetry.cmd_enqueue_reject_count == 1u);
+  assert(pipe.telemetry.control.cmd_enqueue_reject_count == 1u);
 
   printf(" ok\n");
 }
@@ -188,7 +188,7 @@ static void test_staging_push_drain(void) {
   /* Push via staging — lands in staging slots, not in command ring yet */
   logger_writer_cmd_t cmd = make_packet_cmd(42);
   assert(capture_staging_push_pmd(&pipe, &cmd) == true);
-  assert(pipe.telemetry.staging_enqueue_count == 1u);
+  assert(pipe.telemetry.control.staging_enqueue_count == 1u);
   assert(capture_staging_has_data(&pipe) == true);
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
 
@@ -196,7 +196,7 @@ static void test_staging_push_drain(void) {
   assert(capture_staging_drain(&pipe, 10) == 1u);
   assert(capture_staging_has_data(&pipe) == false);
   assert(capture_cmd_ring_occupancy(&pipe) == 1u);
-  assert(pipe.telemetry.staging_drain_count == 1u);
+  assert(pipe.telemetry.control.staging_drain_count == 1u);
 
   /* Verify the command arrived intact */
   logger_writer_cmd_t out;
@@ -227,7 +227,7 @@ static void test_staging_fill_and_drain(void) {
   logger_writer_cmd_t overflow = make_packet_cmd(999);
   assert(capture_staging_push_pmd(&pipe, &overflow) == false);
   assert(pipe.staging.overflow_count == 1u);
-  assert(pipe.telemetry.staging_overflow_count == 1u);
+  assert(pipe.telemetry.control.staging_overflow_count == 1u);
 
   /* Drain in batches: staging (128) > command ring (64), so we
    * drain → dequeue-ring loop until staging is empty. */
@@ -268,7 +268,7 @@ static void test_staging_overflow(void) {
   logger_writer_cmd_t cmd = make_packet_cmd(999);
   assert(capture_staging_push_pmd(&pipe, &cmd) == false);
   assert(pipe.staging.overflow_count == 1u);
-  assert(pipe.telemetry.staging_overflow_count == 1u);
+  assert(pipe.telemetry.control.staging_overflow_count == 1u);
 
   /* In the real firmware, the caller detects staging overflow directly
    * and routes to sd_write_failed immediately — it does not go through
@@ -300,7 +300,7 @@ static void test_health_transitions(void) {
 
   capture_health_t h = capture_pipe_evaluate_health(&pipe, 1000u);
   assert(h == CAPTURE_DISTRESSED);
-  assert(pipe.telemetry.distressed_enter_count == 1u);
+  assert(pipe.telemetry.control.distressed_enter_count == 1u);
 
   /* Drain down to 49% (below recovered threshold of 50%) */
   const uint32_t keep_count =
@@ -314,7 +314,7 @@ static void test_health_transitions(void) {
 
   h = capture_pipe_evaluate_health(&pipe, 2000u);
   assert(h == CAPTURE_HEALTHY);
-  assert(pipe.telemetry.distressed_exit_count == 1u);
+  assert(pipe.telemetry.control.distressed_exit_count == 1u);
   assert(pipe.degraded_deadline_active == false);
 
   printf(" ok\n");
@@ -367,7 +367,7 @@ static void test_hard_failure_recovery_before_deadline(void) {
   assert(pipe.hard_failure_active == false);
   assert(pipe.degraded_deadline_active == false);
   assert(pipe.last_writer_failure == CAPTURE_WRITER_FAILURE_NONE);
-  assert(pipe.telemetry.distressed_exit_count == 1u);
+  assert(pipe.telemetry.control.distressed_exit_count == 1u);
 
   printf(" ok\n");
 }
@@ -512,7 +512,7 @@ static void test_event_ring(void) {
   }
   capture_event_t extra = {.kind = CAPTURE_EVENT_WRITE_FAILED, .cmd_seq = 99};
   assert(capture_event_ring_push(&pipe, &extra) == false);
-  assert(pipe.telemetry.event_push_overflow_count == 1u);
+  assert(pipe.telemetry.writer.event_push_overflow_count == 1u);
 
   printf(" ok\n");
 }
@@ -588,8 +588,8 @@ static void test_wrap_around(void) {
   }
 
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
-  assert(pipe.telemetry.cmd_enqueue_count == 10u * TEST_CMD_RING_CAPACITY);
-  assert(pipe.telemetry.cmd_dequeue_count == 10u * TEST_CMD_RING_CAPACITY);
+  assert(pipe.telemetry.control.cmd_enqueue_count == 10u * TEST_CMD_RING_CAPACITY);
+  assert(pipe.telemetry.writer.cmd_dequeue_count == 10u * TEST_CMD_RING_CAPACITY);
 
   printf(" ok\n");
 }
@@ -607,15 +607,15 @@ static void test_hwm(void) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     assert(capture_cmd_ring_enqueue(&pipe, &cmd) == true);
   }
-  assert(pipe.telemetry.cmd_occupancy_hwm == 32u);
+  assert(pipe.telemetry.control.cmd_occupancy_hwm == 32u);
 
   /* Drain 16 — HWM stays at 32 */
   for (uint32_t i = 0; i < 16; i++) {
     logger_writer_cmd_t out;
     capture_cmd_ring_dequeue(&pipe, &out);
   }
-  assert(pipe.telemetry.cmd_occupancy_hwm == 32u);
-  assert(pipe.telemetry.cmd_occupancy_now == 16u);
+  assert(pipe.telemetry.control.cmd_occupancy_hwm == 32u);
+  assert(pipe.telemetry.writer.cmd_occupancy_after_dequeue == 16u);
 
   printf(" ok\n");
 }
@@ -803,7 +803,7 @@ static void test_historical_overflow_allows_recovery(void) {
   /* 1. A historical staging overflow happens (e.g. during a transient
    *    BLE burst early in the session). */
   pipe.staging.overflow_count = 3u;
-  pipe.telemetry.staging_overflow_count = 3u;
+  pipe.telemetry.control.staging_overflow_count = 3u;
 
   /* 2. Hours pass.  The pipe recovers and is healthy. */
   assert(capture_pipe_evaluate_health(&pipe, 100000u) == CAPTURE_HEALTHY);
@@ -822,7 +822,7 @@ static void test_historical_overflow_allows_recovery(void) {
 
   /* 5. The historical overflow counter is still there for telemetry. */
   assert(pipe.staging.overflow_count == 3u);
-  assert(pipe.telemetry.staging_overflow_count == 3u);
+  assert(pipe.telemetry.control.staging_overflow_count == 3u);
 
   /* 6. needs_recovery also respects the per-period boundary. */
   assert(capture_pipe_needs_recovery(&pipe, 201000u) == false);
@@ -840,7 +840,7 @@ static void test_new_overflow_during_degraded_blocks_recovery(void) {
 
   /* Start with a historical overflow already present */
   pipe.staging.overflow_count = 2u;
-  pipe.telemetry.staging_overflow_count = 2u;
+  pipe.telemetry.control.staging_overflow_count = 2u;
 
   /* Hard failure starts degraded period, snapshot = 2 */
   capture_pipe_note_hard_failure(&pipe, 1000u);
@@ -851,7 +851,7 @@ static void test_new_overflow_during_degraded_blocks_recovery(void) {
 
   /* A NEW overflow during the degraded period */
   pipe.staging.overflow_count = 3u;
-  pipe.telemetry.staging_overflow_count = 3u;
+  pipe.telemetry.control.staging_overflow_count = 3u;
 
   /* Now it's unrecoverable — overflow during degraded period */
   assert(capture_pipe_needs_recovery(&pipe, 5000u) == true);

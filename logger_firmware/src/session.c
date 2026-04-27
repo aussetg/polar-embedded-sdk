@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "ff.h"
+#include "hardware/sync.h"
 #include "pico/rand.h"
 #include "pico/stdlib.h"
 
@@ -80,6 +81,7 @@ logger_session_recovery_workspace_acquire(void) {
 
 static void logger_session_recovery_workspace_release(
     logger_session_recovery_workspace_t *workspace) {
+  (void)workspace;
   assert(workspace == &g_session_recovery_workspace);
   assert(g_session_recovery_workspace.in_use);
   g_session_recovery_workspace.in_use = false;
@@ -96,6 +98,7 @@ logger_session_live_json_workspace_acquire(void) {
 
 static void logger_session_live_json_workspace_release(
     logger_session_live_json_workspace_t *workspace) {
+  (void)workspace;
   assert(workspace == &g_session_live_json_workspace);
   assert(g_session_live_json_workspace.in_use);
   g_session_live_json_workspace.in_use = false;
@@ -112,6 +115,7 @@ logger_session_live_write_workspace_acquire(void) {
 
 static void logger_session_live_write_workspace_release(
     logger_session_live_write_workspace_t *workspace) {
+  (void)workspace;
   assert(workspace == &g_session_live_write_workspace);
   assert(g_session_live_write_workspace.in_use);
   g_session_live_write_workspace.in_use = false;
@@ -127,6 +131,7 @@ logger_session_sha256_workspace_acquire(void) {
 
 static void logger_session_sha256_workspace_release(
     logger_session_sha256_workspace_t *workspace) {
+  (void)workspace;
   assert(workspace == &g_session_sha256_workspace);
   assert(g_session_sha256_workspace.in_use);
   g_session_sha256_workspace.in_use = false;
@@ -141,6 +146,7 @@ static logger_persisted_state_t *logger_session_manifest_persisted_acquire(void)
 
 static void logger_session_manifest_persisted_release(
     logger_persisted_state_t *persisted) {
+  (void)persisted;
   assert(persisted == &g_session_manifest_persisted);
   assert(g_session_manifest_persisted_in_use);
   g_session_manifest_persisted_in_use = false;
@@ -153,6 +159,44 @@ void logger_session_set_capture_stats(logger_capture_stats_t *stats) {
 void logger_session_init_buffers(void) {
   /* Zero-initialise the PSRAM chunk buffer so session init sees clean memory. */
   memset(g_chunk_buf, 0, LOGGER_SESSION_CHUNK_BUF_SIZE);
+}
+
+uint64_t logger_session_writer_journal_size_approx(
+    const logger_session_state_t *session) {
+  if (session == NULL) {
+    return 0u;
+  }
+
+  /* Core 1 owns this 64-bit field.  On RP-class 32-bit cores the load is not
+   * guaranteed to be single-copy atomic, so read twice with acquire fences and
+   * prefer a stable sample.  This is intentionally telemetry-only while a
+   * session is active; callers needing an exact value must first complete a
+   * writer barrier/finalize/recovery boundary. */
+  uint64_t last = 0u;
+  for (uint32_t attempt = 0u; attempt < 4u; ++attempt) {
+    __mem_fence_acquire();
+    const uint64_t first = session->writer.journal_size_bytes;
+    __mem_fence_acquire();
+    const uint64_t second = session->writer.journal_size_bytes;
+    if (first == second) {
+      return second;
+    }
+    last = second;
+  }
+  return last;
+}
+
+static void logger_session_writer_restore_from_scan(
+    logger_session_writer_state_t *writer,
+    const logger_journal_scan_result_t *scan) {
+  hard_assert(writer != NULL);
+  hard_assert(scan != NULL);
+
+  writer->next_record_seq = scan->next_record_seq;
+  writer->journal_size_bytes = scan->valid_size_bytes;
+  writer->next_chunk_seq_in_session = scan->next_chunk_seq_in_session;
+  memcpy(writer->spans, scan->spans, sizeof(writer->spans));
+  logger_chunk_builder_reset(&writer->chunk_builder);
 }
 
 /*
@@ -309,7 +353,7 @@ static bool logger_session_set_paths(logger_session_state_t *session) {
  * No-op when the builder is empty.
  */
 static bool logger_session_seal_active_chunk(logger_session_state_t *session) {
-  logger_chunk_builder_t *cb = &session->chunk_builder;
+  logger_chunk_builder_t *cb = &session->writer.chunk_builder;
   if (!logger_chunk_builder_has_data(cb)) {
     return true;
   }
@@ -320,31 +364,31 @@ static bool logger_session_seal_active_chunk(logger_session_state_t *session) {
 
   const uint8_t *payload = NULL;
   size_t payload_len = 0u;
-  if (!logger_chunk_builder_seal(cb, session->next_chunk_seq_in_session,
+  if (!logger_chunk_builder_seal(cb, session->writer.next_chunk_seq_in_session,
                                  &payload, &payload_len)) {
     return false;
   }
   if (!logger_journal_writer_append_binary(
-          &session->journal_writer, LOGGER_JOURNAL_RECORD_DATA_CHUNK,
-          session->next_record_seq++, payload, payload_len)) {
+          &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_DATA_CHUNK,
+          session->writer.next_record_seq++, payload, payload_len)) {
     /* Journal write failed — lose in-flight data, keep journal consistent */
     logger_chunk_builder_clear(cb);
     return false;
   }
   /* Chunk boundary: sync to make this durable */
-  if (!logger_journal_writer_sync(&session->journal_writer)) {
+  if (!logger_journal_writer_sync(&session->writer.journal_writer)) {
     logger_chunk_builder_clear(cb);
     return false;
   }
 
   /* Update durable size from the writer */
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
+  session->writer.journal_size_bytes =
+      logger_journal_writer_durable_size(&session->writer.journal_writer);
 
   /* Update span counters from the chunk we just emitted */
   if (session->current_span_index < session->span_count) {
     logger_journal_span_summary_t *span =
-        &session->spans[session->current_span_index];
+        &session->writer.spans[session->current_span_index];
     if (span->packet_count == 0u) {
       span->first_seq_in_span = first_seq;
     }
@@ -352,7 +396,7 @@ static bool logger_session_seal_active_chunk(logger_session_state_t *session) {
     span->last_seq_in_span = last_seq;
   }
 
-  session->next_chunk_seq_in_session++;
+  session->writer.next_chunk_seq_in_session++;
   logger_chunk_builder_clear(cb);
   return true;
 }
@@ -428,7 +472,7 @@ logger_session_write_live_internal(const logger_session_state_t *session,
       "s,\"current_span_index\":%s,\"quarantined\":%s,\"clock_state\":\"%s\","
       "\"boot_counter\":%lu}",
       session->session_id, session->study_day_local, session->session_dir_name,
-      (unsigned long long)session->journal_size_bytes,
+      (unsigned long long)session->writer.journal_size_bytes,
       workspace->last_flush_utc_json, (unsigned long long)now_ms * 1000ull,
       workspace->current_span_id_json, workspace->current_span_index_json,
       session->quarantined ? "true" : "false",
@@ -502,9 +546,6 @@ static bool logger_session_begin_span(logger_session_state_t *session,
     return false;
   }
 
-  /* Reset chunk builder for new span */
-  logger_chunk_builder_reset(&session->chunk_builder);
-
   logger_copy_string(span->start_reason, sizeof(span->start_reason),
                      start_reason);
   logger_copy_string(span->start_utc, sizeof(span->start_utc),
@@ -524,6 +565,7 @@ static bool logger_session_begin_span(logger_session_state_t *session,
                      session->session_id);
   logger_copy_string(ss->span_id, sizeof(ss->span_id), span->span_id);
   ss->span_index_in_session = session->current_span_index;
+  logger_copy_string(ss->start_utc, sizeof(ss->start_utc), span->start_utc);
   logger_copy_string(ss->start_reason, sizeof(ss->start_reason), start_reason);
   logger_copy_string(ss->h10_address, sizeof(ss->h10_address), h10_address);
   ss->encrypted = encrypted;
@@ -577,6 +619,9 @@ static bool logger_session_control_close_span(
   logger_copy_string(se->session_id, sizeof(se->session_id),
                      session->session_id);
   logger_copy_string(se->span_id, sizeof(se->span_id), span->span_id);
+  se->span_index_in_session = session->current_span_index;
+  logger_copy_string(se->end_utc, sizeof(se->end_utc),
+                     clock != NULL ? clock->now_utc : NULL);
   logger_copy_string(se->end_reason, sizeof(se->end_reason), end_reason);
   /* packet_count / seq fields are filled by core 1 after sealing */
 
@@ -752,7 +797,7 @@ static bool __attribute__((noinline)) logger_session_build_manifest(
 
   logger_sb_append(&sb, ",\"spans\":[");
   for (uint32_t i = 0u; i < session->span_count && sb.ok; ++i) {
-    const logger_journal_span_summary_t *span = &session->spans[i];
+    const logger_journal_span_summary_t *span = &session->writer.spans[i];
     if (i != 0u) {
       logger_sb_append(&sb, ",");
     }
@@ -970,7 +1015,7 @@ static bool logger_session_start_new_active_internal(
   logger_copy_string(session->session_start_reason,
                      sizeof(session->session_start_reason),
                      "first_span_of_session");
-  session->next_chunk_seq_in_session = 0u;
+  session->writer.next_chunk_seq_in_session = 0u;
   session->next_packet_seq_in_span = 0u;
   /*
    * Set paths in session state so the writer (core 1) can read them
@@ -1166,10 +1211,10 @@ void logger_session_init(logger_session_state_t *session) {
    * Do NOT call force_close when the pipe is attached and the handle
    * appears open — that would be a FatFS call from the wrong core.
    */
-  if (logger_journal_writer_is_open(&session->journal_writer)) {
+  if (logger_journal_writer_is_open(&session->writer.journal_writer)) {
     if (pipe == NULL) {
       /* No pipe — we own the handle, safe to close */
-      logger_journal_writer_force_close(&session->journal_writer);
+      logger_journal_writer_force_close(&session->writer.journal_writer);
     }
     /* else: pipe attached — core 1 owns the handle, do not touch.
      * This should not happen in normal operation (core 1 closes
@@ -1180,9 +1225,9 @@ void logger_session_init(logger_session_state_t *session) {
   memset(session, 0, sizeof(*session));
   session->pipe = pipe;
   session->current_span_index = 0xffffffffu;
-  logger_chunk_builder_init(&session->chunk_builder, g_chunk_buf,
+  logger_chunk_builder_init(&session->writer.chunk_builder, g_chunk_buf,
                             LOGGER_SESSION_CHUNK_BUF_SIZE);
-  logger_journal_writer_init(&session->journal_writer);
+  logger_journal_writer_init(&session->writer.journal_writer);
 }
 
 void logger_session_set_pipe(logger_session_state_t *session,
@@ -1425,17 +1470,17 @@ bool logger_session_seal_chunk_if_needed(logger_session_state_t *session,
   if (!session->active || !session->span_active) {
     return true;
   }
-  if (!logger_chunk_builder_has_data(&session->chunk_builder)) {
-    return true;
-  }
-  if (logger_chunk_builder_age_exceeded(&session->chunk_builder, now_ms)) {
-    logger_writer_cmd_t cmd;
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.type = LOGGER_WRITER_FLUSH_BARRIER;
-    cmd.flush_barrier.now_ms = now_ms;
-    return session_dispatch(session, &cmd);
-  }
-  return true;
+
+  /* Core 1 owns chunk_builder.  Core 0 must not peek at has_data or
+   * first_packet_time_ms here while the writer may be appending packets.
+   * Send a cheap writer-side check instead; core 1 will seal only if the
+   * chunk is old enough. */
+  logger_writer_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.type = LOGGER_WRITER_FLUSH_BARRIER;
+  cmd.flush_barrier.now_ms = now_ms;
+  cmd.flush_barrier.force = false;
+  return session_dispatch(session, &cmd);
 }
 
 /*
@@ -1681,11 +1726,14 @@ bool logger_session_recover_on_boot(
                      workspace->live_path);
   logger_copy_string(session->manifest_path, sizeof(session->manifest_path),
                      workspace->manifest_path);
-  session->next_record_seq = workspace->scan.next_record_seq;
-  session->journal_size_bytes = workspace->scan.valid_size_bytes;
+  /* Pre-worker recovery runs on core 0 before core 1 owns writer-domain
+   * state.  Reconstruct the durable writer mirror from the journal scan here;
+   * after worker launch, steady-state mutations of session->writer are core-1
+   * writer-dispatch responsibilities. */
+  logger_session_writer_restore_from_scan(&session->writer, &workspace->scan);
   /* Open the journal for appending through the writer */
   if (!logger_journal_writer_open_existing(
-          &session->journal_writer, workspace->journal_path,
+          &session->writer.journal_writer, workspace->journal_path,
           workspace->scan.valid_size_bytes)) {
     logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
@@ -1694,7 +1742,6 @@ bool logger_session_recover_on_boot(
         "{\"reason\":\"journal_writer_open_failed\"}");
     return false;
   }
-  session->next_chunk_seq_in_session = workspace->scan.next_chunk_seq_in_session;
   session->next_packet_seq_in_span = workspace->scan.next_packet_seq_in_span;
   session->span_count = workspace->scan.span_count;
   memcpy(session->spans, workspace->scan.spans, sizeof(session->spans));
@@ -1715,8 +1762,6 @@ bool logger_session_recover_on_boot(
         "session_recovery_failed", "{\"reason\":\"span_id_parse_failed\"}");
     return false;
   }
-  /* Initialize chunk builder for the recovered session */
-  logger_chunk_builder_reset(&session->chunk_builder);
   session->quarantine_clock_invalid_at_start =
       workspace->scan.quarantine_clock_invalid_at_start;
   session->quarantine_clock_fixed_mid_session =
@@ -1857,9 +1902,9 @@ writer_emit_session_start(logger_session_state_t *session,
       cmd->session_start_reason);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_SESSION_START,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_SESSION_START,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -1884,9 +1929,9 @@ writer_emit_span_start(logger_session_state_t *session,
       cmd->encrypted ? "true" : "false", cmd->bonded ? "true" : "false");
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_SPAN_START,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_SPAN_START,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -1897,7 +1942,7 @@ writer_emit_span_start(logger_session_state_t *session,
 static bool
 writer_append_pmd_packet(logger_session_state_t *session,
                          const logger_writer_append_pmd_packet_t *cmd) {
-  logger_chunk_builder_t *cb = &session->chunk_builder;
+  logger_chunk_builder_t *cb = &session->writer.chunk_builder;
 
   logger_chunk_result_t r = logger_chunk_builder_append(
       cb, cmd->stream_kind, cmd->span_id_raw, cmd->seq_in_span, cmd->mono_us,
@@ -1940,9 +1985,9 @@ writer_emit_marker(logger_session_state_t *session,
       (unsigned long)cmd->boot_counter, cmd->session_id, cmd->span_id);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_MARKER,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_MARKER,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -1977,9 +2022,9 @@ writer_emit_status_snapshot(logger_session_state_t *session,
       fault_code_json);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -2003,9 +2048,9 @@ writer_emit_h10_battery(logger_session_state_t *session,
       (unsigned)cmd->battery_percent, cmd->read_reason);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_H10_BATTERY,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_H10_BATTERY,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -2025,9 +2070,9 @@ writer_emit_gap(logger_session_state_t *session,
       cmd->gap_reason);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_GAP,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_GAP,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -2049,9 +2094,9 @@ writer_emit_clock_event(logger_session_state_t *session,
       (long long)cmd->new_utc_ns);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_CLOCK_EVENT,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_CLOCK_EVENT,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -2070,9 +2115,9 @@ writer_emit_recovery(logger_session_state_t *session,
       (unsigned long)cmd->boot_counter, cmd->session_id, cmd->recovery_reason);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_RECOVERY,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_RECOVERY,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -2095,9 +2140,9 @@ writer_emit_span_end(logger_session_state_t *session,
       (unsigned long)cmd->last_seq_in_span);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_SPAN_END,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_SPAN_END,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
 }
 
 /*
@@ -2119,27 +2164,63 @@ writer_emit_session_end(logger_session_state_t *session,
       cmd->quarantine_reasons);
   return n > 0 && (size_t)n < sizeof(payload) &&
          logger_journal_writer_append_json(
-             &session->journal_writer, LOGGER_JOURNAL_RECORD_SESSION_END,
-             session->next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->journal_writer);
+             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_SESSION_END,
+             session->writer.next_record_seq++, payload) &&
+         logger_journal_writer_sync(&session->writer.journal_writer);
+}
+
+static bool __attribute__((noinline))
+logger_writer_handle_span_start(logger_session_state_t *session,
+                                const logger_writer_span_start_t *cmd) {
+  if (cmd->span_index_in_session >= LOGGER_JOURNAL_MAX_SPANS) {
+    return false;
+  }
+  if (!writer_emit_span_start(session, cmd)) {
+    return false;
+  }
+
+  /* Writer-owned mirror and chunk state are updated only after the durable
+   * span_start record is written.  Core 0 owns the control-plane span array;
+   * core 1 owns this durable/manifest mirror. */
+  logger_journal_span_summary_t *span =
+      &session->writer.spans[cmd->span_index_in_session];
+  memset(span, 0, sizeof(*span));
+  span->present = true;
+  logger_copy_string(span->span_id, sizeof(span->span_id), cmd->span_id);
+  logger_copy_string(span->start_utc, sizeof(span->start_utc), cmd->start_utc);
+  logger_copy_string(span->start_reason, sizeof(span->start_reason),
+                     cmd->start_reason);
+  logger_chunk_builder_reset(&session->writer.chunk_builder);
+  session->writer.journal_size_bytes =
+      logger_journal_writer_durable_size(&session->writer.journal_writer);
+  return true;
 }
 
 static bool __attribute__((noinline))
 logger_writer_handle_span_end(logger_session_state_t *session,
                               const logger_writer_span_end_t *cmd) {
+  if (cmd->span_index_in_session >= LOGGER_JOURNAL_MAX_SPANS) {
+    return false;
+  }
   if (!logger_session_seal_active_chunk(session))
     return false;
 
   const logger_journal_span_summary_t *span =
-      &session->spans[session->current_span_index];
+      &session->writer.spans[cmd->span_index_in_session];
   logger_writer_span_end_t real = *cmd;
   real.packet_count = span->packet_count;
   real.first_seq_in_span = span->first_seq_in_span;
   real.last_seq_in_span = span->last_seq_in_span;
   if (!writer_emit_span_end(session, &real))
     return false;
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
+  logger_journal_span_summary_t *mutable_span =
+      &session->writer.spans[cmd->span_index_in_session];
+  logger_copy_string(mutable_span->end_utc, sizeof(mutable_span->end_utc),
+                     cmd->end_utc);
+  logger_copy_string(mutable_span->end_reason,
+                     sizeof(mutable_span->end_reason), cmd->end_reason);
+  session->writer.journal_size_bytes =
+      logger_journal_writer_durable_size(&session->writer.journal_writer);
   return true;
 }
 
@@ -2149,10 +2230,10 @@ logger_writer_handle_finalize_session(
     const logger_writer_finalize_session_t *cmd) {
   const logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
 
-  if (!logger_journal_writer_close(&session->journal_writer))
+  if (!logger_journal_writer_close(&session->writer.journal_writer))
     return false;
-  session->journal_size_bytes =
-      logger_journal_writer_durable_size(&session->journal_writer);
+  session->writer.journal_size_bytes =
+      logger_journal_writer_durable_size(&session->writer.journal_writer);
 
   logger_storage_status_t storage_now = mc->storage;
   (void)logger_storage_refresh(&storage_now);
@@ -2164,7 +2245,7 @@ logger_writer_handle_finalize_session(
     return false;
   }
 
-  char *manifest = session->manifest_buf;
+  char *manifest = session->writer.manifest_buf;
   size_t manifest_len = 0u;
   logger_persisted_state_t *persisted_for_manifest =
       logger_session_manifest_persisted_acquire();
@@ -2183,7 +2264,7 @@ logger_writer_handle_finalize_session(
   if (!logger_session_build_manifest(
           session, mc->hardware_id, persisted_for_manifest, &storage_now,
           journal_sha256, journal_size_bytes, manifest,
-          sizeof(session->manifest_buf), &manifest_len)) {
+          sizeof(session->writer.manifest_buf), &manifest_len)) {
     logger_session_manifest_persisted_release(persisted_for_manifest);
     return false;
   }
@@ -2214,23 +2295,19 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
     if (!logger_storage_ensure_dir(session->session_dir_path))
       return false;
     if (!logger_journal_writer_create(
-            &session->journal_writer, session->journal_path,
+            &session->writer.journal_writer, session->journal_path,
             session->session_id, cmd->session_start.boot_counter,
             cmd->session_start.utc_ns))
       return false;
     if (!writer_emit_session_start(session, &cmd->session_start))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     return true;
   }
 
   case LOGGER_WRITER_SPAN_START:
-    if (!writer_emit_span_start(session, &cmd->span_start))
-      return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
-    return true;
+    return logger_writer_handle_span_start(session, &cmd->span_start);
 
   case LOGGER_WRITER_APPEND_PMD_PACKET:
     return writer_append_pmd_packet(session, &cmd->append_pmd_packet);
@@ -2241,8 +2318,8 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
       return false;
     if (!writer_emit_marker(session, &cmd->write_marker))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     return true;
 
   case LOGGER_WRITER_WRITE_STATUS_SNAPSHOT:
@@ -2251,8 +2328,8 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
       return false;
     if (!writer_emit_status_snapshot(session, &cmd->write_status_snapshot))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     /* Status snapshot also refreshes live.json */
     return logger_session_write_live_internal(
         session,
@@ -2268,8 +2345,8 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
       return false;
     if (!writer_emit_h10_battery(session, &cmd->write_h10_battery))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     return true;
 
   case LOGGER_WRITER_WRITE_GAP:
@@ -2278,8 +2355,8 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
       return false;
     if (!writer_emit_gap(session, &cmd->write_gap))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     return true;
 
   case LOGGER_WRITER_WRITE_CLOCK_EVENT:
@@ -2288,15 +2365,15 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
       return false;
     if (!writer_emit_clock_event(session, &cmd->write_clock_event))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     return true;
 
   case LOGGER_WRITER_WRITE_RECOVERY:
     if (!writer_emit_recovery(session, &cmd->write_recovery))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     return true;
 
   case LOGGER_WRITER_SPAN_END:
@@ -2308,8 +2385,8 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
       return false;
     if (!writer_emit_session_end(session, &cmd->session_end))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     return true;
 
   case LOGGER_WRITER_FINALIZE_SESSION:
@@ -2323,10 +2400,15 @@ bool logger_writer_dispatch(logger_session_context_t *ctx,
         cmd->refresh_live.boot_counter, cmd->refresh_live.now_ms);
 
   case LOGGER_WRITER_FLUSH_BARRIER:
+    if (!cmd->flush_barrier.force &&
+        !logger_chunk_builder_age_exceeded(&session->writer.chunk_builder,
+                                           cmd->flush_barrier.now_ms)) {
+      return true;
+    }
     if (!logger_session_seal_active_chunk(session))
       return false;
-    session->journal_size_bytes =
-        logger_journal_writer_durable_size(&session->journal_writer);
+    session->writer.journal_size_bytes =
+        logger_journal_writer_durable_size(&session->writer.journal_writer);
     return true;
 
   default:

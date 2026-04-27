@@ -8,14 +8,15 @@
 /* ── Internal helpers ──────────────────────────────────────────── */
 
 /*
- * Ring index convention: head and tail are uint64_t counters that grow
+ * Ring index convention: head and tail are uint32_t counters that grow
  * monotonically (never reset).  The actual slot index is
  * (head & (cap - 1)).
  * Occupancy is (tail - head) using unsigned arithmetic.
  *
- * The unsigned subtraction is correct across the uint64_t wrap boundary
- * as long as occupancy < 2^64, which is guaranteed since occupancy <= cap
- * and cap is finite.  At 280 pkt/s the counters wrap after ~2e9 years.
+ * The unsigned subtraction is correct across the uint32_t wrap boundary
+ * as long as occupancy < 2^32, which is guaranteed since occupancy <= cap
+ * and cap is finite.  At 280 pkt/s the counters wrap after ~177 days.
+ * Wrap is harmless because occupancy never approaches 2^31.
  *
  * Mask indexing is correct only for non-zero power-of-two capacities.
  * capture_pipe_init() hard-asserts that invariant for both staging and the
@@ -34,15 +35,13 @@ static void capture_pipe_assert_init_params(
   hard_assert(capture_pipe_capacity_is_power_of_two(params->cmd_ring_capacity));
 }
 
-static bool ring_full(uint64_t head, uint64_t tail, uint32_t cap) {
+static bool ring_full(uint32_t head, uint32_t tail, uint32_t cap) {
   return (uint32_t)(tail - head) >= cap;
 }
 
-static bool ring_empty(uint64_t head, uint64_t tail) { return head == tail; }
+static bool ring_empty(uint32_t head, uint32_t tail) { return head == tail; }
 
-static uint32_t ring_occ(uint64_t head, uint64_t tail) {
-  return (uint32_t)(tail - head);
-}
+static uint32_t ring_occ(uint32_t head, uint32_t tail) { return tail - head; }
 
 static uint8_t occ_pct(uint32_t occ, uint32_t cap) {
   if (cap == 0u) {
@@ -61,8 +60,7 @@ static uint8_t occ_pct(uint32_t occ, uint32_t cap) {
 static void capture_pipe_set_health(capture_pipe_t *pipe,
                                     capture_health_t health) {
   pipe->health = health;
-  pipe->telemetry.health = health;
-}
+  }
 
 /* ── Lifecycle ─────────────────────────────────────────────────── */
 
@@ -152,7 +150,7 @@ bool capture_staging_push_pmd(capture_pipe_t *pipe,
 
   if ((s->tail - s->head) >= s->capacity) {
     s->overflow_count += 1u;
-    pipe->telemetry.staging_overflow_count += 1u;
+    pipe->telemetry.control.staging_overflow_count += 1u;
     /* first-writer-wins: preserve an earlier, more specific classification */
     if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
       pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_STAGE_OVERFLOW;
@@ -164,12 +162,12 @@ bool capture_staging_push_pmd(capture_pipe_t *pipe,
   __mem_fence_release(); /* publish slot data before tail */
   s->tail += 1u;
 
-  pipe->telemetry.staging_enqueue_count += 1u;
+  pipe->telemetry.control.staging_enqueue_count += 1u;
   const uint32_t occ = (uint32_t)(s->tail - s->head);
-  if (occ > pipe->telemetry.staging_occupancy_hwm) {
-    pipe->telemetry.staging_occupancy_hwm = (uint16_t)occ;
+  if (occ > pipe->telemetry.control.staging_occupancy_hwm) {
+    pipe->telemetry.control.staging_occupancy_hwm = (uint16_t)occ;
   }
-  pipe->telemetry.staging_occupancy_now = (uint16_t)occ;
+  pipe->telemetry.control.staging_occupancy_now = (uint16_t)occ;
 
   return true;
 }
@@ -204,9 +202,9 @@ uint32_t capture_staging_drain(capture_pipe_t *pipe, uint32_t max_entries) {
   }
 
   if (drained > 0u) {
-    pipe->telemetry.staging_drain_count += drained;
+    pipe->telemetry.control.staging_drain_count += drained;
     const uint32_t occ = (uint32_t)(s->tail - s->head);
-    pipe->telemetry.staging_occupancy_now = (uint16_t)occ;
+    pipe->telemetry.control.staging_occupancy_now = (uint16_t)occ;
   }
 
   return drained;
@@ -222,7 +220,7 @@ bool capture_cmd_ring_enqueue(capture_pipe_t *pipe,
 
   capture_cmd_ring_t *r = &pipe->cmd_ring;
   if (ring_full(r->head, r->tail, r->capacity)) {
-    pipe->telemetry.cmd_enqueue_reject_count += 1u;
+    pipe->telemetry.control.cmd_enqueue_reject_count += 1u;
     return false;
   }
 
@@ -232,12 +230,12 @@ bool capture_cmd_ring_enqueue(capture_pipe_t *pipe,
   __mem_fence_release(); /* publish slot data before tail */
   r->tail += 1u;
 
-  pipe->telemetry.cmd_enqueue_count += 1u;
+  pipe->telemetry.control.cmd_enqueue_count += 1u;
   const uint32_t occ = ring_occ(r->head, r->tail);
-  if (occ > pipe->telemetry.cmd_occupancy_hwm) {
-    pipe->telemetry.cmd_occupancy_hwm = (uint16_t)occ;
+  if (occ > pipe->telemetry.control.cmd_occupancy_hwm) {
+    pipe->telemetry.control.cmd_occupancy_hwm = (uint16_t)occ;
   }
-  pipe->telemetry.cmd_occupancy_now = (uint16_t)occ;
+  pipe->telemetry.control.cmd_occupancy_after_enqueue = (uint16_t)occ;
 
   return true;
 }
@@ -260,9 +258,9 @@ bool capture_cmd_ring_dequeue(capture_pipe_t *pipe,
   __mem_fence_release(); /* publish slot reuse before advancing head */
   r->head += 1u;
 
-  pipe->telemetry.cmd_dequeue_count += 1u;
+  pipe->telemetry.writer.cmd_dequeue_count += 1u;
   const uint32_t occ = ring_occ(r->head, r->tail);
-  pipe->telemetry.cmd_occupancy_now = (uint16_t)occ;
+  pipe->telemetry.writer.cmd_occupancy_after_dequeue = (uint16_t)occ;
 
   return true;
 }
@@ -299,7 +297,7 @@ bool capture_event_ring_push(capture_pipe_t *pipe,
 
   capture_event_ring_t *r = &pipe->event_ring;
   if (ring_full(r->head, r->tail, CAPTURE_EVENT_RING_CAPACITY)) {
-    pipe->telemetry.event_push_overflow_count += 1u;
+    pipe->telemetry.writer.event_push_overflow_count += 1u;
     return false;
   }
 
@@ -308,7 +306,7 @@ bool capture_event_ring_push(capture_pipe_t *pipe,
   __mem_fence_release(); /* publish slot data before tail */
   r->tail += 1u;
 
-  pipe->telemetry.event_push_count += 1u;
+  pipe->telemetry.writer.event_push_count += 1u;
   return true;
 }
 
@@ -329,7 +327,7 @@ bool capture_event_ring_pop(capture_pipe_t *pipe, capture_event_t *out) {
   __mem_fence_release(); /* publish slot reuse before advancing head */
   r->head += 1u;
 
-  pipe->telemetry.event_pop_count += 1u;
+  pipe->telemetry.control.event_pop_count += 1u;
   return true;
 }
 
@@ -342,22 +340,63 @@ bool capture_event_ring_has_data(const capture_pipe_t *pipe) {
   return !ring_empty(pipe->event_ring.head, pipe->event_ring.tail);
 }
 
+void capture_pipe_publish_writer_failure(capture_pipe_t *pipe,
+                                         capture_writer_failure_t failure) {
+  if (pipe == NULL || failure == CAPTURE_WRITER_FAILURE_NONE) {
+    return;
+  }
+
+  /* First unobserved failure wins.  The reliable channel carries the root
+   * cause for recovery routing, not a complete history; later failures before
+   * core 0 ingests this one are usually cascading symptoms and must not mask
+   * the original reason.  Best-effort event telemetry can still record more
+   * than one failure, but this channel preserves the first pending cause. */
+  __mem_fence_acquire();
+  if (pipe->writer_failure_seq != pipe->writer_failure_observed_seq) {
+    return;
+  }
+
+  pipe->writer_failure_kind = failure;
+  __mem_fence_release();
+  pipe->writer_failure_seq += 1u;
+  __mem_fence_release();
+  __sev();
+}
+
+static void capture_pipe_ingest_writer_failure(capture_pipe_t *pipe,
+                                               uint32_t now_ms) {
+  if (pipe == NULL || pipe->writer_failure_seq ==
+                          pipe->writer_failure_observed_seq) {
+    return;
+  }
+  __mem_fence_acquire();
+  const capture_writer_failure_t failure = pipe->writer_failure_kind;
+  pipe->writer_failure_observed_seq = pipe->writer_failure_seq;
+  if (failure == CAPTURE_WRITER_FAILURE_NONE) {
+    return;
+  }
+  if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
+    pipe->last_writer_failure = failure;
+  }
+  capture_pipe_note_hard_failure(pipe, now_ms);
+}
+
 /* ── Internal: tally one popped event into telemetry ─────────── */
 
 static void capture_pipe_tally_event(capture_pipe_t *pipe,
                                      const capture_event_t *event) {
   switch (event->kind) {
   case CAPTURE_EVENT_BARRIER_COMPLETE:
-    pipe->telemetry.event_barrier_complete_count += 1u;
+    pipe->telemetry.control.event_barrier_complete_count += 1u;
     break;
   case CAPTURE_EVENT_WRITE_FAILED:
-    pipe->telemetry.event_write_failed_count += 1u;
+    pipe->telemetry.control.event_write_failed_count += 1u;
     break;
   case CAPTURE_EVENT_WORKER_DISTRESS:
-    pipe->telemetry.event_worker_distress_count += 1u;
+    pipe->telemetry.control.event_worker_distress_count += 1u;
     break;
   case CAPTURE_EVENT_STATS_SNAPSHOT:
-    pipe->telemetry.event_stats_snapshot_count += 1u;
+    pipe->telemetry.control.event_stats_snapshot_count += 1u;
     break;
   }
 }
@@ -454,17 +493,26 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
      * The acquire fence ensures we see the result flag. */
     if (pipe->barriers_done_seq != wait_seq) {
       __mem_fence_acquire();
-      /* first-writer-wins: preserve an earlier, more specific classification */
-      if (!pipe->barrier_last_ok &&
-          pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
-        pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_BARRIER_FAILED;
+      if (!pipe->barrier_last_ok) {
+        /* Core 1 publishes the specific writer failure before advancing the
+         * barrier counter.  Ingest it here before falling back to the generic
+         * barrier failure classification; otherwise the waiter can observe the
+         * failed barrier first, set BARRIER_FAILED, and permanently mask a more
+         * useful FLUSH/FINALIZE/PACKET_WRITE reason. */
+        capture_pipe_ingest_writer_failure(
+            pipe, to_ms_since_boot(get_absolute_time()));
+        /* first-writer-wins: preserve an earlier, more specific classification */
+        if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
+          pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_BARRIER_FAILED;
+        }
       }
       return pipe->barrier_last_ok;
     }
 
-    /* Yield until core 1 makes progress. */
+    /* Yield until core 1 makes progress, but self-wake periodically so the
+     * 5 s software timeout is real even if core 1 wedges without SEV. */
     watchdog_update();
-    __wfe();
+    (void)best_effort_wfe_or_timeout(make_timeout_time_ms(1u));
   }
 
   /* Timeout — core 1 did not drain the barrier within 5 s.
@@ -495,7 +543,8 @@ capture_health_t capture_pipe_evaluate_health(capture_pipe_t *pipe,
   if (pipe == NULL) {
     return CAPTURE_HEALTHY;
   }
-  (void)now_ms;
+
+  capture_pipe_ingest_writer_failure(pipe, now_ms);
 
   /* Hard failure state.
    *
@@ -529,7 +578,7 @@ capture_health_t capture_pipe_evaluate_health(capture_pipe_t *pipe,
         pipe->staging_overflow_at_degraded_start = 0u;
         pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_NONE;
         capture_pipe_set_health(pipe, CAPTURE_HEALTHY);
-        pipe->telemetry.distressed_exit_count += 1u;
+        pipe->telemetry.control.distressed_exit_count += 1u;
         return CAPTURE_HEALTHY;
       }
     }
@@ -549,9 +598,9 @@ capture_health_t capture_pipe_evaluate_health(capture_pipe_t *pipe,
 
   if (next != prev) {
     if (prev == CAPTURE_HEALTHY && next == CAPTURE_DISTRESSED) {
-      pipe->telemetry.distressed_enter_count += 1u;
+      pipe->telemetry.control.distressed_enter_count += 1u;
     } else if (prev == CAPTURE_DISTRESSED && next == CAPTURE_HEALTHY) {
-      pipe->telemetry.distressed_exit_count += 1u;
+      pipe->telemetry.control.distressed_exit_count += 1u;
     }
   }
 
@@ -585,7 +634,7 @@ void capture_pipe_note_hard_failure(capture_pipe_t *pipe, uint32_t now_ms) {
   }
   pipe->hard_failure_active = true;
   capture_pipe_set_health(pipe, CAPTURE_HARD_FAILURE);
-  pipe->telemetry.hard_failure_count += 1u;
+  pipe->telemetry.control.hard_failure_count += 1u;
 
   if (!pipe->degraded_deadline_active) {
     pipe->degraded_deadline_start_ms = now_ms;
