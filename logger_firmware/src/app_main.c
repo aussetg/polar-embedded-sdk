@@ -56,10 +56,10 @@ static void logger_app_reconcile_upload_blocked_fault(logger_app_t *app,
                                                       bool force);
 static bool logger_app_state_allows_deferred_boot_queue_refresh(
     logger_runtime_state_t state);
-static void logger_app_schedule_deferred_boot_queue_refresh(
-    logger_app_t *app, uint32_t now_ms);
-static void logger_app_maybe_run_deferred_boot_queue_refresh(
-    logger_app_t *app, uint32_t now_ms);
+static void logger_app_schedule_deferred_boot_queue_refresh(logger_app_t *app,
+                                                            uint32_t now_ms);
+static void logger_app_maybe_run_deferred_boot_queue_refresh(logger_app_t *app,
+                                                             uint32_t now_ms);
 
 static int64_t logger_app_i64_abs(int64_t value) {
   return value < 0 ? -(value + 1) + 1 : value;
@@ -276,8 +276,10 @@ void logger_app_clear_current_fault(logger_app_t *app, const char *source) {
 }
 
 static bool logger_app_local_time_evaluable(const logger_app_t *app) {
+  logger_clock_datetime_t local;
   return app->clock.valid &&
-         logger_timezone_is_utc_like(app->persisted.config.timezone);
+         logger_clock_observed_local_datetime(
+             &app->clock, app->persisted.config.timezone, &local);
 }
 
 static bool logger_app_should_enter_overnight_idle(const logger_app_t *app) {
@@ -287,8 +289,13 @@ static bool logger_app_should_enter_overnight_idle(const logger_app_t *app) {
   if (!logger_app_local_time_evaluable(app)) {
     return false;
   }
-  return app->clock.hour >= LOGGER_OVERNIGHT_UPLOAD_WINDOW_START_HOUR_LOCAL ||
-         app->clock.hour < LOGGER_OVERNIGHT_UPLOAD_WINDOW_END_HOUR_LOCAL;
+  logger_clock_datetime_t local;
+  if (!logger_clock_observed_local_datetime(
+          &app->clock, app->persisted.config.timezone, &local)) {
+    return false;
+  }
+  return local.hour >= LOGGER_OVERNIGHT_UPLOAD_WINDOW_START_HOUR_LOCAL ||
+         local.hour < LOGGER_OVERNIGHT_UPLOAD_WINDOW_END_HOUR_LOCAL;
 }
 
 static logger_recovery_reason_t
@@ -1814,8 +1821,8 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
       logger_json_object_writer_bool_field(
           &boot_writer, "firmware_changed",
           app->boot_firmware_identity_changed) &&
-      logger_json_object_writer_bool_field(
-          &boot_writer, "watchdog_reboot", wdt_timeout_reboot) &&
+      logger_json_object_writer_bool_field(&boot_writer, "watchdog_reboot",
+                                           wdt_timeout_reboot) &&
       logger_json_object_writer_finish(&boot_writer)) {
     (void)logger_system_log_append(
         &app->system_log, logger_clock_now_utc_or_null(&app->clock), "boot",
@@ -1915,8 +1922,8 @@ static bool logger_app_state_allows_deferred_boot_queue_refresh(
   }
 }
 
-static void logger_app_schedule_deferred_boot_queue_refresh(
-    logger_app_t *app, uint32_t now_ms) {
+static void logger_app_schedule_deferred_boot_queue_refresh(logger_app_t *app,
+                                                            uint32_t now_ms) {
   if (app == NULL || app->deferred_boot_queue_refresh_pending) {
     return;
   }
@@ -1929,8 +1936,8 @@ static void logger_app_schedule_deferred_boot_queue_refresh(
          (unsigned long)LOGGER_BOOT_QUEUE_REFRESH_DEFER_MS);
 }
 
-static void logger_app_maybe_run_deferred_boot_queue_refresh(
-    logger_app_t *app, uint32_t now_ms) {
+static void logger_app_maybe_run_deferred_boot_queue_refresh(logger_app_t *app,
+                                                             uint32_t now_ms) {
   if (app == NULL || !app->deferred_boot_queue_refresh_pending) {
     return;
   }
@@ -1945,10 +1952,9 @@ static void logger_app_maybe_run_deferred_boot_queue_refresh(
         (!app->deferred_boot_queue_refresh_skip_logged ||
          app->deferred_boot_queue_refresh_skip_state !=
              app->runtime.current_state)) {
-      printf(
-          "[logger] deferred boot queue refresh still pending; waiting for "
-          "safe state (current_state=%s)\n",
-          logger_runtime_state_name(app->runtime.current_state));
+      printf("[logger] deferred boot queue refresh still pending; waiting for "
+             "safe state (current_state=%s)\n",
+             logger_runtime_state_name(app->runtime.current_state));
       app->deferred_boot_queue_refresh_skip_logged = true;
       app->deferred_boot_queue_refresh_skip_state = app->runtime.current_state;
     }
@@ -1966,8 +1972,7 @@ static void logger_app_maybe_run_deferred_boot_queue_refresh(
   printf("[logger] running deferred boot queue refresh\n");
 
   if (!logger_storage_svc_queue_refresh(
-          &app->system_log, logger_clock_now_utc_or_null(&app->clock),
-          NULL)) {
+          &app->system_log, logger_clock_now_utc_or_null(&app->clock), NULL)) {
     logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                     app->runtime.current_state,
                                     "deferred_queue_refresh_failed", now_ms);

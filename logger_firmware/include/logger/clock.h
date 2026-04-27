@@ -63,6 +63,9 @@ bool logger_clock_observed_utc_ns(const logger_clock_status_t *status,
                                   int64_t *utc_ns_out);
 bool logger_clock_format_utc_ns_rfc3339(
     int64_t utc_ns, char out_rfc3339[LOGGER_CLOCK_RFC3339_UTC_LEN + 1]);
+bool logger_clock_observed_local_datetime(const logger_clock_status_t *status,
+                                          const char *timezone,
+                                          logger_clock_datetime_t *local_out);
 bool logger_clock_derive_study_day_local_observed(
     const logger_clock_status_t *status, const char *timezone,
     char out_study_day[11]);
