@@ -1108,6 +1108,9 @@ bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,
 
   case LOGGER_RUNTIME_UPLOAD_PREP:
   case LOGGER_RUNTIME_UPLOAD_RUNNING:
+    logger_app_enter_service(app, "host_service_request", now_ms, true);
+    return true;
+
   case LOGGER_RUNTIME_BOOT:
     return false;
 

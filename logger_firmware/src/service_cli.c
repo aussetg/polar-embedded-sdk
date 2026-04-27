@@ -1926,14 +1926,6 @@ static void logger_handle_service_unlock(logger_service_cli_t *cli,
 }
 
 static void logger_handle_service_enter(logger_app_t *app, uint32_t now_ms) {
-  if (logger_cli_is_upload_mode(app)) {
-    jsw w;
-    jsw_err(&w, "service enter", logger_clock_now_utc_or_null(&app->clock),
-            "not_permitted_in_mode",
-            "service enter is not permitted during upload");
-    return;
-  }
-
   const bool already_in_service = logger_cli_is_service_mode(app);
   bool will_stop_logging = false;
   if (!logger_app_request_service_mode(app, now_ms, &will_stop_logging)) {
