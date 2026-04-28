@@ -373,7 +373,23 @@ static void logger_sd_dma_init(void) {
  *   len:    number of bytes to exchange
  *
  * Both channels are paced by their respective SPI DREQs so the
- * transfer proceeds at the SPI clock rate without CPU intervention. */
+ * transfer proceeds at the SPI clock rate without CPU intervention.
+ *
+ * PSRAM/cache coherency policy:
+ * FatFS may pass buffers in the ordinary cached QMI CS1 window
+ * (PSRAM_BASE...) into this function.  That is intentional.  RP2350 has a
+ * single XIP cache inside the XIP subsystem, not private core data caches, and
+ * cached XIP accesses first query that shared cache before going downstream to
+ * QMI/PSRAM.  DMA transfers addressed to the same cached XIP alias therefore
+ * observe the same cache state as CPU memcpy traffic: an SD-write DMA reads
+ * bytes the CPU just wrote through the cached PSRAM alias, and an SD-read DMA
+ * writes the cached alias that later CPU reads use.  No clean/invalidate is
+ * required for this cached-alias-only path.
+ *
+ * Do not mix this path with uncached PSRAM aliases, QMI direct-mode reads, or
+ * external visibility assumptions without adding an explicit XIP cache
+ * clean/invalidate policy.  RP2350 PSRAM writes can be dirty in the shared XIP
+ * cache even when cached CPU/DMA users are mutually coherent. */
 static bool __not_in_flash_func(logger_sd_dma_xfer)(const uint8_t *tx_src,
                                                     uint8_t *rx_dst,
                                                     size_t len) {
