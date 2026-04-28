@@ -122,7 +122,7 @@ typedef struct logger_app {
   uint32_t recovery_attempt_count;
   uint32_t recovery_validation_success_count;
   uint32_t upload_next_attempt_mono_ms;
-  int64_t last_clock_observation_utc_ns;
+  int64_t last_trusted_clock_utc_ns;
   uint8_t upload_retry_backoff_index;
   uint8_t upload_pass_count;
   uint8_t upload_pass_next_index;
@@ -139,7 +139,7 @@ typedef struct logger_app {
   bool last_day_outcome_valid;
   bool pending_next_session_clock_jump;
   bool last_clock_observation_available;
-  bool last_clock_observation_utc_available;
+  bool last_trusted_clock_utc_available;
   bool last_clock_observation_valid;
   bool indicator_led_on;
   bool boot_banner_printed;

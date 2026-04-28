@@ -3248,18 +3248,17 @@ static bool logger_update_clock_from_rfc3339(logger_app_t *app,
                                              int64_t *old_utc_ns_out,
                                              int64_t *new_utc_ns_out) {
   int64_t old_utc_ns = 0ll;
-  (void)logger_clock_observed_utc_ns(&app->clock, &old_utc_ns);
+  (void)logger_clock_valid_utc_ns(&app->clock, &old_utc_ns);
   if (!logger_clock_set_utc(rfc3339, &app->clock)) {
     return false;
   }
   int64_t new_utc_ns = 0ll;
-  const bool have_new_utc =
-      logger_clock_observed_utc_ns(&app->clock, &new_utc_ns);
+  const bool have_new_utc = logger_clock_valid_utc_ns(&app->clock, &new_utc_ns);
   app->last_clock_observation_available = true;
-  app->last_clock_observation_utc_available = have_new_utc;
+  app->last_trusted_clock_utc_available = have_new_utc;
   app->last_clock_observation_valid = app->clock.valid;
   app->last_clock_observation_mono_ms = now_ms;
-  app->last_clock_observation_utc_ns = new_utc_ns;
+  app->last_trusted_clock_utc_ns = new_utc_ns;
   if (old_utc_ns_out != NULL) {
     *old_utc_ns_out = old_utc_ns;
   }

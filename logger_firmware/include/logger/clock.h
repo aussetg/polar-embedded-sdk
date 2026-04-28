@@ -59,8 +59,11 @@ bool logger_clock_ntp_sync(const logger_clock_status_t *current_status,
                            logger_clock_status_t *status_out);
 
 const char *logger_clock_state_name(const logger_clock_status_t *status);
-bool logger_clock_observed_utc_ns(const logger_clock_status_t *status,
-                                  int64_t *utc_ns_out);
+/* Convert the RTC sample to UTC nanoseconds only when clock validity is
+ * trusted. Invalid-but-plausible RTC fields must not leak into journal,
+ * queue, upload, or clock-jump decisions as real UTC. */
+bool logger_clock_valid_utc_ns(const logger_clock_status_t *status,
+                               int64_t *utc_ns_out);
 bool logger_clock_format_utc_ns_rfc3339(
     int64_t utc_ns, char out_rfc3339[LOGGER_CLOCK_RFC3339_UTC_LEN + 1]);
 bool logger_clock_observed_local_datetime(const logger_clock_status_t *status,

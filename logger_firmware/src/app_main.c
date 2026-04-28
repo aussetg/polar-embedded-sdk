@@ -1549,14 +1549,15 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
     app->current_day_has_session = true;
   }
 
-  int64_t observed_utc_ns = 0ll;
-  const bool have_observed_utc =
-      logger_clock_observed_utc_ns(&app->clock, &observed_utc_ns);
+  int64_t trusted_utc_ns = 0ll;
+  const bool have_trusted_utc =
+      logger_clock_valid_utc_ns(&app->clock, &trusted_utc_ns);
 
   const bool had_clock_observation = app->last_clock_observation_available;
   const bool previous_clock_valid = app->last_clock_observation_valid;
-  const bool previous_utc_available = app->last_clock_observation_utc_available;
-  const int64_t previous_utc_ns = app->last_clock_observation_utc_ns;
+  const bool previous_trusted_utc_available =
+      app->last_trusted_clock_utc_available;
+  const int64_t previous_trusted_utc_ns = app->last_trusted_clock_utc_ns;
   const uint32_t previous_mono_ms = app->last_clock_observation_mono_ms;
 
   if (had_clock_observation && previous_clock_valid && !app->clock.valid &&
@@ -1567,16 +1568,17 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
     if (!logger_session_handle_clock_event(
             &app->session, &app->clock, app->persisted.boot_counter, now_ms,
             "clock_invalid", NULL, 0ll,
-            previous_utc_available ? previous_utc_ns : 0ll,
-            have_observed_utc ? observed_utc_ns : 0ll, false)) {
+            previous_trusted_utc_available ? previous_trusted_utc_ns : 0ll,
+            have_trusted_utc ? trusted_utc_ns : 0ll, false)) {
       logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                       LOGGER_RUNTIME_BOOT,
                                       "session_clock_invalid_failed", now_ms);
       return false;
     }
-  } else if (had_clock_observation && have_observed_utc) {
-    const int64_t delta_ns =
-        previous_utc_available ? (observed_utc_ns - previous_utc_ns) : 0ll;
+  } else if (had_clock_observation && have_trusted_utc) {
+    const int64_t delta_ns = previous_trusted_utc_available
+                                 ? (trusted_utc_ns - previous_trusted_utc_ns)
+                                 : 0ll;
     const int64_t expected_delta_ns =
         (int64_t)(now_ms - previous_mono_ms) * 1000000ll;
     const int64_t jump_error_ns = delta_ns - expected_delta_ns;
@@ -1588,8 +1590,8 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
       if (!logger_session_handle_clock_event(
               &app->session, &app->clock, app->persisted.boot_counter, now_ms,
               "clock_fixed", "clock_fix", delta_ns,
-              previous_utc_available ? previous_utc_ns : 0ll, observed_utc_ns,
-              true)) {
+              previous_trusted_utc_available ? previous_trusted_utc_ns : 0ll,
+              trusted_utc_ns, true)) {
         logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                         LOGGER_RUNTIME_BOOT,
                                         "session_clock_fix_failed", now_ms);
@@ -1606,7 +1608,7 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
                                            "clock_fix_new_day", now_ms);
         return false;
       }
-    } else if (previous_clock_valid && previous_utc_available &&
+    } else if (previous_clock_valid && previous_trusted_utc_available &&
                app->clock.valid &&
                logger_app_i64_abs(jump_error_ns) >
                    (5ll * 60ll * 1000000000ll) &&
@@ -1616,8 +1618,8 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
           strcmp(observed_study_day_local, app->session.study_day_local) != 0;
       if (!logger_session_handle_clock_event(
               &app->session, &app->clock, app->persisted.boot_counter, now_ms,
-              "clock_jump", "clock_jump", jump_error_ns, previous_utc_ns,
-              observed_utc_ns, true)) {
+              "clock_jump", "clock_jump", jump_error_ns,
+              previous_trusted_utc_ns, trusted_utc_ns, true)) {
         logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                         LOGGER_RUNTIME_BOOT,
                                         "session_clock_jump_failed", now_ms);
@@ -1657,9 +1659,9 @@ static bool logger_app_handle_day_and_clock_boundaries(logger_app_t *app,
     logger_app_reset_day_tracking(app, observed_study_day_local);
   }
 
-  if (have_observed_utc) {
-    app->last_clock_observation_utc_ns = observed_utc_ns;
-    app->last_clock_observation_utc_available = true;
+  if (have_trusted_utc) {
+    app->last_trusted_clock_utc_ns = trusted_utc_ns;
+    app->last_trusted_clock_utc_available = true;
   }
   app->last_clock_observation_available = true;
   app->last_clock_observation_mono_ms = now_ms;

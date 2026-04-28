@@ -484,8 +484,8 @@ static int logger_weekday_from_date(int year, int month, int day) {
 }
 
 static bool
-logger_clock_status_to_observed_utc_ns(const logger_clock_status_t *status,
-                                       int64_t *utc_ns_out) {
+logger_clock_status_fields_to_utc_ns(const logger_clock_status_t *status,
+                                     int64_t *utc_ns_out) {
   if (!logger_clock_datetime_reasonable(status)) {
     return false;
   }
@@ -669,7 +669,7 @@ bool logger_clock_ntp_sync(const logger_clock_status_t *current_status,
 
   result->previous_valid = current_status->valid;
   logger_copy_string(result->previous_utc, sizeof(result->previous_utc),
-                     current_status->now_utc);
+                     logger_clock_now_utc_or_null(current_status));
 
   const uint64_t nonce = time_us_64();
   const uint32_t originate_sec = (uint32_t)(nonce >> 32);
@@ -677,8 +677,7 @@ bool logger_clock_ntp_sync(const logger_clock_status_t *current_status,
 
   bool have_previous_utc = false;
   int64_t previous_utc_ns = 0ll;
-  if (logger_clock_status_to_observed_utc_ns(current_status,
-                                             &previous_utc_ns)) {
+  if (logger_clock_valid_utc_ns(current_status, &previous_utc_ns)) {
     have_previous_utc = true;
   }
 
@@ -690,11 +689,10 @@ bool logger_clock_ntp_sync(const logger_clock_status_t *current_status,
     result->attempted = true;
 
     int64_t ntp_utc_ns = 0ll;
-    if (!logger_clock_ntp_exchange(server, originate_sec, originate_frac,
-                                   current_status->valid && have_previous_utc,
-                                   previous_utc_ns / 1000000000ll, &ntp_utc_ns,
-                                   &result->stratum, result->remote_address,
-                                   result->message)) {
+    if (!logger_clock_ntp_exchange(
+            server, originate_sec, originate_frac, have_previous_utc,
+            previous_utc_ns / 1000000000ll, &ntp_utc_ns, &result->stratum,
+            result->remote_address, result->message)) {
       continue;
     }
 
@@ -743,12 +741,12 @@ const char *logger_clock_state_name(const logger_clock_status_t *status) {
   return status->valid ? "valid" : "invalid";
 }
 
-bool logger_clock_observed_utc_ns(const logger_clock_status_t *status,
-                                  int64_t *utc_ns_out) {
-  if (status == NULL || utc_ns_out == NULL) {
+bool logger_clock_valid_utc_ns(const logger_clock_status_t *status,
+                               int64_t *utc_ns_out) {
+  if (status == NULL || utc_ns_out == NULL || !status->valid) {
     return false;
   }
-  return logger_clock_status_to_observed_utc_ns(status, utc_ns_out);
+  return logger_clock_status_fields_to_utc_ns(status, utc_ns_out);
 }
 
 bool logger_clock_format_utc_ns_rfc3339(

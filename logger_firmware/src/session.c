@@ -282,9 +282,9 @@ static void logger_random_hex128(char out[LOGGER_SESSION_ID_HEX_LEN + 1]) {
 }
 
 static int64_t
-logger_session_observed_utc_ns_or_zero(const logger_clock_status_t *clock) {
+logger_session_trusted_utc_ns_or_zero(const logger_clock_status_t *clock) {
   int64_t utc_ns = 0ll;
-  (void)logger_clock_observed_utc_ns(clock, &utc_ns);
+  (void)logger_clock_valid_utc_ns(clock, &utc_ns);
   return utc_ns;
 }
 
@@ -614,7 +614,7 @@ logger_session_append_session_start(logger_session_state_t *session,
   logger_writer_session_start_t *s = &cmd.session_start;
   s->boot_counter = boot_counter;
   s->now_ms = now_ms;
-  s->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  s->utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
   logger_copy_string(s->session_id, sizeof(s->session_id), session->session_id);
   logger_copy_string(s->study_day_local, sizeof(s->study_day_local),
                      session->study_day_local);
@@ -675,7 +675,7 @@ static bool logger_session_begin_span(logger_session_state_t *session,
   logger_writer_span_start_t *ss = &cmd.span_start;
   ss->boot_counter = boot_counter;
   ss->now_ms = now_ms;
-  ss->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  ss->utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
   logger_copy_string(ss->session_id, sizeof(ss->session_id),
                      session->session_id);
   logger_copy_string(ss->span_id, sizeof(ss->span_id), span->span_id);
@@ -730,7 +730,7 @@ static bool logger_session_control_close_span(
   logger_writer_span_end_t *se = &cmd.span_end;
   se->boot_counter = boot_counter;
   se->now_ms = now_ms;
-  se->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  se->utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
   logger_copy_string(se->session_id, sizeof(se->session_id),
                      session->session_id);
   logger_copy_string(se->span_id, sizeof(se->span_id), span->span_id);
@@ -767,7 +767,7 @@ static bool logger_session_append_gap(logger_session_state_t *session,
   logger_writer_write_gap_t *g = &cmd.write_gap;
   g->boot_counter = boot_counter;
   g->now_ms = now_ms;
-  g->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  g->utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
   logger_copy_string(g->session_id, sizeof(g->session_id), session->session_id);
   logger_copy_string(g->ended_span_id, sizeof(g->ended_span_id), ended_span_id);
   logger_copy_string(g->gap_reason, sizeof(g->gap_reason),
@@ -786,7 +786,7 @@ static bool logger_session_append_recovery(logger_session_state_t *session,
   logger_writer_write_recovery_t *r = &cmd.write_recovery;
   r->boot_counter = boot_counter;
   r->now_ms = now_ms;
-  r->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  r->utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
   logger_copy_string(r->session_id, sizeof(r->session_id), session->session_id);
   logger_copy_string(r->recovery_reason, sizeof(r->recovery_reason), reason);
   return session_dispatch(session, &cmd);
@@ -814,7 +814,7 @@ static bool logger_session_append_session_end(
   logger_writer_session_end_t *se = &cmd.session_end;
   se->boot_counter = boot_counter;
   se->now_ms = now_ms;
-  se->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  se->utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
   logger_copy_string(se->session_id, sizeof(se->session_id),
                      session->session_id);
   logger_copy_string(se->end_reason, sizeof(se->end_reason), end_reason);
@@ -1593,7 +1593,7 @@ bool logger_session_write_status_snapshot(
   /* Control-plane: recompute quarantine state from current clock */
   logger_session_recompute_quarantine(session, clock);
 
-  const int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  const int64_t utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
 
   /* Construct command with all data copied in */
   logger_writer_cmd_t cmd;
@@ -1631,7 +1631,7 @@ bool logger_session_write_marker(logger_session_state_t *session,
     return false;
   }
 
-  const int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  const int64_t utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
 
   /* Control-plane decision: session/span active. Construct command. */
   logger_writer_cmd_t cmd;
@@ -1699,7 +1699,7 @@ void __time_critical_func(logger_session_pmd_cmd_init)(
   cmd->type = LOGGER_WRITER_APPEND_PMD_PACKET;
   logger_writer_append_pmd_packet_t *p = &cmd->append_pmd_packet;
   p->now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
-  (void)logger_clock_observed_utc_ns(clock, &p->utc_ns);
+  (void)logger_clock_valid_utc_ns(clock, &p->utc_ns);
   memcpy(p->span_id_raw, session->current_span_id_raw, 16);
 }
 
@@ -1862,7 +1862,7 @@ bool logger_session_handle_clock_event(logger_session_state_t *session,
   logger_writer_write_clock_event_t *ce = &cmd.write_clock_event;
   ce->boot_counter = boot_counter;
   ce->now_ms = now_ms;
-  ce->utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  ce->utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
   logger_copy_string(ce->session_id, sizeof(ce->session_id),
                      session->session_id);
   logger_copy_string(ce->event_kind, sizeof(ce->event_kind), event_kind);
@@ -1886,7 +1886,7 @@ bool logger_session_append_h10_battery(logger_session_state_t *session,
     return true;
   }
 
-  const int64_t utc_ns = logger_session_observed_utc_ns_or_zero(clock);
+  const int64_t utc_ns = logger_session_trusted_utc_ns_or_zero(clock);
 
   logger_writer_cmd_t cmd;
   memset(&cmd, 0, sizeof(cmd));
