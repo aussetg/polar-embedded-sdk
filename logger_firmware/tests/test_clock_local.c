@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "logger/clock.h"
+#include "logger/ntp_time.h"
 
 #include "board_config.h"
 
@@ -211,6 +212,50 @@ static void test_study_day_rollover(void) {
                    utc_status(2026, 1, 1, 2, 30, 0), "2025-12-31");
 }
 
+static int64_t test_unix_seconds(int year, int month, int day, int hour,
+                                 int minute, int second) {
+  return logger_days_from_civil(year, (unsigned)month, (unsigned)day) *
+             86400ll +
+         ((int64_t)hour * 3600ll) + ((int64_t)minute * 60ll) + (int64_t)second;
+}
+
+static uint32_t test_ntp_low_word_for_unix(int64_t unix_seconds) {
+  return (uint32_t)(unix_seconds + LOGGER_NTP_UNIX_EPOCH_OFFSET_SECONDS);
+}
+
+static void assert_ntp_unfold(const char *label, int year, int month, int day,
+                              int hour, int minute, int second) {
+  const int64_t expected =
+      test_unix_seconds(year, month, day, hour, minute, second);
+  const uint32_t transmit_seconds = test_ntp_low_word_for_unix(expected);
+  int64_t got = 0ll;
+  if (!logger_ntp_transmit_seconds_to_unix(transmit_seconds, false, 0ll,
+                                           &got) ||
+      got != expected) {
+    fprintf(stderr, "%s: NTP low word 0x%08lx mapped to %lld, expected %lld\n",
+            label, (unsigned long)transmit_seconds, (long long)got,
+            (long long)expected);
+    assert(false);
+  }
+}
+
+static void test_ntp_era_unfolding(void) {
+  assert_ntp_unfold("pre-rollover era 0", 2026, 1, 15, 12, 0, 0);
+  assert_ntp_unfold("last second before NTP era 1", 2036, 2, 7, 6, 28, 15);
+  assert_ntp_unfold("first second of NTP era 1", 2036, 2, 7, 6, 28, 16);
+  assert_ntp_unfold("post-rollover era 1", 2040, 1, 1, 0, 0, 0);
+  assert_ntp_unfold("supported range end", 2099, 12, 31, 23, 59, 59);
+
+  int64_t got = 0ll;
+  assert(!logger_ntp_transmit_seconds_to_unix(
+      test_ntp_low_word_for_unix(test_unix_seconds(2023, 12, 31, 23, 59, 59)),
+      false, 0ll, &got));
+  assert(!logger_ntp_transmit_seconds_to_unix(
+      test_ntp_low_word_for_unix(test_unix_seconds(2100, 1, 1, 0, 0, 0)), false,
+      0ll, &got));
+  assert(!logger_ntp_transmit_seconds_to_unix(0u, false, 0ll, NULL));
+}
+
 int main(void) {
   test_now_utc_or_null_requires_valid_clock();
   test_europe_paris_offsets();
@@ -221,6 +266,7 @@ int main(void) {
   test_us_dst_transitions();
   test_overnight_upload_window();
   test_study_day_rollover();
+  test_ntp_era_unfolding();
   puts("test_clock_local: ok");
   return 0;
 }

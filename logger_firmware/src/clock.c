@@ -19,6 +19,7 @@
 #include "lwip/udp.h"
 
 #include "board_config.h"
+#include "logger/ntp_time.h"
 #include "logger/util.h"
 
 #define LOGGER_PCF8523_REG_CONTROL1 0x00
@@ -34,7 +35,6 @@
 #define LOGGER_CLOCK_NTP_CLIENT_MODE 3u
 #define LOGGER_CLOCK_NTP_SERVER_MODE 4u
 #define LOGGER_CLOCK_NTP_VERSION 4u
-#define LOGGER_CLOCK_NTP_UNIX_EPOCH_OFFSET 2208988800ull
 #define LOGGER_CLOCK_NTP_DNS_TIMEOUT_MS 5000u
 #define LOGGER_CLOCK_NTP_RESPONSE_TIMEOUT_MS 5000u
 
@@ -224,11 +224,11 @@ static bool logger_clock_resolve_ntp_server(
   return true;
 }
 
-static bool
-logger_clock_ntp_exchange(const char *server, uint32_t originate_sec,
-                          uint32_t originate_frac, int64_t *unix_ns_out,
-                          uint8_t *stratum_out, char remote_address_out[48],
-                          char message_out[LOGGER_CLOCK_NTP_MESSAGE_MAX + 1]) {
+static bool logger_clock_ntp_exchange(
+    const char *server, uint32_t originate_sec, uint32_t originate_frac,
+    bool have_reference_unix_seconds, int64_t reference_unix_seconds,
+    int64_t *unix_ns_out, uint8_t *stratum_out, char remote_address_out[48],
+    char message_out[LOGGER_CLOCK_NTP_MESSAGE_MAX + 1]) {
   if (unix_ns_out == NULL || stratum_out == NULL ||
       remote_address_out == NULL || message_out == NULL) {
     return false;
@@ -361,8 +361,15 @@ logger_clock_ntp_exchange(const char *server, uint32_t originate_sec,
     return false;
   }
 
-  const int64_t unix_seconds =
-      (int64_t)transmit_sec - (int64_t)LOGGER_CLOCK_NTP_UNIX_EPOCH_OFFSET;
+  int64_t unix_seconds = 0ll;
+  if (!logger_ntp_transmit_seconds_to_unix(
+          transmit_sec, have_reference_unix_seconds, reference_unix_seconds,
+          &unix_seconds)) {
+    logger_copy_string(message_out, LOGGER_CLOCK_NTP_MESSAGE_MAX + 1u,
+                       "NTP response was outside the supported date range");
+    udp_remove(pcb);
+    return false;
+  }
   *stratum_out = stratum;
   *unix_ns_out = unix_seconds * 1000000000ll +
                  (int64_t)((((uint64_t)transmit_frac) * 1000000000ull) >> 32);
@@ -682,8 +689,10 @@ bool logger_clock_ntp_sync(const logger_clock_status_t *current_status,
 
     int64_t ntp_utc_ns = 0ll;
     if (!logger_clock_ntp_exchange(server, originate_sec, originate_frac,
-                                   &ntp_utc_ns, &result->stratum,
-                                   result->remote_address, result->message)) {
+                                   current_status->valid && have_previous_utc,
+                                   previous_utc_ns / 1000000000ll, &ntp_utc_ns,
+                                   &result->stratum, result->remote_address,
+                                   result->message)) {
       continue;
     }
 
