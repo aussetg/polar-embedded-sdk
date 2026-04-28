@@ -53,10 +53,16 @@ logger_system_log_record_valid(const logger_system_log_record_t *record) {
     return false;
   }
 
-  logger_system_log_record_t copy = *record;
-  copy.crc32 = 0u;
-  return logger_crc32_ieee((const uint8_t *)&copy, sizeof(copy)) ==
-         record->crc32;
+  uint32_t crc = logger_crc32_begin();
+  const uint8_t *bytes = (const uint8_t *)record;
+  const size_t crc_offset = offsetof(logger_system_log_record_t, crc32);
+  const uint32_t zero = 0u;
+  crc = logger_crc32_update(crc, bytes, crc_offset);
+  crc = logger_crc32_update(crc, (const uint8_t *)&zero, sizeof(zero));
+  crc =
+      logger_crc32_update(crc, bytes + crc_offset + sizeof(record->crc32),
+                          sizeof(*record) - crc_offset - sizeof(record->crc32));
+  return logger_crc32_finish(crc) == record->crc32;
 }
 
 static void logger_system_log_scan(logger_system_log_t *log) {

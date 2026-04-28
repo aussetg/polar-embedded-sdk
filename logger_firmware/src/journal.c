@@ -19,6 +19,7 @@
 #define LOGGER_JOURNAL_JSON_TOKEN_MAX 64u
 
 typedef struct {
+  FIL file;
   uint8_t header[LOGGER_JOURNAL_FILE_HEADER_BYTES];
   uint8_t record_header[LOGGER_JOURNAL_RECORD_HEADER_BYTES];
   uint8_t payload_capture[LOGGER_JOURNAL_SCAN_PAYLOAD_CAPTURE_MAX + 1u];
@@ -290,30 +291,29 @@ bool logger_journal_scan(const char *path,
   logger_journal_scan_workspace_t *workspace =
       logger_journal_scan_workspace_acquire();
 
-  FIL file;
-  if (f_open(&file, path, FA_READ) != FR_OK) {
+  if (f_open(&workspace->file, path, FA_READ) != FR_OK) {
     logger_journal_scan_workspace_release(workspace);
     return false;
   }
 
   UINT read_bytes = 0u;
-  if (f_read(&file, workspace->header, sizeof(workspace->header),
+  if (f_read(&workspace->file, workspace->header, sizeof(workspace->header),
              &read_bytes) != FR_OK ||
       read_bytes != sizeof(workspace->header)) {
-    f_close(&file);
+    f_close(&workspace->file);
     logger_journal_scan_workspace_release(workspace);
     return false;
   }
   if (memcmp(workspace->header + 0, "NOF1JNL1", 8u) != 0 ||
       logger_u16le(workspace->header + 8) != LOGGER_JOURNAL_FILE_HEADER_BYTES ||
       logger_u16le(workspace->header + 10) != 1u) {
-    f_close(&file);
+    f_close(&workspace->file);
     logger_journal_scan_workspace_release(workspace);
     return false;
   }
   const uint32_t expect_header_crc = logger_crc32_ieee(workspace->header, 56u);
   if (logger_u32le(workspace->header + 56) != expect_header_crc) {
-    f_close(&file);
+    f_close(&workspace->file);
     logger_journal_scan_workspace_release(workspace);
     return false;
   }
@@ -326,7 +326,7 @@ bool logger_journal_scan(const char *path,
   while (true) {
     read_bytes = 0u;
     const FRESULT header_fr =
-        f_read(&file, workspace->record_header,
+        f_read(&workspace->file, workspace->record_header,
                sizeof(workspace->record_header), &read_bytes);
     if (header_fr != FR_OK) {
       io_error = true;
@@ -371,7 +371,7 @@ bool logger_journal_scan(const char *path,
                             : (UINT)payload_remaining;
       read_bytes = 0u;
       const FRESULT payload_fr =
-          f_read(&file, workspace->chunk, want, &read_bytes);
+          f_read(&workspace->file, workspace->chunk, want, &read_bytes);
       if (payload_fr != FR_OK) {
         io_error = true;
         payload_remaining = UINT32_MAX;
@@ -419,7 +419,7 @@ bool logger_journal_scan(const char *path,
     }
   }
 
-  const bool ok = !io_error && f_close(&file) == FR_OK;
+  const bool ok = !io_error && f_close(&workspace->file) == FR_OK;
   logger_journal_scan_workspace_release(workspace);
   return ok;
 }

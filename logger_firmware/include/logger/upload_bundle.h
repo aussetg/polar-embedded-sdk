@@ -38,6 +38,8 @@ typedef struct {
   uint64_t journal_bytes_streamed;
   FIL journal_file;
   mtar_t tar;
+  mtar_header_t tar_header;
+  char tar_path[LOGGER_STORAGE_PATH_MAX];
   uint8_t emit_buf[LOGGER_UPLOAD_BUNDLE_STREAM_CHUNK_MAX];
   size_t emit_buf_offset;
   size_t emit_buf_len;

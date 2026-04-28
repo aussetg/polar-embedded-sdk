@@ -113,48 +113,49 @@ static bool
 logger_upload_bundle_write_header(logger_upload_bundle_stream_t *stream,
                                   const char *name, unsigned size,
                                   unsigned mode, unsigned type) {
-  mtar_header_t header;
-  memset(&header, 0, sizeof(header));
-  if (!logger_upload_bundle_copy_name(header.name, name)) {
+  mtar_header_t *header = &stream->tar_header;
+  memset(header, 0, sizeof(*header));
+  if (!logger_upload_bundle_copy_name(header->name, name)) {
     return false;
   }
-  header.mode = mode;
-  header.owner = 0u;
-  header.size = size;
-  header.mtime = 0u;
-  header.type = type;
-  return mtar_write_header(&stream->tar, &header) == MTAR_ESUCCESS;
+  header->mode = mode;
+  header->owner = 0u;
+  header->size = size;
+  header->mtime = 0u;
+  header->type = type;
+  return mtar_write_header(&stream->tar, header) == MTAR_ESUCCESS;
 }
 
 static bool logger_upload_bundle_write_root_dir_header(
     logger_upload_bundle_stream_t *stream) {
-  char path[LOGGER_STORAGE_PATH_MAX];
-  if (!logger_path_join2(path, sizeof(path), stream->dir_name, "/")) {
+  if (!logger_path_join2(stream->tar_path, sizeof(stream->tar_path),
+                         stream->dir_name, "/")) {
     return false;
   }
-  return logger_upload_bundle_write_header(stream, path, 0u, 0755u, MTAR_TDIR);
+  return logger_upload_bundle_write_header(stream, stream->tar_path, 0u, 0755u,
+                                           MTAR_TDIR);
 }
 
 static bool logger_upload_bundle_write_manifest_header(
     logger_upload_bundle_stream_t *stream) {
-  char path[LOGGER_STORAGE_PATH_MAX];
-  if (!logger_path_join2(path, sizeof(path), stream->dir_name,
-                         "/manifest.json")) {
+  if (!logger_path_join2(stream->tar_path, sizeof(stream->tar_path),
+                         stream->dir_name, "/manifest.json")) {
     return false;
   }
-  return logger_upload_bundle_write_header(
-      stream, path, (unsigned)stream->manifest_len, 0644u, MTAR_TREG);
+  return logger_upload_bundle_write_header(stream, stream->tar_path,
+                                           (unsigned)stream->manifest_len,
+                                           0644u, MTAR_TREG);
 }
 
 static bool logger_upload_bundle_write_journal_header(
     logger_upload_bundle_stream_t *stream) {
-  char path[LOGGER_STORAGE_PATH_MAX];
-  if (!logger_path_join2(path, sizeof(path), stream->dir_name,
-                         "/journal.bin")) {
+  if (!logger_path_join2(stream->tar_path, sizeof(stream->tar_path),
+                         stream->dir_name, "/journal.bin")) {
     return false;
   }
-  return logger_upload_bundle_write_header(
-      stream, path, (unsigned)stream->journal_size_bytes, 0644u, MTAR_TREG);
+  return logger_upload_bundle_write_header(stream, stream->tar_path,
+                                           (unsigned)stream->journal_size_bytes,
+                                           0644u, MTAR_TREG);
 }
 
 static bool

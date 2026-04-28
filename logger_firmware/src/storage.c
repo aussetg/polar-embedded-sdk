@@ -55,10 +55,10 @@ typedef struct {
   char tmp_path[LOGGER_STORAGE_PATH_MAX];
   FIL file;
   bool in_use;
-} logger_storage_atomic_write_workspace_t;
+} logger_storage_file_workspace_t;
 
 static logger_sd_driver_t g_sd;
-static logger_storage_atomic_write_workspace_t g_storage_atomic_write_workspace;
+static logger_storage_file_workspace_t g_storage_file_workspace;
 /* DMA channels for SPI bulk data phase.
  *   TX channel: memory → SPI TX FIFO, paced by DREQ_SPIx_TX
  *   RX channel: SPI RX FIFO → memory, paced by DREQ_SPIx_RX
@@ -214,23 +214,22 @@ void logger_storage_assert_fatfs_context(void) {
   }
 }
 
-static logger_storage_atomic_write_workspace_t *
-logger_storage_atomic_write_workspace_acquire(void) {
+static logger_storage_file_workspace_t *
+logger_storage_file_workspace_acquire(void) {
   logger_storage_assert_fatfs_context();
-  assert(!g_storage_atomic_write_workspace.in_use);
-  memset(&g_storage_atomic_write_workspace, 0,
-         sizeof(g_storage_atomic_write_workspace));
-  g_storage_atomic_write_workspace.in_use = true;
-  return &g_storage_atomic_write_workspace;
+  assert(!g_storage_file_workspace.in_use);
+  memset(&g_storage_file_workspace, 0, sizeof(g_storage_file_workspace));
+  g_storage_file_workspace.in_use = true;
+  return &g_storage_file_workspace;
 }
 
-static void logger_storage_atomic_write_workspace_release(
-    logger_storage_atomic_write_workspace_t *workspace) {
+static void logger_storage_file_workspace_release(
+    logger_storage_file_workspace_t *workspace) {
   (void)workspace;
   logger_storage_assert_fatfs_context();
-  assert(workspace == &g_storage_atomic_write_workspace);
-  assert(g_storage_atomic_write_workspace.in_use);
-  g_storage_atomic_write_workspace.in_use = false;
+  assert(workspace == &g_storage_file_workspace);
+  assert(g_storage_file_workspace.in_use);
+  g_storage_file_workspace.in_use = false;
 }
 
 static bool logger_sd_detect_pin_active(void) {
@@ -804,18 +803,22 @@ static bool logger_storage_prepare_root(void) {
   }
 
   static const char probe_bytes[] = "ok\n";
-  FIL file;
+  logger_storage_file_workspace_t *workspace =
+      logger_storage_file_workspace_acquire();
   UINT written = 0u;
   const FRESULT open_fr =
-      f_open(&file, LOGGER_SD_STATE_DIR "/.probe", FA_WRITE | FA_CREATE_ALWAYS);
+      f_open(&workspace->file, LOGGER_SD_STATE_DIR "/.probe",
+             FA_WRITE | FA_CREATE_ALWAYS);
   if (open_fr != FR_OK) {
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
-  const FRESULT write_fr =
-      f_write(&file, probe_bytes, sizeof(probe_bytes) - 1u, &written);
-  const FRESULT sync_fr = f_sync(&file);
-  const FRESULT close_fr = f_close(&file);
+  const FRESULT write_fr = f_write(&workspace->file, probe_bytes,
+                                   sizeof(probe_bytes) - 1u, &written);
+  const FRESULT sync_fr = f_sync(&workspace->file);
+  const FRESULT close_fr = f_close(&workspace->file);
   (void)f_unlink(LOGGER_SD_STATE_DIR "/.probe");
+  logger_storage_file_workspace_release(workspace);
   if (write_fr != FR_OK || sync_fr != FR_OK || close_fr != FR_OK ||
       written != (UINT)(sizeof(probe_bytes) - 1u)) {
     return false;
@@ -997,23 +1000,22 @@ bool logger_storage_write_file_atomic(const char *path, const void *data,
                                       size_t len) {
   logger_storage_assert_fatfs_context();
   logger_storage_status_t status;
-  logger_storage_atomic_write_workspace_t *workspace =
-      logger_storage_atomic_write_workspace_acquire();
   (void)logger_storage_refresh(&status);
   if (!status.mounted || !status.writable) {
-    logger_storage_atomic_write_workspace_release(workspace);
     return false;
   }
 
+  logger_storage_file_workspace_t *workspace =
+      logger_storage_file_workspace_acquire();
   if (!logger_storage_path_tmp(workspace->tmp_path, path)) {
-    logger_storage_atomic_write_workspace_release(workspace);
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
 
   UINT written = 0u;
   if (f_open(&workspace->file, workspace->tmp_path,
              FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
-    logger_storage_atomic_write_workspace_release(workspace);
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
 
@@ -1025,17 +1027,17 @@ bool logger_storage_write_file_atomic(const char *path, const void *data,
   if ((len != 0u && (write_fr != FR_OK || written != (UINT)len)) ||
       sync_fr != FR_OK || close_fr != FR_OK) {
     (void)f_unlink(workspace->tmp_path);
-    logger_storage_atomic_write_workspace_release(workspace);
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
 
   (void)f_unlink(path);
   if (f_rename(workspace->tmp_path, path) != FR_OK) {
     (void)f_unlink(workspace->tmp_path);
-    logger_storage_atomic_write_workspace_release(workspace);
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
-  logger_storage_atomic_write_workspace_release(workspace);
+  logger_storage_file_workspace_release(workspace);
   return true;
 }
 
@@ -1087,28 +1089,34 @@ bool logger_storage_read_file(const char *path, void *data, size_t cap,
     return false;
   }
 
-  FIL file;
-  if (f_open(&file, path, FA_READ) != FR_OK) {
+  logger_storage_file_workspace_t *workspace =
+      logger_storage_file_workspace_acquire();
+  if (f_open(&workspace->file, path, FA_READ) != FR_OK) {
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
 
-  const uint64_t file_size = (uint64_t)f_size(&file);
+  const uint64_t file_size = (uint64_t)f_size(&workspace->file);
   if (file_size > cap) {
-    (void)f_close(&file);
+    (void)f_close(&workspace->file);
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
 
   UINT read_bytes = 0u;
   const FRESULT read_fr =
-      (file_size == 0u) ? FR_OK
-                        : f_read(&file, data, (UINT)file_size, &read_bytes);
-  const FRESULT close_fr = f_close(&file);
+      (file_size == 0u)
+          ? FR_OK
+          : f_read(&workspace->file, data, (UINT)file_size, &read_bytes);
+  const FRESULT close_fr = f_close(&workspace->file);
   if (read_fr != FR_OK || close_fr != FR_OK || read_bytes != (UINT)file_size) {
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
   if (len_out != NULL) {
     *len_out = (size_t)file_size;
   }
+  logger_storage_file_workspace_release(workspace);
   return true;
 }
 
@@ -1123,15 +1131,19 @@ bool logger_storage_truncate_file(const char *path, uint64_t size_bytes) {
     return false;
   }
 
-  FIL file;
-  if (f_open(&file, path, FA_WRITE) != FR_OK) {
+  logger_storage_file_workspace_t *workspace =
+      logger_storage_file_workspace_acquire();
+  if (f_open(&workspace->file, path, FA_WRITE) != FR_OK) {
+    logger_storage_file_workspace_release(workspace);
     return false;
   }
-  const FRESULT seek_fr = f_lseek(&file, (FSIZE_t)size_bytes);
+  const FRESULT seek_fr = f_lseek(&workspace->file, (FSIZE_t)size_bytes);
   const FRESULT truncate_fr =
-      (seek_fr == FR_OK) ? f_truncate(&file) : FR_INT_ERR;
-  const FRESULT sync_fr = (truncate_fr == FR_OK) ? f_sync(&file) : FR_INT_ERR;
-  const FRESULT close_fr = f_close(&file);
+      (seek_fr == FR_OK) ? f_truncate(&workspace->file) : FR_INT_ERR;
+  const FRESULT sync_fr =
+      (truncate_fr == FR_OK) ? f_sync(&workspace->file) : FR_INT_ERR;
+  const FRESULT close_fr = f_close(&workspace->file);
+  logger_storage_file_workspace_release(workspace);
   return seek_fr == FR_OK && truncate_fr == FR_OK && sync_fr == FR_OK &&
          close_fr == FR_OK;
 }

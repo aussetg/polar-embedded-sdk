@@ -61,6 +61,10 @@ static void logger_app_schedule_deferred_boot_queue_refresh(logger_app_t *app,
 static void logger_app_maybe_run_deferred_boot_queue_refresh(logger_app_t *app,
                                                              uint32_t now_ms);
 
+static logger_h10_packet_t g_app_h10_packet;
+static logger_writer_cmd_t g_app_h10_cmd;
+static logger_upload_process_result_t g_app_upload_process_result;
+
 static int64_t logger_app_i64_abs(int64_t value) {
   return value < 0 ? -(value + 1) + 1 : value;
 }
@@ -1427,7 +1431,7 @@ __no_inline_not_in_flash_func(logger_app_handle_h10_packets)(logger_app_t *app,
   logger_clock_sample(&app->clock);
   app->runtime.wall_clock_valid = app->clock.valid;
 
-  logger_h10_packet_t packet;
+  logger_h10_packet_t *packet = &g_app_h10_packet;
   bool pushed_any = false;
 
   /*
@@ -1438,10 +1442,10 @@ __no_inline_not_in_flash_func(logger_app_handle_h10_packets)(logger_app_t *app,
    * span_id_raw may change when a new span is opened (first packet only).
    * In that case we re-init the skeleton to pick up the new span id.
    */
-  logger_writer_cmd_t cmd;
+  logger_writer_cmd_t *cmd = &g_app_h10_cmd;
   bool cmd_initialized = false;
 
-  while (logger_h10_pop_packet(&app->h10, &packet)) {
+  while (logger_h10_pop_packet(&app->h10, packet)) {
     if (!app->session.span_active) {
       char reason_buf[sizeof(app->next_span_start_reason)];
       const char *span_start_reason = logger_app_take_next_span_start_reason(
@@ -1469,18 +1473,18 @@ __no_inline_not_in_flash_func(logger_app_handle_h10_packets)(logger_app_t *app,
       app->last_session_snapshot_mono_ms = now_ms;
       app->last_chunk_seal_mono_ms = now_ms;
       /* (Re-)init skeleton after span open — span_id_raw has changed */
-      logger_session_pmd_cmd_init(&app->session, &app->clock, &cmd);
+      logger_session_pmd_cmd_init(&app->session, &app->clock, cmd);
       cmd_initialized = true;
     }
 
     if (!cmd_initialized) {
-      logger_session_pmd_cmd_init(&app->session, &app->clock, &cmd);
+      logger_session_pmd_cmd_init(&app->session, &app->clock, cmd);
       cmd_initialized = true;
     }
 
-    if (!logger_session_pmd_cmd_submit(&app->session, &cmd, packet.stream_kind,
-                                       packet.mono_us, packet.value,
-                                       packet.value_len)) {
+    if (!logger_session_pmd_cmd_submit(&app->session, cmd, packet->stream_kind,
+                                       packet->mono_us, packet->value,
+                                       packet->value_len)) {
       logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
                                       LOGGER_RUNTIME_BOOT,
                                       "control_stage_overflow", now_ms);
@@ -2609,17 +2613,18 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
 
   const char *session_id =
       app->upload_pass_session_ids[app->upload_pass_next_index];
-  logger_upload_process_result_t result;
+  logger_upload_process_result_t *result = &g_app_upload_process_result;
   (void)logger_upload_process_session(
       &app->system_log, &app->persisted.config, app->hardware_id,
-      logger_clock_now_utc_or_null(&app->clock), session_id, &result);
+      logger_clock_now_utc_or_null(&app->clock), session_id, result);
 
-  if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED) {
+  if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED) {
     app->upload_pass_had_success = true;
-  } else if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
+  } else if (result->code ==
+             LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
     logger_app_maybe_latch_new_fault(app,
                                      LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE);
-  } else if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
+  } else if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
     logger_app_transition_idle_upload_complete(app, app->battery.vbus_present,
                                                "upload_not_attempted", now_ms);
     return;

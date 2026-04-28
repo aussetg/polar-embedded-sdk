@@ -122,6 +122,7 @@ typedef struct {
 typedef struct {
   logger_upload_url_t url;
   logger_upload_server_reply_t reply;
+  jsmntok_t reply_tokens[32];
   char manifest_path[LOGGER_STORAGE_PATH_MAX];
   char journal_path[LOGGER_STORAGE_PATH_MAX];
   char request_text[LOGGER_UPLOAD_HTTP_REQUEST_MAX + 1u];
@@ -863,14 +864,14 @@ static bool logger_upload_http_execute(
 
 static bool
 logger_upload_parse_server_reply(const logger_upload_http_response_t *response,
-                                 logger_upload_server_reply_t *reply) {
+                                 logger_upload_server_reply_t *reply,
+                                 jsmntok_t *tokens, size_t token_count) {
   memset(reply, 0, sizeof(*reply));
   reply->retryable = false;
 
-  jsmntok_t tokens[32];
   logger_json_doc_t doc;
   if (!logger_json_parse(&doc, response->body, strlen(response->body), tokens,
-                         sizeof(tokens) / sizeof(tokens[0]))) {
+                         token_count)) {
     return false;
   }
   const jsmntok_t *root = logger_json_root(&doc);
@@ -1129,28 +1130,26 @@ static void logger_upload_append_verified_event(logger_system_log_t *system_log,
                                  logger_json_object_writer_data(&writer));
 }
 
-static bool
-logger_upload_recompute_entry_bundle(logger_upload_queue_entry_t *entry,
-                                     char *message, size_t message_len) {
-  char manifest_path[LOGGER_STORAGE_PATH_MAX];
-  char journal_path[LOGGER_STORAGE_PATH_MAX];
-  if (!logger_path_join3(manifest_path, sizeof(manifest_path),
-                         "0:/logger/sessions/", entry->dir_name,
-                         "/manifest.json") ||
-      !logger_path_join3(journal_path, sizeof(journal_path),
-                         "0:/logger/sessions/", entry->dir_name,
-                         "/journal.bin")) {
+static bool logger_upload_recompute_entry_bundle(
+    logger_upload_process_workspace_t *workspace,
+    logger_upload_queue_entry_t *entry, char *message, size_t message_len) {
+  if (!logger_path_join3(
+          workspace->manifest_path, sizeof(workspace->manifest_path),
+          "0:/logger/sessions/", entry->dir_name, "/manifest.json") ||
+      !logger_path_join3(workspace->journal_path,
+                         sizeof(workspace->journal_path), "0:/logger/sessions/",
+                         entry->dir_name, "/journal.bin")) {
     logger_copy_string(message, message_len, "session path too long");
     return false;
   }
-  if (!logger_storage_svc_file_exists(manifest_path) ||
-      !logger_storage_svc_file_exists(journal_path)) {
+  if (!logger_storage_svc_file_exists(workspace->manifest_path) ||
+      !logger_storage_svc_file_exists(workspace->journal_path)) {
     logger_copy_string(message, message_len, "session files missing");
     return false;
   }
-  if (!logger_storage_svc_bundle_compute(entry->dir_name, manifest_path,
-                                         journal_path, entry->bundle_sha256,
-                                         &entry->bundle_size_bytes)) {
+  if (!logger_storage_svc_bundle_compute(
+          entry->dir_name, workspace->manifest_path, workspace->journal_path,
+          entry->bundle_sha256, &entry->bundle_size_bytes)) {
     logger_copy_string(message, message_len,
                        "failed to compute canonical bundle");
     return false;
@@ -1389,8 +1388,8 @@ static bool logger_upload_process_selected(
   logger_copy_string(result->session_id, sizeof(result->session_id),
                      entry->session_id);
 
-  if (!logger_upload_recompute_entry_bundle(entry, result->message,
-                                            sizeof(result->message))) {
+  if (!logger_upload_recompute_entry_bundle(
+          process_workspace, entry, result->message, sizeof(result->message))) {
     logger_upload_queue_set_updated_at(queue, now_utc_or_null);
     logger_copy_string(entry->status, sizeof(entry->status), "failed");
     logger_copy_string(entry->last_failure_class,
@@ -1412,22 +1411,6 @@ static bool logger_upload_process_selected(
     logger_upload_append_failure_event(
         system_log, now_utc_or_null, "upload_failed",
         LOGGER_SYSTEM_LOG_SEVERITY_WARN, entry->session_id, "local_corrupt");
-    return false;
-  }
-
-  if (!logger_path_join3(process_workspace->manifest_path,
-                         sizeof(process_workspace->manifest_path),
-                         "0:/logger/sessions/", entry->dir_name,
-                         "/manifest.json") ||
-      !logger_path_join3(process_workspace->journal_path,
-                         sizeof(process_workspace->journal_path),
-                         "0:/logger/sessions/", entry->dir_name,
-                         "/journal.bin")) {
-    logger_upload_process_workspace_release(process_workspace);
-    logger_upload_queue_tmp_release(queue);
-    result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
-    logger_copy_string(result->message, sizeof(result->message),
-                       "session path is too long");
     return false;
   }
 
@@ -1598,8 +1581,11 @@ static bool logger_upload_process_selected(
     return false;
   }
 
-  if (!logger_upload_parse_server_reply(http_response,
-                                        &process_workspace->reply)) {
+  if (!logger_upload_parse_server_reply(
+          http_response, &process_workspace->reply,
+          process_workspace->reply_tokens,
+          sizeof(process_workspace->reply_tokens) /
+              sizeof(process_workspace->reply_tokens[0]))) {
     const char *failure_class = logger_upload_failure_class_for_http(
         http_response->http_status, &process_workspace->reply);
     logger_upload_queue_set_updated_at(queue, now_utc_or_null);

@@ -32,9 +32,10 @@ static uint8_t
     g_service_cli_anchor_der_buf[LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_DER_MAX];
 static char g_service_cli_anchor_der_base64_buf
     [LOGGER_CONFIG_UPLOAD_TLS_ANCHOR_BASE64_MAX + 1u];
-static char
-    g_service_cli_config_change_details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX +
-                                        1u];
+static char g_service_cli_details_json[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1u];
+static logger_upload_net_test_result_t g_service_cli_net_test_result;
+static logger_upload_process_result_t g_service_cli_upload_process_result;
+static logger_system_log_event_t g_service_cli_system_log_event;
 
 #define LOGGER_SERVICE_BUNDLE_EXPORT_CHUNK_BYTES STORAGE_SVC_BUNDLE_READ_MAX
 
@@ -42,6 +43,8 @@ typedef struct {
   bool open;
   char session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
   char dir_name[64];
+  char manifest_path[LOGGER_STORAGE_PATH_MAX];
+  char journal_path[LOGGER_STORAGE_PATH_MAX];
   uint64_t bundle_size_bytes;
   uint64_t offset;
   uint8_t chunk[LOGGER_SERVICE_BUNDLE_EXPORT_CHUNK_BYTES];
@@ -63,6 +66,8 @@ typedef struct {
   char network_psk[LOGGER_CONFIG_WIFI_PSK_MAX];
   char upload_url[LOGGER_CONFIG_UPLOAD_URL_MAX];
   char auth_type[24];
+  char tls_mode[32];
+  char root_profile[64];
   char auth_api_key[LOGGER_CONFIG_UPLOAD_API_KEY_MAX];
   char auth_token[LOGGER_CONFIG_UPLOAD_TOKEN_MAX];
   char anchor_format[32];
@@ -447,17 +452,22 @@ static bool logger_parse_config_import_upload_tls(
     return false;
   }
 
-  char tls_mode[32] = {0};
-  char root_profile[64] = {0};
+  logger_service_cli_config_import_workspace_t *const workspace =
+      &g_service_cli_config_import_workspace;
+  char *const tls_mode = workspace->tls_mode;
+  char *const root_profile = workspace->root_profile;
+  tls_mode[0] = '\0';
+  root_profile[0] = '\0';
   if (logger_json_object_has_key(doc, tls_tok, "mode") &&
       !logger_json_object_copy_string_or_null(doc, tls_tok, "mode", tls_mode,
-                                              sizeof(tls_mode))) {
+                                              sizeof(workspace->tls_mode))) {
     *error_message_out = "config import upload.tls.mode is invalid";
     return false;
   }
   if (logger_json_object_has_key(doc, tls_tok, "root_profile") &&
       !logger_json_object_copy_string_or_null(
-          doc, tls_tok, "root_profile", root_profile, sizeof(root_profile))) {
+          doc, tls_tok, "root_profile", root_profile,
+          sizeof(workspace->root_profile))) {
     *error_message_out = "config import upload.tls.root_profile is invalid";
     return false;
   }
@@ -1622,22 +1632,23 @@ static void logger_handle_system_log_export_json(logger_app_t *app) {
   logger_json_stream_writer_field_array_begin(&w, "events");
 
   for (uint32_t i = 0u; i < logger_system_log_count(&app->system_log); ++i) {
-    logger_system_log_event_t event;
-    if (!logger_system_log_read_event(&app->system_log, i, &event)) {
+    logger_system_log_event_t *event = &g_service_cli_system_log_event;
+    if (!logger_system_log_read_event(&app->system_log, i, event)) {
       continue;
     }
     logger_json_stream_writer_elem_object_begin(&w);
-    logger_json_stream_writer_field_uint32(&w, "event_seq", event.event_seq);
+    logger_json_stream_writer_field_uint32(&w, "event_seq", event->event_seq);
     logger_json_stream_writer_field_string_or_null(
-        &w, "utc", logger_string_present(event.utc) ? event.utc : NULL);
+        &w, "utc", logger_string_present(event->utc) ? event->utc : NULL);
     logger_json_stream_writer_field_uint32(&w, "boot_counter",
-                                           event.boot_counter);
-    logger_json_stream_writer_field_string_or_null(&w, "kind", event.kind);
+                                           event->boot_counter);
+    logger_json_stream_writer_field_string_or_null(&w, "kind", event->kind);
     logger_json_stream_writer_field_string_or_null(
-        &w, "severity", logger_system_log_severity_name(event.severity));
+        &w, "severity", logger_system_log_severity_name(event->severity));
     logger_json_stream_writer_field_raw(
         &w, "details",
-        logger_string_present(event.details_json) ? event.details_json : "{}");
+        logger_string_present(event->details_json) ? event->details_json
+                                                   : "{}");
     logger_json_stream_writer_object_end(&w);
   }
 
@@ -1918,45 +1929,45 @@ static void logger_handle_net_test_json(logger_app_t *app) {
     return;
   }
 
-  logger_upload_net_test_result_t result;
-  const bool ok = logger_upload_net_test(&app->persisted.config, &result);
+  logger_upload_net_test_result_t *result = &g_service_cli_net_test_result;
+  const bool ok = logger_upload_net_test(&app->persisted.config, result);
 
   jsw w;
   jsw_ok(&w, "net-test", logger_clock_now_utc_or_null(&app->clock));
 
   logger_json_stream_writer_field_object_begin(&w, "wifi_join");
   logger_json_stream_writer_field_string_or_null(&w, "result",
-                                                 result.wifi_join_result);
+                                                 result->wifi_join_result);
   logger_json_stream_writer_field_object_begin(&w, "details");
   logger_json_stream_writer_field_string_or_null(&w, "message",
-                                                 result.wifi_join_details);
+                                                 result->wifi_join_details);
   logger_json_stream_writer_object_end(&w);
   logger_json_stream_writer_object_end(&w);
 
   logger_json_stream_writer_field_object_begin(&w, "dns");
   logger_json_stream_writer_field_string_or_null(&w, "result",
-                                                 result.dns_result);
+                                                 result->dns_result);
   logger_json_stream_writer_field_object_begin(&w, "details");
   logger_json_stream_writer_field_string_or_null(&w, "message",
-                                                 result.dns_details);
+                                                 result->dns_details);
   logger_json_stream_writer_object_end(&w);
   logger_json_stream_writer_object_end(&w);
 
   logger_json_stream_writer_field_object_begin(&w, "tls");
   logger_json_stream_writer_field_string_or_null(&w, "result",
-                                                 result.tls_result);
+                                                 result->tls_result);
   logger_json_stream_writer_field_object_begin(&w, "details");
   logger_json_stream_writer_field_string_or_null(&w, "message",
-                                                 result.tls_details);
+                                                 result->tls_details);
   logger_json_stream_writer_object_end(&w);
   logger_json_stream_writer_object_end(&w);
 
   logger_json_stream_writer_field_object_begin(&w, "upload_endpoint_reachable");
   logger_json_stream_writer_field_string_or_null(
-      &w, "result", result.upload_endpoint_reachable_result);
+      &w, "result", result->upload_endpoint_reachable_result);
   logger_json_stream_writer_field_object_begin(&w, "details");
   logger_json_stream_writer_field_string_or_null(
-      &w, "message", result.upload_endpoint_reachable_details);
+      &w, "message", result->upload_endpoint_reachable_details);
   logger_json_stream_writer_field_bool(&w, "ok", ok);
   logger_json_stream_writer_object_end(&w);
   logger_json_stream_writer_object_end(&w);
@@ -2303,8 +2314,8 @@ static void __attribute__((noinline))
 logger_service_cli_append_config_changed_event(logger_app_t *app,
                                                bool bond_cleared) {
   logger_json_object_writer_t writer;
-  logger_json_object_writer_init(&writer, g_service_cli_config_change_details,
-                                 sizeof(g_service_cli_config_change_details));
+  logger_json_object_writer_init(&writer, g_service_cli_details_json,
+                                 sizeof(g_service_cli_details_json));
   if (logger_json_object_writer_string_field(&writer, "source",
                                              "config_import") &&
       logger_json_object_writer_bool_field(&writer, "bond_cleared",
@@ -2607,9 +2618,9 @@ logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli,
     return;
   }
 
-  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
   logger_json_object_writer_t writer;
-  logger_json_object_writer_init(&writer, details, sizeof(details));
+  logger_json_object_writer_init(&writer, g_service_cli_details_json,
+                                 sizeof(g_service_cli_details_json));
   if (logger_json_object_writer_string_field(
           &writer, "source", "upload_tls_clear_provisioned_anchor") &&
       logger_json_object_writer_bool_field(&writer, "had_anchor", had_anchor) &&
@@ -2746,9 +2757,9 @@ static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
     return;
   }
 
-  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
   logger_json_object_writer_t writer;
-  logger_json_object_writer_init(&writer, details, sizeof(details));
+  logger_json_object_writer_init(&writer, g_service_cli_details_json,
+                                 sizeof(g_service_cli_details_json));
   if (logger_json_object_writer_string_field(&writer, "field", field) &&
       logger_json_object_writer_finish(&writer)) {
     (void)logger_system_log_append(
@@ -3197,9 +3208,9 @@ logger_handle_debug_synth_no_session_day(const logger_service_cli_t *cli,
     return;
   }
 
-  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
   logger_json_object_writer_t writer;
-  logger_json_object_writer_init(&writer, details, sizeof(details));
+  logger_json_object_writer_init(&writer, g_service_cli_details_json,
+                                 sizeof(g_service_cli_details_json));
   if (!logger_json_object_writer_string_field(&writer, "study_day_local",
                                               study_day_local) ||
       !logger_json_object_writer_string_field(&writer, "reason", reason) ||
@@ -3683,9 +3694,9 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
   logger_upload_queue_compute_summary(queue, &summary);
   logger_upload_queue_tmp_release(queue);
 
-  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
   logger_json_object_writer_t writer;
-  logger_json_object_writer_init(&writer, details, sizeof(details));
+  logger_json_object_writer_init(&writer, g_service_cli_details_json,
+                                 sizeof(g_service_cli_details_json));
   if (logger_json_object_writer_string_field(&writer, "session_id",
                                              session_id) &&
       logger_json_object_writer_string_field(&writer, "receipt_id",
@@ -3811,9 +3822,9 @@ static void logger_handle_debug_queue_mark_nonretryable(
   logger_upload_queue_compute_summary(queue, &summary);
   logger_upload_queue_tmp_release(queue);
 
-  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
   logger_json_object_writer_t writer;
-  logger_json_object_writer_init(&writer, details, sizeof(details));
+  logger_json_object_writer_init(&writer, g_service_cli_details_json,
+                                 sizeof(g_service_cli_details_json));
   if (logger_json_object_writer_string_field(&writer, "session_id",
                                              session_id) &&
       logger_json_object_writer_string_field(&writer, "reason", reason) &&
@@ -3890,16 +3901,17 @@ static void logger_handle_debug_bundle_open(logger_service_cli_t *cli,
     return;
   }
 
-  char manifest_path[LOGGER_STORAGE_PATH_MAX];
-  char journal_path[LOGGER_STORAGE_PATH_MAX];
   const bool paths_ok =
-      logger_path_join3(manifest_path, sizeof(manifest_path),
+      logger_path_join3(g_service_bundle_export.manifest_path,
+                        sizeof(g_service_bundle_export.manifest_path),
                         "0:/logger/sessions/", entry->dir_name,
                         "/manifest.json") &&
-      logger_path_join3(journal_path, sizeof(journal_path),
+      logger_path_join3(g_service_bundle_export.journal_path,
+                        sizeof(g_service_bundle_export.journal_path),
                         "0:/logger/sessions/", entry->dir_name, "/journal.bin");
-  if (paths_ok && logger_storage_svc_bundle_open(entry->dir_name, manifest_path,
-                                                 journal_path)) {
+  if (paths_ok && logger_storage_svc_bundle_open(
+                      entry->dir_name, g_service_bundle_export.manifest_path,
+                      g_service_bundle_export.journal_path)) {
     g_service_bundle_export.open = true;
     logger_copy_string(g_service_bundle_export.session_id,
                        sizeof(g_service_bundle_export.session_id),
@@ -4087,77 +4099,79 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
     return;
   }
 
-  logger_upload_process_result_t result;
+  logger_upload_process_result_t *result = &g_service_cli_upload_process_result;
   const bool ok = logger_upload_process_one(
       &app->system_log, &app->persisted.config, app->hardware_id,
-      logger_clock_now_utc_or_null(&app->clock), &result);
+      logger_clock_now_utc_or_null(&app->clock), result);
 
-  if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
+  if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
     jsw w;
     jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
-            "invalid_config", result.message);
+            "invalid_config", result->message);
     return;
   }
-  if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_FAILED) {
+  if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_FAILED) {
     jsw w;
     jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
-            logger_string_present(result.failure_class) ? result.failure_class
-                                                        : "upload_failed",
-            result.message);
+            logger_string_present(result->failure_class) ? result->failure_class
+                                                         : "upload_failed",
+            result->message);
     return;
   }
-  if (result.code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
+  if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
     jsw w;
     jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
-            "min_firmware_rejected", result.message);
+            "min_firmware_rejected", result->message);
     return;
   }
 
   jsw w;
   jsw_ok(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock));
-  logger_json_stream_writer_field_bool(&w, "attempted", result.attempted);
+  logger_json_stream_writer_field_bool(&w, "attempted", result->attempted);
   logger_json_stream_writer_field_string_or_null(
       &w, "result",
-      result.code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED ? "verified"
-      : result.code == LOGGER_UPLOAD_PROCESS_RESULT_NO_WORK
+      result->code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED ? "verified"
+      : result->code == LOGGER_UPLOAD_PROCESS_RESULT_NO_WORK
           ? "no_work"
           : (ok ? "ok" : "unknown"));
   logger_json_stream_writer_field_string_or_null(
       &w, "session_id",
-      logger_string_present(result.session_id) ? result.session_id : NULL);
+      logger_string_present(result->session_id) ? result->session_id : NULL);
   logger_json_stream_writer_field_string_or_null(
       &w, "final_status",
-      logger_string_present(result.final_status) ? result.final_status : NULL);
+      logger_string_present(result->final_status) ? result->final_status
+                                                  : NULL);
   logger_json_stream_writer_field_string_or_null(
       &w, "receipt_id",
-      logger_string_present(result.receipt_id) ? result.receipt_id : NULL);
+      logger_string_present(result->receipt_id) ? result->receipt_id : NULL);
   logger_json_stream_writer_field_string_or_null(
       &w, "verified_upload_utc",
-      logger_string_present(result.verified_upload_utc)
-          ? result.verified_upload_utc
+      logger_string_present(result->verified_upload_utc)
+          ? result->verified_upload_utc
           : NULL);
-  if (result.http_status >= 0) {
+  if (result->http_status >= 0) {
     logger_json_stream_writer_field_int32(&w, "http_status",
-                                          result.http_status);
+                                          result->http_status);
   } else {
     logger_json_stream_writer_field_null(&w, "http_status");
   }
   logger_json_stream_writer_field_string_or_null(
       &w, "server_error_code",
-      logger_string_present(result.server_error_code) ? result.server_error_code
-                                                      : NULL);
+      logger_string_present(result->server_error_code)
+          ? result->server_error_code
+          : NULL);
   logger_json_stream_writer_field_string_or_null(
       &w, "server_error_message",
-      logger_string_present(result.server_error_message)
-          ? result.server_error_message
+      logger_string_present(result->server_error_message)
+          ? result->server_error_message
           : NULL);
   logger_json_stream_writer_field_string_or_null(
       &w, "response_excerpt",
-      logger_string_present(result.response_excerpt) ? result.response_excerpt
-                                                     : NULL);
+      logger_string_present(result->response_excerpt) ? result->response_excerpt
+                                                      : NULL);
   logger_json_stream_writer_field_string_or_null(
       &w, "message",
-      logger_string_present(result.message) ? result.message : NULL);
+      logger_string_present(result->message) ? result->message : NULL);
   jsw_end(&w);
 }
 
