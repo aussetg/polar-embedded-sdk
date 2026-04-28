@@ -373,7 +373,7 @@ static bool logger_queue_status_valid(const char *status) {
   return strcmp(status, "pending") == 0 || strcmp(status, "uploading") == 0 ||
          strcmp(status, "verified") == 0 ||
          strcmp(status, "blocked_min_firmware") == 0 ||
-         strcmp(status, "failed") == 0;
+         strcmp(status, "nonretryable") == 0 || strcmp(status, "failed") == 0;
 }
 
 static bool

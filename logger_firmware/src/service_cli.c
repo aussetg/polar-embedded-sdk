@@ -128,6 +128,20 @@ logger_upload_queue_entry_retry_hint(const logger_upload_queue_entry_t *entry) {
   return logger_upload_blocked_retry_hint();
 }
 
+static bool logger_cli_reason_token_valid(const char *reason) {
+  if (!logger_string_present(reason) ||
+      strlen(reason) > LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX) {
+    return false;
+  }
+  for (size_t i = 0u; reason[i] != '\0'; ++i) {
+    const char ch = reason[i];
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool logger_parse_u8(const char *text, uint8_t *value_out) {
   if (text == NULL || value_out == NULL || text[0] == '\0') {
     return false;
@@ -3658,6 +3672,128 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+static void logger_handle_debug_queue_mark_nonretryable(
+    logger_service_cli_t *cli, logger_app_t *app, const char *args) {
+  const char *command = "debug queue mark-nonretryable";
+  if (!logger_cli_require_service_unlocked(cli, app, command)) {
+    return;
+  }
+
+  char session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
+  char reason[LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX + 1];
+  memset(session_id, 0, sizeof(session_id));
+  memset(reason, 0, sizeof(reason));
+
+  const char *space = args != NULL ? strchr(args, ' ') : NULL;
+  if (space == NULL || (size_t)(space - args) != LOGGER_SESSION_ID_HEX_LEN ||
+      strlen(space + 1u) > LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX) {
+    jsw w;
+    jsw_err(
+        &w, command, logger_clock_now_utc_or_null(&app->clock),
+        "invalid_argument",
+        "expected: debug queue mark-nonretryable <session_id> <reason_token>");
+    return;
+  }
+  memcpy(session_id, args, LOGGER_SESSION_ID_HEX_LEN);
+  logger_copy_string(reason, sizeof(reason), space + 1u);
+  if (!logger_cli_reason_token_valid(reason)) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument",
+            "reason_token must be lowercase snake_case and <=160 chars");
+    return;
+  }
+
+  uint8_t session_id_bytes[16];
+  if (!logger_hex_to_bytes_16(session_id, session_id_bytes)) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument", "session_id must be 32 hexadecimal chars");
+    return;
+  }
+
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
+  if (!logger_storage_svc_queue_load(queue)) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to load upload_queue.json");
+    return;
+  }
+
+  logger_upload_queue_entry_t *entry = NULL;
+  for (size_t i = 0u; i < queue->session_count; ++i) {
+    if (strcmp(queue->sessions[i].session_id, session_id) == 0) {
+      entry = &queue->sessions[i];
+      break;
+    }
+  }
+  if (entry == NULL) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock), "not_found",
+            "session_id is not present in upload_queue.json");
+    return;
+  }
+  if (strcmp(entry->status, "verified") == 0) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_status",
+            "verified sessions cannot be marked nonretryable");
+    return;
+  }
+
+  logger_copy_string(entry->status, sizeof(entry->status), "nonretryable");
+  logger_copy_string(entry->last_failure_class,
+                     sizeof(entry->last_failure_class), "manual_nonretryable");
+  entry->last_http_status = 0u;
+  entry->last_server_error_code[0] = '\0';
+  entry->last_server_error_message[0] = '\0';
+  logger_copy_string(entry->last_response_excerpt,
+                     sizeof(entry->last_response_excerpt), reason);
+  entry->verified_upload_utc[0] = '\0';
+  entry->verified_bundle_sha256[0] = '\0';
+  entry->receipt_id[0] = '\0';
+  logger_copy_string(queue->updated_at_utc, sizeof(queue->updated_at_utc),
+                     logger_clock_now_utc_or_null(&app->clock));
+
+  if (!logger_storage_svc_queue_write(queue)) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to write upload_queue.json");
+    return;
+  }
+
+  logger_upload_queue_summary_t summary;
+  logger_upload_queue_compute_summary(queue, &summary);
+  logger_upload_queue_tmp_release(queue);
+
+  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+  logger_json_object_writer_t writer;
+  logger_json_object_writer_init(&writer, details, sizeof(details));
+  if (logger_json_object_writer_string_field(&writer, "session_id",
+                                             session_id) &&
+      logger_json_object_writer_string_field(&writer, "reason", reason) &&
+      logger_json_object_writer_string_field(&writer, "source", "host") &&
+      logger_json_object_writer_finish(&writer)) {
+    (void)logger_system_log_append(
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+        "queue_mark_nonretryable", LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+        logger_json_object_writer_data(&writer));
+  }
+
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "session_id", session_id);
+  logger_json_stream_writer_field_string_or_null(&w, "status", "nonretryable");
+  logger_json_stream_writer_field_string_or_null(&w, "reason", reason);
+  logger_json_stream_writer_field_uint32(&w, "pending_count",
+                                         summary.pending_count);
+  jsw_end(&w);
+}
+
 static void logger_service_bundle_export_reset(void) {
   if (g_service_bundle_export.open) {
     logger_storage_svc_bundle_close();
@@ -4191,6 +4327,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strncmp(line, "debug queue mark-verified ", 26) == 0) {
     logger_handle_debug_queue_mark_verified(cli, app, line + 26);
+    return;
+  }
+  if (strncmp(line, "debug queue mark-nonretryable ", 30) == 0) {
+    logger_handle_debug_queue_mark_nonretryable(cli, app, line + 30);
     return;
   }
   if (strncmp(line, "debug bundle open ", 18) == 0) {
