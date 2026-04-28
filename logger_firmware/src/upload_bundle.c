@@ -21,8 +21,7 @@
  * so one shared workspace is sufficient and avoids blowing the 4 KiB scratch
  * stacks with an 11 KiB stream object.
  */
-#define LOGGER_UPLOAD_BUNDLE_PSRAM_STREAM_ADDR                                \
-  (PSRAM_UPLOAD_BUNDLE_REGION_BASE)
+#define LOGGER_UPLOAD_BUNDLE_PSRAM_STREAM_ADDR (PSRAM_UPLOAD_BUNDLE_REGION_BASE)
 
 _Static_assert(LOGGER_UPLOAD_BUNDLE_PSRAM_STREAM_ADDR +
                        sizeof(logger_upload_bundle_stream_t) <=
@@ -63,9 +62,9 @@ static void logger_upload_bundle_compute_end(void) {
   g_bundle_compute_active = false;
 }
 
-static logger_upload_bundle_stream_t *logger_upload_bundle_stream_workspace_ptr(
-    void) {
-  return (logger_upload_bundle_stream_t *)LOGGER_UPLOAD_BUNDLE_PSRAM_STREAM_ADDR;
+static logger_upload_bundle_stream_t *
+logger_upload_bundle_stream_workspace_ptr(void) {
+  return (logger_upload_bundle_stream_t *)PSRAM_UPLOAD_BUNDLE_REGION_BASE;
 }
 
 static bool
@@ -359,19 +358,20 @@ bool logger_upload_bundle_compute(
   logger_sha256_t sha;
   logger_sha256_init(&sha);
   uint64_t total_size = 0u;
-  uint8_t chunk[LOGGER_UPLOAD_BUNDLE_STREAM_CHUNK_MAX];
   bool ok = true;
   for (;;) {
     size_t len = 0u;
-    if (!logger_upload_bundle_stream_read(stream, chunk, sizeof(chunk),
-                                          &len)) {
+    /* Reuse the stream's PSRAM-backed I/O buffer as the hash read buffer;
+     * keeping a second 1 KiB buffer on a 4 KiB core stack is not worth it. */
+    if (!logger_upload_bundle_stream_read(stream, stream->io_buf,
+                                          sizeof(stream->io_buf), &len)) {
       ok = false;
       break;
     }
     if (len == 0u) {
       break;
     }
-    logger_sha256_update(&sha, chunk, len);
+    logger_sha256_update(&sha, stream->io_buf, len);
     total_size += len;
   }
   logger_upload_bundle_stream_close(stream);

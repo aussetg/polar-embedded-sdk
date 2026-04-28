@@ -38,6 +38,11 @@ typedef struct {
   char journal_path[LOGGER_STORAGE_PATH_MAX];
   char live_path[LOGGER_STORAGE_PATH_MAX];
   char manifest_path[LOGGER_STORAGE_PATH_MAX];
+  char candidate_dir_name[64];
+  char candidate_dir_path[LOGGER_STORAGE_PATH_MAX];
+  char candidate_journal_path[LOGGER_STORAGE_PATH_MAX];
+  char candidate_live_path[LOGGER_STORAGE_PATH_MAX];
+  char candidate_manifest_path[LOGGER_STORAGE_PATH_MAX];
   char live_session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
   logger_journal_scan_result_t scan;
   bool live_present;
@@ -59,6 +64,16 @@ typedef struct {
 } logger_session_live_write_workspace_t;
 
 typedef struct {
+  char payload[LOGGER_SESSION_JSON_MAX];
+  char logger_id_escaped[LOGGER_CONFIG_LOGGER_ID_MAX * 2u];
+  char subject_id_escaped[LOGGER_CONFIG_SUBJECT_ID_MAX * 2u];
+  char timezone_escaped[LOGGER_CONFIG_TIMEZONE_MAX * 2u];
+  char json_a[64];
+  char json_b[64];
+  bool in_use;
+} logger_session_writer_json_workspace_t;
+
+typedef struct {
   FIL file;
   logger_sha256_t sha;
   uint8_t chunk[256];
@@ -68,6 +83,7 @@ typedef struct {
 static logger_session_recovery_workspace_t g_session_recovery_workspace;
 static logger_session_live_json_workspace_t g_session_live_json_workspace;
 static logger_session_live_write_workspace_t g_session_live_write_workspace;
+static logger_session_writer_json_workspace_t g_session_writer_json_workspace;
 static logger_session_sha256_workspace_t g_session_sha256_workspace;
 static logger_persisted_state_t g_session_manifest_persisted;
 static bool g_session_manifest_persisted_in_use;
@@ -121,6 +137,23 @@ static void logger_session_live_write_workspace_release(
   assert(workspace == &g_session_live_write_workspace);
   assert(g_session_live_write_workspace.in_use);
   g_session_live_write_workspace.in_use = false;
+}
+
+static logger_session_writer_json_workspace_t *
+logger_session_writer_json_workspace_acquire(void) {
+  assert(!g_session_writer_json_workspace.in_use);
+  memset(&g_session_writer_json_workspace, 0,
+         sizeof(g_session_writer_json_workspace));
+  g_session_writer_json_workspace.in_use = true;
+  return &g_session_writer_json_workspace;
+}
+
+static void logger_session_writer_json_workspace_release(
+    logger_session_writer_json_workspace_t *workspace) {
+  (void)workspace;
+  assert(workspace == &g_session_writer_json_workspace);
+  assert(g_session_writer_json_workspace.in_use);
+  g_session_writer_json_workspace.in_use = false;
 }
 
 static logger_session_sha256_workspace_t *
@@ -1225,17 +1258,12 @@ static bool logger_session_store_recovery_paths(
 }
 
 static bool logger_session_find_recovery_paths(
-    char dir_name_out[64], char dir_path_out[LOGGER_STORAGE_PATH_MAX],
-    char journal_path_out[LOGGER_STORAGE_PATH_MAX],
-    char live_path_out[LOGGER_STORAGE_PATH_MAX],
-    char manifest_path_out[LOGGER_STORAGE_PATH_MAX], bool *live_present_out,
-    bool *io_error_out) {
+    logger_session_recovery_workspace_t *workspace, bool *io_error_out) {
+  assert(workspace != NULL);
   if (io_error_out != NULL) {
     *io_error_out = false;
   }
-  if (live_present_out != NULL) {
-    *live_present_out = false;
-  }
+  workspace->live_present = false;
   DIR dir;
   if (f_opendir(&dir, "0:/logger/sessions") != FR_OK) {
     if (io_error_out != NULL) {
@@ -1263,38 +1291,37 @@ static bool logger_session_find_recovery_paths(
       continue;
     }
 
-    char dir_path[LOGGER_STORAGE_PATH_MAX];
-    char journal_path[LOGGER_STORAGE_PATH_MAX];
-    char live_path[LOGGER_STORAGE_PATH_MAX];
-    char manifest_path[LOGGER_STORAGE_PATH_MAX];
-    char candidate_dir_name[64];
-    if (!logger_session_store_recovery_paths(candidate_dir_name, dir_path,
-                                             journal_path, live_path,
-                                             manifest_path, info.fname)) {
+    if (!logger_session_store_recovery_paths(
+            workspace->candidate_dir_name, workspace->candidate_dir_path,
+            workspace->candidate_journal_path, workspace->candidate_live_path,
+            workspace->candidate_manifest_path, info.fname)) {
       continue;
     }
 
     bool live_exists = false;
     bool journal_exists = false;
     bool manifest_exists = false;
-    if (!logger_session_path_exists(live_path, &live_exists, &io_error) ||
-        !logger_session_path_exists(journal_path, &journal_exists, &io_error) ||
-        !logger_session_path_exists(manifest_path, &manifest_exists,
-                                    &io_error)) {
+    if (!logger_session_path_exists(workspace->candidate_live_path,
+                                    &live_exists, &io_error) ||
+        !logger_session_path_exists(workspace->candidate_journal_path,
+                                    &journal_exists, &io_error) ||
+        !logger_session_path_exists(workspace->candidate_manifest_path,
+                                    &manifest_exists, &io_error)) {
       break;
     }
 
     if (live_exists) {
-      logger_copy_string(dir_name_out, 64u, candidate_dir_name);
-      logger_copy_string(dir_path_out, LOGGER_STORAGE_PATH_MAX, dir_path);
-      logger_copy_string(journal_path_out, LOGGER_STORAGE_PATH_MAX,
-                         journal_path);
-      logger_copy_string(live_path_out, LOGGER_STORAGE_PATH_MAX, live_path);
-      logger_copy_string(manifest_path_out, LOGGER_STORAGE_PATH_MAX,
-                         manifest_path);
-      if (live_present_out != NULL) {
-        *live_present_out = true;
-      }
+      logger_copy_string(workspace->dir_name, 64u,
+                         workspace->candidate_dir_name);
+      logger_copy_string(workspace->dir_path, LOGGER_STORAGE_PATH_MAX,
+                         workspace->candidate_dir_path);
+      logger_copy_string(workspace->journal_path, LOGGER_STORAGE_PATH_MAX,
+                         workspace->candidate_journal_path);
+      logger_copy_string(workspace->live_path, LOGGER_STORAGE_PATH_MAX,
+                         workspace->candidate_live_path);
+      logger_copy_string(workspace->manifest_path, LOGGER_STORAGE_PATH_MAX,
+                         workspace->candidate_manifest_path);
+      workspace->live_present = true;
       found = true;
       break;
     }
@@ -1302,15 +1329,16 @@ static bool logger_session_find_recovery_paths(
     if (found_journal_only || !journal_exists || manifest_exists) {
       continue;
     }
-    logger_copy_string(dir_name_out, 64u, candidate_dir_name);
-    logger_copy_string(dir_path_out, LOGGER_STORAGE_PATH_MAX, dir_path);
-    logger_copy_string(journal_path_out, LOGGER_STORAGE_PATH_MAX, journal_path);
-    logger_copy_string(live_path_out, LOGGER_STORAGE_PATH_MAX, live_path);
-    logger_copy_string(manifest_path_out, LOGGER_STORAGE_PATH_MAX,
-                       manifest_path);
-    if (live_present_out != NULL) {
-      *live_present_out = false;
-    }
+    logger_copy_string(workspace->dir_name, 64u, workspace->candidate_dir_name);
+    logger_copy_string(workspace->dir_path, LOGGER_STORAGE_PATH_MAX,
+                       workspace->candidate_dir_path);
+    logger_copy_string(workspace->journal_path, LOGGER_STORAGE_PATH_MAX,
+                       workspace->candidate_journal_path);
+    logger_copy_string(workspace->live_path, LOGGER_STORAGE_PATH_MAX,
+                       workspace->candidate_live_path);
+    logger_copy_string(workspace->manifest_path, LOGGER_STORAGE_PATH_MAX,
+                       workspace->candidate_manifest_path);
+    workspace->live_present = false;
     found = true;
     found_journal_only = true;
   }
@@ -1922,10 +1950,7 @@ bool logger_session_recover_on_boot(
   workspace = logger_session_recovery_workspace_acquire();
 
   bool live_scan_error = false;
-  if (!logger_session_find_recovery_paths(
-          workspace->dir_name, workspace->dir_path, workspace->journal_path,
-          workspace->live_path, workspace->manifest_path,
-          &workspace->live_present, &live_scan_error)) {
+  if (!logger_session_find_recovery_paths(workspace, &live_scan_error)) {
     logger_session_recovery_workspace_release(workspace);
     if (live_scan_error) {
       logger_session_log_recovery_issue(
@@ -2140,21 +2165,28 @@ bool logger_session_recover_on_boot(
 static bool __attribute__((noinline))
 writer_emit_session_start(logger_session_state_t *session,
                           const logger_writer_session_start_t *cmd) {
-  char logger_id_escaped[LOGGER_CONFIG_LOGGER_ID_MAX * 2u];
-  char subject_id_escaped[LOGGER_CONFIG_SUBJECT_ID_MAX * 2u];
-  char timezone_escaped[LOGGER_CONFIG_TIMEZONE_MAX * 2u];
-  if (!logger_json_escape_into(logger_id_escaped, sizeof(logger_id_escaped),
-                               cmd->logger_id) ||
-      !logger_json_escape_into(subject_id_escaped, sizeof(subject_id_escaped),
-                               cmd->subject_id) ||
-      !logger_json_escape_into(timezone_escaped, sizeof(timezone_escaped),
-                               cmd->timezone)) {
+  logger_session_writer_json_workspace_t *workspace =
+      logger_session_writer_json_workspace_acquire();
+  char *logger_id_escaped = workspace->logger_id_escaped;
+  char *subject_id_escaped = workspace->subject_id_escaped;
+  char *timezone_escaped = workspace->timezone_escaped;
+  bool ok = logger_json_escape_into(logger_id_escaped,
+                                    sizeof(workspace->logger_id_escaped),
+                                    cmd->logger_id) &&
+            logger_json_escape_into(subject_id_escaped,
+                                    sizeof(workspace->subject_id_escaped),
+                                    cmd->subject_id) &&
+            logger_json_escape_into(timezone_escaped,
+                                    sizeof(workspace->timezone_escaped),
+                                    cmd->timezone);
+  if (!ok) {
+    logger_session_writer_json_workspace_release(workspace);
     return false;
   }
 
-  char payload[LOGGER_SESSION_JSON_MAX];
+  char *payload = workspace->payload;
   const int n = snprintf(
-      payload, sizeof(payload),
+      payload, sizeof(workspace->payload),
       "{\"schema_version\":1,\"record_type\":\"session_start\",\"utc_ns\":%lld,"
       "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"study_day_"
       "local\":\"%s\",\"logger_id\":\"%s\",\"subject_id\":\"%s\",\"timezone\":"
@@ -2163,12 +2195,13 @@ writer_emit_session_start(logger_session_state_t *session,
       (unsigned long)cmd->boot_counter, cmd->session_id, cmd->study_day_local,
       logger_id_escaped, subject_id_escaped, timezone_escaped, cmd->clock_state,
       cmd->session_start_reason);
-  return n > 0 && (size_t)n < sizeof(payload) &&
-         logger_journal_writer_append_json(&session->writer.journal_writer,
-                                           LOGGER_JOURNAL_RECORD_SESSION_START,
-                                           session->writer.next_record_seq++,
-                                           payload) &&
-         logger_journal_writer_sync(&session->writer.journal_writer);
+  ok = n > 0 && (size_t)n < sizeof(workspace->payload) &&
+       logger_journal_writer_append_json(
+           &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_SESSION_START,
+           session->writer.next_record_seq++, payload) &&
+       logger_journal_writer_sync(&session->writer.journal_writer);
+  logger_session_writer_json_workspace_release(workspace);
+  return ok;
 }
 
 /*
@@ -2177,15 +2210,18 @@ writer_emit_session_start(logger_session_state_t *session,
 static bool __attribute__((noinline))
 writer_emit_span_start(logger_session_state_t *session,
                        const logger_writer_span_start_t *cmd) {
-  char h10_escaped[18 * 2u];
-  if (!logger_json_escape_into(h10_escaped, sizeof(h10_escaped),
+  logger_session_writer_json_workspace_t *workspace =
+      logger_session_writer_json_workspace_acquire();
+  char *h10_escaped = workspace->json_a;
+  if (!logger_json_escape_into(h10_escaped, sizeof(workspace->json_a),
                                cmd->h10_address)) {
+    logger_session_writer_json_workspace_release(workspace);
     return false;
   }
 
-  char payload[LOGGER_SESSION_JSON_MAX];
+  char *payload = workspace->payload;
   const int n = snprintf(
-      payload, sizeof(payload),
+      payload, sizeof(workspace->payload),
       "{\"schema_version\":1,\"record_type\":\"span_start\",\"utc_ns\":%lld,"
       "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":"
       "\"%s\",\"span_index_in_session\":%lu,\"start_reason\":\"%s\",\"h10_"
@@ -2194,11 +2230,14 @@ writer_emit_span_start(logger_session_state_t *session,
       (unsigned long)cmd->boot_counter, cmd->session_id, cmd->span_id,
       (unsigned long)cmd->span_index_in_session, cmd->start_reason, h10_escaped,
       cmd->encrypted ? "true" : "false", cmd->bonded ? "true" : "false");
-  return n > 0 && (size_t)n < sizeof(payload) &&
-         logger_journal_writer_append_json(
-             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_SPAN_START,
-             session->writer.next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->writer.journal_writer);
+  const bool ok =
+      n > 0 && (size_t)n < sizeof(workspace->payload) &&
+      logger_journal_writer_append_json(
+          &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_SPAN_START,
+          session->writer.next_record_seq++, payload) &&
+      logger_journal_writer_sync(&session->writer.journal_writer);
+  logger_session_writer_json_workspace_release(workspace);
+  return ok;
 }
 
 /*
@@ -2263,19 +2302,22 @@ writer_emit_marker(logger_session_state_t *session,
 static bool __attribute__((noinline))
 writer_emit_status_snapshot(logger_session_state_t *session,
                             const logger_writer_write_status_snapshot_t *cmd) {
-  char active_span_id_json[64];
-  char fault_code_json[64];
+  logger_session_writer_json_workspace_t *workspace =
+      logger_session_writer_json_workspace_acquire();
+  char *active_span_id_json = workspace->json_a;
+  char *fault_code_json = workspace->json_b;
   if (!logger_json_string_literal(
-          active_span_id_json, sizeof(active_span_id_json),
+          active_span_id_json, sizeof(workspace->json_a),
           cmd->active_span_id[0] != '\0' ? cmd->active_span_id : NULL) ||
-      !logger_json_string_literal(fault_code_json, sizeof(fault_code_json),
+      !logger_json_string_literal(fault_code_json, sizeof(workspace->json_b),
                                   cmd->fault_code)) {
+    logger_session_writer_json_workspace_release(workspace);
     return false;
   }
 
-  char payload[LOGGER_SESSION_JSON_MAX];
+  char *payload = workspace->payload;
   const int n = snprintf(
-      payload, sizeof(payload),
+      payload, sizeof(workspace->payload),
       "{\"schema_version\":1,\"record_type\":\"status_snapshot\",\"utc_ns\":%"
       "lld,\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\","
       "\"active_span_id\":%s,\"battery_voltage_mv\":%u,\"battery_estimate_"
@@ -2289,12 +2331,14 @@ writer_emit_status_snapshot(logger_session_state_t *session,
       (unsigned long long)cmd->sd_free_bytes,
       (unsigned long)cmd->sd_reserve_bytes, cmd->quarantined ? "true" : "false",
       fault_code_json);
-  return n > 0 && (size_t)n < sizeof(payload) &&
-         logger_journal_writer_append_json(
-             &session->writer.journal_writer,
-             LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT,
-             session->writer.next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->writer.journal_writer);
+  const bool ok = n > 0 && (size_t)n < sizeof(workspace->payload) &&
+                  logger_journal_writer_append_json(
+                      &session->writer.journal_writer,
+                      LOGGER_JOURNAL_RECORD_STATUS_SNAPSHOT,
+                      session->writer.next_record_seq++, payload) &&
+                  logger_journal_writer_sync(&session->writer.journal_writer);
+  logger_session_writer_json_workspace_release(workspace);
+  return ok;
 }
 
 /*
@@ -2303,27 +2347,33 @@ writer_emit_status_snapshot(logger_session_state_t *session,
 static bool __attribute__((noinline))
 writer_emit_h10_battery(logger_session_state_t *session,
                         const logger_writer_write_h10_battery_t *cmd) {
-  char span_id_json[64];
-  if (!logger_json_string_literal(span_id_json, sizeof(span_id_json),
+  logger_session_writer_json_workspace_t *workspace =
+      logger_session_writer_json_workspace_acquire();
+  char *span_id_json = workspace->json_a;
+  if (!logger_json_string_literal(span_id_json, sizeof(workspace->json_a),
                                   cmd->span_id[0] != '\0' ? cmd->span_id
                                                           : NULL)) {
+    logger_session_writer_json_workspace_release(workspace);
     return false;
   }
 
-  char payload[LOGGER_SESSION_JSON_MAX];
+  char *payload = workspace->payload;
   const int n = snprintf(
-      payload, sizeof(payload),
+      payload, sizeof(workspace->payload),
       "{\"schema_version\":1,\"record_type\":\"h10_battery\",\"utc_ns\":%lld,"
       "\"mono_us\":%llu,\"boot_counter\":%lu,\"session_id\":\"%s\",\"span_id\":"
       "%s,\"battery_percent\":%u,\"read_reason\":\"%s\"}",
       (long long)cmd->utc_ns, (unsigned long long)cmd->now_ms * 1000ull,
       (unsigned long)cmd->boot_counter, cmd->session_id, span_id_json,
       (unsigned)cmd->battery_percent, cmd->read_reason);
-  return n > 0 && (size_t)n < sizeof(payload) &&
-         logger_journal_writer_append_json(
-             &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_H10_BATTERY,
-             session->writer.next_record_seq++, payload) &&
-         logger_journal_writer_sync(&session->writer.journal_writer);
+  const bool ok =
+      n > 0 && (size_t)n < sizeof(workspace->payload) &&
+      logger_journal_writer_append_json(
+          &session->writer.journal_writer, LOGGER_JOURNAL_RECORD_H10_BATTERY,
+          session->writer.next_record_seq++, payload) &&
+      logger_journal_writer_sync(&session->writer.journal_writer);
+  logger_session_writer_json_workspace_release(workspace);
+  return ok;
 }
 
 /*

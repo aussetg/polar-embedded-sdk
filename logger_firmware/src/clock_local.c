@@ -4,10 +4,32 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "board_config.h"
+
+static void logger_clock_local_write_2_digits(char *dst, unsigned value) {
+  dst[0] = (char)('0' + ((value / 10u) % 10u));
+  dst[1] = (char)('0' + (value % 10u));
+}
+
+static void logger_clock_local_write_4_digits(char *dst, unsigned value) {
+  dst[0] = (char)('0' + ((value / 1000u) % 10u));
+  dst[1] = (char)('0' + ((value / 100u) % 10u));
+  dst[2] = (char)('0' + ((value / 10u) % 10u));
+  dst[3] = (char)('0' + (value % 10u));
+}
+
+static void logger_clock_local_format_date(char out_study_day[11],
+                                           unsigned year, unsigned month,
+                                           unsigned day) {
+  logger_clock_local_write_4_digits(out_study_day, year);
+  out_study_day[4] = '-';
+  logger_clock_local_write_2_digits(out_study_day + 5, month);
+  out_study_day[7] = '-';
+  logger_clock_local_write_2_digits(out_study_day + 8, day);
+  out_study_day[10] = '\0';
+}
 
 static bool logger_clock_local_timezone_present(const char *timezone) {
   return timezone != NULL && timezone[0] != '\0';
@@ -244,7 +266,8 @@ static bool logger_clock_local_derive_study_day_from_fields(
     }
   }
 
-  snprintf(out_study_day, 11, "%04d-%02d-%02d", year, month, day);
+  logger_clock_local_format_date(out_study_day, (unsigned)year, (unsigned)month,
+                                 (unsigned)day);
   return true;
 }
 

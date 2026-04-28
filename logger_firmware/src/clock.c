@@ -46,6 +46,53 @@ static const char *const LOGGER_CLOCK_NTP_SERVERS[] = {
 
 static bool g_clock_initialized = false;
 
+static void logger_clock_write_2_digits(char *dst, unsigned value) {
+  dst[0] = (char)('0' + ((value / 10u) % 10u));
+  dst[1] = (char)('0' + (value % 10u));
+}
+
+static void logger_clock_write_4_digits(char *dst, unsigned value) {
+  dst[0] = (char)('0' + ((value / 1000u) % 10u));
+  dst[1] = (char)('0' + ((value / 100u) % 10u));
+  dst[2] = (char)('0' + ((value / 10u) % 10u));
+  dst[3] = (char)('0' + (value % 10u));
+}
+
+static void logger_clock_write_9_digits(char *dst, unsigned value) {
+  for (size_t i = 9u; i > 0u; --i) {
+    dst[i - 1u] = (char)('0' + (value % 10u));
+    value /= 10u;
+  }
+}
+
+static void
+logger_clock_format_utc_base(char out_rfc3339[LOGGER_CLOCK_RFC3339_UTC_LEN + 1],
+                             unsigned year, unsigned month, unsigned day,
+                             unsigned hour, unsigned minute, unsigned second) {
+  logger_clock_write_4_digits(out_rfc3339, year);
+  out_rfc3339[4] = '-';
+  logger_clock_write_2_digits(out_rfc3339 + 5, month);
+  out_rfc3339[7] = '-';
+  logger_clock_write_2_digits(out_rfc3339 + 8, day);
+  out_rfc3339[10] = 'T';
+  logger_clock_write_2_digits(out_rfc3339 + 11, hour);
+  out_rfc3339[13] = ':';
+  logger_clock_write_2_digits(out_rfc3339 + 14, minute);
+  out_rfc3339[16] = ':';
+  logger_clock_write_2_digits(out_rfc3339 + 17, second);
+  out_rfc3339[19] = '\0';
+}
+
+static void
+logger_clock_format_utc_z(char out_rfc3339[LOGGER_CLOCK_RFC3339_UTC_LEN + 1],
+                          unsigned year, unsigned month, unsigned day,
+                          unsigned hour, unsigned minute, unsigned second) {
+  logger_clock_format_utc_base(out_rfc3339, year, month, day, hour, minute,
+                               second);
+  out_rfc3339[19] = 'Z';
+  out_rfc3339[20] = '\0';
+}
+
 static bool logger_clock_datetime_reasonable_parts(int year, int month, int day,
                                                    int hour, int minute,
                                                    int second);
@@ -344,10 +391,9 @@ static bool logger_clock_format_unix_seconds_rfc3339(
     return false;
   }
 
-  const int n = snprintf(out_rfc3339, LOGGER_CLOCK_RFC3339_UTC_LEN + 1u,
-                         "%04d-%02u-%02uT%02d:%02d:%02dZ", year, month, day,
-                         hour, minute, second);
-  return n > 0 && (size_t)n < (LOGGER_CLOCK_RFC3339_UTC_LEN + 1u);
+  logger_clock_format_utc_z(out_rfc3339, (unsigned)year, month, day,
+                            (unsigned)hour, (unsigned)minute, (unsigned)second);
+  return true;
 }
 
 void logger_clock_ntp_sync_result_init(logger_clock_ntp_sync_result_t *result) {
@@ -482,9 +528,14 @@ static bool logger_clock_update_reg(uint8_t reg, uint8_t mask, uint8_t value) {
 }
 
 static void logger_clock_format_now(logger_clock_status_t *status) {
-  snprintf(status->now_utc, sizeof(status->now_utc),
-           "%04d-%02d-%02dT%02d:%02d:%02dZ", status->year, status->month,
-           status->day, status->hour, status->minute, status->second);
+  if (!logger_clock_datetime_reasonable(status)) {
+    status->now_utc[0] = '\0';
+    return;
+  }
+  logger_clock_format_utc_z(status->now_utc, (unsigned)status->year,
+                            (unsigned)status->month, (unsigned)status->day,
+                            (unsigned)status->hour, (unsigned)status->minute,
+                            (unsigned)status->second);
 }
 
 void logger_clock_init(void) {
@@ -716,14 +767,15 @@ bool logger_clock_format_utc_ns_rfc3339(
   const int hour = (int)(day_seconds / 3600ll);
   const int minute = (int)((day_seconds % 3600ll) / 60ll);
   const int second = (int)(day_seconds % 60ll);
-
-  const int base_n = snprintf(out_rfc3339, LOGGER_CLOCK_RFC3339_UTC_LEN + 1,
-                              "%04d-%02u-%02uT%02d:%02d:%02d", year, month, day,
-                              hour, minute, second);
-  if (base_n <= 0 || (size_t)base_n >= (LOGGER_CLOCK_RFC3339_UTC_LEN + 1u)) {
+  if (!logger_clock_datetime_reasonable_parts(year, (int)month, (int)day, hour,
+                                              minute, second)) {
     return false;
   }
-  size_t out_len = (size_t)base_n;
+
+  logger_clock_format_utc_base(out_rfc3339, (unsigned)year, month, day,
+                               (unsigned)hour, (unsigned)minute,
+                               (unsigned)second);
+  size_t out_len = 19u;
 
   if (nanos == 0) {
     out_rfc3339[out_len++] = 'Z';
@@ -731,11 +783,11 @@ bool logger_clock_format_utc_ns_rfc3339(
     return true;
   }
 
-  char frac[10];
-  snprintf(frac, sizeof(frac), "%09d", (int)nanos);
+  char frac[9];
+  logger_clock_write_9_digits(frac, (unsigned)nanos);
   size_t frac_len = 9u;
   while (frac_len > 0u && frac[frac_len - 1u] == '0') {
-    frac[--frac_len] = '\0';
+    --frac_len;
   }
 
   out_rfc3339[out_len++] = '.';

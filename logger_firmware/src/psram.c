@@ -16,6 +16,7 @@
 #include "hardware/structs/qmi.h"
 #include "hardware/structs/xip_ctrl.h"
 #include "hardware/sync.h"
+#include "hardware/xip_cache.h"
 
 #include <stdbool.h>
 
@@ -69,14 +70,17 @@ _Static_assert(PSRAM_SIZE == APS6404L_SIZE_BYTES,
 
 /* QPI Fast Quad Read 0xEB is command + 24-bit address + six wait cycles
  * before data (command table p. 9; QPI read operation p. 16).  RP2350 QMI can
- * overrun MAX_SELECT by one complete in-progress cache-line transfer; QMI's
- * register docs say to account for a data payload as large as one 32-byte XIP
- * cache line. */
+ * overrun MAX_SELECT by one complete in-progress transfer.  The RP2350
+ * datasheet says cache misses are issued as 64-bit QSPI transfers, and the
+ * pico-sdk XIP cache API defines XIP_CACHE_LINE_SIZE as 8 bytes. */
 #define APS6404L_QPI_CMD_BITS 8u
 #define APS6404L_QPI_ADDR_BITS 24u
 #define APS6404L_QPI_FAST_READ_WAIT_CYCLES 6u
-#define RP2350_XIP_CACHE_LINE_BYTES 32u
+#define RP2350_QMI_CACHE_MISS_TRANSFER_BYTES 8u
 #define RP2350_QMI_MAX_SELECT_GUARD_SCK 1u
+
+_Static_assert(RP2350_QMI_CACHE_MISS_TRANSFER_BYTES == XIP_CACHE_LINE_SIZE,
+               "RP2350 QMI cache-miss transfer size must match XIP line size");
 
 #define QMI_MAX_SELECT_FIELD_MAX 0x3fu
 #define QMI_MIN_DESELECT_FIELD_MAX 0x1fu
@@ -123,9 +127,10 @@ static bool psram_compute_qmi_timing(uint32_t clock_hz, uint32_t *timing_out) {
   const uint32_t qpi_read_overhead_sck = (APS6404L_QPI_CMD_BITS / 4u) +
                                          (APS6404L_QPI_ADDR_BITS / 4u) +
                                          APS6404L_QPI_FAST_READ_WAIT_CYCLES;
-  const uint32_t cache_line_data_sck = (RP2350_XIP_CACHE_LINE_BYTES * 8u) / 4u;
+  const uint32_t cache_miss_data_sck =
+      (RP2350_QMI_CACHE_MISS_TRANSFER_BYTES * 8u) / 4u;
   const uint32_t worst_overrun_sck = qpi_read_overhead_sck +
-                                     cache_line_data_sck +
+                                     cache_miss_data_sck +
                                      RP2350_QMI_MAX_SELECT_GUARD_SCK;
   const uint32_t worst_overrun_ns =
       psram_ceil_div_u64((uint64_t)worst_overrun_sck * 1000000000ull, sck_hz);

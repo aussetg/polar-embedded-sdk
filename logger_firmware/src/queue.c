@@ -1112,15 +1112,15 @@ static bool logger_upload_queue_load_from_path(logger_upload_queue_t *queue,
       logger_upload_queue_init(queue);
       return false;
     }
-    logger_upload_queue_entry_t entry;
-    if (!logger_parse_queue_entry_json(&doc, entry_tok, &entry) ||
-        logger_upload_queue_find_by_session_id(queue, entry.session_id) !=
+    logger_upload_queue_entry_t *entry = &queue->sessions[queue->session_count];
+    if (!logger_parse_queue_entry_json(&doc, entry_tok, entry) ||
+        logger_upload_queue_find_by_session_id(queue, entry->session_id) !=
             NULL) {
       logger_upload_queue_init(queue);
       return false;
     }
 
-    queue->sessions[queue->session_count++] = entry;
+    queue->session_count += 1u;
   }
 
   logger_upload_queue_sort(queue);

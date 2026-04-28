@@ -14,10 +14,15 @@ endif()
 
 set(_logger_board_header_dir "${CMAKE_CURRENT_LIST_DIR}/../firmware/boards/RP2_2")
 if(DEFINED PICO_BOARD_HEADER_DIRS AND NOT PICO_BOARD_HEADER_DIRS STREQUAL "")
-    set(PICO_BOARD_HEADER_DIRS "${PICO_BOARD_HEADER_DIRS};${_logger_board_header_dir}" CACHE STRING "Additional Pico board header search paths" FORCE)
+    set(_logger_board_header_dirs ${PICO_BOARD_HEADER_DIRS})
 else()
-    set(PICO_BOARD_HEADER_DIRS "${_logger_board_header_dir}" CACHE STRING "Additional Pico board header search paths" FORCE)
+    set(_logger_board_header_dirs)
 endif()
+list(FIND _logger_board_header_dirs "${_logger_board_header_dir}" _logger_board_header_dir_index)
+if(_logger_board_header_dir_index EQUAL -1)
+    list(APPEND _logger_board_header_dirs "${_logger_board_header_dir}")
+endif()
+set(PICO_BOARD_HEADER_DIRS "${_logger_board_header_dirs}" CACHE STRING "Additional Pico board header search paths" FORCE)
 
 include("${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
 
@@ -30,6 +35,51 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(LOGGER_FIRMWARE_VERSION "0.2.0" CACHE STRING "Semantic firmware version string")
 set(LOGGER_BUILD_ID "logger-fw-dev" CACHE STRING "Opaque firmware build identifier")
 set(PICO_MBEDTLS_CONFIG_FILE "logger_mbedtls_config.h" CACHE STRING "Project-local Mbed TLS configuration header")
+option(LOGGER_VERIFY_VENDOR_STATE
+    "Fail configure if required local vendor patch state is missing"
+    ON)
+
+if(LOGGER_VERIFY_VENDOR_STATE)
+    set(_logger_tinyusb_ffconf "${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ffconf.h")
+    if(NOT EXISTS "${_logger_tinyusb_ffconf}")
+        message(FATAL_ERROR "TinyUSB FatFs config not found: ${_logger_tinyusb_ffconf}")
+    endif()
+    file(STRINGS "${_logger_tinyusb_ffconf}" _logger_ff_use_mkfs
+        REGEX "^#define FF_USE_MKFS.*1")
+    if(NOT _logger_ff_use_mkfs)
+        message(FATAL_ERROR
+            "TinyUSB FatFs mkfs support is not enabled. "
+            "Run: ./patches/apply_tinyusb_patches.sh --target vendors/pico-sdk/lib/tinyusb")
+    endif()
+
+    set(_logger_pico_mbedtls_cmake "${PICO_SDK_PATH}/src/rp2_common/pico_mbedtls/CMakeLists.txt")
+    if(NOT EXISTS "${_logger_pico_mbedtls_cmake}")
+        message(FATAL_ERROR "pico_mbedtls CMake file not found: ${_logger_pico_mbedtls_cmake}")
+    endif()
+    file(READ "${_logger_pico_mbedtls_cmake}" _logger_pico_mbedtls_text)
+    if(_logger_pico_mbedtls_text MATCHES "psa_crypto_storage\\.c" OR
+       _logger_pico_mbedtls_text MATCHES "psa_its_file\\.c")
+        message(FATAL_ERROR
+            "pico_mbedtls still lists PSA file-storage sources. "
+            "Run: ./patches/apply_pico_sdk_patches.sh --target vendors/pico-sdk")
+    endif()
+
+    set(_logger_btstack_alignment_check "${CMAKE_CURRENT_LIST_DIR}/../patches/check_btstack_alignment.sh")
+    if(EXISTS "${_logger_btstack_alignment_check}")
+        execute_process(
+            COMMAND "${_logger_btstack_alignment_check}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/.."
+            RESULT_VARIABLE _logger_btstack_alignment_rc
+            OUTPUT_VARIABLE _logger_btstack_alignment_stdout
+            ERROR_VARIABLE _logger_btstack_alignment_stderr
+        )
+        if(NOT _logger_btstack_alignment_rc EQUAL 0)
+            message(FATAL_ERROR
+                "BTstack vendor trees are not aligned. Run: ./patches/align_btstack_trees.sh\n"
+                "${_logger_btstack_alignment_stdout}${_logger_btstack_alignment_stderr}")
+        endif()
+    endif()
+endif()
 
 set(LOGGER_TLS_ROOTS_SOURCE_PEM "${CMAKE_CURRENT_LIST_DIR}/tls/public_roots_v1.pem")
 set(LOGGER_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -51,8 +101,7 @@ add_custom_command(
 
 pico_sdk_init()
 
-add_executable(logger_appliance
-    ${LOGGER_UPLOAD_TLS_ROOTS_HEADER}
+set(LOGGER_PROJECT_SOURCES
     src/main.c
     src/app_main.c
     src/app_state.c
@@ -112,11 +161,23 @@ add_executable(logger_appliance
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_security.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_sm_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_transport_adapter.c
+)
+
+set(LOGGER_VENDOR_SOURCES
     ${PICO_SDK_PATH}/lib/btstack/3rd-party/micro-ecc/uECC.c
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src/microtar.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ff.c
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ffunicode.c
 )
+
+add_custom_target(logger_upload_tls_roots
+    DEPENDS "${LOGGER_UPLOAD_TLS_ROOTS_HEADER}")
+
+add_executable(logger_appliance
+    ${LOGGER_PROJECT_SOURCES}
+    ${LOGGER_VENDOR_SOURCES}
+)
+add_dependencies(logger_appliance logger_upload_tls_roots)
 
 option(LOGGER_USE_SRAM_LOCKED_LINKER
     "Use the custom linker script with an explicit RAM hot-path allowlist and SRAM reserve check"
@@ -142,19 +203,27 @@ if(LOGGER_USE_SRAM_LOCKED_LINKER)
         LINKER:--defsym=LOGGER_SRAM_LOCKED_MIN_FREE=${LOGGER_SRAM_LOCKED_MIN_FREE})
 endif()
 
-target_include_directories(logger_appliance PRIVATE
+set(LOGGER_PRIVATE_INCLUDE_DIRS
     ${LOGGER_GENERATED_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/boards/rp2_2
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/include
+)
+
+set(LOGGER_SYSTEM_INCLUDE_DIRS
     ${PICO_SDK_PATH}/lib/btstack/3rd-party/micro-ecc
     ${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/jsmn
     ${CMAKE_CURRENT_LIST_DIR}/../vendors/microtar/src
 )
 
-target_link_libraries(logger_appliance PRIVATE
+target_include_directories(logger_appliance PRIVATE
+    ${LOGGER_PRIVATE_INCLUDE_DIRS})
+target_include_directories(logger_appliance SYSTEM PRIVATE
+    ${LOGGER_SYSTEM_INCLUDE_DIRS})
+
+set(LOGGER_PICO_LIBS
     pico_stdlib
     pico_cyw43_arch_lwip_poll
     pico_lwip_mbedtls
@@ -173,6 +242,10 @@ target_link_libraries(logger_appliance PRIVATE
     hardware_dma
     hardware_spi
     hardware_watchdog
+)
+
+target_link_libraries(logger_appliance PRIVATE
+    ${LOGGER_PICO_LIBS}
 )
 
 target_link_options(logger_appliance PRIVATE
@@ -221,7 +294,11 @@ target_compile_definitions(logger_appliance PRIVATE
     PICO_CORE1_STACK_SIZE=0x1000
 )
 
-target_compile_options(logger_appliance PRIVATE
+option(LOGGER_ERROR_ON_PROJECT_WARNINGS
+    "Treat warnings from project-owned firmware sources as errors"
+    ON)
+
+set(LOGGER_PROJECT_WARNING_OPTIONS
     -Wall
     -Wextra
     -Wshadow
@@ -241,19 +318,25 @@ target_compile_options(logger_appliance PRIVATE
 )
 
 if(LOGGER_WARN_LARGE_STACK_FRAMES)
-    target_compile_options(logger_appliance PRIVATE
+    list(APPEND LOGGER_PROJECT_WARNING_OPTIONS
         -Wframe-larger-than=${LOGGER_STACK_FRAME_WARN_BYTES})
 endif()
 
-if(LOGGER_ERROR_ON_LARGE_STACK_FRAMES)
-    target_compile_options(logger_appliance PRIVATE
-        -Werror=frame-larger-than)
+if(LOGGER_ERROR_ON_PROJECT_WARNINGS)
+    list(APPEND LOGGER_PROJECT_WARNING_OPTIONS -Werror)
+elseif(LOGGER_ERROR_ON_LARGE_STACK_FRAMES)
+    list(APPEND LOGGER_PROJECT_WARNING_OPTIONS -Werror=frame-larger-than)
 endif()
 
 if(LOGGER_EMIT_STACK_USAGE)
-    target_compile_options(logger_appliance PRIVATE
-        -fstack-usage)
+    list(APPEND LOGGER_PROJECT_WARNING_OPTIONS -fstack-usage)
 endif()
+
+# Pico SDK libraries add their own SDK/vendor translation units to the final
+# executable target. Keep strict warning policy scoped to files we own; putting
+# these flags on logger_appliance itself makes third-party code inherit -Werror.
+set_source_files_properties(${LOGGER_PROJECT_SOURCES}
+    PROPERTIES COMPILE_OPTIONS "${LOGGER_PROJECT_WARNING_OPTIONS}")
 
 pico_enable_stdio_usb(logger_appliance 1)
 pico_enable_stdio_uart(logger_appliance 0)
