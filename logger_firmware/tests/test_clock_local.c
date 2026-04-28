@@ -36,20 +36,27 @@ static logger_clock_status_t utc_status(int year, int month, int day, int hour,
   return status;
 }
 
-static void assert_local(const char *label, logger_clock_status_t utc, int year,
-                         int month, int day, int hour, int minute, int second) {
+static void assert_local_tz(const char *label, const char *timezone,
+                            logger_clock_status_t utc, int year, int month,
+                            int day, int hour, int minute, int second) {
   logger_clock_datetime_t local;
   memset(&local, 0, sizeof(local));
-  assert(logger_clock_observed_local_datetime(&utc, "Europe/Paris", &local));
+  assert(logger_clock_observed_local_datetime(&utc, timezone, &local));
   if (local.year != year || local.month != month || local.day != day ||
       local.hour != hour || local.minute != minute || local.second != second) {
     fprintf(stderr,
-            "%s: got %04d-%02d-%02dT%02d:%02d:%02d, expected "
+            "%s (%s): got %04d-%02d-%02dT%02d:%02d:%02d, expected "
             "%04d-%02d-%02dT%02d:%02d:%02d\n",
-            label, local.year, local.month, local.day, local.hour, local.minute,
-            local.second, year, month, day, hour, minute, second);
+            label, timezone, local.year, local.month, local.day, local.hour,
+            local.minute, local.second, year, month, day, hour, minute, second);
     assert(false);
   }
+}
+
+static void assert_local(const char *label, logger_clock_status_t utc, int year,
+                         int month, int day, int hour, int minute, int second) {
+  assert_local_tz(label, "Europe/Paris", utc, year, month, day, hour, minute,
+                  second);
 }
 
 static void assert_window(const char *label, logger_clock_status_t utc,
@@ -83,6 +90,76 @@ static void test_europe_paris_offsets(void) {
                15, 13, 0, 0);
   assert_local("summer CEST offset", utc_status(2026, 7, 15, 12, 0, 0), 2026, 7,
                15, 14, 0, 0);
+}
+
+static void test_fixed_offset_timezones(void) {
+  assert_local_tz("UTC", "UTC", utc_status(2026, 1, 15, 12, 0, 0), 2026, 1, 15,
+                  12, 0, 0);
+  assert_local_tz("GMT alias", "GMT", utc_status(2026, 1, 15, 12, 0, 0), 2026,
+                  1, 15, 12, 0, 0);
+  assert_local_tz("IANA POSIX sign west", "Etc/GMT+12",
+                  utc_status(2026, 1, 15, 12, 0, 0), 2026, 1, 15, 0, 0, 0);
+  assert_local_tz("IANA POSIX sign east", "Etc/GMT-14",
+                  utc_status(2026, 1, 15, 12, 0, 0), 2026, 1, 16, 2, 0, 0);
+  assert_local_tz("Etc/GMT-1 is UTC+1", "Etc/GMT-1",
+                  utc_status(2026, 1, 15, 12, 0, 0), 2026, 1, 15, 13, 0, 0);
+
+  logger_clock_datetime_t local;
+  logger_clock_status_t utc = utc_status(2026, 1, 15, 12, 0, 0);
+  assert(
+      !logger_clock_observed_local_datetime(&utc, "America/Toronto", &local));
+}
+
+static void test_europe_capital_timezones(void) {
+  assert_local_tz("London winter", "Europe/London",
+                  utc_status(2026, 1, 15, 12, 0, 0), 2026, 1, 15, 12, 0, 0);
+  assert_local_tz("London summer", "Europe/London",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 13, 0, 0);
+  assert_local_tz("Berlin winter", "Europe/Berlin",
+                  utc_status(2026, 1, 15, 12, 0, 0), 2026, 1, 15, 13, 0, 0);
+  assert_local_tz("Athens summer", "Europe/Athens",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 15, 0, 0);
+  assert_local_tz("Reykjavik fixed", "Atlantic/Reykjavik",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 12, 0, 0);
+  assert_local_tz("Istanbul fixed", "Europe/Istanbul",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 15, 0, 0);
+}
+
+static void test_us_timezones(void) {
+  assert_local_tz("New York winter", "America/New_York",
+                  utc_status(2026, 1, 15, 12, 0, 0), 2026, 1, 15, 7, 0, 0);
+  assert_local_tz("New York summer", "America/New_York",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 8, 0, 0);
+  assert_local_tz("Chicago summer", "America/Chicago",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 7, 0, 0);
+  assert_local_tz("Denver winter", "America/Denver",
+                  utc_status(2026, 1, 15, 12, 0, 0), 2026, 1, 15, 5, 0, 0);
+  assert_local_tz("Los Angeles summer", "America/Los_Angeles",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 5, 0, 0);
+  assert_local_tz("Phoenix fixed", "America/Phoenix",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 5, 0, 0);
+  assert_local_tz("Anchorage summer", "America/Anchorage",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 4, 0, 0);
+  assert_local_tz("Honolulu fixed", "Pacific/Honolulu",
+                  utc_status(2026, 7, 15, 12, 0, 0), 2026, 7, 15, 2, 0, 0);
+}
+
+static void test_us_dst_transitions(void) {
+  /* 2026-03-08 is the second Sunday of March.  Eastern time jumps at
+   * 07:00 UTC: 01:59:59 EST is followed by 03:00:00 EDT.
+   */
+  assert_local_tz("US DST before spring transition", "America/New_York",
+                  utc_status(2026, 3, 8, 6, 59, 59), 2026, 3, 8, 1, 59, 59);
+  assert_local_tz("US DST at spring transition", "America/New_York",
+                  utc_status(2026, 3, 8, 7, 0, 0), 2026, 3, 8, 3, 0, 0);
+
+  /* 2026-11-01 is the first Sunday of November.  Eastern time falls back at
+   * 06:00 UTC: 01:59:59 EDT is followed by 01:00:00 EST.
+   */
+  assert_local_tz("US DST before fall transition", "America/New_York",
+                  utc_status(2026, 11, 1, 5, 59, 59), 2026, 11, 1, 1, 59, 59);
+  assert_local_tz("US DST at fall transition", "America/New_York",
+                  utc_status(2026, 11, 1, 6, 0, 0), 2026, 11, 1, 1, 0, 0);
 }
 
 static void test_europe_paris_dst_transitions(void) {
@@ -125,7 +202,11 @@ static void test_study_day_rollover(void) {
 
 int main(void) {
   test_europe_paris_offsets();
+  test_fixed_offset_timezones();
+  test_europe_capital_timezones();
+  test_us_timezones();
   test_europe_paris_dst_transitions();
+  test_us_dst_transitions();
   test_overnight_upload_window();
   test_study_day_rollover();
   puts("test_clock_local: ok");

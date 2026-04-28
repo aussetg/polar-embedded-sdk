@@ -616,7 +616,7 @@ bool logger_config_normal_logging_ready(const logger_config_t *config) {
   return logger_string_present(config->logger_id) &&
          logger_string_present(config->subject_id) &&
          logger_string_present(config->bound_h10_address) &&
-         logger_string_present(config->timezone);
+         logger_timezone_supported(config->timezone);
 }
 
 bool logger_config_upload_configured(const logger_config_t *config) {
@@ -751,6 +751,9 @@ bool logger_config_set_bound_h10_address(logger_persisted_state_t *state,
 
 bool logger_config_set_timezone(logger_persisted_state_t *state,
                                 const char *value) {
+  if (logger_string_present(value) && !logger_timezone_supported(value)) {
+    return false;
+  }
   if (!logger_write_if_changed(state->config.timezone,
                                sizeof(state->config.timezone), value, NULL)) {
     return false;

@@ -35,10 +35,6 @@ static bool logger_clock_local_timezone_present(const char *timezone) {
   return timezone != NULL && timezone[0] != '\0';
 }
 
-static bool logger_clock_local_timezone_is_europe_paris(const char *timezone) {
-  return timezone != NULL && strcmp(timezone, "Europe/Paris") == 0;
-}
-
 static bool logger_clock_local_is_leap_year(int year) {
   if ((year % 400) == 0) {
     return true;
@@ -126,8 +122,17 @@ static int logger_clock_local_last_sunday_of_month(int year, int month) {
   return last_day - ((weekday + 1) % 7);
 }
 
-static bool logger_clock_local_europe_paris_dst_active_utc(
-    const logger_clock_status_t *status) {
+static int logger_clock_local_first_sunday_of_month(int year, int month) {
+  const int weekday = logger_clock_local_weekday_from_date(year, month, 1);
+  return 1 + ((6 - weekday + 7) % 7);
+}
+
+static int logger_clock_local_second_sunday_of_month(int year, int month) {
+  return logger_clock_local_first_sunday_of_month(year, month) + 7;
+}
+
+static bool
+logger_clock_local_europe_dst_active_utc(const logger_clock_status_t *status) {
   const int month = status->month;
   if (month < 3 || month > 10) {
     return false;
@@ -152,6 +157,37 @@ static bool logger_clock_local_europe_paris_dst_active_utc(
   return status->hour < 1;
 }
 
+static bool
+logger_clock_local_us_dst_active_utc(const logger_clock_status_t *status,
+                                     int32_t base_offset_seconds) {
+  const int month = status->month;
+  if (month < 3 || month > 11) {
+    return false;
+  }
+  if (month > 3 && month < 11) {
+    return true;
+  }
+
+  const int base_offset_hours = (int)(base_offset_seconds / 3600);
+  if (month == 3) {
+    const int transition_day =
+        logger_clock_local_second_sunday_of_month(status->year, 3);
+    const int transition_hour_utc = 2 - base_offset_hours;
+    if (status->day != transition_day) {
+      return status->day > transition_day;
+    }
+    return status->hour >= transition_hour_utc;
+  }
+
+  const int transition_day =
+      logger_clock_local_first_sunday_of_month(status->year, 11);
+  const int transition_hour_utc = 1 - base_offset_hours;
+  if (status->day != transition_day) {
+    return status->day < transition_day;
+  }
+  return status->hour < transition_hour_utc;
+}
+
 static bool logger_clock_local_timezone_utc_offset_seconds(
     const logger_clock_status_t *utc_status, const char *timezone,
     int32_t *offset_seconds_out) {
@@ -159,14 +195,29 @@ static bool logger_clock_local_timezone_utc_offset_seconds(
       !logger_clock_local_datetime_reasonable(utc_status)) {
     return false;
   }
-  if (logger_timezone_is_utc_like(timezone)) {
-    *offset_seconds_out = 0;
+  if (logger_timezone_fixed_offset_seconds(timezone, offset_seconds_out)) {
     return true;
   }
-  if (logger_clock_local_timezone_is_europe_paris(timezone)) {
+  if (logger_timezone_named_fixed_offset_seconds(timezone,
+                                                 offset_seconds_out)) {
+    return true;
+  }
+
+  int32_t base_offset_seconds = 0;
+  if (logger_timezone_europe_dst_base_offset_seconds(timezone,
+                                                     &base_offset_seconds)) {
     *offset_seconds_out =
-        logger_clock_local_europe_paris_dst_active_utc(utc_status) ? 7200
-                                                                   : 3600;
+        base_offset_seconds +
+        (logger_clock_local_europe_dst_active_utc(utc_status) ? 3600 : 0);
+    return true;
+  }
+  if (logger_timezone_us_dst_base_offset_seconds(timezone,
+                                                 &base_offset_seconds)) {
+    *offset_seconds_out =
+        base_offset_seconds +
+        (logger_clock_local_us_dst_active_utc(utc_status, base_offset_seconds)
+             ? 3600
+             : 0);
     return true;
   }
   return false;

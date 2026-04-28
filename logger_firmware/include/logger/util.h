@@ -146,6 +146,221 @@ static inline bool logger_timezone_is_utc_like(const char *timezone) {
 }
 
 /*
+ * Fixed-offset timezone support.
+ *
+ * Accept the canonical IANA Etc/GMT family, plus GMT/Etc/GMT zero aliases:
+ *   UTC, Etc/UTC, GMT, Etc/GMT, Etc/GMT0, Etc/GMT+N, Etc/GMT-N
+ *
+ * IANA's Etc/GMT signs are intentionally POSIX-style and therefore inverted:
+ *   Etc/GMT+1 == UTC-01:00
+ *   Etc/GMT-1 == UTC+01:00
+ *
+ * Ranges follow tzdb's useful civil offsets: UTC-12 through UTC+14.
+ */
+static inline bool
+logger_timezone_fixed_offset_seconds(const char *timezone,
+                                     int32_t *offset_seconds_out) {
+  if (timezone == NULL || offset_seconds_out == NULL) {
+    return false;
+  }
+
+  if (logger_timezone_is_utc_like(timezone) || strcmp(timezone, "GMT") == 0 ||
+      strcmp(timezone, "Etc/GMT") == 0 || strcmp(timezone, "Etc/GMT0") == 0) {
+    *offset_seconds_out = 0;
+    return true;
+  }
+
+  const char prefix[] = "Etc/GMT";
+  const size_t prefix_len = sizeof(prefix) - 1u;
+  if (strncmp(timezone, prefix, prefix_len) != 0) {
+    return false;
+  }
+
+  const char sign = timezone[prefix_len];
+  if (sign != '+' && sign != '-') {
+    return false;
+  }
+
+  const char *p = timezone + prefix_len + 1u;
+  if (*p == '\0') {
+    return false;
+  }
+
+  unsigned hours = 0u;
+  while (*p != '\0') {
+    if (!isdigit((unsigned char)*p)) {
+      return false;
+    }
+    hours = (hours * 10u) + (unsigned)(*p - '0');
+    if (hours > 14u) {
+      return false;
+    }
+    ++p;
+  }
+
+  if (sign == '+' && hours > 12u) {
+    return false;
+  }
+  *offset_seconds_out =
+      (int32_t)((sign == '+') ? -(int)hours * 3600 : (int)hours * 3600);
+  return true;
+}
+
+static inline bool
+logger_timezone_named_fixed_offset_seconds(const char *timezone,
+                                           int32_t *offset_seconds_out) {
+  if (timezone == NULL || offset_seconds_out == NULL) {
+    return false;
+  }
+  if (strcmp(timezone, "Atlantic/Reykjavik") == 0) {
+    *offset_seconds_out = 0;
+    return true;
+  }
+  if (strcmp(timezone, "Europe/Istanbul") == 0 ||
+      strcmp(timezone, "Europe/Minsk") == 0 ||
+      strcmp(timezone, "Europe/Moscow") == 0) {
+    *offset_seconds_out = 3 * 3600;
+    return true;
+  }
+  if (strcmp(timezone, "America/Phoenix") == 0) {
+    *offset_seconds_out = -7 * 3600;
+    return true;
+  }
+  if (strcmp(timezone, "America/Puerto_Rico") == 0) {
+    *offset_seconds_out = -4 * 3600;
+    return true;
+  }
+  if (strcmp(timezone, "Pacific/Honolulu") == 0) {
+    *offset_seconds_out = -10 * 3600;
+    return true;
+  }
+  if (strcmp(timezone, "Pacific/Guam") == 0) {
+    *offset_seconds_out = 10 * 3600;
+    return true;
+  }
+  return false;
+}
+
+static inline bool logger_timezone_europe_dst_base_offset_seconds(
+    const char *timezone, int32_t *base_offset_seconds_out) {
+  if (timezone == NULL || base_offset_seconds_out == NULL) {
+    return false;
+  }
+
+  if (strcmp(timezone, "Europe/Dublin") == 0 ||
+      strcmp(timezone, "Europe/Lisbon") == 0 ||
+      strcmp(timezone, "Europe/London") == 0) {
+    *base_offset_seconds_out = 0;
+    return true;
+  }
+
+  if (strcmp(timezone, "Europe/Amsterdam") == 0 ||
+      strcmp(timezone, "Europe/Andorra") == 0 ||
+      strcmp(timezone, "Europe/Belgrade") == 0 ||
+      strcmp(timezone, "Europe/Berlin") == 0 ||
+      strcmp(timezone, "Europe/Bratislava") == 0 ||
+      strcmp(timezone, "Europe/Brussels") == 0 ||
+      strcmp(timezone, "Europe/Budapest") == 0 ||
+      strcmp(timezone, "Europe/Copenhagen") == 0 ||
+      strcmp(timezone, "Europe/Gibraltar") == 0 ||
+      strcmp(timezone, "Europe/Ljubljana") == 0 ||
+      strcmp(timezone, "Europe/Luxembourg") == 0 ||
+      strcmp(timezone, "Europe/Madrid") == 0 ||
+      strcmp(timezone, "Europe/Malta") == 0 ||
+      strcmp(timezone, "Europe/Monaco") == 0 ||
+      strcmp(timezone, "Europe/Oslo") == 0 ||
+      strcmp(timezone, "Europe/Paris") == 0 ||
+      strcmp(timezone, "Europe/Podgorica") == 0 ||
+      strcmp(timezone, "Europe/Prague") == 0 ||
+      strcmp(timezone, "Europe/Rome") == 0 ||
+      strcmp(timezone, "Europe/San_Marino") == 0 ||
+      strcmp(timezone, "Europe/Sarajevo") == 0 ||
+      strcmp(timezone, "Europe/Skopje") == 0 ||
+      strcmp(timezone, "Europe/Stockholm") == 0 ||
+      strcmp(timezone, "Europe/Tirane") == 0 ||
+      strcmp(timezone, "Europe/Vaduz") == 0 ||
+      strcmp(timezone, "Europe/Vatican") == 0 ||
+      strcmp(timezone, "Europe/Vienna") == 0 ||
+      strcmp(timezone, "Europe/Warsaw") == 0 ||
+      strcmp(timezone, "Europe/Zagreb") == 0 ||
+      strcmp(timezone, "Europe/Zurich") == 0) {
+    *base_offset_seconds_out = 3600;
+    return true;
+  }
+
+  if (strcmp(timezone, "Europe/Athens") == 0 ||
+      strcmp(timezone, "Europe/Bucharest") == 0 ||
+      strcmp(timezone, "Europe/Chisinau") == 0 ||
+      strcmp(timezone, "Europe/Helsinki") == 0 ||
+      strcmp(timezone, "Europe/Kiev") == 0 ||
+      strcmp(timezone, "Europe/Kyiv") == 0 ||
+      strcmp(timezone, "Europe/Riga") == 0 ||
+      strcmp(timezone, "Europe/Sofia") == 0 ||
+      strcmp(timezone, "Europe/Tallinn") == 0 ||
+      strcmp(timezone, "Europe/Vilnius") == 0) {
+    *base_offset_seconds_out = 2 * 3600;
+    return true;
+  }
+
+  return false;
+}
+
+static inline bool
+logger_timezone_us_dst_base_offset_seconds(const char *timezone,
+                                           int32_t *base_offset_seconds_out) {
+  if (timezone == NULL || base_offset_seconds_out == NULL) {
+    return false;
+  }
+
+  if (strcmp(timezone, "America/Detroit") == 0 ||
+      strcmp(timezone, "America/Indiana/Indianapolis") == 0 ||
+      strcmp(timezone, "America/Kentucky/Louisville") == 0 ||
+      strcmp(timezone, "America/New_York") == 0) {
+    *base_offset_seconds_out = -5 * 3600;
+    return true;
+  }
+  if (strcmp(timezone, "America/Chicago") == 0 ||
+      strcmp(timezone, "America/Indiana/Knox") == 0 ||
+      strcmp(timezone, "America/Menominee") == 0 ||
+      strcmp(timezone, "America/North_Dakota/Center") == 0) {
+    *base_offset_seconds_out = -6 * 3600;
+    return true;
+  }
+  if (strcmp(timezone, "America/Boise") == 0 ||
+      strcmp(timezone, "America/Denver") == 0) {
+    *base_offset_seconds_out = -7 * 3600;
+    return true;
+  }
+  if (strcmp(timezone, "America/Los_Angeles") == 0) {
+    *base_offset_seconds_out = -8 * 3600;
+    return true;
+  }
+  if (strcmp(timezone, "America/Anchorage") == 0 ||
+      strcmp(timezone, "America/Juneau") == 0 ||
+      strcmp(timezone, "America/Nome") == 0 ||
+      strcmp(timezone, "America/Sitka") == 0) {
+    *base_offset_seconds_out = -9 * 3600;
+    return true;
+  }
+  return false;
+}
+
+/*
+ * Timezones implemented by clock_local.c.  Keep this explicit: accepting an
+ * arbitrary IANA name here would make provisioning look complete, then fail
+ * later when local study-day/upload policy is evaluated.
+ */
+static inline bool logger_timezone_supported(const char *timezone) {
+  int32_t offset_seconds = 0;
+  return logger_timezone_fixed_offset_seconds(timezone, &offset_seconds) ||
+         logger_timezone_named_fixed_offset_seconds(timezone,
+                                                    &offset_seconds) ||
+         logger_timezone_europe_dst_base_offset_seconds(timezone,
+                                                        &offset_seconds) ||
+         logger_timezone_us_dst_base_offset_seconds(timezone, &offset_seconds);
+}
+
+/*
  * True when value is non-NULL and not the empty string.
  */
 static inline bool logger_string_present(const char *value) {

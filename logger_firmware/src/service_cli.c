@@ -679,6 +679,11 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     *error_message_out = "config import time.timezone is invalid";
     return false;
   }
+  if (logger_string_present(state_out->config.timezone) &&
+      !logger_timezone_supported(state_out->config.timezone)) {
+    *error_message_out = "config import time.timezone is unsupported";
+    return false;
+  }
 
   const jsmntok_t *critical_tok =
       logger_json_object_get(&doc, battery_tok, "critical_stop_voltage_v");
@@ -965,18 +970,19 @@ static void jsw_err(jsw *w, const char *command, const char *utc,
 
 static void logger_write_required_field_array(jsw *w, const logger_app_t *app,
                                               bool present) {
-  static const char *names[] = {"bound_h10_address", "logger_id", "subject_id",
-                                "timezone"};
+  static const char *names[] = {"bound_h10_address", "logger_id", "subject_id"};
   const char *values[] = {
       app->persisted.config.bound_h10_address,
       app->persisted.config.logger_id,
       app->persisted.config.subject_id,
-      app->persisted.config.timezone,
   };
-  for (size_t i = 0u; i < 4u; i++) {
+  for (size_t i = 0u; i < 3u; i++) {
     if (logger_string_present(values[i]) == present) {
       logger_json_stream_writer_elem_string_or_null(w, names[i]);
     }
+  }
+  if (logger_timezone_supported(app->persisted.config.timezone) == present) {
+    logger_json_stream_writer_elem_string_or_null(w, "timezone");
   }
 }
 
@@ -1003,6 +1009,10 @@ static void logger_write_warnings_array(jsw *w, const logger_app_t *app) {
   }
   if (!logger_config_wifi_configured(&app->persisted.config)) {
     logger_json_stream_writer_elem_string_or_null(w, "wifi_not_configured");
+  }
+  if (logger_string_present(app->persisted.config.timezone) &&
+      !logger_timezone_supported(app->persisted.config.timezone)) {
+    logger_json_stream_writer_elem_string_or_null(w, "timezone_unsupported");
   }
 }
 
