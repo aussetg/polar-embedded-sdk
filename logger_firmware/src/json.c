@@ -126,19 +126,18 @@ static bool logger_json_append_utf8(char *out, size_t out_len, size_t *out_i,
   return false;
 }
 
-void logger_json_escape_into(char *dst, size_t dst_len, const char *src) {
+bool logger_json_escape_into(char *dst, size_t dst_len, const char *src) {
   if (dst == NULL || dst_len == 0u) {
-    return;
+    return false;
   }
 
   size_t out = 0u;
+  dst[0] = '\0';
   if (src == NULL) {
-    dst[0] = '\0';
-    return;
+    return true;
   }
 
-  for (const unsigned char *p = (const unsigned char *)src;
-       *p != '\0' && (out + 1u) < dst_len; ++p) {
+  for (const unsigned char *p = (const unsigned char *)src; *p != '\0'; ++p) {
     const char *replacement = NULL;
     switch (*p) {
     case '\\':
@@ -168,7 +167,8 @@ void logger_json_escape_into(char *dst, size_t dst_len, const char *src) {
     if (replacement != NULL) {
       const size_t repl_len = strlen(replacement);
       if ((out + repl_len) >= dst_len) {
-        break;
+        dst[0] = '\0';
+        return false;
       }
       memcpy(dst + out, replacement, repl_len);
       out += repl_len;
@@ -178,45 +178,55 @@ void logger_json_escape_into(char *dst, size_t dst_len, const char *src) {
       char unicode_buf[7];
       const int n = snprintf(unicode_buf, sizeof(unicode_buf), "\\u%04x", *p);
       if (n != 6 || (out + 6u) >= dst_len) {
-        break;
+        dst[0] = '\0';
+        return false;
       }
       memcpy(dst + out, unicode_buf, 6u);
       out += 6u;
       continue;
     }
+    if ((out + 1u) >= dst_len) {
+      dst[0] = '\0';
+      return false;
+    }
     dst[out++] = (char)*p;
   }
 
   dst[out] = '\0';
+  return true;
 }
 
-void logger_json_string_literal(char *dst, size_t dst_len, const char *src) {
+bool logger_json_string_literal(char *dst, size_t dst_len, const char *src) {
   if (dst == NULL || dst_len == 0u) {
-    return;
+    return false;
   }
+  dst[0] = '\0';
 
   if (src == NULL || src[0] == '\0') {
     const char null_literal[] = "null";
-    const size_t copy_len =
-        sizeof(null_literal) < dst_len ? sizeof(null_literal) : dst_len;
-    memcpy(dst, null_literal, copy_len - 1u);
-    dst[copy_len - 1u] = '\0';
-    return;
+    if (sizeof(null_literal) > dst_len) {
+      return false;
+    }
+    memcpy(dst, null_literal, sizeof(null_literal));
+    return true;
   }
 
   if (dst_len < 3u) {
-    dst[0] = '\0';
-    return;
+    return false;
   }
 
   dst[0] = '"';
   /* Reserve 2 bytes: closing quote + NUL. escape_into writes up to
      (dst_len - 2) - 1 chars plus its own NUL, which we overwrite. */
-  logger_json_escape_into(dst + 1u, dst_len - 2u, src);
+  if (!logger_json_escape_into(dst + 1u, dst_len - 2u, src)) {
+    dst[0] = '\0';
+    return false;
+  }
 
   const size_t escaped_len = strlen(dst + 1u);
   dst[1u + escaped_len] = '"';
   dst[2u + escaped_len] = '\0';
+  return true;
 }
 
 void logger_json_fwrite_escaped(FILE *stream, const char *value) {

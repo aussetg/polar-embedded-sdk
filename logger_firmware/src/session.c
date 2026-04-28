@@ -270,12 +270,26 @@ static void logger_sb_append(logger_sb_t *sb, const char *text) {
     return;
   }
   const size_t text_len = strlen(text);
-  if ((sb->len + text_len + 1u) > sb->cap) {
+  if (sb->len >= sb->cap || text_len >= (sb->cap - sb->len)) {
     sb->ok = false;
     return;
   }
   memcpy(sb->buf + sb->len, text, text_len + 1u);
   sb->len += text_len;
+}
+
+static void logger_sb_appendn(logger_sb_t *sb, const char *text,
+                              size_t text_len) {
+  if (!sb->ok || text == NULL) {
+    return;
+  }
+  if (sb->len >= sb->cap || text_len >= (sb->cap - sb->len)) {
+    sb->ok = false;
+    return;
+  }
+  memcpy(sb->buf + sb->len, text, text_len);
+  sb->len += text_len;
+  sb->buf[sb->len] = '\0';
 }
 
 static void logger_sb_appendf(logger_sb_t *sb, const char *fmt, ...) {
@@ -295,9 +309,64 @@ static void logger_sb_appendf(logger_sb_t *sb, const char *fmt, ...) {
 
 static void logger_sb_append_json_string_or_null(logger_sb_t *sb,
                                                  const char *value) {
-  char literal[256];
-  logger_json_string_literal(literal, sizeof(literal), value);
-  logger_sb_append(sb, literal);
+  if (value == NULL || value[0] == '\0') {
+    logger_sb_append(sb, "null");
+    return;
+  }
+
+  logger_sb_append(sb, "\"");
+  const char *run = value;
+  for (const unsigned char *p = (const unsigned char *)value;
+       sb->ok && *p != '\0'; ++p) {
+    const char *replacement = NULL;
+    char unicode_buf[7];
+    switch (*p) {
+    case '\\':
+      replacement = "\\\\";
+      break;
+    case '"':
+      replacement = "\\\"";
+      break;
+    case '\b':
+      replacement = "\\b";
+      break;
+    case '\f':
+      replacement = "\\f";
+      break;
+    case '\n':
+      replacement = "\\n";
+      break;
+    case '\r':
+      replacement = "\\r";
+      break;
+    case '\t':
+      replacement = "\\t";
+      break;
+    default:
+      if (*p < 0x20u) {
+        const int n = snprintf(unicode_buf, sizeof(unicode_buf), "\\u%04x", *p);
+        if (n != 6) {
+          sb->ok = false;
+          return;
+        }
+        replacement = unicode_buf;
+      } else {
+        continue;
+      }
+      break;
+    }
+
+    const char *escaped_at = (const char *)p;
+    if (escaped_at > run) {
+      logger_sb_appendn(sb, run, (size_t)(escaped_at - run));
+    }
+    logger_sb_append(sb, replacement);
+    run = escaped_at + 1u;
+  }
+  if (sb->ok && run[0] != '\0') {
+    logger_sb_append(sb, run);
+  }
+  logger_sb_append(sb, "\"");
 }
 
 static void
@@ -456,9 +525,13 @@ logger_session_write_live_internal(const logger_session_state_t *session,
   logger_session_live_write_workspace_t *workspace =
       logger_session_live_write_workspace_acquire();
 
-  logger_json_string_literal(
-      workspace->current_span_id_json, sizeof(workspace->current_span_id_json),
-      session->span_active ? session->current_span_id : NULL);
+  if (!logger_json_string_literal(
+          workspace->current_span_id_json,
+          sizeof(workspace->current_span_id_json),
+          session->span_active ? session->current_span_id : NULL)) {
+    logger_session_live_write_workspace_release(workspace);
+    return false;
+  }
   if (session->span_active) {
     snprintf(workspace->current_span_index_json,
              sizeof(workspace->current_span_index_json), "%lu",
@@ -467,8 +540,12 @@ logger_session_write_live_internal(const logger_session_state_t *session,
     logger_copy_string(workspace->current_span_index_json,
                        sizeof(workspace->current_span_index_json), "null");
   }
-  logger_json_string_literal(workspace->last_flush_utc_json,
-                             sizeof(workspace->last_flush_utc_json), now_utc);
+  if (!logger_json_string_literal(workspace->last_flush_utc_json,
+                                  sizeof(workspace->last_flush_utc_json),
+                                  now_utc)) {
+    logger_session_live_write_workspace_release(workspace);
+    return false;
+  }
 
   const int n = snprintf(
       workspace->payload, sizeof(workspace->payload),
@@ -2066,12 +2143,14 @@ writer_emit_session_start(logger_session_state_t *session,
   char logger_id_escaped[LOGGER_CONFIG_LOGGER_ID_MAX * 2u];
   char subject_id_escaped[LOGGER_CONFIG_SUBJECT_ID_MAX * 2u];
   char timezone_escaped[LOGGER_CONFIG_TIMEZONE_MAX * 2u];
-  logger_json_escape_into(logger_id_escaped, sizeof(logger_id_escaped),
-                          cmd->logger_id);
-  logger_json_escape_into(subject_id_escaped, sizeof(subject_id_escaped),
-                          cmd->subject_id);
-  logger_json_escape_into(timezone_escaped, sizeof(timezone_escaped),
-                          cmd->timezone);
+  if (!logger_json_escape_into(logger_id_escaped, sizeof(logger_id_escaped),
+                               cmd->logger_id) ||
+      !logger_json_escape_into(subject_id_escaped, sizeof(subject_id_escaped),
+                               cmd->subject_id) ||
+      !logger_json_escape_into(timezone_escaped, sizeof(timezone_escaped),
+                               cmd->timezone)) {
+    return false;
+  }
 
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
@@ -2099,7 +2178,10 @@ static bool __attribute__((noinline))
 writer_emit_span_start(logger_session_state_t *session,
                        const logger_writer_span_start_t *cmd) {
   char h10_escaped[18 * 2u];
-  logger_json_escape_into(h10_escaped, sizeof(h10_escaped), cmd->h10_address);
+  if (!logger_json_escape_into(h10_escaped, sizeof(h10_escaped),
+                               cmd->h10_address)) {
+    return false;
+  }
 
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
@@ -2183,11 +2265,13 @@ writer_emit_status_snapshot(logger_session_state_t *session,
                             const logger_writer_write_status_snapshot_t *cmd) {
   char active_span_id_json[64];
   char fault_code_json[64];
-  logger_json_string_literal(
-      active_span_id_json, sizeof(active_span_id_json),
-      cmd->active_span_id[0] != '\0' ? cmd->active_span_id : NULL);
-  logger_json_string_literal(fault_code_json, sizeof(fault_code_json),
-                             cmd->fault_code);
+  if (!logger_json_string_literal(
+          active_span_id_json, sizeof(active_span_id_json),
+          cmd->active_span_id[0] != '\0' ? cmd->active_span_id : NULL) ||
+      !logger_json_string_literal(fault_code_json, sizeof(fault_code_json),
+                                  cmd->fault_code)) {
+    return false;
+  }
 
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(
@@ -2220,8 +2304,11 @@ static bool __attribute__((noinline))
 writer_emit_h10_battery(logger_session_state_t *session,
                         const logger_writer_write_h10_battery_t *cmd) {
   char span_id_json[64];
-  logger_json_string_literal(span_id_json, sizeof(span_id_json),
-                             cmd->span_id[0] != '\0' ? cmd->span_id : NULL);
+  if (!logger_json_string_literal(span_id_json, sizeof(span_id_json),
+                                  cmd->span_id[0] != '\0' ? cmd->span_id
+                                                          : NULL)) {
+    return false;
+  }
 
   char payload[LOGGER_SESSION_JSON_MAX];
   const int n = snprintf(

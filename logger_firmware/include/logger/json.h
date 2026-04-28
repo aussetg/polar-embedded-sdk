@@ -19,8 +19,10 @@ typedef struct {
 bool logger_json_parse(logger_json_doc_t *doc, const char *json,
                        size_t json_len, jsmntok_t *tokens, size_t token_cap);
 
-void logger_json_escape_into(char *dst, size_t dst_len, const char *src);
-void logger_json_string_literal(char *dst, size_t dst_len, const char *src);
+bool logger_json_escape_into(char *dst, size_t dst_len, const char *src)
+    __attribute__((warn_unused_result));
+bool logger_json_string_literal(char *dst, size_t dst_len, const char *src)
+    __attribute__((warn_unused_result));
 void logger_json_fwrite_escaped(FILE *stream, const char *value);
 
 const jsmntok_t *logger_json_root(const logger_json_doc_t *doc);
