@@ -139,6 +139,7 @@ typedef struct logger_app {
   bool last_day_outcome_valid;
   bool pending_next_session_clock_jump;
   bool last_clock_observation_available;
+  bool last_clock_observation_utc_available;
   bool last_clock_observation_valid;
   bool indicator_led_on;
   bool boot_banner_printed;
