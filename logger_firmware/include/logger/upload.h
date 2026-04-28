@@ -40,6 +40,9 @@ typedef struct {
   char session_id[33];
   char final_status[LOGGER_UPLOAD_QUEUE_STATUS_MAX + 1];
   char failure_class[LOGGER_UPLOAD_QUEUE_FAILURE_CLASS_MAX + 1];
+  char server_error_code[LOGGER_UPLOAD_QUEUE_SERVER_ERROR_CODE_MAX + 1];
+  char server_error_message[LOGGER_UPLOAD_QUEUE_SERVER_ERROR_MESSAGE_MAX + 1];
+  char response_excerpt[LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX + 1];
   char receipt_id[LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX + 1];
   char verified_upload_utc[LOGGER_UPLOAD_QUEUE_UTC_MAX + 1];
   char message[LOGGER_UPLOAD_MESSAGE_MAX + 1];

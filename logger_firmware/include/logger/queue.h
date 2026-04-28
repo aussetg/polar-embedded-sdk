@@ -10,6 +10,9 @@
 #define LOGGER_UPLOAD_QUEUE_MAX_SESSIONS 64
 #define LOGGER_UPLOAD_QUEUE_STATUS_MAX 24
 #define LOGGER_UPLOAD_QUEUE_FAILURE_CLASS_MAX 32
+#define LOGGER_UPLOAD_QUEUE_SERVER_ERROR_CODE_MAX 48
+#define LOGGER_UPLOAD_QUEUE_SERVER_ERROR_MESSAGE_MAX 160
+#define LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX 160
 #define LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX 96
 #define LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN 64
 #define LOGGER_UPLOAD_QUEUE_UTC_MAX 31
@@ -27,6 +30,11 @@ typedef struct {
   uint32_t attempt_count;
   char last_attempt_utc[LOGGER_UPLOAD_QUEUE_UTC_MAX + 1];
   char last_failure_class[LOGGER_UPLOAD_QUEUE_FAILURE_CLASS_MAX + 1];
+  uint16_t last_http_status;
+  char last_server_error_code[LOGGER_UPLOAD_QUEUE_SERVER_ERROR_CODE_MAX + 1];
+  char last_server_error_message[LOGGER_UPLOAD_QUEUE_SERVER_ERROR_MESSAGE_MAX +
+                                 1];
+  char last_response_excerpt[LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX + 1];
   char verified_upload_utc[LOGGER_UPLOAD_QUEUE_UTC_MAX + 1];
   char receipt_id[LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX + 1];
 } logger_upload_queue_entry_t;

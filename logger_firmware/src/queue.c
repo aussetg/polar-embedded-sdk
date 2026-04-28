@@ -22,7 +22,7 @@
 #define LOGGER_QUEUE_READ_MAX 49152u
 #define LOGGER_MANIFEST_JSON_TOKEN_MAX 512u
 #define LOGGER_QUEUE_TOP_LEVEL_JSON_TOKEN_COUNT 7u
-#define LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT 29u
+#define LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT 37u
 #define LOGGER_QUEUE_JSON_TOKEN_MAX                                            \
   (LOGGER_QUEUE_TOP_LEVEL_JSON_TOKEN_COUNT +                                   \
    (LOGGER_UPLOAD_QUEUE_MAX_SESSIONS * LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT))
@@ -83,23 +83,21 @@ typedef struct {
 
 #define LOGGER_QUEUE_SCRATCH_ADDR (PSRAM_QUEUE_REGION_BASE)
 
-#define LOGGER_QUEUE_PSRAM_WORKSPACE_BASE                                     \
+#define LOGGER_QUEUE_PSRAM_WORKSPACE_BASE                                      \
   (LOGGER_QUEUE_SCRATCH_ADDR + sizeof(queue_scratch_t))
-#define LOGGER_QUEUE_TMP_WORKSPACE_ADDR                                       \
-  (LOGGER_QUEUE_PSRAM_WORKSPACE_BASE)
-#define LOGGER_QUEUE_OP_WORKSPACE_ADDR                                        \
+#define LOGGER_QUEUE_TMP_WORKSPACE_ADDR (LOGGER_QUEUE_PSRAM_WORKSPACE_BASE)
+#define LOGGER_QUEUE_OP_WORKSPACE_ADDR                                         \
   (LOGGER_QUEUE_TMP_WORKSPACE_ADDR + sizeof(queue_tmp_workspace_t))
-#define LOGGER_QUEUE_SCAN_WORKSPACE_ADDR                                      \
+#define LOGGER_QUEUE_SCAN_WORKSPACE_ADDR                                       \
   (LOGGER_QUEUE_OP_WORKSPACE_ADDR + sizeof(queue_op_workspace_t))
-#define LOGGER_QUEUE_DELETE_WORKSPACE_ADDR                                    \
+#define LOGGER_QUEUE_DELETE_WORKSPACE_ADDR                                     \
   (LOGGER_QUEUE_SCAN_WORKSPACE_ADDR + sizeof(queue_scan_workspace_t))
-#define LOGGER_QUEUE_PSRAM_WORKSPACE_END                                      \
+#define LOGGER_QUEUE_PSRAM_WORKSPACE_END                                       \
   (LOGGER_QUEUE_DELETE_WORKSPACE_ADDR + sizeof(queue_delete_workspace_t))
 
-_Static_assert(
-    LOGGER_QUEUE_PSRAM_WORKSPACE_END <=
-        PSRAM_QUEUE_REGION_BASE + PSRAM_QUEUE_REGION_SIZE,
-    "queue PSRAM workspace exceeds reserved queue region");
+_Static_assert(LOGGER_QUEUE_PSRAM_WORKSPACE_END <=
+                   PSRAM_QUEUE_REGION_BASE + PSRAM_QUEUE_REGION_SIZE,
+               "queue PSRAM workspace exceeds reserved queue region");
 
 static queue_scratch_t *g_queue_scratch;
 
@@ -175,8 +173,8 @@ static queue_scan_workspace_t *logger_queue_scan_workspace_acquire(void) {
   return workspace;
 }
 
-static void logger_queue_scan_workspace_release(
-    queue_scan_workspace_t *workspace) {
+static void
+logger_queue_scan_workspace_release(queue_scan_workspace_t *workspace) {
   (void)workspace;
   queue_scan_workspace_t *const expected = logger_queue_scan_workspace_ptr();
   assert(workspace == expected);
@@ -192,8 +190,8 @@ static queue_delete_workspace_t *logger_queue_delete_workspace_acquire(void) {
   return workspace;
 }
 
-static void logger_queue_delete_workspace_release(
-    queue_delete_workspace_t *workspace) {
+static void
+logger_queue_delete_workspace_release(queue_delete_workspace_t *workspace) {
   (void)workspace;
   queue_delete_workspace_t *const expected =
       logger_queue_delete_workspace_ptr();
@@ -400,9 +398,50 @@ logger_queue_copy_mutable_fields(logger_upload_queue_entry_t *dst,
                      src->last_attempt_utc);
   logger_copy_string(dst->last_failure_class, sizeof(dst->last_failure_class),
                      src->last_failure_class);
+  dst->last_http_status = src->last_http_status;
+  logger_copy_string(dst->last_server_error_code,
+                     sizeof(dst->last_server_error_code),
+                     src->last_server_error_code);
+  logger_copy_string(dst->last_server_error_message,
+                     sizeof(dst->last_server_error_message),
+                     src->last_server_error_message);
+  logger_copy_string(dst->last_response_excerpt,
+                     sizeof(dst->last_response_excerpt),
+                     src->last_response_excerpt);
   logger_copy_string(dst->verified_upload_utc, sizeof(dst->verified_upload_utc),
                      src->verified_upload_utc);
   logger_copy_string(dst->receipt_id, sizeof(dst->receipt_id), src->receipt_id);
+}
+
+static void logger_queue_copy_optional_string(const logger_json_doc_t *doc,
+                                              const jsmntok_t *object_tok,
+                                              const char *key, char *out,
+                                              size_t out_len) {
+  if (out == NULL || out_len == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  const jsmntok_t *tok = logger_json_object_get(doc, object_tok, key);
+  if (tok == NULL || logger_json_token_is_null(doc, tok)) {
+    return;
+  }
+  (void)logger_json_token_copy_string(doc, tok, out, out_len);
+}
+
+static void
+logger_queue_copy_optional_http_status(const logger_json_doc_t *doc,
+                                       const jsmntok_t *object_tok,
+                                       logger_upload_queue_entry_t *entry) {
+  entry->last_http_status = 0u;
+  const jsmntok_t *tok =
+      logger_json_object_get(doc, object_tok, "last_http_status");
+  if (tok == NULL || logger_json_token_is_null(doc, tok)) {
+    return;
+  }
+  uint32_t value = 0u;
+  if (logger_json_token_get_uint32(doc, tok, &value) && value <= 999u) {
+    entry->last_http_status = (uint16_t)value;
+  }
 }
 
 static bool
@@ -476,6 +515,17 @@ static bool logger_parse_queue_entry_json(const logger_json_doc_t *doc,
   }
 
   entry->attempt_count = attempt_count;
+  logger_queue_copy_optional_http_status(doc, object_tok, entry);
+  logger_queue_copy_optional_string(doc, object_tok, "last_server_error_code",
+                                    entry->last_server_error_code,
+                                    sizeof(entry->last_server_error_code));
+  logger_queue_copy_optional_string(doc, object_tok,
+                                    "last_server_error_message",
+                                    entry->last_server_error_message,
+                                    sizeof(entry->last_server_error_message));
+  logger_queue_copy_optional_string(doc, object_tok, "last_response_excerpt",
+                                    entry->last_response_excerpt,
+                                    sizeof(entry->last_response_excerpt));
   return true;
 }
 
@@ -617,8 +667,7 @@ static bool logger_remove_closed_session_dir(const char *dir_name) {
       break;
     }
 
-    if (!logger_path_join3(workspace->child_path,
-                           sizeof(workspace->child_path),
+    if (!logger_path_join3(workspace->child_path, sizeof(workspace->child_path),
                            workspace->dir_path, "/", workspace->info.fname) ||
         f_unlink(workspace->child_path) != FR_OK) {
       ok = false;
@@ -635,8 +684,7 @@ static bool logger_remove_closed_session_dir(const char *dir_name) {
   return removed;
 }
 
-static void __attribute__((noinline))
-logger_upload_queue_merge_scanned_entries(
+static void __attribute__((noinline)) logger_upload_queue_merge_scanned_entries(
     logger_upload_queue_t *merged, const logger_upload_queue_t *scanned,
     const logger_upload_queue_t *previous, bool loaded_previous,
     bool *previous_seen, logger_system_log_t *system_log,
@@ -711,9 +759,9 @@ static bool logger_upload_queue_merge_scan_with_previous(
 
   logger_copy_string(merged->updated_at_utc, sizeof(merged->updated_at_utc),
                      updated_at_utc_or_null);
-  logger_upload_queue_merge_scanned_entries(
-      merged, scanned, previous, loaded_previous, previous_seen, system_log,
-      updated_at_utc_or_null);
+  logger_upload_queue_merge_scanned_entries(merged, scanned, previous,
+                                            loaded_previous, previous_seen,
+                                            system_log, updated_at_utc_or_null);
   if (loaded_previous) {
     logger_upload_queue_log_unreconciled_previous(
         previous, previous_seen, system_log, updated_at_utc_or_null);
@@ -922,18 +970,16 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
 
     if (!logger_path_join3(scan_workspace->manifest_path,
                            sizeof(scan_workspace->manifest_path),
-                           LOGGER_SESSIONS_DIR "/",
-                           scan_workspace->info.fname,
+                           LOGGER_SESSIONS_DIR "/", scan_workspace->info.fname,
                            "/manifest.json") ||
         !logger_path_join3(scan_workspace->journal_path,
                            sizeof(scan_workspace->journal_path),
-                           LOGGER_SESSIONS_DIR "/",
-                           scan_workspace->info.fname,
+                           LOGGER_SESSIONS_DIR "/", scan_workspace->info.fname,
                            "/journal.bin") ||
         !logger_path_join3(scan_workspace->live_path,
                            sizeof(scan_workspace->live_path),
-                           LOGGER_SESSIONS_DIR "/",
-                           scan_workspace->info.fname, "/live.json")) {
+                           LOGGER_SESSIONS_DIR "/", scan_workspace->info.fname,
+                           "/live.json")) {
       logger_log_local_corrupt(system_log, updated_at_utc_or_null,
                                scan_workspace->info.fname, "path_too_long");
       continue;
@@ -989,11 +1035,10 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
     entry->quarantined = manifest.quarantined;
     logger_copy_string(entry->status, sizeof(entry->status), "pending");
 
-    if (!logger_upload_bundle_compute(scan_workspace->info.fname,
-                                      scan_workspace->manifest_path,
-                                      scan_workspace->journal_path,
-                                      entry->bundle_sha256,
-                                      &entry->bundle_size_bytes)) {
+    if (!logger_upload_bundle_compute(
+            scan_workspace->info.fname, scan_workspace->manifest_path,
+            scan_workspace->journal_path, entry->bundle_sha256,
+            &entry->bundle_size_bytes)) {
       logger_log_local_corrupt(system_log, updated_at_utc_or_null,
                                scan_workspace->info.fname,
                                "bundle_hash_failed");
@@ -1072,6 +1117,24 @@ bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
     ok = ok && logger_file_write_cstr(&file, ",\"last_failure_class\":");
     ok = ok && logger_file_write_json_string_or_null(&file,
                                                      entry->last_failure_class);
+    ok = ok && logger_file_write_cstr(&file, ",\"last_http_status\":");
+    if (entry->last_http_status > 0u) {
+      const int http_n = snprintf(number_buf, sizeof(number_buf), "%u",
+                                  (unsigned)entry->last_http_status);
+      ok = ok && http_n > 0 && (size_t)http_n < sizeof(number_buf) &&
+           logger_file_write_all(&file, number_buf, (size_t)http_n);
+    } else {
+      ok = ok && logger_file_write_cstr(&file, "null");
+    }
+    ok = ok && logger_file_write_cstr(&file, ",\"last_server_error_code\":");
+    ok = ok && logger_file_write_json_string_or_null(
+                   &file, entry->last_server_error_code);
+    ok = ok && logger_file_write_cstr(&file, ",\"last_server_error_message\":");
+    ok = ok && logger_file_write_json_string_or_null(
+                   &file, entry->last_server_error_message);
+    ok = ok && logger_file_write_cstr(&file, ",\"last_response_excerpt\":");
+    ok = ok && logger_file_write_json_string_or_null(
+                   &file, entry->last_response_excerpt);
     ok = ok && logger_file_write_cstr(&file, ",\"verified_upload_utc\":");
     ok = ok && logger_file_write_json_string_or_null(
                    &file, entry->verified_upload_utc);
@@ -1113,9 +1176,9 @@ bool logger_upload_queue_rebuild_file(
     return false;
   }
 
-  if (!logger_upload_queue_merge_scan_with_previous(
-          rebuilt, scanned, previous, previous_seen, system_log,
-          updated_at_utc_or_null)) {
+  if (!logger_upload_queue_merge_scan_with_previous(rebuilt, scanned, previous,
+                                                    previous_seen, system_log,
+                                                    updated_at_utc_or_null)) {
     logger_queue_op_workspace_release(workspace);
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
@@ -1159,6 +1222,10 @@ bool logger_upload_queue_requeue_blocked_file(
     }
     logger_copy_string(entry->status, sizeof(entry->status), "pending");
     entry->last_failure_class[0] = '\0';
+    entry->last_http_status = 0u;
+    entry->last_server_error_code[0] = '\0';
+    entry->last_server_error_message[0] = '\0';
+    entry->last_response_excerpt[0] = '\0';
     entry->verified_upload_utc[0] = '\0';
     entry->receipt_id[0] = '\0';
     requeued_count += 1u;

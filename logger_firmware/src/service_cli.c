@@ -105,7 +105,16 @@ static const char *logger_upload_queue_summary_blocked_retry_hint(
 
 static const char *logger_upload_queue_entry_status_detail(
     const logger_upload_queue_entry_t *entry) {
-  if (entry == NULL || strcmp(entry->status, "blocked_min_firmware") != 0) {
+  if (entry == NULL) {
+    return NULL;
+  }
+  if (logger_string_present(entry->last_server_error_message)) {
+    return entry->last_server_error_message;
+  }
+  if (logger_string_present(entry->last_response_excerpt)) {
+    return entry->last_response_excerpt;
+  }
+  if (strcmp(entry->status, "blocked_min_firmware") != 0) {
     return NULL;
   }
   return logger_upload_blocked_reason_hint();
@@ -1531,6 +1540,27 @@ static void logger_handle_queue_json(logger_app_t *app) {
         &w, "last_failure_class",
         logger_string_present(entry->last_failure_class)
             ? entry->last_failure_class
+            : NULL);
+    if (entry->last_http_status > 0u) {
+      logger_json_stream_writer_field_int32(&w, "last_http_status",
+                                            (int32_t)entry->last_http_status);
+    } else {
+      logger_json_stream_writer_field_null(&w, "last_http_status");
+    }
+    logger_json_stream_writer_field_string_or_null(
+        &w, "last_server_error_code",
+        logger_string_present(entry->last_server_error_code)
+            ? entry->last_server_error_code
+            : NULL);
+    logger_json_stream_writer_field_string_or_null(
+        &w, "last_server_error_message",
+        logger_string_present(entry->last_server_error_message)
+            ? entry->last_server_error_message
+            : NULL);
+    logger_json_stream_writer_field_string_or_null(
+        &w, "last_response_excerpt",
+        logger_string_present(entry->last_response_excerpt)
+            ? entry->last_response_excerpt
             : NULL);
     logger_json_stream_writer_field_string_or_null(
         &w, "verified_upload_utc",
@@ -3555,6 +3585,10 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
                      sizeof(entry->verified_upload_utc),
                      logger_clock_now_utc_or_null(&app->clock));
   entry->last_failure_class[0] = '\0';
+  entry->last_http_status = 0u;
+  entry->last_server_error_code[0] = '\0';
+  entry->last_server_error_message[0] = '\0';
+  entry->last_response_excerpt[0] = '\0';
   logger_copy_string(queue->updated_at_utc, sizeof(queue->updated_at_utc),
                      logger_clock_now_utc_or_null(&app->clock));
 
@@ -3903,6 +3937,19 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
   } else {
     logger_json_stream_writer_field_null(&w, "http_status");
   }
+  logger_json_stream_writer_field_string_or_null(
+      &w, "server_error_code",
+      logger_string_present(result.server_error_code) ? result.server_error_code
+                                                      : NULL);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "server_error_message",
+      logger_string_present(result.server_error_message)
+          ? result.server_error_message
+          : NULL);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "response_excerpt",
+      logger_string_present(result.response_excerpt) ? result.response_excerpt
+                                                     : NULL);
   logger_json_stream_writer_field_string_or_null(
       &w, "message",
       logger_string_present(result.message) ? result.message : NULL);
