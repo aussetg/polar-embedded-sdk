@@ -790,7 +790,8 @@ static bool logger_upload_http_execute(
     cyw43_arch_poll();
 
     const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    if (!request->dns_done && now_ms >= dns_deadline) {
+    if (!request->dns_done &&
+        logger_mono_ms_deadline_reached(now_ms, dns_deadline)) {
       request->transport_failed = true;
       request->transport_err = ERR_TIMEOUT;
       break;
@@ -804,7 +805,7 @@ static bool logger_upload_http_execute(
       (void)logger_upload_http_connect(request, url, config);
     }
     if (request->connect_started && !request->connected &&
-        now_ms >= connect_deadline) {
+        logger_mono_ms_deadline_reached(now_ms, connect_deadline)) {
       request->transport_failed = true;
       request->transport_err = ERR_TIMEOUT;
       break;
@@ -812,7 +813,7 @@ static bool logger_upload_http_execute(
     if (request->connected) {
       (void)logger_upload_http_send_more(request);
     }
-    if (now_ms >= deadline) {
+    if (logger_mono_ms_deadline_reached(now_ms, deadline)) {
       request->transport_failed = true;
       request->transport_err = ERR_TIMEOUT;
       break;

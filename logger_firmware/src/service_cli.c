@@ -1305,7 +1305,8 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   if (app->recovery_reason == LOGGER_RECOVERY_NONE) {
     logger_json_stream_writer_field_null(w, "next_attempt_ms");
   } else if (app->recovery_next_attempt_mono_ms == 0u ||
-             now_ms >= app->recovery_next_attempt_mono_ms) {
+             logger_mono_ms_deadline_reached(
+                 now_ms, app->recovery_next_attempt_mono_ms)) {
     logger_json_stream_writer_field_uint32(w, "next_attempt_ms", 0u);
   } else {
     logger_json_stream_writer_field_uint32(
@@ -4167,7 +4168,8 @@ void logger_service_cli_init(logger_service_cli_t *cli) {
 
 static bool logger_service_cli_is_unlocked(const logger_service_cli_t *cli,
                                            uint32_t now_ms) {
-  return cli->unlocked && now_ms < cli->unlock_deadline_mono_ms;
+  return cli->unlocked &&
+         !logger_mono_ms_deadline_reached(now_ms, cli->unlock_deadline_mono_ms);
 }
 
 static void logger_handle_capture_stats_json(const logger_app_t *app) {
@@ -4225,7 +4227,8 @@ static void logger_handle_capture_stats_json(const logger_app_t *app) {
 static void logger_service_cli_execute(logger_service_cli_t *cli,
                                        logger_app_t *app, const char *line,
                                        uint32_t now_ms) {
-  if (cli->unlocked && now_ms >= cli->unlock_deadline_mono_ms) {
+  if (cli->unlocked &&
+      logger_mono_ms_deadline_reached(now_ms, cli->unlock_deadline_mono_ms)) {
     cli->unlocked = false;
   }
 

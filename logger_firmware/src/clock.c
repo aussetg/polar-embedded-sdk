@@ -206,7 +206,8 @@ static bool logger_clock_resolve_ntp_server(
       to_ms_since_boot(get_absolute_time()) + LOGGER_CLOCK_NTP_DNS_TIMEOUT_MS;
   while (!resolution.done) {
     cyw43_arch_poll();
-    if (to_ms_since_boot(get_absolute_time()) >= deadline_ms) {
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (logger_mono_ms_deadline_reached(now_ms, deadline_ms)) {
       logger_copy_string(message_out, LOGGER_CLOCK_NTP_MESSAGE_MAX + 1u,
                          "DNS lookup timed out");
       return false;
@@ -299,7 +300,8 @@ static bool logger_clock_ntp_exchange(
                                LOGGER_CLOCK_NTP_RESPONSE_TIMEOUT_MS;
   while (!response_state.received) {
     cyw43_arch_poll();
-    if (to_ms_since_boot(get_absolute_time()) >= deadline_ms) {
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (logger_mono_ms_deadline_reached(now_ms, deadline_ms)) {
       logger_copy_string(message_out, LOGGER_CLOCK_NTP_MESSAGE_MAX + 1u,
                          "NTP response timed out");
       udp_remove(pcb);

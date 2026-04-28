@@ -18,6 +18,7 @@
 
 #include "logger/clock.h"
 #include "logger/ntp_time.h"
+#include "logger/util.h"
 
 #include "board_config.h"
 
@@ -46,6 +47,19 @@ static void test_now_utc_or_null_requires_valid_clock(void) {
   status.valid = false;
   assert(logger_clock_now_utc_or_null(&status) == NULL);
   assert(logger_clock_now_utc_or_null(NULL) == NULL);
+}
+
+static void test_mono_deadline_wrap(void) {
+  assert(!logger_mono_ms_deadline_reached(999u, 1000u));
+  assert(logger_mono_ms_deadline_reached(1000u, 1000u));
+  assert(logger_mono_ms_deadline_reached(1001u, 1000u));
+
+  const uint32_t before_wrap = 0xfffffff0u;
+  const uint32_t deadline = before_wrap + 32u;
+  assert(!logger_mono_ms_deadline_reached(before_wrap, deadline));
+  assert(!logger_mono_ms_deadline_reached(0x0000000fu, deadline));
+  assert(logger_mono_ms_deadline_reached(0x00000010u, deadline));
+  assert(logger_mono_ms_deadline_reached(0x00000011u, deadline));
 }
 
 static void assert_local_tz(const char *label, const char *timezone,
@@ -258,6 +272,7 @@ static void test_ntp_era_unfolding(void) {
 
 int main(void) {
   test_now_utc_or_null_requires_valid_clock();
+  test_mono_deadline_wrap();
   test_europe_paris_offsets();
   test_fixed_offset_timezones();
   test_europe_capital_timezones();

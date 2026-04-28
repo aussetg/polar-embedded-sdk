@@ -138,6 +138,19 @@ static inline uint32_t logger_crc32_finish(uint32_t crc) {
 }
 
 /*
+ * Return true when a uint32_t millisecond monotonic deadline has been reached.
+ *
+ * Pico SDK's to_ms_since_boot() returns uint32_t and therefore wraps about
+ * every 49.7 days.  Deadline comparisons must be done by signed subtraction,
+ * not by raw >= / <, as long as individual deadlines are less than 2^31 ms
+ * into the future (true for all logger firmware waits/backoffs).
+ */
+static inline bool logger_mono_ms_deadline_reached(uint32_t now_ms,
+                                                   uint32_t deadline_ms) {
+  return (int32_t)(now_ms - deadline_ms) >= 0;
+}
+
+/*
  * True when timezone is "UTC" or "Etc/UTC".
  */
 static inline bool logger_timezone_is_utc_like(const char *timezone) {

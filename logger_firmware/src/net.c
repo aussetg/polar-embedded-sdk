@@ -48,7 +48,8 @@ static int logger_net_wifi_join_auth_mode(const char *ssid, const char *psk,
     if (status == CYW43_LINK_FAIL) {
       return PICO_ERROR_CONNECT_FAILED;
     }
-    if ((int32_t)(to_ms_since_boot(get_absolute_time()) - deadline) >= 0) {
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (logger_mono_ms_deadline_reached(now_ms, deadline)) {
       return PICO_ERROR_TIMEOUT;
     }
 
@@ -110,7 +111,8 @@ bool logger_net_wifi_join(const logger_config_t *config, int *rc_out,
         !ip4_addr_isany(netif_ip4_addr(netif_default))) {
       break;
     }
-    if (to_ms_since_boot(get_absolute_time()) >= dhcp_deadline) {
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (logger_mono_ms_deadline_reached(now_ms, dhcp_deadline)) {
       if (rc_out != NULL) {
         *rc_out = PICO_ERROR_TIMEOUT;
       }
