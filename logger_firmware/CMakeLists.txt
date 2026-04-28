@@ -62,6 +62,7 @@ add_executable(logger_appliance
     src/capture_stats.c
     src/chunk_builder.c
     src/clock.c
+    src/clock_local.c
     src/config_store.c
     src/faults.c
     src/h10.c

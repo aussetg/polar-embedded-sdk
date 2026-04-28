@@ -275,27 +275,19 @@ void logger_app_clear_current_fault(logger_app_t *app, const char *source) {
       logger_json_object_writer_data(&writer));
 }
 
-static bool logger_app_local_time_evaluable(const logger_app_t *app) {
-  logger_clock_datetime_t local;
-  return app->clock.valid &&
-         logger_clock_observed_local_datetime(
-             &app->clock, app->persisted.config.timezone, &local);
-}
-
 static bool logger_app_should_enter_overnight_idle(const logger_app_t *app) {
   if (!app->battery.vbus_present) {
     return false;
   }
-  if (!logger_app_local_time_evaluable(app)) {
+  bool in_window = false;
+  if (!app->clock.valid ||
+      !logger_clock_observed_local_hour_in_window(
+          &app->clock, app->persisted.config.timezone,
+          LOGGER_OVERNIGHT_UPLOAD_WINDOW_START_HOUR_LOCAL,
+          LOGGER_OVERNIGHT_UPLOAD_WINDOW_END_HOUR_LOCAL, &in_window)) {
     return false;
   }
-  logger_clock_datetime_t local;
-  if (!logger_clock_observed_local_datetime(
-          &app->clock, app->persisted.config.timezone, &local)) {
-    return false;
-  }
-  return local.hour >= LOGGER_OVERNIGHT_UPLOAD_WINDOW_START_HOUR_LOCAL ||
-         local.hour < LOGGER_OVERNIGHT_UPLOAD_WINDOW_END_HOUR_LOCAL;
+  return in_window;
 }
 
 static logger_recovery_reason_t
