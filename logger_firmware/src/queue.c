@@ -18,6 +18,7 @@
 #define LOGGER_QUEUE_PATH "0:/logger/state/upload_queue.json"
 #define LOGGER_QUEUE_TMP_PATH "0:/logger/state/upload_queue.json.tmp"
 #define LOGGER_QUEUE_BACKUP_PATH "0:/logger/state/upload_queue.json.bak"
+#define LOGGER_QUEUE_ROLLBACK_PATH "0:/logger/state/upload_queue.json.rollback"
 #define LOGGER_SESSIONS_DIR "0:/logger/sessions"
 #define LOGGER_MANIFEST_READ_MAX 8192u
 #define LOGGER_QUEUE_READ_MAX 49152u
@@ -1156,27 +1157,43 @@ static bool logger_queue_file_exists(const char *path, bool *exists_out) {
   return fr == FR_NO_FILE || fr == FR_NO_PATH;
 }
 
+static bool logger_queue_remove_if_present(const char *path) {
+  const FRESULT fr = f_unlink(path);
+  return fr == FR_OK || fr == FR_NO_FILE || fr == FR_NO_PATH;
+}
+
 static bool logger_upload_queue_promote_tmp(void) {
   bool current_exists = false;
   if (!logger_queue_file_exists(LOGGER_QUEUE_PATH, &current_exists)) {
     return false;
   }
 
+  bool backup_exists = false;
+  if (!logger_queue_file_exists(LOGGER_QUEUE_BACKUP_PATH, &backup_exists)) {
+    return false;
+  }
+
   if (current_exists) {
-    const FRESULT unlink_backup_fr = f_unlink(LOGGER_QUEUE_BACKUP_PATH);
-    if (unlink_backup_fr != FR_OK && unlink_backup_fr != FR_NO_FILE) {
-      return false;
-    }
-    if (f_rename(LOGGER_QUEUE_PATH, LOGGER_QUEUE_BACKUP_PATH) != FR_OK) {
+    if (backup_exists) {
+      if (!logger_queue_remove_if_present(LOGGER_QUEUE_ROLLBACK_PATH) ||
+          f_rename(LOGGER_QUEUE_PATH, LOGGER_QUEUE_ROLLBACK_PATH) != FR_OK) {
+        return false;
+      }
+    } else if (f_rename(LOGGER_QUEUE_PATH, LOGGER_QUEUE_BACKUP_PATH) != FR_OK) {
       return false;
     }
   }
 
   if (f_rename(LOGGER_QUEUE_TMP_PATH, LOGGER_QUEUE_PATH) != FR_OK) {
     if (current_exists) {
-      (void)f_rename(LOGGER_QUEUE_BACKUP_PATH, LOGGER_QUEUE_PATH);
+      (void)f_rename(backup_exists ? LOGGER_QUEUE_ROLLBACK_PATH
+                                   : LOGGER_QUEUE_BACKUP_PATH,
+                     LOGGER_QUEUE_PATH);
     }
     return false;
+  }
+  if (current_exists && backup_exists) {
+    (void)logger_queue_remove_if_present(LOGGER_QUEUE_ROLLBACK_PATH);
   }
   return true;
 }
