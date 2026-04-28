@@ -55,24 +55,14 @@ SECTIONS
         KEEP (*(.embedded_block))
         __embedded_block_end = .;
         KEEP (*(.reset))
-        /* TODO revisit this now memset/memcpy/float in ROM */
-        /* bit of a hack right now to exclude all floating point and time critical (e.g. memset, memcpy) code from
-         * FLASH ... we will include any thing excluded here in .data below by default */
+        /* Keep ordinary code in flash.  Only sections explicitly marked
+         * .time_critical.* are copied to RAM by the .data output section
+         * below.  This keeps the SRAM-locked build intentional: hot paths are
+         * allowlisted at the function/site level instead of by broad object
+         * filename patterns. */
         *(.init)
         *libgcc.a:cmse_nonsecure_call.o
-        *(EXCLUDE_FILE(
-            *libgcc.a:
-            *libc.a:*lib_a-mem*.o
-            *libm.a:
-            *btstack*
-            *polar_sdk_btstack*
-            */src/h10.c.o
-            */src/capture_pipe.c.o
-            */src/session.c.o
-            */src/chunk_builder.c.o
-            */src/journal_writer.c.o
-            */src/storage_worker.c.o
-        ) .text*)
+        *(.text*)
         *(.fini)
         /* Pull all c'tors into .text */
         *crtbegin.o(.ctors)
@@ -134,19 +124,7 @@ SECTIONS
         "ERROR: Pico second stage bootloader must be no more than 256 bytes in size")
 
     .rodata : {
-        *(EXCLUDE_FILE(
-            *libgcc.a:
-            *libc.a:*lib_a-mem*.o
-            *libm.a:
-            *btstack*
-            *polar_sdk_btstack*
-            */src/h10.c.o
-            */src/capture_pipe.c.o
-            */src/session.c.o
-            */src/chunk_builder.c.o
-            */src/journal_writer.c.o
-            */src/storage_worker.c.o
-        ) .rodata*)
+        *(.rodata*)
         *(.srodata*)
         . = ALIGN(4);
         *(SORT_BY_ALIGNMENT(SORT_BY_NAME(.flashdata*)))
@@ -255,6 +233,9 @@ SECTIONS
     /* historically on GCC sbrk was growing past __HeapLimit to __StackLimit, however
        to be more compatible, we now set __HeapLimit explicitly to where the end of the heap is */
     __HeapLimit = ORIGIN(RAM) + LENGTH(RAM);
+    __logger_static_ram_end = ADDR(.heap) + SIZEOF(.heap);
+    __logger_main_ram_free = __HeapLimit - __logger_static_ram_end;
+    __logger_sram_locked_min_free = DEFINED(LOGGER_SRAM_LOCKED_MIN_FREE) ? LOGGER_SRAM_LOCKED_MIN_FREE : 64K;
 
     /* Start and end symbols must be word-aligned */
     .scratch_x : {
@@ -317,10 +298,10 @@ SECTIONS
 
     /* Check if data + heap + stack exceeds RAM limit */
     ASSERT(__StackLimit >= __HeapLimit, "region RAM overflowed")
+    ASSERT(__logger_main_ram_free >= __logger_sram_locked_min_free,
+        "logger SRAM-locked main RAM reserve below LOGGER_SRAM_LOCKED_MIN_FREE")
 
     ASSERT( __binary_info_header_end - __logical_binary_start <= 1024, "Binary info must be in first 1024 bytes of the binary")
     ASSERT( __embedded_block_end - __logical_binary_start <= 4096, "Embedded block must be in first 4096 bytes of the binary")
-
-    /* todo assert on extra code */
 }
 

@@ -2,26 +2,28 @@
 
 #include <string.h>
 
+#include "pico.h"
+
 /* ── little-endian encoding helpers ────────────────────────────── */
 
-static void cb_put_u16le(uint8_t *dst, uint16_t v) {
+static inline void cb_put_u16le(uint8_t *dst, uint16_t v) {
   dst[0] = (uint8_t)v;
   dst[1] = (uint8_t)(v >> 8);
 }
 
-static void cb_put_u32le(uint8_t *dst, uint32_t v) {
+static inline void cb_put_u32le(uint8_t *dst, uint32_t v) {
   dst[0] = (uint8_t)v;
   dst[1] = (uint8_t)(v >> 8);
   dst[2] = (uint8_t)(v >> 16);
   dst[3] = (uint8_t)(v >> 24);
 }
 
-static void cb_put_u64le(uint8_t *dst, uint64_t v) {
+static inline void cb_put_u64le(uint8_t *dst, uint64_t v) {
   for (size_t i = 0u; i < 8u; ++i)
     dst[i] = (uint8_t)(v >> (8u * i));
 }
 
-static size_t cb_align4(size_t n) { return (n + 3u) & ~(size_t)3u; }
+static inline size_t cb_align4(size_t n) { return (n + 3u) & ~(size_t)3u; }
 
 /* ── public API ────────────────────────────────────────────────── */
 
@@ -58,7 +60,7 @@ void logger_chunk_builder_reset(logger_chunk_builder_t *cb) {
   cb->first_packet_time_ms = 0u;
 }
 
-logger_chunk_result_t logger_chunk_builder_append(
+logger_chunk_result_t __time_critical_func(logger_chunk_builder_append)(
     logger_chunk_builder_t *cb, uint16_t stream_kind,
     const uint8_t span_id_raw[16], uint32_t seq_in_span, uint64_t mono_us,
     int64_t utc_ns, const uint8_t *value, size_t value_len, uint32_t now_ms) {
@@ -115,21 +117,21 @@ logger_chunk_result_t logger_chunk_builder_append(
   return LOGGER_CHUNK_OK;
 }
 
-bool logger_chunk_builder_age_exceeded(const logger_chunk_builder_t *cb,
-                                       uint32_t now_ms) {
+bool __time_critical_func(logger_chunk_builder_age_exceeded)(
+    const logger_chunk_builder_t *cb, uint32_t now_ms) {
   if (!cb->has_data)
     return false;
   return (now_ms - cb->first_packet_time_ms) >= LOGGER_CHUNK_MAX_AGE_MS;
 }
 
-bool logger_chunk_builder_has_data(const logger_chunk_builder_t *cb) {
+bool __time_critical_func(logger_chunk_builder_has_data)(
+    const logger_chunk_builder_t *cb) {
   return cb->has_data;
 }
 
-bool logger_chunk_builder_seal(logger_chunk_builder_t *cb,
-                               uint32_t chunk_seq_in_session,
-                               const uint8_t **payload_out,
-                               size_t *payload_len_out) {
+bool __time_critical_func(logger_chunk_builder_seal)(
+    logger_chunk_builder_t *cb, uint32_t chunk_seq_in_session,
+    const uint8_t **payload_out, size_t *payload_len_out) {
   if (!cb->has_data)
     return false;
 
@@ -160,7 +162,8 @@ bool logger_chunk_builder_seal(logger_chunk_builder_t *cb,
   return true;
 }
 
-void logger_chunk_builder_clear(logger_chunk_builder_t *cb) {
+void __time_critical_func(logger_chunk_builder_clear)(
+    logger_chunk_builder_t *cb) {
   cb->has_data = false;
   cb->packet_count = 0u;
   cb->first_seq_in_span = 0u;

@@ -119,12 +119,27 @@ add_executable(logger_appliance
 )
 
 option(LOGGER_USE_SRAM_LOCKED_LINKER
-    "Use the custom linker script that forces selected code/rodata into SRAM"
+    "Use the custom linker script with an explicit RAM hot-path allowlist and SRAM reserve check"
     ON)
+set(LOGGER_SRAM_LOCKED_MIN_FREE "65536" CACHE STRING
+    "Minimum main-SRAM reserve, in bytes, required by the SRAM-locked linker")
+set(LOGGER_STACK_FRAME_WARN_BYTES "1024" CACHE STRING
+    "Warn when a firmware C/C++ function stack frame exceeds this many bytes")
+option(LOGGER_WARN_LARGE_STACK_FRAMES
+    "Enable compiler warnings for oversized stack frames"
+    ON)
+option(LOGGER_ERROR_ON_LARGE_STACK_FRAMES
+    "Treat oversized stack-frame warnings as build errors"
+    OFF)
+option(LOGGER_EMIT_STACK_USAGE
+    "Emit GCC .su stack-usage sidecar files for firmware objects"
+    OFF)
 
 if(LOGGER_USE_SRAM_LOCKED_LINKER)
     pico_set_linker_script(logger_appliance
         ${CMAKE_CURRENT_LIST_DIR}/ld/memmap_sram_locked.ld)
+    target_link_options(logger_appliance PRIVATE
+        LINKER:--defsym=LOGGER_SRAM_LOCKED_MIN_FREE=${LOGGER_SRAM_LOCKED_MIN_FREE})
 endif()
 
 target_include_directories(logger_appliance PRIVATE
@@ -224,6 +239,21 @@ target_compile_options(logger_appliance PRIVATE
     -Wcast-align=strict
     -Wwrite-strings
 )
+
+if(LOGGER_WARN_LARGE_STACK_FRAMES)
+    target_compile_options(logger_appliance PRIVATE
+        -Wframe-larger-than=${LOGGER_STACK_FRAME_WARN_BYTES})
+endif()
+
+if(LOGGER_ERROR_ON_LARGE_STACK_FRAMES)
+    target_compile_options(logger_appliance PRIVATE
+        -Werror=frame-larger-than)
+endif()
+
+if(LOGGER_EMIT_STACK_USAGE)
+    target_compile_options(logger_appliance PRIVATE
+        -fstack-usage)
+endif()
 
 pico_enable_stdio_usb(logger_appliance 1)
 pico_enable_stdio_uart(logger_appliance 0)

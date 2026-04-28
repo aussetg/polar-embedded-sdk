@@ -213,8 +213,9 @@ static void logger_session_writer_restore_from_scan(
  * Every session function calls session_dispatch() instead of
  * logger_writer_dispatch() directly.
  */
-static bool session_dispatch(logger_session_state_t *session,
-                             const logger_writer_cmd_t *cmd) {
+static bool
+__time_critical_func(session_dispatch)(logger_session_state_t *session,
+                                       const logger_writer_cmd_t *cmd) {
   if (session == NULL || cmd == NULL) {
     return false;
   }
@@ -357,7 +358,8 @@ static bool logger_session_set_paths(logger_session_state_t *session) {
  *
  * No-op when the builder is empty.
  */
-static bool logger_session_seal_active_chunk(logger_session_state_t *session) {
+static bool __time_critical_func(logger_session_seal_active_chunk)(
+    logger_session_state_t *session) {
   logger_chunk_builder_t *cb = &session->writer.chunk_builder;
   if (!logger_chunk_builder_has_data(cb)) {
     return true;
@@ -1585,9 +1587,9 @@ bool logger_session_ensure_active_span(
  * Called once before a drain loop; per-packet fields are then set by
  * logger_session_pmd_cmd_submit() without zeroing ~320 bytes each time.
  */
-void logger_session_pmd_cmd_init(logger_session_state_t *session,
-                                 const logger_clock_status_t *clock,
-                                 logger_writer_cmd_t *cmd) {
+void __time_critical_func(logger_session_pmd_cmd_init)(
+    logger_session_state_t *session, const logger_clock_status_t *clock,
+    logger_writer_cmd_t *cmd) {
   memset(cmd, 0, sizeof(*cmd));
   cmd->type = LOGGER_WRITER_APPEND_PMD_PACKET;
   logger_writer_append_pmd_packet_t *p = &cmd->append_pmd_packet;
@@ -1601,10 +1603,10 @@ void logger_session_pmd_cmd_init(logger_session_state_t *session,
  * No memset — only the fields that change between packets are written.
  * The value[] tail beyond value_len is stale but unread by the consumer.
  */
-bool logger_session_pmd_cmd_submit(logger_session_state_t *session,
-                                   logger_writer_cmd_t *cmd,
-                                   uint16_t stream_kind, uint64_t mono_us,
-                                   const uint8_t *value, size_t value_len) {
+bool __time_critical_func(logger_session_pmd_cmd_submit)(
+    logger_session_state_t *session, logger_writer_cmd_t *cmd,
+    uint16_t stream_kind, uint64_t mono_us, const uint8_t *value,
+    size_t value_len) {
   if (!session->active || !session->span_active || value == NULL ||
       value_len == 0u || value_len > LOGGER_H10_PACKET_MAX_BYTES ||
       (stream_kind != LOGGER_SESSION_STREAM_KIND_ECG &&
@@ -2122,9 +2124,9 @@ writer_emit_span_start(logger_session_state_t *session,
  * Returns false only on writer-side failure (seal failure).
  * May seal and emit a chunk if the builder is full or at target size.
  */
-static bool
-writer_append_pmd_packet(logger_session_state_t *session,
-                         const logger_writer_append_pmd_packet_t *cmd) {
+static bool __time_critical_func(writer_append_pmd_packet)(
+    logger_session_state_t *session,
+    const logger_writer_append_pmd_packet_t *cmd) {
   logger_chunk_builder_t *cb = &session->writer.chunk_builder;
 
   logger_chunk_result_t r = logger_chunk_builder_append(
@@ -2453,8 +2455,8 @@ static bool __attribute__((noinline)) logger_writer_handle_finalize_session(
   return logger_upload_queue_refresh_file(mc->system_log, queue_utc, NULL);
 }
 
-bool logger_writer_dispatch(logger_session_context_t *ctx,
-                            const logger_writer_cmd_t *cmd) {
+bool __time_critical_func(logger_writer_dispatch)(
+    logger_session_context_t *ctx, const logger_writer_cmd_t *cmd) {
   logger_session_state_t *const session = (logger_session_state_t *)ctx;
 
   switch (cmd->type) {

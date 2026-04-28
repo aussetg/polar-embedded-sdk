@@ -35,13 +35,17 @@ capture_pipe_assert_init_params(const capture_pipe_init_params_t *params) {
   hard_assert(capture_pipe_capacity_is_power_of_two(params->cmd_ring_capacity));
 }
 
-static bool ring_full(uint32_t head, uint32_t tail, uint32_t cap) {
+static inline bool ring_full(uint32_t head, uint32_t tail, uint32_t cap) {
   return (uint32_t)(tail - head) >= cap;
 }
 
-static bool ring_empty(uint32_t head, uint32_t tail) { return head == tail; }
+static inline bool ring_empty(uint32_t head, uint32_t tail) {
+  return head == tail;
+}
 
-static uint32_t ring_occ(uint32_t head, uint32_t tail) { return tail - head; }
+static inline uint32_t ring_occ(uint32_t head, uint32_t tail) {
+  return tail - head;
+}
 
 static uint8_t occ_pct(uint32_t occ, uint32_t cap) {
   if (cap == 0u) {
@@ -158,8 +162,8 @@ capture_writer_classify_cmd_failure(logger_writer_cmd_type_t cmd_type) {
  * consumes.
  */
 
-bool capture_staging_push_pmd(capture_pipe_t *pipe,
-                              const logger_writer_cmd_t *cmd) {
+bool __time_critical_func(capture_staging_push_pmd)(
+    capture_pipe_t *pipe, const logger_writer_cmd_t *cmd) {
   if (pipe == NULL || cmd == NULL) {
     return false;
   }
@@ -191,14 +195,16 @@ bool capture_staging_push_pmd(capture_pipe_t *pipe,
   return true;
 }
 
-bool capture_staging_has_data(const capture_pipe_t *pipe) {
+bool __time_critical_func(capture_staging_has_data)(
+    const capture_pipe_t *pipe) {
   if (pipe == NULL) {
     return false;
   }
   return pipe->staging.head != pipe->staging.tail;
 }
 
-uint32_t capture_staging_drain(capture_pipe_t *pipe, uint32_t max_entries) {
+uint32_t __time_critical_func(capture_staging_drain)(capture_pipe_t *pipe,
+                                                     uint32_t max_entries) {
   if (pipe == NULL) {
     return 0u;
   }
@@ -230,8 +236,8 @@ uint32_t capture_staging_drain(capture_pipe_t *pipe, uint32_t max_entries) {
 
 /* ── Command ring ──────────────────────────────────────────────── */
 
-bool capture_cmd_ring_enqueue(capture_pipe_t *pipe,
-                              const logger_writer_cmd_t *cmd) {
+bool __time_critical_func(capture_cmd_ring_enqueue)(
+    capture_pipe_t *pipe, const logger_writer_cmd_t *cmd) {
   if (pipe == NULL || cmd == NULL) {
     return false;
   }
@@ -260,8 +266,8 @@ bool capture_cmd_ring_enqueue(capture_pipe_t *pipe,
   return true;
 }
 
-bool capture_cmd_ring_dequeue(capture_pipe_t *pipe,
-                              logger_writer_cmd_t *cmd_out) {
+bool __time_critical_func(capture_cmd_ring_dequeue)(
+    capture_pipe_t *pipe, logger_writer_cmd_t *cmd_out) {
   if (pipe == NULL || cmd_out == NULL) {
     return false;
   }
@@ -286,7 +292,8 @@ bool capture_cmd_ring_dequeue(capture_pipe_t *pipe,
   return true;
 }
 
-uint32_t capture_cmd_ring_occupancy(const capture_pipe_t *pipe) {
+uint32_t
+__time_critical_func(capture_cmd_ring_occupancy)(const capture_pipe_t *pipe) {
   if (pipe == NULL) {
     return 0u;
   }
@@ -304,8 +311,8 @@ uint8_t capture_cmd_ring_occupancy_pct(const capture_pipe_t *pipe) {
 
 /* ── Event ring ────────────────────────────────────────────────── */
 
-bool capture_event_ring_push(capture_pipe_t *pipe,
-                             const capture_event_t *event) {
+bool __time_critical_func(capture_event_ring_push)(
+    capture_pipe_t *pipe, const capture_event_t *event) {
   if (pipe == NULL || event == NULL) {
     return false;
   }
@@ -326,7 +333,8 @@ bool capture_event_ring_push(capture_pipe_t *pipe,
   return true;
 }
 
-bool capture_event_ring_pop(capture_pipe_t *pipe, capture_event_t *out) {
+bool __time_critical_func(capture_event_ring_pop)(capture_pipe_t *pipe,
+                                                  capture_event_t *out) {
   if (pipe == NULL || out == NULL) {
     return false;
   }
@@ -427,14 +435,14 @@ static void capture_pipe_tally_event(capture_pipe_t *pipe,
 
 /* ── High-level submit ─────────────────────────────────────────── */
 
-bool capture_pipe_submit_pmd(capture_pipe_t *pipe,
-                             const logger_writer_cmd_t *cmd) {
+bool __time_critical_func(capture_pipe_submit_pmd)(
+    capture_pipe_t *pipe, const logger_writer_cmd_t *cmd) {
   return capture_staging_push_pmd(pipe, cmd);
 }
 
-bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
-                             logger_session_context_t *session_ctx,
-                             const logger_writer_cmd_t *cmd) {
+bool __time_critical_func(capture_pipe_submit_cmd)(
+    capture_pipe_t *pipe, logger_session_context_t *session_ctx,
+    const logger_writer_cmd_t *cmd) {
   if (pipe == NULL || session_ctx == NULL || cmd == NULL) {
     return false;
   }
@@ -745,7 +753,8 @@ bool capture_pipe_needs_recovery(const capture_pipe_t *pipe, uint32_t now_ms) {
 
 /* ── Event processing ─────────────────────────────────────────── */
 
-uint32_t capture_pipe_process_events(capture_pipe_t *pipe) {
+uint32_t
+__time_critical_func(capture_pipe_process_events)(capture_pipe_t *pipe) {
   if (pipe == NULL) {
     return 0u;
   }

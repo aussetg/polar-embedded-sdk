@@ -1379,7 +1379,9 @@ static void logger_app_handle_h10_recovery_events(logger_app_t *app) {
  * This function does NOT execute commands inline — core 1 owns
  * SD/FatFS and is the exclusive writer.
  */
-static bool logger_app_drain_capture_pipe(logger_app_t *app, uint32_t now_ms) {
+static bool
+__no_inline_not_in_flash_func(logger_app_drain_capture_pipe)(logger_app_t *app,
+                                                             uint32_t now_ms) {
   capture_pipe_t *pipe = &app->capture_pipe;
 
   /* Drain source staging into the command ring */
@@ -1415,7 +1417,9 @@ static bool logger_app_drain_capture_pipe(logger_app_t *app, uint32_t now_ms) {
   return true;
 }
 
-static bool logger_app_handle_h10_packets(logger_app_t *app, uint32_t now_ms) {
+static bool
+__no_inline_not_in_flash_func(logger_app_handle_h10_packets)(logger_app_t *app,
+                                                             uint32_t now_ms) {
   if (app->h10.packet_count == 0u) {
     return true;
   }

@@ -120,9 +120,8 @@ static bool g_battery_read_active = false;
 static bool g_battery_value_received = false;
 static uint8_t g_battery_pending_reason = LOGGER_H10_BATTERY_REASON_NONE;
 
-static void logger_h10_gatt_packet_handler(uint8_t packet_type,
-                                           uint16_t channel, uint8_t *packet,
-                                           uint16_t size);
+static void __time_critical_func(logger_h10_gatt_packet_handler)(
+    uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void logger_h10_schedule_retry(logger_h10_state_t *state,
                                       uint32_t now_ms);
 static void logger_h10_stop_scan(logger_h10_state_t *state);
@@ -425,10 +424,9 @@ static void logger_h10_disconnect_for_restart(logger_h10_state_t *state) {
   logger_h10_schedule_retry(state, btstack_run_loop_get_time_ms());
 }
 
-static bool logger_h10_queue_push_packet(logger_h10_state_t *state,
-                                         logger_h10_stream_kind_t stream_kind,
-                                         uint64_t mono_us, const uint8_t *value,
-                                         uint16_t value_len) {
+static bool __time_critical_func(logger_h10_queue_push_packet)(
+    logger_h10_state_t *state, logger_h10_stream_kind_t stream_kind,
+    uint64_t mono_us, const uint8_t *value, uint16_t value_len) {
   /* The H10 packet queue is deliberately lock-free because both BTstack
    * callbacks and app drains are expected to run synchronously on core 0 in
    * pico_cyw43_arch_lwip_poll mode.  Fail fast if that invariant changes. */
@@ -463,8 +461,8 @@ static bool logger_h10_queue_push_packet(logger_h10_state_t *state,
   return true;
 }
 
-bool logger_h10_pop_packet(logger_h10_state_t *state,
-                           logger_h10_packet_t *out) {
+bool __time_critical_func(logger_h10_pop_packet)(logger_h10_state_t *state,
+                                                 logger_h10_packet_t *out) {
   hard_assert(get_core_num() == 0u);
   hard_assert(__get_current_exception() == 0u);
   if (state == NULL || out == NULL || state->packet_count == 0u) {
@@ -480,8 +478,8 @@ bool logger_h10_pop_packet(logger_h10_state_t *state,
   return true;
 }
 
-bool logger_h10_take_battery_event(logger_h10_state_t *state,
-                                   logger_h10_battery_event_t *out) {
+bool __time_critical_func(logger_h10_take_battery_event)(
+    logger_h10_state_t *state, logger_h10_battery_event_t *out) {
   if (state == NULL || out == NULL || !state->battery_event_pending ||
       state->battery_percent < 0) {
     return false;
@@ -497,8 +495,8 @@ bool logger_h10_take_battery_event(logger_h10_state_t *state,
   return true;
 }
 
-bool logger_h10_take_recovery_event(logger_h10_state_t *state,
-                                    logger_h10_recovery_event_t *out) {
+bool __time_critical_func(logger_h10_take_recovery_event)(
+    logger_h10_state_t *state, logger_h10_recovery_event_t *out) {
   if (state == NULL || out == NULL ||
       state->recovery_event == LOGGER_H10_RECOVERY_EVENT_NONE) {
     return false;
@@ -1204,7 +1202,7 @@ static int logger_h10_adv_runtime_connect(void *ctx, const uint8_t *addr,
   return gap_connect(target, addr_type);
 }
 
-static void logger_h10_dispatch_on_adv_report(
+static void __time_critical_func(logger_h10_dispatch_on_adv_report)(
     void *ctx, const polar_sdk_btstack_adv_report_t *adv_report) {
   logger_h10_state_t *state = (logger_h10_state_t *)ctx;
   polar_sdk_btstack_scan_filter_t filter = {
@@ -1234,9 +1232,8 @@ static void logger_h10_dispatch_on_adv_report(
       &g_runtime_link, &filter, adv_report, ERROR_CODE_SUCCESS, &ops);
 }
 
-static void
-logger_h10_dispatch_on_link_event(void *ctx,
-                                  const polar_sdk_link_event_t *link_event) {
+static void __time_critical_func(logger_h10_dispatch_on_link_event)(
+    void *ctx, const polar_sdk_link_event_t *link_event) {
   logger_h10_state_t *state = (logger_h10_state_t *)ctx;
   polar_sdk_runtime_context_link_ops_t ops = {
       .ctx = state,
@@ -1257,9 +1254,8 @@ logger_h10_dispatch_on_link_event(void *ctx,
   }
 }
 
-static void
-logger_h10_dispatch_on_sm_event(void *ctx,
-                                const polar_sdk_sm_event_t *sm_event) {
+static void __time_critical_func(logger_h10_dispatch_on_sm_event)(
+    void *ctx, const polar_sdk_sm_event_t *sm_event) {
   logger_h10_state_t *state = (logger_h10_state_t *)ctx;
   if (sm_event->type == POLAR_SDK_SM_EVENT_JUST_WORKS_REQUEST) {
     sm_just_works_confirm(sm_event->handle);
@@ -1288,8 +1284,8 @@ logger_h10_dispatch_on_sm_event(void *ctx,
   }
 }
 
-static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
-                                          uint8_t *packet, uint16_t size) {
+static void __time_critical_func(logger_h10_hci_packet_handler)(
+    uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
   (void)channel;
   (void)size;
 
@@ -1362,8 +1358,8 @@ static void logger_h10_hci_packet_handler(uint8_t packet_type, uint16_t channel,
   }
 }
 
-static void logger_h10_sm_packet_handler(uint8_t packet_type, uint16_t channel,
-                                         uint8_t *packet, uint16_t size) {
+static void __time_critical_func(logger_h10_sm_packet_handler)(
+    uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
   (void)channel;
   (void)size;
 
@@ -1377,9 +1373,8 @@ static void logger_h10_sm_packet_handler(uint8_t packet_type, uint16_t channel,
   }
 }
 
-static void logger_h10_gatt_packet_handler(uint8_t packet_type,
-                                           uint16_t channel, uint8_t *packet,
-                                           uint16_t size) {
+static void __time_critical_func(logger_h10_gatt_packet_handler)(
+    uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
   (void)channel;
   (void)size;
 
@@ -1632,7 +1627,8 @@ void logger_h10_set_enabled(logger_h10_state_t *state, bool enabled) {
   logger_h10_power_off(state);
 }
 
-void logger_h10_poll(logger_h10_state_t *state, uint32_t now_ms) {
+void __time_critical_func(logger_h10_poll)(logger_h10_state_t *state,
+                                           uint32_t now_ms) {
   if (!state->enabled || !state->controller_ready) {
     return;
   }

@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "pico.h"
+
 #include "logger/util.h"
 
 #define JOURNAL_FILE_HEADER_BYTES 64u
@@ -31,8 +33,8 @@ static void put_u64le(uint8_t *dst, uint64_t value) {
 
 /* ── FatFS helpers ─────────────────────────────────────────────── */
 
-static bool writer_fwrite(logger_journal_writer_t *w, const void *data,
-                          size_t len) {
+static bool __time_critical_func(writer_fwrite)(logger_journal_writer_t *w,
+                                                const void *data, size_t len) {
   if (!w->open || data == NULL) {
     return false;
   }
@@ -157,7 +159,7 @@ bool logger_journal_writer_append_json(logger_journal_writer_t *w,
   return true;
 }
 
-bool logger_journal_writer_append_binary(
+bool __time_critical_func(logger_journal_writer_append_binary)(
     logger_journal_writer_t *w, logger_journal_record_type_t record_type,
     uint64_t record_seq, const void *payload, size_t payload_len) {
   if (w == NULL || !w->open || payload == NULL ||
@@ -187,7 +189,8 @@ bool logger_journal_writer_append_binary(
   return true;
 }
 
-bool logger_journal_writer_sync(logger_journal_writer_t *w) {
+bool __time_critical_func(logger_journal_writer_sync)(
+    logger_journal_writer_t *w) {
   if (w == NULL || !w->open) {
     return false;
   }

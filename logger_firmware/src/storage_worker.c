@@ -240,8 +240,8 @@ static bool storage_worker_init_flash_safety(void) {
   return true;
 }
 
-static void storage_worker_idle_wait_poll(capture_pipe_t *pipe,
-                                          uint32_t max_wait_us) {
+static void __no_inline_not_in_flash_func(storage_worker_idle_wait_poll)(
+    capture_pipe_t *pipe, uint32_t max_wait_us) {
   if (pipe == NULL || max_wait_us == 0u) {
     return;
   }
@@ -266,7 +266,8 @@ static void storage_worker_idle_wait_poll(capture_pipe_t *pipe,
  * The release fence after dequeue guarantees core 0 sees the slot
  * as reclaimed before it observes the advanced head.
  */
-static void logger_storage_worker_drain(storage_worker_shared_t *shared) {
+static void __no_inline_not_in_flash_func(logger_storage_worker_drain)(
+    storage_worker_shared_t *shared) {
   if (shared == NULL || shared->pipe == NULL || shared->session_ctx == NULL) {
     return;
   }
