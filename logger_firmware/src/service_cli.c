@@ -2624,15 +2624,44 @@ logger_handle_upload_tls_clear_provisioned_anchor(logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+static bool logger_parse_debug_config_set_args(const char *args, char *field,
+                                               size_t field_len,
+                                               const char **value_out) {
+  if (args == NULL || field == NULL || field_len == 0u || value_out == NULL) {
+    return false;
+  }
+
+  const char *p = args;
+  while (*p != '\0' && isspace((unsigned char)*p)) {
+    ++p;
+  }
+  const char *field_start = p;
+  while (*p != '\0' && !isspace((unsigned char)*p)) {
+    ++p;
+  }
+  const size_t parsed_field_len = (size_t)(p - field_start);
+  while (*p != '\0' && isspace((unsigned char)*p)) {
+    ++p;
+  }
+  if (parsed_field_len == 0u || parsed_field_len >= field_len || *p == '\0') {
+    field[0] = '\0';
+    *value_out = NULL;
+    return false;
+  }
+
+  memcpy(field, field_start, parsed_field_len);
+  field[parsed_field_len] = '\0';
+  *value_out = p;
+  return true;
+}
+
 static void logger_handle_debug_config_set(const logger_service_cli_t *cli,
                                            logger_app_t *app,
                                            const char *args) {
   char field[48];
-  char value[256];
+  const char *value = NULL;
   field[0] = '\0';
-  value[0] = '\0';
-  const int matched = sscanf(args, "%47s %255[^\n]", field, value);
-  if (matched < 2) {
+  if (!logger_parse_debug_config_set_args(args, field, sizeof(field), &value)) {
     jsw w;
     jsw_err(&w, "debug config set", logger_clock_now_utc_or_null(&app->clock),
             "invalid_config", "expected: debug config set <field> <value>");

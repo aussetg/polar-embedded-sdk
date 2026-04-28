@@ -77,15 +77,16 @@ static logger_flash_store_cache_t g_store;
 static logger_flash_config_record_t g_config_record_workspace;
 static bool g_config_record_workspace_in_use;
 
-static logger_flash_config_record_t *logger_config_record_workspace_acquire(void) {
+static logger_flash_config_record_t *
+logger_config_record_workspace_acquire(void) {
   assert(!g_config_record_workspace_in_use);
   g_config_record_workspace_in_use = true;
   memset(&g_config_record_workspace, 0xff, sizeof(g_config_record_workspace));
   return &g_config_record_workspace;
 }
 
-static void logger_config_record_workspace_release(
-    logger_flash_config_record_t *record) {
+static void
+logger_config_record_workspace_release(logger_flash_config_record_t *record) {
   (void)record;
   assert(record == &g_config_record_workspace);
   assert(g_config_record_workspace_in_use);
@@ -131,9 +132,9 @@ logger_flash_config_record_valid(const logger_flash_config_record_t *record) {
   const uint32_t zero = 0u;
   crc = logger_crc32_update(crc, bytes, crc_offset);
   crc = logger_crc32_update(crc, (const uint8_t *)&zero, sizeof(zero));
-  crc = logger_crc32_update(
-      crc, bytes + crc_offset + sizeof(record->crc32),
-      sizeof(*record) - crc_offset - sizeof(record->crc32));
+  crc =
+      logger_crc32_update(crc, bytes + crc_offset + sizeof(record->crc32),
+                          sizeof(*record) - crc_offset - sizeof(record->crc32));
   return logger_crc32_finish(crc) == record->crc32;
 }
 
@@ -155,9 +156,9 @@ static bool logger_flash_metadata_record_valid(
   const uint32_t zero = 0u;
   crc = logger_crc32_update(crc, bytes, crc_offset);
   crc = logger_crc32_update(crc, (const uint8_t *)&zero, sizeof(zero));
-  crc = logger_crc32_update(
-      crc, bytes + crc_offset + sizeof(record->crc32),
-      sizeof(*record) - crc_offset - sizeof(record->crc32));
+  crc =
+      logger_crc32_update(crc, bytes + crc_offset + sizeof(record->crc32),
+                          sizeof(*record) - crc_offset - sizeof(record->crc32));
   return logger_crc32_finish(crc) == record->crc32;
 }
 
@@ -342,8 +343,7 @@ static void logger_store_cache_reset(void) {
   g_store.metadata_slot = -1;
 }
 
-static void logger_store_cache_apply_to_state(
-    logger_persisted_state_t *state) {
+static void logger_store_cache_apply_to_state(logger_persisted_state_t *state) {
   logger_persisted_state_init(state);
   if (g_store.config_valid) {
     state->config = g_store.config;
@@ -399,9 +399,9 @@ static bool logger_flash_select_latest_config(logger_config_t *config_out,
   return found;
 }
 
-static bool logger_flash_select_latest_metadata(
-    logger_persisted_metadata_t *metadata_out, uint32_t *sequence_out,
-    int *slot_out) {
+static bool
+logger_flash_select_latest_metadata(logger_persisted_metadata_t *metadata_out,
+                                    uint32_t *sequence_out, int *slot_out) {
   bool found = false;
   uint32_t best_sequence = 0u;
   int best_slot = -1;
@@ -450,9 +450,8 @@ static bool logger_config_store_refresh_cache(void) {
   uint32_t metadata_sequence = 0u;
   int config_slot = -1;
   int metadata_slot = -1;
-  bool have_config =
-      logger_flash_select_latest_config(&g_store.config, &config_sequence,
-                                        &config_slot);
+  bool have_config = logger_flash_select_latest_config(
+      &g_store.config, &config_sequence, &config_slot);
   bool have_metadata = logger_flash_select_latest_metadata(
       &g_store.metadata, &metadata_sequence, &metadata_slot);
 
@@ -641,14 +640,53 @@ bool logger_config_wifi_configured(const logger_config_t *config) {
          logger_string_present(config->wifi_psk);
 }
 
+static bool logger_string_len_within(const char *value, size_t storage_len,
+                                     size_t *len_out) {
+  if (value == NULL || storage_len == 0u || len_out == NULL) {
+    return false;
+  }
+  for (size_t i = 0u; i < storage_len; ++i) {
+    if (value[i] == '\0') {
+      *len_out = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool logger_stored_string_equals(const char *dst, size_t dst_len,
+                                        const char *value, size_t value_len) {
+  size_t dst_used = 0u;
+  if (!logger_string_len_within(dst, dst_len, &dst_used)) {
+    return false;
+  }
+  return dst_used == value_len && memcmp(dst, value, value_len) == 0;
+}
+
 static bool logger_write_if_changed(char *dst, size_t dst_len,
-                                    const char *value) {
-  const char *cmp = (value != NULL) ? value : "";
-  if (strncmp(dst, cmp, dst_len) == 0) {
+                                    const char *value, bool *changed_out) {
+  if (changed_out != NULL) {
+    *changed_out = false;
+  }
+  if (dst == NULL || dst_len == 0u) {
+    return false;
+  }
+
+  const char *src = (value != NULL) ? value : "";
+  size_t src_len = 0u;
+  if (!logger_string_len_within(src, dst_len, &src_len)) {
+    return false;
+  }
+  if (logger_stored_string_equals(dst, dst_len, src, src_len)) {
     return true;
   }
+
   memset(dst, 0, dst_len);
-  logger_copy_string(dst, dst_len, value);
+  memcpy(dst, src, src_len);
+  dst[src_len] = '\0';
+  if (changed_out != NULL) {
+    *changed_out = true;
+  }
   return true;
 }
 
@@ -679,7 +717,7 @@ logger_normalize_h10_address(const char *src,
 bool logger_config_set_logger_id(logger_persisted_state_t *state,
                                  const char *value) {
   if (!logger_write_if_changed(state->config.logger_id,
-                               sizeof(state->config.logger_id), value)) {
+                               sizeof(state->config.logger_id), value, NULL)) {
     return false;
   }
   return logger_config_store_save(state);
@@ -688,7 +726,7 @@ bool logger_config_set_logger_id(logger_persisted_state_t *state,
 bool logger_config_set_subject_id(logger_persisted_state_t *state,
                                   const char *value) {
   if (!logger_write_if_changed(state->config.subject_id,
-                               sizeof(state->config.subject_id), value)) {
+                               sizeof(state->config.subject_id), value, NULL)) {
     return false;
   }
   return logger_config_store_save(state);
@@ -714,7 +752,7 @@ bool logger_config_set_bound_h10_address(logger_persisted_state_t *state,
 bool logger_config_set_timezone(logger_persisted_state_t *state,
                                 const char *value) {
   if (!logger_write_if_changed(state->config.timezone,
-                               sizeof(state->config.timezone), value)) {
+                               sizeof(state->config.timezone), value, NULL)) {
     return false;
   }
   return logger_config_store_save(state);
@@ -723,7 +761,7 @@ bool logger_config_set_timezone(logger_persisted_state_t *state,
 bool logger_config_set_wifi_ssid(logger_persisted_state_t *state,
                                  const char *value) {
   if (!logger_write_if_changed(state->config.wifi_ssid,
-                               sizeof(state->config.wifi_ssid), value)) {
+                               sizeof(state->config.wifi_ssid), value, NULL)) {
     return false;
   }
   return logger_config_store_save(state);
@@ -732,7 +770,7 @@ bool logger_config_set_wifi_ssid(logger_persisted_state_t *state,
 bool logger_config_set_wifi_psk(logger_persisted_state_t *state,
                                 const char *value) {
   if (!logger_write_if_changed(state->config.wifi_psk,
-                               sizeof(state->config.wifi_psk), value)) {
+                               sizeof(state->config.wifi_psk), value, NULL)) {
     return false;
   }
   return logger_config_store_save(state);
@@ -740,11 +778,10 @@ bool logger_config_set_wifi_psk(logger_persisted_state_t *state,
 
 bool logger_config_set_upload_url(logger_persisted_state_t *state,
                                   const char *value) {
-  const char *cmp = (value != NULL) ? value : "";
-  const bool url_changed = strncmp(state->config.upload_url, cmp,
-                                   sizeof(state->config.upload_url)) != 0;
+  bool url_changed = false;
   if (!logger_write_if_changed(state->config.upload_url,
-                               sizeof(state->config.upload_url), value)) {
+                               sizeof(state->config.upload_url), value,
+                               &url_changed)) {
     return false;
   }
   if (url_changed) {
@@ -760,7 +797,8 @@ bool logger_config_set_upload_url(logger_persisted_state_t *state,
 bool logger_config_set_upload_api_key(logger_persisted_state_t *state,
                                       const char *value) {
   if (!logger_write_if_changed(state->config.upload_api_key,
-                               sizeof(state->config.upload_api_key), value)) {
+                               sizeof(state->config.upload_api_key), value,
+                               NULL)) {
     return false;
   }
   return logger_config_store_save(state);
@@ -769,7 +807,8 @@ bool logger_config_set_upload_api_key(logger_persisted_state_t *state,
 bool logger_config_set_upload_token(logger_persisted_state_t *state,
                                     const char *value) {
   if (!logger_write_if_changed(state->config.upload_token,
-                               sizeof(state->config.upload_token), value)) {
+                               sizeof(state->config.upload_token), value,
+                               NULL)) {
     return false;
   }
   return logger_config_store_save(state);
