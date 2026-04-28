@@ -27,7 +27,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-set(LOGGER_FIRMWARE_VERSION "0.1.0" CACHE STRING "Semantic firmware version string")
+set(LOGGER_FIRMWARE_VERSION "0.2.0" CACHE STRING "Semantic firmware version string")
 set(LOGGER_BUILD_ID "logger-fw-dev" CACHE STRING "Opaque firmware build identifier")
 set(PICO_MBEDTLS_CONFIG_FILE "logger_mbedtls_config.h" CACHE STRING "Project-local Mbed TLS configuration header")
 
