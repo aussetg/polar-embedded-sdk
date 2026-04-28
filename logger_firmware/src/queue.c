@@ -21,7 +21,14 @@
 #define LOGGER_QUEUE_ROLLBACK_PATH "0:/logger/state/upload_queue.json.rollback"
 #define LOGGER_SESSIONS_DIR "0:/logger/sessions"
 #define LOGGER_MANIFEST_READ_MAX 8192u
-#define LOGGER_QUEUE_READ_MAX 49152u
+/*
+ * Bound the persisted queue by the v1 schema, not by a typical-case sample.
+ * With 64 sessions, every bounded string full, and every byte escaped as
+ * a six-byte JSON unicode escape, serialized JSON is ~357 KiB. 384 KiB is
+ * the next clean sector-aligned ceiling and still fits easily inside the
+ * 1 MiB PSRAM queue region together with tokens and queue workspaces.
+ */
+#define LOGGER_QUEUE_FILE_MAX (384u * 1024u)
 #define LOGGER_MANIFEST_JSON_TOKEN_MAX 512u
 #define LOGGER_QUEUE_TOP_LEVEL_JSON_TOKEN_COUNT 7u
 #define LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT 39u
@@ -31,6 +38,69 @@
 #define LOGGER_UPLOAD_RETENTION_DAYS 14u
 #define LOGGER_UPLOAD_RETENTION_SECONDS                                        \
   (LOGGER_UPLOAD_RETENTION_DAYS * 24u * 60u * 60u)
+
+#define LOGGER_JSON_STRING_LITERAL_MAX(raw_len) (2u + (6u * (raw_len)))
+#define LOGGER_DECIMAL_U64_MAX 20u
+#define LOGGER_DECIMAL_U32_MAX 10u
+#define LOGGER_HTTP_STATUS_DECIMAL_MAX 5u
+
+#define LOGGER_QUEUE_FIELD_STRING_MAX(name, raw_len)                           \
+  ((sizeof("\"" name "\":") - 1u) + LOGGER_JSON_STRING_LITERAL_MAX(raw_len))
+#define LOGGER_QUEUE_COMMA_FIELD_STRING_MAX(name, raw_len)                     \
+  ((sizeof(",\"" name "\":") - 1u) + LOGGER_JSON_STRING_LITERAL_MAX(raw_len))
+#define LOGGER_QUEUE_COMMA_FIELD_RAW_MAX(name, raw_len)                        \
+  ((sizeof(",\"" name "\":") - 1u) + (raw_len))
+
+#define LOGGER_QUEUE_ENTRY_JSON_WORST_CASE_MAX                                 \
+  (2u /* ",{"; first entry uses one byte less */ +                             \
+   LOGGER_QUEUE_FIELD_STRING_MAX("session_id", 32u) +                          \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("study_day_local", 10u) +               \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("dir_name", 63u) +                      \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("session_start_utc",                    \
+                                       LOGGER_UPLOAD_QUEUE_UTC_MAX) +          \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("session_end_utc",                      \
+                                       LOGGER_UPLOAD_QUEUE_UTC_MAX) +          \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("bundle_sha256",                        \
+                                       LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN) +   \
+   LOGGER_QUEUE_COMMA_FIELD_RAW_MAX("bundle_size_bytes",                       \
+                                    LOGGER_DECIMAL_U64_MAX) +                  \
+   LOGGER_QUEUE_COMMA_FIELD_RAW_MAX("quarantined", 5u) +                       \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("status",                               \
+                                       LOGGER_UPLOAD_QUEUE_STATUS_MAX) +       \
+   LOGGER_QUEUE_COMMA_FIELD_RAW_MAX("attempt_count", LOGGER_DECIMAL_U32_MAX) + \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("last_attempt_utc",                     \
+                                       LOGGER_UPLOAD_QUEUE_UTC_MAX) +          \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX(                                        \
+       "last_failure_class", LOGGER_UPLOAD_QUEUE_FAILURE_CLASS_MAX) +          \
+   LOGGER_QUEUE_COMMA_FIELD_RAW_MAX("last_http_status",                        \
+                                    LOGGER_HTTP_STATUS_DECIMAL_MAX) +          \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX(                                        \
+       "last_server_error_code", LOGGER_UPLOAD_QUEUE_SERVER_ERROR_CODE_MAX) +  \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX(                                        \
+       "last_server_error_message",                                            \
+       LOGGER_UPLOAD_QUEUE_SERVER_ERROR_MESSAGE_MAX) +                         \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX(                                        \
+       "last_response_excerpt", LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX) +    \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("verified_upload_utc",                  \
+                                       LOGGER_UPLOAD_QUEUE_UTC_MAX) +          \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("verified_bundle_sha256",               \
+                                       LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN) +   \
+   LOGGER_QUEUE_COMMA_FIELD_STRING_MAX("receipt_id",                           \
+                                       LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX) +   \
+   1u /* } */)
+
+#define LOGGER_QUEUE_FILE_WORST_CASE_MAX                                       \
+  ((sizeof("{\"schema_version\":1,\"updated_at_utc\":") - 1u) +                \
+   LOGGER_JSON_STRING_LITERAL_MAX(LOGGER_UPLOAD_QUEUE_UTC_MAX) +               \
+   (sizeof(",\"sessions\":[") - 1u) +                                          \
+   (LOGGER_UPLOAD_QUEUE_MAX_SESSIONS *                                         \
+    LOGGER_QUEUE_ENTRY_JSON_WORST_CASE_MAX) +                                  \
+   (sizeof("]}") - 1u))
+
+_Static_assert(LOGGER_QUEUE_FILE_WORST_CASE_MAX <= LOGGER_QUEUE_FILE_MAX,
+               "upload queue file cap must cover max serialized v1 queue");
+_Static_assert((LOGGER_QUEUE_FILE_MAX % 512u) == 0u,
+               "upload queue file cap should be sector-aligned");
 
 typedef struct {
   char session_id[33];
@@ -45,7 +115,7 @@ typedef struct {
  * PSRAM-backed to free ~70 KiB of SRAM. */
 typedef union {
   struct {
-    char json[LOGGER_QUEUE_READ_MAX + 1u];
+    char json[LOGGER_QUEUE_FILE_MAX + 1u];
     jsmntok_t tokens[LOGGER_QUEUE_JSON_TOKEN_MAX];
   } load;
   struct {
@@ -82,6 +152,12 @@ typedef struct {
   FILINFO info;
   bool in_use;
 } queue_delete_workspace_t;
+
+typedef struct {
+  FIL *file;
+  size_t bytes_written;
+  size_t limit;
+} logger_queue_file_writer_t;
 
 #define LOGGER_QUEUE_SCRATCH_ADDR (PSRAM_QUEUE_REGION_BASE)
 
@@ -805,21 +881,93 @@ static bool logger_upload_queue_merge_scan_with_previous(
 }
 
 static bool __attribute__((noinline))
-logger_file_write_all(FIL *file, const void *data, size_t len) {
+logger_file_write_all(logger_queue_file_writer_t *writer, const void *data,
+                      size_t len) {
+  if (writer == NULL || writer->file == NULL || data == NULL) {
+    return false;
+  }
+  if (writer->bytes_written > writer->limit ||
+      len > (writer->limit - writer->bytes_written)) {
+    return false;
+  }
+  if (len == 0u) {
+    return true;
+  }
   UINT written = 0u;
-  return f_write(file, data, len, &written) == FR_OK && written == len;
-}
-
-static bool __attribute__((noinline)) logger_file_write_cstr(FIL *file,
-                                                             const char *text) {
-  return logger_file_write_all(file, text, strlen(text));
+  if (f_write(writer->file, data, len, &written) != FR_OK || written != len) {
+    return false;
+  }
+  writer->bytes_written += len;
+  return true;
 }
 
 static bool __attribute__((noinline))
-logger_file_write_json_string_or_null(FIL *file, const char *value) {
-  char quoted[544];
-  logger_json_string_literal(quoted, sizeof(quoted), value);
-  return logger_file_write_cstr(file, quoted);
+logger_file_write_cstr(logger_queue_file_writer_t *writer, const char *text) {
+  return text != NULL && logger_file_write_all(writer, text, strlen(text));
+}
+
+static bool __attribute__((noinline))
+logger_file_write_json_string_or_null(logger_queue_file_writer_t *writer,
+                                      const char *value) {
+  if (value == NULL || value[0] == '\0') {
+    return logger_file_write_cstr(writer, "null");
+  }
+  if (!logger_file_write_cstr(writer, "\"")) {
+    return false;
+  }
+  const char *run = value;
+  for (const unsigned char *p = (const unsigned char *)value; *p != '\0'; ++p) {
+    const char *replacement = NULL;
+    char unicode_buf[7];
+    switch (*p) {
+    case '\\':
+      replacement = "\\\\";
+      break;
+    case '"':
+      replacement = "\\\"";
+      break;
+    case '\b':
+      replacement = "\\b";
+      break;
+    case '\f':
+      replacement = "\\f";
+      break;
+    case '\n':
+      replacement = "\\n";
+      break;
+    case '\r':
+      replacement = "\\r";
+      break;
+    case '\t':
+      replacement = "\\t";
+      break;
+    default:
+      if (*p < 0x20u) {
+        const int n = snprintf(unicode_buf, sizeof(unicode_buf), "\\u%04x", *p);
+        if (n != 6) {
+          return false;
+        }
+        replacement = unicode_buf;
+      } else {
+        continue;
+      }
+      break;
+    }
+
+    const char *escaped_at = (const char *)p;
+    if (escaped_at > run &&
+        !logger_file_write_all(writer, run, (size_t)(escaped_at - run))) {
+      return false;
+    }
+    if (!logger_file_write_cstr(writer, replacement)) {
+      return false;
+    }
+    run = escaped_at + 1u;
+  }
+  if (run[0] != '\0' && !logger_file_write_cstr(writer, run)) {
+    return false;
+  }
+  return logger_file_write_cstr(writer, "\"");
 }
 
 const logger_upload_queue_entry_t *
@@ -914,7 +1062,7 @@ static bool logger_upload_queue_load_from_path(logger_upload_queue_t *queue,
   size_t len = 0u;
   assert(g_queue_scratch != NULL);
   if (!logger_storage_read_file(path, g_queue_scratch->load.json,
-                                LOGGER_QUEUE_READ_MAX, &len)) {
+                                LOGGER_QUEUE_FILE_MAX, &len)) {
     logger_upload_queue_init(queue);
     return false;
   }
@@ -1199,6 +1347,11 @@ static bool logger_upload_queue_promote_tmp(void) {
 }
 
 bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
+  if (queue == NULL ||
+      queue->session_count > LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
+    return false;
+  }
+
   logger_storage_status_t storage;
   (void)logger_storage_refresh(&storage);
   if (!storage.mounted || !storage.writable) {
@@ -1210,87 +1363,95 @@ bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
       FR_OK) {
     return false;
   }
+  logger_queue_file_writer_t writer = {
+      .file = &file,
+      .bytes_written = 0u,
+      .limit = LOGGER_QUEUE_FILE_MAX,
+  };
 
   bool ok = true;
   ok = ok && logger_file_write_cstr(
-                 &file, "{\"schema_version\":1,\"updated_at_utc\":");
-  ok =
-      ok && logger_file_write_json_string_or_null(&file, queue->updated_at_utc);
-  ok = ok && logger_file_write_cstr(&file, ",\"sessions\":[");
+                 &writer, "{\"schema_version\":1,\"updated_at_utc\":");
+  ok = ok &&
+       logger_file_write_json_string_or_null(&writer, queue->updated_at_utc);
+  ok = ok && logger_file_write_cstr(&writer, ",\"sessions\":[");
 
   for (size_t i = 0u; ok && i < queue->session_count; ++i) {
     const logger_upload_queue_entry_t *entry = &queue->sessions[i];
     char number_buf[32];
 
-    ok = ok && logger_file_write_cstr(&file, i == 0u ? "{" : ",{");
+    ok = ok && logger_file_write_cstr(&writer, i == 0u ? "{" : ",{");
 
-    ok = ok && logger_file_write_cstr(&file, "\"session_id\":");
-    ok = ok && logger_file_write_json_string_or_null(&file, entry->session_id);
-    ok = ok && logger_file_write_cstr(&file, ",\"study_day_local\":");
+    ok = ok && logger_file_write_cstr(&writer, "\"session_id\":");
+    ok =
+        ok && logger_file_write_json_string_or_null(&writer, entry->session_id);
+    ok = ok && logger_file_write_cstr(&writer, ",\"study_day_local\":");
     ok = ok &&
-         logger_file_write_json_string_or_null(&file, entry->study_day_local);
-    ok = ok && logger_file_write_cstr(&file, ",\"dir_name\":");
-    ok = ok && logger_file_write_json_string_or_null(&file, entry->dir_name);
-    ok = ok && logger_file_write_cstr(&file, ",\"session_start_utc\":");
+         logger_file_write_json_string_or_null(&writer, entry->study_day_local);
+    ok = ok && logger_file_write_cstr(&writer, ",\"dir_name\":");
+    ok = ok && logger_file_write_json_string_or_null(&writer, entry->dir_name);
+    ok = ok && logger_file_write_cstr(&writer, ",\"session_start_utc\":");
+    ok = ok && logger_file_write_json_string_or_null(&writer,
+                                                     entry->session_start_utc);
+    ok = ok && logger_file_write_cstr(&writer, ",\"session_end_utc\":");
     ok = ok &&
-         logger_file_write_json_string_or_null(&file, entry->session_start_utc);
-    ok = ok && logger_file_write_cstr(&file, ",\"session_end_utc\":");
+         logger_file_write_json_string_or_null(&writer, entry->session_end_utc);
+    ok = ok && logger_file_write_cstr(&writer, ",\"bundle_sha256\":");
     ok = ok &&
-         logger_file_write_json_string_or_null(&file, entry->session_end_utc);
-    ok = ok && logger_file_write_cstr(&file, ",\"bundle_sha256\":");
-    ok = ok &&
-         logger_file_write_json_string_or_null(&file, entry->bundle_sha256);
-    ok = ok && logger_file_write_cstr(&file, ",\"bundle_size_bytes\":");
+         logger_file_write_json_string_or_null(&writer, entry->bundle_sha256);
+    ok = ok && logger_file_write_cstr(&writer, ",\"bundle_size_bytes\":");
     const int bundle_n = snprintf(number_buf, sizeof(number_buf), "%llu",
                                   (unsigned long long)entry->bundle_size_bytes);
     ok = ok && bundle_n > 0 && (size_t)bundle_n < sizeof(number_buf) &&
-         logger_file_write_all(&file, number_buf, (size_t)bundle_n);
-    ok = ok && logger_file_write_cstr(&file, ",\"quarantined\":");
+         logger_file_write_all(&writer, number_buf, (size_t)bundle_n);
+    ok = ok && logger_file_write_cstr(&writer, ",\"quarantined\":");
     ok = ok &&
-         logger_file_write_cstr(&file, entry->quarantined ? "true" : "false");
-    ok = ok && logger_file_write_cstr(&file, ",\"status\":");
-    ok = ok && logger_file_write_json_string_or_null(&file, entry->status);
-    ok = ok && logger_file_write_cstr(&file, ",\"attempt_count\":");
+         logger_file_write_cstr(&writer, entry->quarantined ? "true" : "false");
+    ok = ok && logger_file_write_cstr(&writer, ",\"status\":");
+    ok = ok && logger_file_write_json_string_or_null(&writer, entry->status);
+    ok = ok && logger_file_write_cstr(&writer, ",\"attempt_count\":");
     const int attempt_n = snprintf(number_buf, sizeof(number_buf), "%lu",
                                    (unsigned long)entry->attempt_count);
     ok = ok && attempt_n > 0 && (size_t)attempt_n < sizeof(number_buf) &&
-         logger_file_write_all(&file, number_buf, (size_t)attempt_n);
-    ok = ok && logger_file_write_cstr(&file, ",\"last_attempt_utc\":");
-    ok = ok &&
-         logger_file_write_json_string_or_null(&file, entry->last_attempt_utc);
-    ok = ok && logger_file_write_cstr(&file, ",\"last_failure_class\":");
-    ok = ok && logger_file_write_json_string_or_null(&file,
+         logger_file_write_all(&writer, number_buf, (size_t)attempt_n);
+    ok = ok && logger_file_write_cstr(&writer, ",\"last_attempt_utc\":");
+    ok = ok && logger_file_write_json_string_or_null(&writer,
+                                                     entry->last_attempt_utc);
+    ok = ok && logger_file_write_cstr(&writer, ",\"last_failure_class\":");
+    ok = ok && logger_file_write_json_string_or_null(&writer,
                                                      entry->last_failure_class);
-    ok = ok && logger_file_write_cstr(&file, ",\"last_http_status\":");
+    ok = ok && logger_file_write_cstr(&writer, ",\"last_http_status\":");
     if (entry->last_http_status > 0u) {
       const int http_n = snprintf(number_buf, sizeof(number_buf), "%u",
                                   (unsigned)entry->last_http_status);
       ok = ok && http_n > 0 && (size_t)http_n < sizeof(number_buf) &&
-           logger_file_write_all(&file, number_buf, (size_t)http_n);
+           logger_file_write_all(&writer, number_buf, (size_t)http_n);
     } else {
-      ok = ok && logger_file_write_cstr(&file, "null");
+      ok = ok && logger_file_write_cstr(&writer, "null");
     }
-    ok = ok && logger_file_write_cstr(&file, ",\"last_server_error_code\":");
+    ok = ok && logger_file_write_cstr(&writer, ",\"last_server_error_code\":");
     ok = ok && logger_file_write_json_string_or_null(
-                   &file, entry->last_server_error_code);
-    ok = ok && logger_file_write_cstr(&file, ",\"last_server_error_message\":");
+                   &writer, entry->last_server_error_code);
+    ok = ok &&
+         logger_file_write_cstr(&writer, ",\"last_server_error_message\":");
     ok = ok && logger_file_write_json_string_or_null(
-                   &file, entry->last_server_error_message);
-    ok = ok && logger_file_write_cstr(&file, ",\"last_response_excerpt\":");
+                   &writer, entry->last_server_error_message);
+    ok = ok && logger_file_write_cstr(&writer, ",\"last_response_excerpt\":");
     ok = ok && logger_file_write_json_string_or_null(
-                   &file, entry->last_response_excerpt);
-    ok = ok && logger_file_write_cstr(&file, ",\"verified_upload_utc\":");
+                   &writer, entry->last_response_excerpt);
+    ok = ok && logger_file_write_cstr(&writer, ",\"verified_upload_utc\":");
     ok = ok && logger_file_write_json_string_or_null(
-                   &file, entry->verified_upload_utc);
-    ok = ok && logger_file_write_cstr(&file, ",\"verified_bundle_sha256\":");
+                   &writer, entry->verified_upload_utc);
+    ok = ok && logger_file_write_cstr(&writer, ",\"verified_bundle_sha256\":");
     ok = ok && logger_file_write_json_string_or_null(
-                   &file, entry->verified_bundle_sha256);
-    ok = ok && logger_file_write_cstr(&file, ",\"receipt_id\":");
-    ok = ok && logger_file_write_json_string_or_null(&file, entry->receipt_id);
-    ok = ok && logger_file_write_cstr(&file, "}");
+                   &writer, entry->verified_bundle_sha256);
+    ok = ok && logger_file_write_cstr(&writer, ",\"receipt_id\":");
+    ok =
+        ok && logger_file_write_json_string_or_null(&writer, entry->receipt_id);
+    ok = ok && logger_file_write_cstr(&writer, "}");
   }
 
-  ok = ok && logger_file_write_cstr(&file, "]}");
+  ok = ok && logger_file_write_cstr(&writer, "]}");
   const FRESULT sync_fr = ok ? f_sync(&file) : FR_INT_ERR;
   const FRESULT close_fr = f_close(&file);
   if (!ok || sync_fr != FR_OK || close_fr != FR_OK) {
