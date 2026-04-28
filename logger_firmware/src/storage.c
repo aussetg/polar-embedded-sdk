@@ -202,7 +202,7 @@ static bool logger_storage_path_tmp(char out[LOGGER_STORAGE_PATH_MAX],
   return true;
 }
 
-static void logger_storage_assert_atomic_write_context(void) {
+static void logger_storage_assert_fatfs_context(void) {
   hard_assert(__get_current_exception() == 0u);
 
   const bool worker_owns_fatfs = logger_storage_worker_owns_fatfs();
@@ -216,7 +216,7 @@ static void logger_storage_assert_atomic_write_context(void) {
 
 static logger_storage_atomic_write_workspace_t *
 logger_storage_atomic_write_workspace_acquire(void) {
-  logger_storage_assert_atomic_write_context();
+  logger_storage_assert_fatfs_context();
   assert(!g_storage_atomic_write_workspace.in_use);
   memset(&g_storage_atomic_write_workspace, 0,
          sizeof(g_storage_atomic_write_workspace));
@@ -227,7 +227,7 @@ logger_storage_atomic_write_workspace_acquire(void) {
 static void logger_storage_atomic_write_workspace_release(
     logger_storage_atomic_write_workspace_t *workspace) {
   (void)workspace;
-  logger_storage_assert_atomic_write_context();
+  logger_storage_assert_fatfs_context();
   assert(workspace == &g_storage_atomic_write_workspace);
   assert(g_storage_atomic_write_workspace.in_use);
   g_storage_atomic_write_workspace.in_use = false;
@@ -268,21 +268,20 @@ static bool logger_sd_spi_xfer_byte(uint8_t tx, uint8_t *rx_out,
   return true;
 }
 
-static uint8_t logger_sd_spi_xfer(uint8_t tx) {
-  uint8_t rx = 0xffu;
-  (void)logger_sd_spi_xfer_byte(tx, &rx, LOGGER_SD_SPI_BYTE_TIMEOUT_US);
-  return rx;
-}
-
-static void logger_sd_spi_write_ff(size_t count) {
+static bool logger_sd_spi_write_ff(size_t count) {
   while (count-- > 0u) {
-    (void)logger_sd_spi_xfer(0xffu);
+    uint8_t rx = 0xffu;
+    if (!logger_sd_spi_xfer_byte(0xffu, &rx, LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+      return false;
+    }
   }
+  return true;
 }
 
-static void logger_sd_deselect(void) {
+static bool logger_sd_deselect(void) {
   gpio_put(LOGGER_SD_CS_PIN, 1);
-  (void)logger_sd_spi_xfer(0xffu);
+  uint8_t rx = 0xffu;
+  return logger_sd_spi_xfer_byte(0xffu, &rx, LOGGER_SD_SPI_BYTE_TIMEOUT_US);
 }
 
 static void logger_sd_select(void) { gpio_put(LOGGER_SD_CS_PIN, 0); }
@@ -290,7 +289,11 @@ static void logger_sd_select(void) { gpio_put(LOGGER_SD_CS_PIN, 0); }
 static bool logger_sd_wait_ready(uint32_t timeout_ms) {
   const uint32_t start_ms = to_ms_since_boot(get_absolute_time());
   while ((to_ms_since_boot(get_absolute_time()) - start_ms) < timeout_ms) {
-    if (logger_sd_spi_xfer(0xffu) == 0xffu) {
+    uint8_t rx = 0xffu;
+    if (!logger_sd_spi_xfer_byte(0xffu, &rx, LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+      return false;
+    }
+    if (rx == 0xffu) {
       return true;
     }
   }
@@ -311,12 +314,24 @@ static uint8_t logger_sd_send_command(uint8_t cmd, uint32_t arg, uint8_t crc,
   frame[5] = crc;
 
   for (size_t i = 0u; i < sizeof(frame); ++i) {
-    (void)logger_sd_spi_xfer(frame[i]);
+    uint8_t rx = 0xffu;
+    if (!logger_sd_spi_xfer_byte(frame[i], &rx,
+                                 LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+      if (release) {
+        (void)logger_sd_deselect();
+      }
+      return 0xffu;
+    }
   }
 
   uint8_t r1 = 0xffu;
   for (int i = 0; i < 100; ++i) {
-    r1 = logger_sd_spi_xfer(0xffu);
+    if (!logger_sd_spi_xfer_byte(0xffu, &r1, LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+      if (release) {
+        (void)logger_sd_deselect();
+      }
+      return 0xffu;
+    }
     if ((r1 & 0x80u) == 0u) {
       break;
     }
@@ -324,12 +339,20 @@ static uint8_t logger_sd_send_command(uint8_t cmd, uint32_t arg, uint8_t crc,
 
   if (((r1 & 0x80u) == 0u) && extra != NULL) {
     for (size_t i = 0u; i < extra_len; ++i) {
-      extra[i] = logger_sd_spi_xfer(0xffu);
+      if (!logger_sd_spi_xfer_byte(0xffu, &extra[i],
+                                   LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+        if (release) {
+          (void)logger_sd_deselect();
+        }
+        return 0xffu;
+      }
     }
   }
 
   if (release) {
-    logger_sd_deselect();
+    if (!logger_sd_deselect()) {
+      return 0xffu;
+    }
   }
 
   return r1;
@@ -468,7 +491,10 @@ static bool logger_sd_receive_data(uint8_t *buf, size_t len) {
   uint8_t token = 0xffu;
   while ((to_ms_since_boot(get_absolute_time()) - start_ms) <
          LOGGER_SD_DATA_TIMEOUT_MS) {
-    token = logger_sd_spi_xfer(0xffu);
+    if (!logger_sd_spi_xfer_byte(0xffu, &token,
+                                 LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+      return false;
+    }
     if (token != 0xffu) {
       break;
     }
@@ -482,9 +508,18 @@ static bool logger_sd_receive_data(uint8_t *buf, size_t len) {
     return false;
   }
 
-  (void)logger_sd_spi_xfer(0xffu); /* CRC byte 1 */
-  (void)logger_sd_spi_xfer(0xffu); /* CRC byte 2 */
+  uint8_t crc = 0xffu;
+  if (!logger_sd_spi_xfer_byte(0xffu, &crc, LOGGER_SD_SPI_BYTE_TIMEOUT_US) ||
+      !logger_sd_spi_xfer_byte(0xffu, &crc, LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+    return false;
+  }
   return true;
+}
+
+static bool logger_sd_check_programming_status(void) {
+  uint8_t status2 = 0xffu;
+  const uint8_t r1 = logger_sd_send_command(13u, 0u, 0x00u, &status2, 1u, true);
+  return r1 == 0x00u && status2 == 0x00u;
 }
 
 static bool logger_sd_send_data_block(const uint8_t *buf, size_t len) {
@@ -492,21 +527,37 @@ static bool logger_sd_send_data_block(const uint8_t *buf, size_t len) {
     return false;
   }
 
-  (void)logger_sd_spi_xfer(LOGGER_SD_TOKEN_START_BLOCK);
+  uint8_t rx = 0xffu;
+  if (!logger_sd_spi_xfer_byte(LOGGER_SD_TOKEN_START_BLOCK, &rx,
+                               LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+    return false;
+  }
 
   /* Bulk data phase: DMA clocks out buf while draining RX. */
   if (!logger_sd_dma_xfer(buf, NULL, len)) {
     return false;
   }
 
-  (void)logger_sd_spi_xfer(0xffu); /* CRC byte 1 */
-  (void)logger_sd_spi_xfer(0xffu); /* CRC byte 2 */
+  if (!logger_sd_spi_xfer_byte(0xffu, &rx, LOGGER_SD_SPI_BYTE_TIMEOUT_US) ||
+      !logger_sd_spi_xfer_byte(0xffu, &rx, LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+    return false;
+  }
 
-  const uint8_t resp = logger_sd_spi_xfer(0xffu);
+  uint8_t resp = 0xffu;
+  if (!logger_sd_spi_xfer_byte(0xffu, &resp, LOGGER_SD_SPI_BYTE_TIMEOUT_US)) {
+    return false;
+  }
   if ((resp & 0x1fu) != 0x05u) {
     return false;
   }
-  return logger_sd_wait_ready(LOGGER_SD_DATA_TIMEOUT_MS);
+  if (!logger_sd_wait_ready(LOGGER_SD_DATA_TIMEOUT_MS)) {
+    return false;
+  }
+
+  /* The SD SPI data-response token reports CRC/general write acceptance.
+   * Some programming failures (for example address-range and write-protect
+   * violations) are only reflected in card status after the busy period. */
+  return logger_sd_check_programming_status();
 }
 
 static uint32_t logger_sd_parse_sector_count(const uint8_t csd[16]) {
@@ -560,8 +611,9 @@ static bool logger_sd_initialize_card(void) {
   }
 
   spi_set_baudrate(logger_sd_spi_bus(), LOGGER_SD_SPI_INIT_BAUD_HZ);
-  logger_sd_deselect();
-  logger_sd_spi_write_ff(16u);
+  if (!logger_sd_deselect() || !logger_sd_spi_write_ff(16u)) {
+    return false;
+  }
 
   uint8_t r1 = 0xffu;
   for (int i = 0; i < 10; ++i) {
@@ -624,17 +676,17 @@ static bool logger_sd_initialize_card(void) {
 
   r1 = logger_sd_send_command(9u, 0u, 0x00u, NULL, 0u, false);
   if (r1 != 0x00u || !logger_sd_receive_data(sd->csd, sizeof(sd->csd))) {
-    logger_sd_deselect();
+    (void)logger_sd_deselect();
     return false;
   }
-  logger_sd_deselect();
+  (void)logger_sd_deselect();
 
   r1 = logger_sd_send_command(10u, 0u, 0x00u, NULL, 0u, false);
   if (r1 != 0x00u || !logger_sd_receive_data(sd->cid, sizeof(sd->cid))) {
-    logger_sd_deselect();
+    (void)logger_sd_deselect();
     return false;
   }
-  logger_sd_deselect();
+  (void)logger_sd_deselect();
 
   sd->sector_count = logger_sd_parse_sector_count(sd->csd);
   sd->high_capacity = high_capacity;
@@ -706,8 +758,8 @@ static void logger_storage_reset_card_state(void) {
   memset(g_sd.ocr, 0, sizeof(g_sd.ocr));
 
   spi_set_baudrate(logger_sd_spi_bus(), LOGGER_SD_SPI_INIT_BAUD_HZ);
-  logger_sd_deselect();
-  logger_sd_spi_write_ff(16u);
+  (void)logger_sd_deselect();
+  (void)logger_sd_spi_write_ff(16u);
 }
 
 static void logger_storage_unmount(void) {
@@ -764,6 +816,10 @@ static void logger_storage_zero_status(logger_storage_status_t *status) {
 }
 
 bool logger_storage_refresh(logger_storage_status_t *status) {
+  if (status == NULL) {
+    return false;
+  }
+  logger_storage_assert_fatfs_context();
   logger_storage_zero_status(status);
   logger_storage_init();
 
@@ -771,9 +827,25 @@ bool logger_storage_refresh(logger_storage_status_t *status) {
   status->detect_pin_configured = true;
   status->detect_pin_asserted = logger_sd_detect_pin_active();
 
+  if (!status->detect_pin_asserted) {
+    logger_storage_unmount();
+    logger_sd_invalidate_card_state();
+    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
+    status->card_present = false;
+    return false;
+  }
+  if ((g_sd.dstatus & STA_NODISK) != 0u) {
+    g_sd.dstatus = (DSTATUS)(g_sd.dstatus & ~STA_NODISK);
+  }
+
   if (!logger_storage_mount_if_needed()) {
-    status->card_present =
-        logger_sd_detect_pin_active() || g_sd.card_initialized;
+    status->card_present = true;
+    status->card_initialized = g_sd.card_initialized;
+    status->capacity_bytes = (uint64_t)g_sd.sector_count * 512u;
+    status->sector_count = g_sd.sector_count;
+    if (g_sd.card_initialized) {
+      logger_sd_fill_identity(status);
+    }
     return false;
   }
 
@@ -817,7 +889,21 @@ bool logger_storage_refresh(logger_storage_status_t *status) {
 }
 
 bool logger_storage_format(logger_storage_status_t *status) {
+  logger_storage_assert_fatfs_context();
   logger_storage_init();
+
+  if (!logger_sd_detect_pin_active()) {
+    logger_storage_unmount();
+    logger_sd_invalidate_card_state();
+    g_sd.dstatus = (DSTATUS)(STA_NOINIT | STA_NODISK);
+    if (status != NULL) {
+      (void)logger_storage_refresh(status);
+    }
+    return false;
+  }
+  if ((g_sd.dstatus & STA_NODISK) != 0u) {
+    g_sd.dstatus = (DSTATUS)(g_sd.dstatus & ~STA_NODISK);
+  }
 
   logger_storage_unmount();
 
@@ -881,6 +967,7 @@ bool logger_storage_ready_for_logging(const logger_storage_status_t *status) {
 }
 
 bool logger_storage_ensure_dir(const char *path) {
+  logger_storage_assert_fatfs_context();
   logger_storage_status_t status;
   (void)logger_storage_refresh(&status);
   if (!status.mounted) {
@@ -892,6 +979,7 @@ bool logger_storage_ensure_dir(const char *path) {
 
 bool logger_storage_write_file_atomic(const char *path, const void *data,
                                       size_t len) {
+  logger_storage_assert_fatfs_context();
   logger_storage_status_t status;
   logger_storage_atomic_write_workspace_t *workspace =
       logger_storage_atomic_write_workspace_acquire();
@@ -936,6 +1024,7 @@ bool logger_storage_write_file_atomic(const char *path, const void *data,
 }
 
 bool logger_storage_remove_file(const char *path) {
+  logger_storage_assert_fatfs_context();
   logger_storage_status_t status;
   (void)logger_storage_refresh(&status);
   if (!status.mounted) {
@@ -946,6 +1035,7 @@ bool logger_storage_remove_file(const char *path) {
 }
 
 bool logger_storage_file_size(const char *path, uint64_t *size_bytes) {
+  logger_storage_assert_fatfs_context();
   FILINFO info;
   logger_storage_status_t status;
   (void)logger_storage_refresh(&status);
@@ -962,6 +1052,7 @@ bool logger_storage_file_size(const char *path, uint64_t *size_bytes) {
 }
 
 bool logger_storage_file_exists(const char *path) {
+  logger_storage_assert_fatfs_context();
   FILINFO info;
   logger_storage_status_t status;
   (void)logger_storage_refresh(&status);
@@ -973,6 +1064,7 @@ bool logger_storage_file_exists(const char *path) {
 
 bool logger_storage_read_file(const char *path, void *data, size_t cap,
                               size_t *len_out) {
+  logger_storage_assert_fatfs_context();
   logger_storage_status_t status;
   (void)logger_storage_refresh(&status);
   if (!status.mounted || data == NULL) {
@@ -1005,6 +1097,7 @@ bool logger_storage_read_file(const char *path, void *data, size_t cap,
 }
 
 bool logger_storage_truncate_file(const char *path, uint64_t size_bytes) {
+  logger_storage_assert_fatfs_context();
   logger_storage_status_t status;
   (void)logger_storage_refresh(&status);
   if (!status.mounted || !status.writable) {
@@ -1061,17 +1154,18 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
     block *= 512u;
   }
 
-  logger_sd_deselect();
-  logger_sd_spi_write_ff(1u);
+  if (!logger_sd_deselect() || !logger_sd_spi_write_ff(1u)) {
+    return RES_ERROR;
+  }
 
   for (UINT i = 0u; i < count; ++i) {
     const uint8_t r1 =
         logger_sd_send_command(17u, block, 0x00u, NULL, 0u, false);
     if (r1 != 0x00u || !logger_sd_receive_data(buff + (i * 512u), 512u)) {
-      logger_sd_deselect();
+      (void)logger_sd_deselect();
       return RES_ERROR;
     }
-    logger_sd_deselect();
+    (void)logger_sd_deselect();
     block += g_sd.high_capacity ? 1u : 512u;
   }
 
@@ -1091,17 +1185,18 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
     block *= 512u;
   }
 
-  logger_sd_deselect();
-  logger_sd_spi_write_ff(1u);
+  if (!logger_sd_deselect() || !logger_sd_spi_write_ff(1u)) {
+    return RES_ERROR;
+  }
 
   for (UINT i = 0u; i < count; ++i) {
     const uint8_t r1 =
         logger_sd_send_command(24u, block, 0x00u, NULL, 0u, false);
     if (r1 != 0x00u || !logger_sd_send_data_block(buff + (i * 512u), 512u)) {
-      logger_sd_deselect();
+      (void)logger_sd_deselect();
       return RES_ERROR;
     }
-    logger_sd_deselect();
+    (void)logger_sd_deselect();
     block += g_sd.high_capacity ? 1u : 512u;
   }
 
@@ -1121,7 +1216,7 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
     logger_sd_select();
     {
       const bool ready = logger_sd_wait_ready(LOGGER_SD_DATA_TIMEOUT_MS);
-      logger_sd_deselect();
+      (void)logger_sd_deselect();
       return ready ? RES_OK : RES_ERROR;
     }
   case GET_SECTOR_COUNT:

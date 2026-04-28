@@ -39,6 +39,7 @@ logger_journal_scan_workspace_acquire(void) {
 
 static void logger_journal_scan_workspace_release(
     logger_journal_scan_workspace_t *workspace) {
+  (void)workspace;
   assert(workspace == &g_journal_scan_workspace);
   assert(g_journal_scan_workspace.in_use);
   g_journal_scan_workspace.in_use = false;
@@ -319,6 +320,7 @@ bool logger_journal_scan(const char *path,
   logger_bytes_to_hex_16(workspace->header + 16, result->session_id);
   result->valid = true;
   result->valid_size_bytes = LOGGER_JOURNAL_FILE_HEADER_BYTES;
+  bool io_error = false;
 
   while (true) {
     read_bytes = 0u;
@@ -326,6 +328,7 @@ bool logger_journal_scan(const char *path,
         f_read(&file, workspace->record_header,
                sizeof(workspace->record_header), &read_bytes);
     if (header_fr != FR_OK) {
+      io_error = true;
       break;
     }
     if (read_bytes == 0u) {
@@ -366,8 +369,14 @@ bool logger_journal_scan(const char *path,
                             ? sizeof(workspace->chunk)
                             : (UINT)payload_remaining;
       read_bytes = 0u;
-      if (f_read(&file, workspace->chunk, want, &read_bytes) != FR_OK ||
-          read_bytes != want) {
+      const FRESULT payload_fr =
+          f_read(&file, workspace->chunk, want, &read_bytes);
+      if (payload_fr != FR_OK) {
+        io_error = true;
+        payload_remaining = UINT32_MAX;
+        break;
+      }
+      if (read_bytes != want) {
         payload_remaining = UINT32_MAX;
         break;
       }
@@ -409,7 +418,7 @@ bool logger_journal_scan(const char *path,
     }
   }
 
-  const bool ok = f_close(&file) == FR_OK;
+  const bool ok = !io_error && f_close(&file) == FR_OK;
   logger_journal_scan_workspace_release(workspace);
   return ok;
 }

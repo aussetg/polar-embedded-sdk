@@ -64,8 +64,8 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
     const char *utc = svc->params.utc_only.updated_at_utc[0] != '\0'
                           ? svc->params.utc_only.updated_at_utc
                           : NULL;
-    svc->ok = logger_upload_queue_scan(&svc->response.queue, svc->system_log,
-                                       utc);
+    svc->ok =
+        logger_upload_queue_scan(&svc->response.queue, svc->system_log, utc);
     break;
   }
 
@@ -118,7 +118,12 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
   }
 
   case STORAGE_SVC_STORAGE_REFRESH: {
-    svc->ok = logger_storage_refresh(&svc->response.storage_status);
+    /* A refresh is an observation, not a readiness predicate.  The status
+     * payload is useful when the card is absent, low on reserve, or otherwise
+     * not ready for logging, so report mailbox success as long as the worker
+     * executed the refresh path and let callers inspect the status fields. */
+    (void)logger_storage_refresh(&svc->response.storage_status);
+    svc->ok = true;
     break;
   }
 
@@ -214,7 +219,7 @@ static bool storage_worker_init_flash_safety(void) {
 }
 
 static void storage_worker_idle_wait_poll(capture_pipe_t *pipe,
-                                         uint32_t max_wait_us) {
+                                          uint32_t max_wait_us) {
   if (pipe == NULL || max_wait_us == 0u) {
     return;
   }
@@ -470,8 +475,7 @@ bool logger_storage_worker_launch(storage_worker_shared_t *shared) {
   const uint32_t launch_timeout_ms = 5000u;
   const uint32_t start_ms = (uint32_t)(time_us_64() / 1000ull);
   while (!shared->core1_lockout_ready) {
-    if (((uint32_t)(time_us_64() / 1000ull) - start_ms) >=
-        launch_timeout_ms) {
+    if (((uint32_t)(time_us_64() / 1000ull) - start_ms) >= launch_timeout_ms) {
       printf("[storage_worker] core 1 lockout timed out\n");
       return false;
     }

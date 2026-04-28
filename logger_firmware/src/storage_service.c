@@ -50,8 +50,7 @@ static bool logger_storage_svc_available(void) {
 #define STORAGE_SVC_BUNDLE_COMPUTE_TIMEOUT_MS (5u * 60u * 1000u)
 #define STORAGE_SVC_WAIT_HEARTBEAT_MS 100u
 
-static uint32_t
-logger_storage_svc_timeout_ms(storage_service_kind_t kind) {
+static uint32_t logger_storage_svc_timeout_ms(storage_service_kind_t kind) {
   switch (kind) {
   case STORAGE_SVC_QUEUE_SCAN:
   case STORAGE_SVC_QUEUE_REFRESH:
@@ -165,8 +164,7 @@ static bool logger_storage_svc_wait(storage_service_kind_t kind,
   }
   __mem_fence_acquire();
 
-  const bool ok = !timed_out &&
-                  svc->state == STORAGE_SVC_STATE_DONE && svc->ok;
+  const bool ok = !timed_out && svc->state == STORAGE_SVC_STATE_DONE && svc->ok;
   svc->kind = STORAGE_SVC_NONE;
   svc->state = STORAGE_SVC_STATE_IDLE;
   return ok;
@@ -355,7 +353,8 @@ bool logger_storage_svc_refresh(logger_storage_status_t *status) {
     return false;
   }
   if (!logger_storage_svc_available()) {
-    return logger_storage_refresh(status);
+    (void)logger_storage_refresh(status);
+    return true;
   }
   storage_service_t *svc = &g_svc_shared->service;
   logger_storage_svc_prepare(svc);

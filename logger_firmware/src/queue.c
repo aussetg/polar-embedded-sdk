@@ -17,6 +17,7 @@
 
 #define LOGGER_QUEUE_PATH "0:/logger/state/upload_queue.json"
 #define LOGGER_QUEUE_TMP_PATH "0:/logger/state/upload_queue.json.tmp"
+#define LOGGER_QUEUE_BACKUP_PATH "0:/logger/state/upload_queue.json.bak"
 #define LOGGER_SESSIONS_DIR "0:/logger/sessions"
 #define LOGGER_MANIFEST_READ_MAX 8192u
 #define LOGGER_QUEUE_READ_MAX 49152u
@@ -376,6 +377,12 @@ static bool logger_queue_status_valid(const char *status) {
          strcmp(status, "nonretryable") == 0 || strcmp(status, "failed") == 0;
 }
 
+static bool logger_queue_status_is_protected(const char *status) {
+  return strcmp(status, "verified") == 0 ||
+         strcmp(status, "blocked_min_firmware") == 0 ||
+         strcmp(status, "nonretryable") == 0;
+}
+
 static bool
 logger_queue_entry_immutable_match(const logger_upload_queue_entry_t *a,
                                    const logger_upload_queue_entry_t *b) {
@@ -680,7 +687,9 @@ static bool logger_remove_closed_session_dir(const char *dir_name) {
       break;
     }
   }
-  (void)f_closedir(&workspace->dir);
+  if (f_closedir(&workspace->dir) != FR_OK) {
+    ok = false;
+  }
   if (!ok) {
     logger_queue_delete_workspace_release(workspace);
     return false;
@@ -724,6 +733,23 @@ static void __attribute__((noinline)) logger_upload_queue_merge_scanned_entries(
             logger_log_local_corrupt(system_log, updated_at_utc_or_null,
                                      entry->dir_name,
                                      "queue_entry_identity_changed");
+            if (logger_queue_status_is_protected(
+                    previous->sessions[j].status)) {
+              *entry = previous->sessions[j];
+            } else {
+              logger_copy_string(entry->status, sizeof(entry->status),
+                                 "nonretryable");
+              logger_copy_string(entry->last_failure_class,
+                                 sizeof(entry->last_failure_class),
+                                 "local_corrupt");
+              entry->last_http_status = 0u;
+              entry->last_server_error_code[0] = '\0';
+              entry->last_server_error_message[0] = '\0';
+              entry->last_response_excerpt[0] = '\0';
+              entry->verified_upload_utc[0] = '\0';
+              entry->verified_bundle_sha256[0] = '\0';
+              entry->receipt_id[0] = '\0';
+            }
           }
           break;
         }
@@ -863,22 +889,32 @@ void logger_upload_queue_compute_summary(
   }
 }
 
-bool logger_upload_queue_load(logger_upload_queue_t *queue) {
+static bool logger_upload_queue_load_from_path(logger_upload_queue_t *queue,
+                                               const char *path,
+                                               bool *present_out) {
   logger_upload_queue_init(queue);
+  if (present_out != NULL) {
+    *present_out = false;
+  }
 
-  logger_storage_status_t storage;
-  (void)logger_storage_refresh(&storage);
-  if (!storage.mounted) {
+  FILINFO info;
+  memset(&info, 0, sizeof(info));
+  const FRESULT stat_fr = f_stat(path, &info);
+  if (stat_fr == FR_NO_FILE || stat_fr == FR_NO_PATH) {
+    return true;
+  }
+  if (stat_fr != FR_OK) {
     return false;
   }
-  if (!logger_storage_file_exists(LOGGER_QUEUE_PATH)) {
-    return true;
+  if (present_out != NULL) {
+    *present_out = true;
   }
 
   size_t len = 0u;
   assert(g_queue_scratch != NULL);
-  if (!logger_storage_read_file(LOGGER_QUEUE_PATH, g_queue_scratch->load.json,
+  if (!logger_storage_read_file(path, g_queue_scratch->load.json,
                                 LOGGER_QUEUE_READ_MAX, &len)) {
+    logger_upload_queue_init(queue);
     return false;
   }
   g_queue_scratch->load.json[len] = '\0';
@@ -887,11 +923,13 @@ bool logger_upload_queue_load(logger_upload_queue_t *queue) {
   if (!logger_json_parse(&doc, g_queue_scratch->load.json, len,
                          g_queue_scratch->load.tokens,
                          LOGGER_QUEUE_JSON_TOKEN_MAX)) {
+    logger_upload_queue_init(queue);
     return false;
   }
 
   const jsmntok_t *root = logger_json_root(&doc);
   if (root == NULL || root->type != JSMN_OBJECT) {
+    logger_upload_queue_init(queue);
     return false;
   }
 
@@ -899,12 +937,14 @@ bool logger_upload_queue_load(logger_upload_queue_t *queue) {
   if (!logger_json_object_get_uint32(&doc, root, "schema_version",
                                      &schema_version) ||
       schema_version != 1u) {
+    logger_upload_queue_init(queue);
     return false;
   }
 
   if (!logger_json_object_copy_string_or_null(&doc, root, "updated_at_utc",
                                               queue->updated_at_utc,
                                               sizeof(queue->updated_at_utc))) {
+    logger_upload_queue_init(queue);
     return false;
   }
 
@@ -912,6 +952,7 @@ bool logger_upload_queue_load(logger_upload_queue_t *queue) {
       logger_json_object_get(&doc, root, "sessions");
   if (sessions_tok == NULL || sessions_tok->type != JSMN_ARRAY ||
       (size_t)sessions_tok->size > LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
+    logger_upload_queue_init(queue);
     return false;
   }
 
@@ -919,12 +960,14 @@ bool logger_upload_queue_load(logger_upload_queue_t *queue) {
     const jsmntok_t *entry_tok = logger_json_array_get(&doc, sessions_tok, i);
     if (entry_tok == NULL || entry_tok->type != JSMN_OBJECT ||
         queue->session_count >= LOGGER_UPLOAD_QUEUE_MAX_SESSIONS) {
+      logger_upload_queue_init(queue);
       return false;
     }
     logger_upload_queue_entry_t entry;
     if (!logger_parse_queue_entry_json(&doc, entry_tok, &entry) ||
         logger_upload_queue_find_by_session_id(queue, entry.session_id) !=
             NULL) {
+      logger_upload_queue_init(queue);
       return false;
     }
 
@@ -933,6 +976,32 @@ bool logger_upload_queue_load(logger_upload_queue_t *queue) {
 
   logger_upload_queue_sort(queue);
   return true;
+}
+
+bool logger_upload_queue_load(logger_upload_queue_t *queue) {
+  logger_storage_status_t storage;
+  (void)logger_storage_refresh(&storage);
+  if (!storage.mounted) {
+    logger_upload_queue_init(queue);
+    return false;
+  }
+
+  bool primary_present = false;
+  const bool primary_ok = logger_upload_queue_load_from_path(
+      queue, LOGGER_QUEUE_PATH, &primary_present);
+  if (primary_ok && primary_present) {
+    return true;
+  }
+
+  bool backup_present = false;
+  const bool backup_ok = logger_upload_queue_load_from_path(
+      queue, LOGGER_QUEUE_BACKUP_PATH, &backup_present);
+  if (backup_ok && backup_present) {
+    return true;
+  }
+
+  logger_upload_queue_init(queue);
+  return primary_ok && !primary_present && backup_ok && !backup_present;
 }
 
 bool logger_upload_queue_scan(logger_upload_queue_t *queue,
@@ -959,10 +1028,15 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
     return false;
   }
 
+  bool ok = true;
   for (;;) {
     memset(&scan_workspace->info, 0, sizeof(scan_workspace->info));
     const FRESULT fr = f_readdir(&dir, &scan_workspace->info);
-    if (fr != FR_OK || scan_workspace->info.fname[0] == '\0') {
+    if (fr != FR_OK) {
+      ok = false;
+      break;
+    }
+    if (scan_workspace->info.fname[0] == '\0') {
       break;
     }
     if ((scan_workspace->info.fattrib & AM_DIR) == 0u ||
@@ -1054,9 +1128,56 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
     queue->session_count += 1u;
   }
 
-  (void)f_closedir(&dir);
+  if (f_closedir(&dir) != FR_OK) {
+    ok = false;
+  }
   logger_queue_scan_workspace_release(scan_workspace);
+  if (!ok) {
+    logger_upload_queue_init(queue);
+    return false;
+  }
   logger_upload_queue_sort(queue);
+  return true;
+}
+
+static bool logger_queue_file_exists(const char *path, bool *exists_out) {
+  if (exists_out != NULL) {
+    *exists_out = false;
+  }
+  FILINFO info;
+  memset(&info, 0, sizeof(info));
+  const FRESULT fr = f_stat(path, &info);
+  if (fr == FR_OK) {
+    if (exists_out != NULL) {
+      *exists_out = true;
+    }
+    return true;
+  }
+  return fr == FR_NO_FILE || fr == FR_NO_PATH;
+}
+
+static bool logger_upload_queue_promote_tmp(void) {
+  bool current_exists = false;
+  if (!logger_queue_file_exists(LOGGER_QUEUE_PATH, &current_exists)) {
+    return false;
+  }
+
+  if (current_exists) {
+    const FRESULT unlink_backup_fr = f_unlink(LOGGER_QUEUE_BACKUP_PATH);
+    if (unlink_backup_fr != FR_OK && unlink_backup_fr != FR_NO_FILE) {
+      return false;
+    }
+    if (f_rename(LOGGER_QUEUE_PATH, LOGGER_QUEUE_BACKUP_PATH) != FR_OK) {
+      return false;
+    }
+  }
+
+  if (f_rename(LOGGER_QUEUE_TMP_PATH, LOGGER_QUEUE_PATH) != FR_OK) {
+    if (current_exists) {
+      (void)f_rename(LOGGER_QUEUE_BACKUP_PATH, LOGGER_QUEUE_PATH);
+    }
+    return false;
+  }
   return true;
 }
 
@@ -1160,8 +1281,7 @@ bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
     return false;
   }
 
-  (void)f_unlink(LOGGER_QUEUE_PATH);
-  if (f_rename(LOGGER_QUEUE_TMP_PATH, LOGGER_QUEUE_PATH) != FR_OK) {
+  if (!logger_upload_queue_promote_tmp()) {
     (void)f_unlink(LOGGER_QUEUE_TMP_PATH);
     return false;
   }
@@ -1284,8 +1404,8 @@ bool logger_upload_queue_prune_file(
   }
 
   logger_storage_status_t storage;
-  if (!logger_storage_refresh(&storage) || !storage.mounted ||
-      !storage.writable || !storage.logger_root_ready) {
+  (void)logger_storage_refresh(&storage);
+  if (!storage.mounted || !storage.writable || !storage.logger_root_ready) {
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
     }
@@ -1329,7 +1449,8 @@ bool logger_upload_queue_prune_file(
     changed = true;
   }
 
-  if (!logger_storage_refresh(&storage)) {
+  (void)logger_storage_refresh(&storage);
+  if (!storage.mounted || !storage.writable || !storage.logger_root_ready) {
     logger_queue_op_workspace_release(workspace);
     if (summary_out != NULL) {
       logger_upload_queue_summary_init(summary_out);
@@ -1359,7 +1480,8 @@ bool logger_upload_queue_prune_file(
     reserve_pruned_count += 1u;
     changed = true;
 
-    if (!logger_storage_refresh(&storage)) {
+    (void)logger_storage_refresh(&storage);
+    if (!storage.mounted || !storage.writable || !storage.logger_root_ready) {
       logger_queue_op_workspace_release(workspace);
       if (summary_out != NULL) {
         logger_upload_queue_summary_init(summary_out);

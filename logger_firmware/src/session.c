@@ -40,6 +40,7 @@ typedef struct {
   char manifest_path[LOGGER_STORAGE_PATH_MAX];
   char live_session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
   logger_journal_scan_result_t scan;
+  bool live_present;
   bool in_use;
 } logger_session_recovery_workspace_t;
 
@@ -1102,22 +1103,80 @@ static void logger_session_log_recovery_issue(logger_system_log_t *system_log,
                                  details_json != NULL ? details_json : "{}");
 }
 
-static bool logger_session_find_live_paths(
+static bool logger_session_path_exists(const char *path, bool *exists_out,
+                                       bool *io_error_out) {
+  if (exists_out != NULL) {
+    *exists_out = false;
+  }
+  FILINFO info;
+  memset(&info, 0, sizeof(info));
+  const FRESULT fr = f_stat(path, &info);
+  if (fr == FR_OK) {
+    if (exists_out != NULL) {
+      *exists_out = true;
+    }
+    return true;
+  }
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    return true;
+  }
+  if (io_error_out != NULL) {
+    *io_error_out = true;
+  }
+  return false;
+}
+
+static bool logger_session_store_recovery_paths(
     char dir_name_out[64], char dir_path_out[LOGGER_STORAGE_PATH_MAX],
     char journal_path_out[LOGGER_STORAGE_PATH_MAX],
     char live_path_out[LOGGER_STORAGE_PATH_MAX],
-    char manifest_path_out[LOGGER_STORAGE_PATH_MAX]) {
+    char manifest_path_out[LOGGER_STORAGE_PATH_MAX], const char *dir_name) {
+  if (strlen(dir_name) >= 64u) {
+    return false;
+  }
+  logger_copy_string(dir_name_out, 64u, dir_name);
+  return logger_path_join2(dir_path_out, LOGGER_STORAGE_PATH_MAX,
+                           "0:/logger/sessions/", dir_name) &&
+         logger_path_join2(journal_path_out, LOGGER_STORAGE_PATH_MAX,
+                           dir_path_out, "/journal.bin") &&
+         logger_path_join2(live_path_out, LOGGER_STORAGE_PATH_MAX, dir_path_out,
+                           "/live.json") &&
+         logger_path_join2(manifest_path_out, LOGGER_STORAGE_PATH_MAX,
+                           dir_path_out, "/manifest.json");
+}
+
+static bool logger_session_find_recovery_paths(
+    char dir_name_out[64], char dir_path_out[LOGGER_STORAGE_PATH_MAX],
+    char journal_path_out[LOGGER_STORAGE_PATH_MAX],
+    char live_path_out[LOGGER_STORAGE_PATH_MAX],
+    char manifest_path_out[LOGGER_STORAGE_PATH_MAX], bool *live_present_out,
+    bool *io_error_out) {
+  if (io_error_out != NULL) {
+    *io_error_out = false;
+  }
+  if (live_present_out != NULL) {
+    *live_present_out = false;
+  }
   DIR dir;
   if (f_opendir(&dir, "0:/logger/sessions") != FR_OK) {
+    if (io_error_out != NULL) {
+      *io_error_out = true;
+    }
     return false;
   }
 
   bool found = false;
+  bool io_error = false;
+  bool found_journal_only = false;
   for (;;) {
     FILINFO info;
     memset(&info, 0, sizeof(info));
     const FRESULT fr = f_readdir(&dir, &info);
-    if (fr != FR_OK || info.fname[0] == '\0') {
+    if (fr != FR_OK) {
+      io_error = true;
+      break;
+    }
+    if (info.fname[0] == '\0') {
       break;
     }
     if ((info.fattrib & AM_DIR) == 0u || strcmp(info.fname, ".") == 0 ||
@@ -1125,31 +1184,65 @@ static bool logger_session_find_live_paths(
       continue;
     }
 
+    char dir_path[LOGGER_STORAGE_PATH_MAX];
+    char journal_path[LOGGER_STORAGE_PATH_MAX];
     char live_path[LOGGER_STORAGE_PATH_MAX];
-    if (!logger_path_join3(live_path, sizeof(live_path), "0:/logger/sessions/",
-                           info.fname, "/live.json")) {
-      continue;
-    }
-    if (!logger_storage_file_exists(live_path)) {
+    char manifest_path[LOGGER_STORAGE_PATH_MAX];
+    char candidate_dir_name[64];
+    if (!logger_session_store_recovery_paths(candidate_dir_name, dir_path,
+                                             journal_path, live_path,
+                                             manifest_path, info.fname)) {
       continue;
     }
 
-    logger_copy_string(dir_name_out, 64u, info.fname);
-    if (!logger_path_join2(dir_path_out, LOGGER_STORAGE_PATH_MAX,
-                           "0:/logger/sessions/", info.fname) ||
-        !logger_path_join2(journal_path_out, LOGGER_STORAGE_PATH_MAX,
-                           dir_path_out, "/journal.bin") ||
-        !logger_path_join2(live_path_out, LOGGER_STORAGE_PATH_MAX, dir_path_out,
-                           "/live.json") ||
-        !logger_path_join2(manifest_path_out, LOGGER_STORAGE_PATH_MAX,
-                           dir_path_out, "/manifest.json")) {
+    bool live_exists = false;
+    bool journal_exists = false;
+    bool manifest_exists = false;
+    if (!logger_session_path_exists(live_path, &live_exists, &io_error) ||
+        !logger_session_path_exists(journal_path, &journal_exists, &io_error) ||
+        !logger_session_path_exists(manifest_path, &manifest_exists,
+                                    &io_error)) {
+      break;
+    }
+
+    if (live_exists) {
+      logger_copy_string(dir_name_out, 64u, candidate_dir_name);
+      logger_copy_string(dir_path_out, LOGGER_STORAGE_PATH_MAX, dir_path);
+      logger_copy_string(journal_path_out, LOGGER_STORAGE_PATH_MAX,
+                         journal_path);
+      logger_copy_string(live_path_out, LOGGER_STORAGE_PATH_MAX, live_path);
+      logger_copy_string(manifest_path_out, LOGGER_STORAGE_PATH_MAX,
+                         manifest_path);
+      if (live_present_out != NULL) {
+        *live_present_out = true;
+      }
+      found = true;
+      break;
+    }
+
+    if (found_journal_only || !journal_exists || manifest_exists) {
       continue;
+    }
+    logger_copy_string(dir_name_out, 64u, candidate_dir_name);
+    logger_copy_string(dir_path_out, LOGGER_STORAGE_PATH_MAX, dir_path);
+    logger_copy_string(journal_path_out, LOGGER_STORAGE_PATH_MAX, journal_path);
+    logger_copy_string(live_path_out, LOGGER_STORAGE_PATH_MAX, live_path);
+    logger_copy_string(manifest_path_out, LOGGER_STORAGE_PATH_MAX,
+                       manifest_path);
+    if (live_present_out != NULL) {
+      *live_present_out = false;
     }
     found = true;
-    break;
+    found_journal_only = true;
   }
 
-  return f_closedir(&dir) == FR_OK && found;
+  if (f_closedir(&dir) != FR_OK) {
+    io_error = true;
+  }
+  if (io_error_out != NULL) {
+    *io_error_out = io_error;
+  }
+  return !io_error && found;
 }
 
 static bool logger_session_load_live_session_id(
@@ -1183,6 +1276,113 @@ static bool logger_session_load_live_session_id(
       strlen(session_id_out) == LOGGER_SESSION_ID_HEX_LEN;
   logger_session_live_json_workspace_release(workspace);
   return ok;
+}
+
+static bool logger_session_restore_state_from_scan(
+    logger_session_state_t *session,
+    const logger_session_recovery_workspace_t *workspace,
+    logger_system_log_t *system_log, const logger_clock_status_t *clock) {
+  logger_session_init(session);
+  session->active = true;
+  logger_copy_string(session->session_id, sizeof(session->session_id),
+                     workspace->scan.session_id);
+  logger_copy_string(session->study_day_local, sizeof(session->study_day_local),
+                     workspace->scan.study_day_local);
+  logger_copy_string(session->session_start_utc,
+                     sizeof(session->session_start_utc),
+                     workspace->scan.session_start_utc);
+  logger_copy_string(session->session_end_utc, sizeof(session->session_end_utc),
+                     workspace->scan.session_end_utc);
+  logger_copy_string(session->session_start_reason,
+                     sizeof(session->session_start_reason),
+                     workspace->scan.session_start_reason);
+  logger_copy_string(session->session_end_reason,
+                     sizeof(session->session_end_reason),
+                     workspace->scan.session_end_reason);
+  logger_copy_string(session->session_dir_name,
+                     sizeof(session->session_dir_name), workspace->dir_name);
+  logger_copy_string(session->session_dir_path,
+                     sizeof(session->session_dir_path), workspace->dir_path);
+  logger_copy_string(session->journal_path, sizeof(session->journal_path),
+                     workspace->journal_path);
+  logger_copy_string(session->live_path, sizeof(session->live_path),
+                     workspace->live_path);
+  logger_copy_string(session->manifest_path, sizeof(session->manifest_path),
+                     workspace->manifest_path);
+
+  logger_session_writer_restore_from_scan(&session->writer, &workspace->scan);
+  session->next_packet_seq_in_span = workspace->scan.next_packet_seq_in_span;
+  session->span_count = workspace->scan.span_count;
+  memcpy(session->spans, workspace->scan.spans, sizeof(session->spans));
+  session->span_active = workspace->scan.active_span_open;
+  session->current_span_index = workspace->scan.active_span_open
+                                    ? workspace->scan.active_span_index
+                                    : 0xffffffffu;
+  logger_copy_string(
+      session->current_span_id, sizeof(session->current_span_id),
+      workspace->scan.active_span_open ? workspace->scan.active_span_id : NULL);
+  if (workspace->scan.active_span_open &&
+      !logger_hex_to_bytes_16(session->current_span_id,
+                              session->current_span_id_raw)) {
+    logger_session_log_recovery_issue(
+        system_log, clock != NULL ? clock->now_utc : NULL,
+        "session_recovery_failed", "{\"reason\":\"span_id_parse_failed\"}");
+    return false;
+  }
+  session->quarantine_clock_invalid_at_start =
+      workspace->scan.quarantine_clock_invalid_at_start;
+  session->quarantine_clock_fixed_mid_session =
+      workspace->scan.quarantine_clock_fixed_mid_session;
+  session->quarantine_clock_jump = workspace->scan.quarantine_clock_jump;
+  session->quarantine_recovery_after_reset =
+      workspace->scan.quarantine_recovery_after_reset;
+  logger_session_recompute_quarantine(session, clock);
+  return true;
+}
+
+static bool logger_session_materialize_recovered_manifest(
+    logger_session_state_t *session, logger_system_log_t *system_log,
+    const logger_clock_status_t *clock) {
+  const logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
+
+  logger_storage_status_t storage_now = mc->storage;
+  (void)logger_storage_refresh(&storage_now);
+
+  char journal_sha256[LOGGER_SHA256_HEX_LEN + 1];
+  uint64_t journal_size_bytes = 0u;
+  if (!logger_session_compute_file_sha256(session->journal_path, journal_sha256,
+                                          &journal_size_bytes)) {
+    logger_session_log_recovery_issue(
+        system_log, clock != NULL ? clock->now_utc : NULL,
+        "session_recovery_failed", "{\"reason\":\"journal_hash_failed\"}");
+    return false;
+  }
+
+  char *manifest = session->writer.manifest_buf;
+  size_t manifest_len = 0u;
+  logger_persisted_state_t *persisted_for_manifest =
+      logger_session_manifest_persisted_acquire();
+  logger_session_manifest_ctx_copy_persisted(mc, persisted_for_manifest);
+  const bool build_ok = logger_session_build_manifest(
+      session, mc->hardware_id, persisted_for_manifest, &storage_now,
+      journal_sha256, journal_size_bytes, manifest,
+      sizeof(session->writer.manifest_buf), &manifest_len);
+  logger_session_manifest_persisted_release(persisted_for_manifest);
+  if (!build_ok) {
+    logger_session_log_recovery_issue(
+        system_log, clock != NULL ? clock->now_utc : NULL,
+        "session_recovery_failed", "{\"reason\":\"manifest_build_failed\"}");
+    return false;
+  }
+
+  if (!logger_storage_write_file_atomic(session->manifest_path, manifest,
+                                        manifest_len)) {
+    logger_session_log_recovery_issue(
+        system_log, clock != NULL ? clock->now_utc : NULL,
+        "session_recovery_failed", "{\"reason\":\"manifest_write_failed\"}");
+    return false;
+  }
+  return true;
 }
 
 void logger_session_init(logger_session_state_t *session) {
@@ -1642,15 +1842,25 @@ bool logger_session_recover_on_boot(
 
   workspace = logger_session_recovery_workspace_acquire();
 
-  if (!logger_session_find_live_paths(
+  bool live_scan_error = false;
+  if (!logger_session_find_recovery_paths(
           workspace->dir_name, workspace->dir_path, workspace->journal_path,
-          workspace->live_path, workspace->manifest_path)) {
+          workspace->live_path, workspace->manifest_path,
+          &workspace->live_present, &live_scan_error)) {
     logger_session_recovery_workspace_release(workspace);
+    if (live_scan_error) {
+      logger_session_log_recovery_issue(
+          system_log, clock != NULL ? clock->now_utc : NULL,
+          "session_recovery_failed", "{\"reason\":\"live_scan_failed\"}");
+      return false;
+    }
     return true;
   }
 
-  const bool have_live_session_id = logger_session_load_live_session_id(
-      workspace->live_path, workspace->live_session_id);
+  const bool have_live_session_id =
+      workspace->live_present &&
+      logger_session_load_live_session_id(workspace->live_path,
+                                          workspace->live_session_id);
 
   if (!logger_journal_scan(workspace->journal_path, &workspace->scan) ||
       !workspace->scan.valid) {
@@ -1683,85 +1893,11 @@ bool logger_session_recover_on_boot(
     return false;
   }
 
-  if (workspace->scan.session_closed ||
-      logger_storage_file_exists(workspace->manifest_path)) {
-    (void)logger_storage_remove_file(workspace->live_path);
-    (void)logger_upload_queue_refresh_file(
-        system_log, clock != NULL ? clock->now_utc : NULL, NULL);
+  if (!logger_session_restore_state_from_scan(session, workspace, system_log,
+                                              clock)) {
     logger_session_recovery_workspace_release(workspace);
-    return true;
-  }
-
-  logger_session_init(session);
-  session->active = true;
-  logger_copy_string(session->session_id, sizeof(session->session_id),
-                     workspace->scan.session_id);
-  logger_copy_string(session->study_day_local, sizeof(session->study_day_local),
-                     workspace->scan.study_day_local);
-  logger_copy_string(session->session_start_utc,
-                     sizeof(session->session_start_utc),
-                     workspace->scan.session_start_utc);
-  logger_copy_string(session->session_end_utc, sizeof(session->session_end_utc),
-                     workspace->scan.session_end_utc);
-  logger_copy_string(session->session_start_reason,
-                     sizeof(session->session_start_reason),
-                     workspace->scan.session_start_reason);
-  logger_copy_string(session->session_end_reason,
-                     sizeof(session->session_end_reason),
-                     workspace->scan.session_end_reason);
-  logger_copy_string(session->session_dir_name,
-                     sizeof(session->session_dir_name), workspace->dir_name);
-  logger_copy_string(session->session_dir_path,
-                     sizeof(session->session_dir_path), workspace->dir_path);
-  logger_copy_string(session->journal_path, sizeof(session->journal_path),
-                     workspace->journal_path);
-  logger_copy_string(session->live_path, sizeof(session->live_path),
-                     workspace->live_path);
-  logger_copy_string(session->manifest_path, sizeof(session->manifest_path),
-                     workspace->manifest_path);
-  /* Pre-worker recovery runs on core 0 before core 1 owns writer-domain
-   * state.  Reconstruct the durable writer mirror from the journal scan here;
-   * after worker launch, steady-state mutations of session->writer are core-1
-   * writer-dispatch responsibilities. */
-  logger_session_writer_restore_from_scan(&session->writer, &workspace->scan);
-  /* Open the journal for appending through the writer */
-  if (!logger_journal_writer_open_existing(&session->writer.journal_writer,
-                                           workspace->journal_path,
-                                           workspace->scan.valid_size_bytes)) {
-    logger_session_recovery_workspace_release(workspace);
-    logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
-        "session_recovery_failed",
-        "{\"reason\":\"journal_writer_open_failed\"}");
     return false;
   }
-  session->next_packet_seq_in_span = workspace->scan.next_packet_seq_in_span;
-  session->span_count = workspace->scan.span_count;
-  memcpy(session->spans, workspace->scan.spans, sizeof(session->spans));
-  session->span_active = workspace->scan.active_span_open;
-  session->current_span_index = workspace->scan.active_span_open
-                                    ? workspace->scan.active_span_index
-                                    : 0xffffffffu;
-  logger_copy_string(
-      session->current_span_id, sizeof(session->current_span_id),
-      workspace->scan.active_span_open ? workspace->scan.active_span_id : NULL);
-  if (workspace->scan.active_span_open &&
-      !logger_hex_to_bytes_16(session->current_span_id,
-                              session->current_span_id_raw)) {
-    logger_session_recovery_workspace_release(workspace);
-    logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
-        "session_recovery_failed", "{\"reason\":\"span_id_parse_failed\"}");
-    return false;
-  }
-  session->quarantine_clock_invalid_at_start =
-      workspace->scan.quarantine_clock_invalid_at_start;
-  session->quarantine_clock_fixed_mid_session =
-      workspace->scan.quarantine_clock_fixed_mid_session;
-  session->quarantine_clock_jump = workspace->scan.quarantine_clock_jump;
-  session->quarantine_recovery_after_reset =
-      workspace->scan.quarantine_recovery_after_reset;
-  logger_session_recompute_quarantine(session, clock);
 
   /*
    * Populate manifest context for the recovered session.
@@ -1775,6 +1911,58 @@ bool logger_session_recover_on_boot(
     logger_session_manifest_ctx_seed_recovered(mc, hardware_id,
                                                &workspace->scan, persisted,
                                                storage, false, system_log);
+  }
+
+  const bool manifest_exists =
+      logger_storage_file_exists(workspace->manifest_path);
+  if (manifest_exists) {
+    if (workspace->live_present) {
+      (void)logger_storage_remove_file(workspace->live_path);
+    }
+    if (!logger_upload_queue_refresh_file(
+            system_log, clock != NULL ? clock->now_utc : NULL, NULL)) {
+      logger_session_recovery_workspace_release(workspace);
+      return false;
+    }
+    logger_session_init(session);
+    logger_session_recovery_workspace_release(workspace);
+    return true;
+  }
+
+  if (workspace->scan.session_closed) {
+    if (!logger_session_materialize_recovered_manifest(session, system_log,
+                                                       clock)) {
+      logger_session_recovery_workspace_release(workspace);
+      return false;
+    }
+    if (workspace->live_present) {
+      (void)logger_storage_remove_file(workspace->live_path);
+    }
+    if (!logger_upload_queue_refresh_file(
+            system_log, clock != NULL ? clock->now_utc : NULL, NULL)) {
+      logger_session_recovery_workspace_release(workspace);
+      return false;
+    }
+    if (closed_session_out != NULL) {
+      *closed_session_out = true;
+    }
+    logger_session_init(session);
+    logger_session_recovery_workspace_release(workspace);
+    return true;
+  }
+
+  /* Pre-worker recovery runs on core 0 before core 1 owns writer-domain
+   * state.  Open the reconstructed journal only for sessions that still need
+   * appends (resume, recovery markers, or unexpected-reboot finalization). */
+  if (!logger_journal_writer_open_existing(&session->writer.journal_writer,
+                                           workspace->journal_path,
+                                           workspace->scan.valid_size_bytes)) {
+    logger_session_recovery_workspace_release(workspace);
+    logger_session_log_recovery_issue(
+        system_log, clock != NULL ? clock->now_utc : NULL,
+        "session_recovery_failed",
+        "{\"reason\":\"journal_writer_open_failed\"}");
+    return false;
   }
 
   if (!resume_allowed) {
