@@ -26,8 +26,8 @@ static bool capture_pipe_capacity_is_power_of_two(uint32_t capacity) {
   return capacity != 0u && (capacity & (capacity - 1u)) == 0u;
 }
 
-static void capture_pipe_assert_init_params(
-    const capture_pipe_init_params_t *params) {
+static void
+capture_pipe_assert_init_params(const capture_pipe_init_params_t *params) {
   hard_assert(params != NULL);
   hard_assert(params->staging_slots != NULL);
   hard_assert(params->cmd_ring_slots != NULL);
@@ -51,6 +51,15 @@ static uint8_t occ_pct(uint32_t occ, uint32_t cap) {
   return pct > 100u ? 100u : (uint8_t)pct;
 }
 
+static bool
+capture_pipe_failure_requires_recovery(capture_writer_failure_t failure) {
+  /* A concrete failure reason means the writer stream is no longer provably
+   * intact.  Queue occupancy can recover from backpressure; it cannot recover
+   * a dropped packet, failed journal write, failed finalize, or a synchronous
+   * command that was not executed. */
+  return failure != CAPTURE_WRITER_FAILURE_NONE;
+}
+
 /* ── Internal: set pipe health (primary + telemetry mirror) ──── */
 
 /*
@@ -60,7 +69,7 @@ static uint8_t occ_pct(uint32_t occ, uint32_t cap) {
 static void capture_pipe_set_health(capture_pipe_t *pipe,
                                     capture_health_t health) {
   pipe->health = health;
-  }
+}
 
 /* ── Lifecycle ─────────────────────────────────────────────────── */
 
@@ -75,6 +84,17 @@ void capture_pipe_init(capture_pipe_t *pipe,
   pipe->staging.capacity = params->staging_capacity;
   pipe->cmd_ring.slots = params->cmd_ring_slots;
   pipe->cmd_ring.capacity = params->cmd_ring_capacity;
+
+  logger_ipc_u32_store_relaxed(&pipe->cmd_ring.head, 0u);
+  logger_ipc_u32_store_relaxed(&pipe->cmd_ring.tail, 0u);
+  logger_ipc_u32_store_relaxed(&pipe->event_ring.head, 0u);
+  logger_ipc_u32_store_relaxed(&pipe->event_ring.tail, 0u);
+  logger_ipc_u32_store_relaxed(&pipe->barriers_done_seq, 0u);
+  logger_ipc_bool_store_relaxed(&pipe->barrier_last_ok, false);
+  logger_ipc_u32_store_relaxed(&pipe->writer_failure_seq, 0u);
+  logger_ipc_u32_store_relaxed(&pipe->writer_failure_kind,
+                               CAPTURE_WRITER_FAILURE_NONE);
+  logger_ipc_u32_store_relaxed(&pipe->writer_failure_observed_seq, 0u);
 
   capture_pipe_set_health(pipe, CAPTURE_HEALTHY);
   pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_NONE;
@@ -145,8 +165,7 @@ bool capture_staging_push_pmd(capture_pipe_t *pipe,
   }
 
   capture_source_staging_t *s = &pipe->staging;
-  const uint32_t idx =
-      s->tail & (s->capacity - 1u); /* power-of-2 mask */
+  const uint32_t idx = s->tail & (s->capacity - 1u); /* power-of-2 mask */
 
   if ((s->tail - s->head) >= s->capacity) {
     s->overflow_count += 1u;
@@ -188,8 +207,7 @@ uint32_t capture_staging_drain(capture_pipe_t *pipe, uint32_t max_entries) {
   capture_source_staging_t *s = &pipe->staging;
 
   while (drained < max_entries && s->head != s->tail) {
-    const uint32_t idx =
-        s->head & (s->capacity - 1u); /* power-of-2 mask */
+    const uint32_t idx = s->head & (s->capacity - 1u); /* power-of-2 mask */
 
     if (!capture_cmd_ring_enqueue(pipe, &s->slots[idx])) {
       break;
@@ -219,19 +237,21 @@ bool capture_cmd_ring_enqueue(capture_pipe_t *pipe,
   }
 
   capture_cmd_ring_t *r = &pipe->cmd_ring;
-  if (ring_full(r->head, r->tail, r->capacity)) {
+  const uint32_t head = logger_ipc_u32_load_acquire(&r->head);
+  const uint32_t tail = logger_ipc_u32_load_relaxed(&r->tail);
+  if (ring_full(head, tail, r->capacity)) {
     pipe->telemetry.control.cmd_enqueue_reject_count += 1u;
     return false;
   }
 
-  const uint32_t idx = r->tail & (r->capacity - 1u);
+  const uint32_t idx = tail & (r->capacity - 1u);
   r->slots[idx] = *cmd;
   r->seq += 1u;
-  __mem_fence_release(); /* publish slot data before tail */
-  r->tail += 1u;
+  const uint32_t next_tail = tail + 1u;
+  logger_ipc_u32_store_release(&r->tail, next_tail);
 
   pipe->telemetry.control.cmd_enqueue_count += 1u;
-  const uint32_t occ = ring_occ(r->head, r->tail);
+  const uint32_t occ = ring_occ(head, next_tail);
   if (occ > pipe->telemetry.control.cmd_occupancy_hwm) {
     pipe->telemetry.control.cmd_occupancy_hwm = (uint16_t)occ;
   }
@@ -247,19 +267,20 @@ bool capture_cmd_ring_dequeue(capture_pipe_t *pipe,
   }
 
   capture_cmd_ring_t *r = &pipe->cmd_ring;
-  if (ring_empty(r->head, r->tail)) {
+  const uint32_t head = logger_ipc_u32_load_relaxed(&r->head);
+  const uint32_t tail = logger_ipc_u32_load_acquire(&r->tail);
+  if (ring_empty(head, tail)) {
     return false;
   }
-  __mem_fence_acquire(); /* see slot data after reading tail */
 
-  const uint32_t idx = r->head & (r->capacity - 1u);
+  const uint32_t idx = head & (r->capacity - 1u);
   *cmd_out = r->slots[idx];
   memset(&r->slots[idx], 0, sizeof(r->slots[idx]));
-  __mem_fence_release(); /* publish slot reuse before advancing head */
-  r->head += 1u;
+  const uint32_t next_head = head + 1u;
+  logger_ipc_u32_store_release(&r->head, next_head);
 
   pipe->telemetry.writer.cmd_dequeue_count += 1u;
-  const uint32_t occ = ring_occ(r->head, r->tail);
+  const uint32_t occ = ring_occ(next_head, tail);
   pipe->telemetry.writer.cmd_occupancy_after_dequeue = (uint16_t)occ;
 
   return true;
@@ -269,15 +290,9 @@ uint32_t capture_cmd_ring_occupancy(const capture_pipe_t *pipe) {
   if (pipe == NULL) {
     return 0u;
   }
-  /*
-   * Acquire fence: head is written by core 1 (release fence in
-   * dequeue).  Without this acquire, core 0 can observe a stale
-   * head value, making occupancy appear higher than reality.
-   * That's safe (longer spin) but architecturally wrong without
-   * the fence.  tail is core 0's own word and is always current.
-   */
-  __mem_fence_acquire();
-  return ring_occ(pipe->cmd_ring.head, pipe->cmd_ring.tail);
+  const uint32_t head = logger_ipc_u32_load_acquire(&pipe->cmd_ring.head);
+  const uint32_t tail = logger_ipc_u32_load_acquire(&pipe->cmd_ring.tail);
+  return ring_occ(head, tail);
 }
 
 uint8_t capture_cmd_ring_occupancy_pct(const capture_pipe_t *pipe) {
@@ -296,15 +311,16 @@ bool capture_event_ring_push(capture_pipe_t *pipe,
   }
 
   capture_event_ring_t *r = &pipe->event_ring;
-  if (ring_full(r->head, r->tail, CAPTURE_EVENT_RING_CAPACITY)) {
+  const uint32_t head = logger_ipc_u32_load_acquire(&r->head);
+  const uint32_t tail = logger_ipc_u32_load_relaxed(&r->tail);
+  if (ring_full(head, tail, CAPTURE_EVENT_RING_CAPACITY)) {
     pipe->telemetry.writer.event_push_overflow_count += 1u;
     return false;
   }
 
-  const uint32_t idx = r->tail % CAPTURE_EVENT_RING_CAPACITY;
+  const uint32_t idx = tail % CAPTURE_EVENT_RING_CAPACITY;
   r->slots[idx] = *event;
-  __mem_fence_release(); /* publish slot data before tail */
-  r->tail += 1u;
+  logger_ipc_u32_store_release(&r->tail, tail + 1u);
 
   pipe->telemetry.writer.event_push_count += 1u;
   return true;
@@ -316,16 +332,16 @@ bool capture_event_ring_pop(capture_pipe_t *pipe, capture_event_t *out) {
   }
 
   capture_event_ring_t *r = &pipe->event_ring;
-  if (ring_empty(r->head, r->tail)) {
+  const uint32_t head = logger_ipc_u32_load_relaxed(&r->head);
+  const uint32_t tail = logger_ipc_u32_load_acquire(&r->tail);
+  if (ring_empty(head, tail)) {
     return false;
   }
-  __mem_fence_acquire(); /* see slot data after reading tail */
 
-  const uint32_t idx = r->head % CAPTURE_EVENT_RING_CAPACITY;
+  const uint32_t idx = head % CAPTURE_EVENT_RING_CAPACITY;
   *out = r->slots[idx];
   memset(&r->slots[idx], 0, sizeof(r->slots[idx]));
-  __mem_fence_release(); /* publish slot reuse before advancing head */
-  r->head += 1u;
+  logger_ipc_u32_store_release(&r->head, head + 1u);
 
   pipe->telemetry.control.event_pop_count += 1u;
   return true;
@@ -335,9 +351,9 @@ bool capture_event_ring_has_data(const capture_pipe_t *pipe) {
   if (pipe == NULL) {
     return false;
   }
-  /* tail is written by core 1 (release fence in push). */
-  __mem_fence_acquire();
-  return !ring_empty(pipe->event_ring.head, pipe->event_ring.tail);
+  const uint32_t head = logger_ipc_u32_load_relaxed(&pipe->event_ring.head);
+  const uint32_t tail = logger_ipc_u32_load_acquire(&pipe->event_ring.tail);
+  return !ring_empty(head, tail);
 }
 
 void capture_pipe_publish_writer_failure(capture_pipe_t *pipe,
@@ -351,34 +367,42 @@ void capture_pipe_publish_writer_failure(capture_pipe_t *pipe,
    * core 0 ingests this one are usually cascading symptoms and must not mask
    * the original reason.  Best-effort event telemetry can still record more
    * than one failure, but this channel preserves the first pending cause. */
-  __mem_fence_acquire();
-  if (pipe->writer_failure_seq != pipe->writer_failure_observed_seq) {
+  const uint32_t seq = logger_ipc_u32_load_acquire(&pipe->writer_failure_seq);
+  const uint32_t observed =
+      logger_ipc_u32_load_acquire(&pipe->writer_failure_observed_seq);
+  if (seq != observed) {
     return;
   }
 
-  pipe->writer_failure_kind = failure;
-  __mem_fence_release();
-  pipe->writer_failure_seq += 1u;
-  __mem_fence_release();
+  logger_ipc_u32_store_relaxed(&pipe->writer_failure_kind, (uint32_t)failure);
+  logger_ipc_u32_store_release(&pipe->writer_failure_seq, seq + 1u);
   __sev();
 }
 
-static void capture_pipe_ingest_writer_failure(capture_pipe_t *pipe,
+static bool capture_pipe_ingest_writer_failure(capture_pipe_t *pipe,
                                                uint32_t now_ms) {
-  if (pipe == NULL || pipe->writer_failure_seq ==
-                          pipe->writer_failure_observed_seq) {
-    return;
+  if (pipe == NULL) {
+    return false;
   }
-  __mem_fence_acquire();
-  const capture_writer_failure_t failure = pipe->writer_failure_kind;
-  pipe->writer_failure_observed_seq = pipe->writer_failure_seq;
+  const uint32_t seq = logger_ipc_u32_load_acquire(&pipe->writer_failure_seq);
+  const uint32_t observed =
+      logger_ipc_u32_load_relaxed(&pipe->writer_failure_observed_seq);
+  if (seq == observed) {
+    return false;
+  }
+
+  const capture_writer_failure_t failure =
+      (capture_writer_failure_t)logger_ipc_u32_load_relaxed(
+          &pipe->writer_failure_kind);
+  logger_ipc_u32_store_release(&pipe->writer_failure_observed_seq, seq);
   if (failure == CAPTURE_WRITER_FAILURE_NONE) {
-    return;
+    return false;
   }
   if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
     pipe->last_writer_failure = failure;
   }
   capture_pipe_note_hard_failure(pipe, now_ms);
+  return true;
 }
 
 /* ── Internal: tally one popped event into telemetry ─────────── */
@@ -415,6 +439,17 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
     return false;
   }
 
+  const uint32_t submit_now_ms = to_ms_since_boot(get_absolute_time());
+
+  /* Do not let a successful later barrier mask an already-published async
+   * writer failure.  Ingest pending failure first; if a concrete failure has
+   * been classified, the stream is already in the sd_write_failed path and no
+   * new synchronous command should report success. */
+  (void)capture_pipe_ingest_writer_failure(pipe, submit_now_ms);
+  if (capture_pipe_failure_requires_recovery(pipe->last_writer_failure)) {
+    return false;
+  }
+
   /* Drain any pending staging data first (ordering) */
   if (capture_staging_has_data(pipe)) {
     (void)capture_staging_drain(pipe, pipe->staging.capacity);
@@ -437,12 +472,12 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
    * the field as a false sd_write_failed / writer_enqueue_timeout even though
    * core 1 had successfully processed the command.
    *
-   * Acquire before the snapshot pairs with core 1's release after advancing
-   * barriers_done_seq, so the baseline is current before this command is made
-   * visible through the command-ring tail.
+   * Acquire-loading the counter pairs with core 1's release-store completion,
+   * so the baseline is current before this command is made visible through the
+   * command-ring tail.
    */
-  __mem_fence_acquire();
-  const uint32_t wait_seq = pipe->barriers_done_seq;
+  const uint32_t wait_seq =
+      logger_ipc_u32_load_acquire(&pipe->barriers_done_seq);
 
   if (!capture_cmd_ring_enqueue(pipe, cmd)) {
     /* Ring is full — synchronous command cannot be enqueued.
@@ -455,7 +490,7 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
     memset(&event, 0, sizeof(event));
     event.kind = CAPTURE_EVENT_WRITE_FAILED;
     event.success = false;
-    capture_pipe_note_hard_failure(pipe, 0u);
+    capture_pipe_note_hard_failure(pipe, submit_now_ms);
     capture_event_ring_push(pipe, &event);
     return false;
   }
@@ -490,23 +525,32 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
     }
 
     /* Core 1 set barrier_last_ok before advancing barriers_done_seq.
-     * The acquire fence ensures we see the result flag. */
-    if (pipe->barriers_done_seq != wait_seq) {
-      __mem_fence_acquire();
-      if (!pipe->barrier_last_ok) {
-        /* Core 1 publishes the specific writer failure before advancing the
-         * barrier counter.  Ingest it here before falling back to the generic
-         * barrier failure classification; otherwise the waiter can observe the
-         * failed barrier first, set BARRIER_FAILED, and permanently mask a more
-         * useful FLUSH/FINALIZE/PACKET_WRITE reason. */
-        capture_pipe_ingest_writer_failure(
-            pipe, to_ms_since_boot(get_absolute_time()));
-        /* first-writer-wins: preserve an earlier, more specific classification */
+     * The acquire load ensures we see the result flag and any writer-failure
+     * publication that happened-before the completion counter advanced. */
+    if (logger_ipc_u32_load_acquire(&pipe->barriers_done_seq) != wait_seq) {
+      const bool barrier_ok =
+          logger_ipc_bool_load_relaxed(&pipe->barrier_last_ok);
+
+      /* Core 1 publishes writer failures on a separate reliable channel.
+       * Ingest it for both failed and successful barriers: async packet writes
+       * before this barrier do not set barrier_last_ok, so a successful later
+       * FLUSH/REFRESH/etc. must not hide them. */
+      const uint32_t completion_now_ms = to_ms_since_boot(get_absolute_time());
+      (void)capture_pipe_ingest_writer_failure(pipe, completion_now_ms);
+
+      if (!barrier_ok) {
+        /* first-writer-wins: preserve an earlier, more specific classification
+         */
         if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
           pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_BARRIER_FAILED;
         }
+        if (!pipe->hard_failure_active) {
+          capture_pipe_note_hard_failure(pipe, completion_now_ms);
+        }
       }
-      return pipe->barrier_last_ok;
+
+      return barrier_ok &&
+             !capture_pipe_failure_requires_recovery(pipe->last_writer_failure);
     }
 
     /* Yield until core 1 makes progress, but self-wake periodically so the
@@ -522,10 +566,14 @@ bool capture_pipe_submit_cmd(capture_pipe_t *pipe,
   /* first-writer-wins: core 1 may have already set a more specific
    * classification (e.g. PACKET_WRITE_FAILED or FINALIZE_FAILED) before
    * this 5-second timeout expired.  Don't erase it. */
+  const uint32_t timeout_now_ms = to_ms_since_boot(get_absolute_time());
+  (void)capture_pipe_ingest_writer_failure(pipe, timeout_now_ms);
   if (pipe->last_writer_failure == CAPTURE_WRITER_FAILURE_NONE) {
     pipe->last_writer_failure = CAPTURE_WRITER_FAILURE_ENQUEUE_TIMEOUT;
   }
-  capture_pipe_note_hard_failure(pipe, 0u);
+  if (!pipe->hard_failure_active) {
+    capture_pipe_note_hard_failure(pipe, timeout_now_ms);
+  }
   {
     capture_event_t event;
     memset(&event, 0, sizeof(event));
@@ -546,12 +594,23 @@ capture_health_t capture_pipe_evaluate_health(capture_pipe_t *pipe,
 
   capture_pipe_ingest_writer_failure(pipe, now_ms);
 
-  /* Hard failure state.
+  if (capture_pipe_failure_requires_recovery(pipe->last_writer_failure)) {
+    if (!pipe->hard_failure_active) {
+      capture_pipe_note_hard_failure(pipe, now_ms);
+    }
+    capture_pipe_set_health(pipe, CAPTURE_HARD_FAILURE);
+    return CAPTURE_HARD_FAILURE;
+  }
+
+  /* Unclassified hard-failure state.
    *
    * hard_failure_active is set by note_hard_failure() and cleared
    * by this function when recovery-before-deadline succeeds.
    * It is NOT a cumulative historical counter — the telemetry
    * field hard_failure_count serves that purpose.
+   *
+   * Classified writer failures returned above: once a concrete sd_write_failed
+   * reason exists, queue drainage is not allowed to clear it.
    *
    * While active, the pipe stays in HARD_FAILURE unless ALL of
    * these are true (recovery before deadline):
@@ -649,6 +708,13 @@ void capture_pipe_note_hard_failure(capture_pipe_t *pipe, uint32_t now_ms) {
 bool capture_pipe_needs_recovery(const capture_pipe_t *pipe, uint32_t now_ms) {
   if (pipe == NULL) {
     return false;
+  }
+
+  /* Concrete writer/data-loss classifications are terminal for the current
+   * capture stream.  The degraded-deadline recovery window only applies to an
+   * unclassified pressure state; it must never clear a known write failure. */
+  if (capture_pipe_failure_requires_recovery(pipe->last_writer_failure)) {
+    return true;
   }
 
   /* No degraded period active — nothing to recover from.

@@ -6,6 +6,7 @@
 #include "btstack.h"
 
 #include "hardware/sync.h"
+#include "hardware/watchdog.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 
@@ -567,11 +568,22 @@ static void logger_h10_power_off(logger_h10_state_t *state) {
   logger_h10_set_phase(state, LOGGER_H10_PHASE_OFF);
 }
 
+static void logger_h10_foreground_wait_heartbeat(void) {
+  /* H10 startup/security uses a few synchronous BTstack helper calls.  They
+   * run on core 0 inside logger_app_step(), so the main loop cannot feed the
+   * watchdog until they return.  Keep every bounded wait alive here while still
+   * letting a true hang inside cyw43_arch_poll()/BTstack be reset by the
+   * hardware watchdog. */
+  watchdog_update();
+  cyw43_arch_poll();
+}
+
 static void logger_h10_sleep_ms(uint32_t ms) {
   while (ms-- > 0u) {
-    cyw43_arch_poll();
+    logger_h10_foreground_wait_heartbeat();
     sleep_ms(1u);
   }
+  logger_h10_foreground_wait_heartbeat();
 }
 
 static void logger_h10_refresh_link_security_state(logger_h10_state_t *state) {
@@ -593,8 +605,9 @@ static void logger_h10_refresh_link_security_state(logger_h10_state_t *state) {
 
 static bool logger_h10_wait_flag_until_true(const volatile bool *flag,
                                             uint32_t timeout_ms) {
-  uint32_t elapsed = 0u;
-  while (elapsed < timeout_ms) {
+  const uint32_t start_ms = to_ms_since_boot(get_absolute_time());
+  while ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) <
+         timeout_ms) {
     if (*flag) {
       return true;
     }
@@ -603,7 +616,6 @@ static bool logger_h10_wait_flag_until_true(const volatile bool *flag,
       return false;
     }
     logger_h10_sleep_ms(1u);
-    elapsed += 1u;
   }
   return *flag;
 }

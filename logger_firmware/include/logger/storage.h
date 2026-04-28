@@ -31,6 +31,18 @@ typedef struct {
 } logger_storage_status_t;
 
 void logger_storage_init(void);
+/*
+ * Fail-fast tripwire for the one true SD/FatFS ownership invariant.
+ *
+ * FatFS is deliberately not made thread-safe in this firmware.  During the
+ * pre-worker BOOT window, core 0 may touch SD/FatFS directly.  After the
+ * storage worker has launched, core 1 is the sole SD/FatFS owner and core 0
+ * must route storage work through the storage service/capture pipe.
+ *
+ * This is not a lock.  A violation is a programmer error and indicates a path
+ * that can corrupt FatFS state or race the SD block driver.
+ */
+void logger_storage_assert_fatfs_context(void);
 bool logger_storage_refresh(logger_storage_status_t *status);
 bool logger_storage_format(logger_storage_status_t *status);
 bool logger_storage_ready_for_logging(const logger_storage_status_t *status);

@@ -202,7 +202,7 @@ static bool logger_storage_path_tmp(char out[LOGGER_STORAGE_PATH_MAX],
   return true;
 }
 
-static void logger_storage_assert_fatfs_context(void) {
+void logger_storage_assert_fatfs_context(void) {
   hard_assert(__get_current_exception() == 0u);
 
   const bool worker_owns_fatfs = logger_storage_worker_owns_fatfs();
@@ -1121,6 +1121,7 @@ bool logger_storage_truncate_file(const char *path, uint64_t size_bytes) {
 }
 
 DSTATUS disk_initialize(BYTE pdrv) {
+  logger_storage_assert_fatfs_context();
   logger_storage_init();
   if (pdrv != 0u) {
     return STA_NOINIT;
@@ -1134,6 +1135,7 @@ DSTATUS disk_initialize(BYTE pdrv) {
 }
 
 DSTATUS disk_status(BYTE pdrv) {
+  logger_storage_assert_fatfs_context();
   if (pdrv != 0u) {
     return STA_NOINIT;
   }
@@ -1142,6 +1144,7 @@ DSTATUS disk_status(BYTE pdrv) {
 }
 
 DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
+  logger_storage_assert_fatfs_context();
   if (pdrv != 0u || buff == NULL || count == 0u) {
     return RES_PARERR;
   }
@@ -1173,6 +1176,7 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
 }
 
 DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
+  logger_storage_assert_fatfs_context();
   if (pdrv != 0u || buff == NULL || count == 0u) {
     return RES_PARERR;
   }
@@ -1204,6 +1208,7 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
 }
 
 DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
+  logger_storage_assert_fatfs_context();
   if (pdrv != 0u) {
     return RES_PARERR;
   }

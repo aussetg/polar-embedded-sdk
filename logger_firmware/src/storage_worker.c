@@ -8,15 +8,35 @@
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 
+#include "logger/flash_safety.h"
 #include "logger/queue.h"
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
 
-static volatile bool g_storage_worker_owns_fatfs;
+static logger_ipc_bool_t g_storage_worker_owns_fatfs;
 
 bool logger_storage_worker_owns_fatfs(void) {
-  __mem_fence_acquire();
-  return g_storage_worker_owns_fatfs;
+  return logger_ipc_bool_load_acquire(&g_storage_worker_owns_fatfs);
+}
+
+static storage_service_state_t
+storage_svc_state_load_acquire(const storage_service_t *svc) {
+  return (storage_service_state_t)logger_ipc_u32_load_acquire(&svc->state);
+}
+
+static storage_service_kind_t
+storage_svc_kind_load_relaxed(const storage_service_t *svc) {
+  return (storage_service_kind_t)logger_ipc_u32_load_relaxed(&svc->kind);
+}
+
+static uint32_t
+storage_svc_request_seq_load_relaxed(const storage_service_t *svc) {
+  return logger_ipc_u32_load_relaxed(&svc->request_seq);
+}
+
+static void storage_svc_state_store_release(storage_service_t *svc,
+                                            storage_service_state_t state) {
+  logger_ipc_u32_store_release(&svc->state, (uint32_t)state);
 }
 
 /* The FIFO mailbox passes a pointer as a uint32_t word.
@@ -37,26 +57,29 @@ static_assert(sizeof(uint32_t) == sizeof(storage_worker_shared_t *),
 static void
 logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
   storage_service_t *svc = &shared->service;
-  __mem_fence_acquire();
-  if (svc->state != STORAGE_SVC_STATE_SUBMITTED ||
-      svc->kind == STORAGE_SVC_NONE) {
-    svc->ok = false;
-    __mem_fence_release();
-    svc->done_seq = svc->request_seq;
-    svc->state = STORAGE_SVC_STATE_FAILED;
+  const storage_service_state_t submitted_state =
+      storage_svc_state_load_acquire(svc);
+  const storage_service_kind_t submitted_kind =
+      storage_svc_kind_load_relaxed(svc);
+  if (submitted_state != STORAGE_SVC_STATE_SUBMITTED ||
+      submitted_kind == STORAGE_SVC_NONE) {
+    logger_ipc_bool_store_relaxed(&svc->ok, false);
+    logger_ipc_u32_store_release(&svc->done_seq,
+                                 storage_svc_request_seq_load_relaxed(svc));
+    storage_svc_state_store_release(svc, STORAGE_SVC_STATE_FAILED);
     __sev();
     return;
   }
 
-  svc->state = STORAGE_SVC_STATE_RUNNING;
-  __mem_fence_release();
+  storage_svc_state_store_release(svc, STORAGE_SVC_STATE_RUNNING);
 
-  const storage_service_kind_t kind = svc->kind;
-  const uint32_t request_seq = svc->request_seq;
+  const storage_service_kind_t kind = submitted_kind;
+  const uint32_t request_seq = storage_svc_request_seq_load_relaxed(svc);
+  bool ok = false;
 
   switch (kind) {
   case STORAGE_SVC_QUEUE_LOAD: {
-    svc->ok = logger_upload_queue_load(&svc->response.queue);
+    ok = logger_upload_queue_load(&svc->response.queue);
     break;
   }
 
@@ -64,13 +87,12 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
     const char *utc = svc->params.utc_only.updated_at_utc[0] != '\0'
                           ? svc->params.utc_only.updated_at_utc
                           : NULL;
-    svc->ok =
-        logger_upload_queue_scan(&svc->response.queue, svc->system_log, utc);
+    ok = logger_upload_queue_scan(&svc->response.queue, svc->system_log, utc);
     break;
   }
 
   case STORAGE_SVC_QUEUE_WRITE: {
-    svc->ok = logger_upload_queue_write(&svc->response.queue);
+    ok = logger_upload_queue_write(&svc->response.queue);
     break;
   }
 
@@ -78,8 +100,8 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
     const char *utc = svc->params.utc_only.updated_at_utc[0] != '\0'
                           ? svc->params.utc_only.updated_at_utc
                           : NULL;
-    svc->ok = logger_upload_queue_refresh_file(svc->system_log, utc,
-                                               &svc->response.summary);
+    ok = logger_upload_queue_refresh_file(svc->system_log, utc,
+                                          &svc->response.summary);
     break;
   }
 
@@ -87,7 +109,7 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
     const char *utc = svc->params.prune.updated_at_utc[0] != '\0'
                           ? svc->params.prune.updated_at_utc
                           : NULL;
-    svc->ok = logger_upload_queue_prune_file(
+    ok = logger_upload_queue_prune_file(
         svc->system_log, utc, svc->params.prune.reserve_bytes,
         &svc->response.retention_pruned_count,
         &svc->response.reserve_pruned_count, &svc->response.reserve_met,
@@ -99,8 +121,8 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
     const char *utc = svc->params.utc_only.updated_at_utc[0] != '\0'
                           ? svc->params.utc_only.updated_at_utc
                           : NULL;
-    svc->ok = logger_upload_queue_rebuild_file(svc->system_log, utc,
-                                               &svc->response.summary);
+    ok = logger_upload_queue_rebuild_file(svc->system_log, utc,
+                                          &svc->response.summary);
     break;
   }
 
@@ -111,9 +133,9 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
     const char *reason = svc->params.requeue.reason[0] != '\0'
                              ? svc->params.requeue.reason
                              : NULL;
-    svc->ok = logger_upload_queue_requeue_blocked_file(
-        svc->system_log, utc, reason, &svc->response.requeued_count,
-        &svc->response.summary);
+    ok = logger_upload_queue_requeue_blocked_file(svc->system_log, utc, reason,
+                                                  &svc->response.requeued_count,
+                                                  &svc->response.summary);
     break;
   }
 
@@ -123,21 +145,20 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
      * not ready for logging, so report mailbox success as long as the worker
      * executed the refresh path and let callers inspect the status fields. */
     (void)logger_storage_refresh(&svc->response.storage_status);
-    svc->ok = true;
+    ok = true;
     break;
   }
 
   case STORAGE_SVC_STORAGE_SELF_TEST: {
     static const char probe_data[] = "ok\n";
-    svc->ok =
-        logger_storage_write_file_atomic(LOGGER_RECOVERY_PROBE_PATH, probe_data,
-                                         sizeof(probe_data) - 1u) &&
-        logger_storage_remove_file(LOGGER_RECOVERY_PROBE_PATH);
+    ok = logger_storage_write_file_atomic(
+             LOGGER_RECOVERY_PROBE_PATH, probe_data, sizeof(probe_data) - 1u) &&
+         logger_storage_remove_file(LOGGER_RECOVERY_PROBE_PATH);
     break;
   }
 
   case STORAGE_SVC_BUNDLE_COMPUTE: {
-    svc->ok = logger_upload_bundle_compute(
+    ok = logger_upload_bundle_compute(
         svc->params.bundle.dir_name, svc->params.bundle.manifest_path,
         svc->params.bundle.journal_path, svc->response.sha256,
         &svc->response.bundle_size);
@@ -148,18 +169,18 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
     shared->bundle_stream_open = logger_upload_bundle_stream_open(
         &shared->bundle_stream, svc->params.bundle.dir_name,
         svc->params.bundle.manifest_path, svc->params.bundle.journal_path);
-    svc->ok = shared->bundle_stream_open;
+    ok = shared->bundle_stream_open;
     break;
   }
 
   case STORAGE_SVC_BUNDLE_READ: {
     if (shared->bundle_stream_open) {
-      svc->ok = logger_upload_bundle_stream_read(
+      ok = logger_upload_bundle_stream_read(
           &shared->bundle_stream, svc->response.bundle_read_data,
           svc->params.bundle_read.cap, &svc->response.bundle_read_len);
     } else {
       svc->response.bundle_read_len = 0u;
-      svc->ok = false;
+      ok = false;
     }
     break;
   }
@@ -169,32 +190,33 @@ logger_storage_worker_handle_service(storage_worker_shared_t *shared) {
       logger_upload_bundle_stream_close(&shared->bundle_stream);
       shared->bundle_stream_open = false;
     }
-    svc->ok = true;
+    ok = true;
     break;
   }
 
   case STORAGE_SVC_STORAGE_FORMAT: {
-    svc->ok = logger_storage_format(&svc->response.format_status);
+    ok = logger_storage_format(&svc->response.format_status);
     break;
   }
 
   case STORAGE_SVC_FILE_EXISTS: {
     svc->response.file_exists =
         logger_storage_file_exists(svc->params.file_exists.path);
-    svc->ok = true;
+    ok = true;
     break;
   }
 
   case STORAGE_SVC_NONE:
   default:
-    svc->ok = false;
+    ok = false;
     break;
   }
 
-  /* Signal completion to core 0 */
-  __mem_fence_release();
-  svc->done_seq = request_seq;
-  svc->state = STORAGE_SVC_STATE_DONE;
+  /* Signal completion to core 0.  Response fields and ok are written before
+   * the release-store completion words. */
+  logger_ipc_bool_store_relaxed(&svc->ok, ok);
+  logger_ipc_u32_store_release(&svc->done_seq, request_seq);
+  storage_svc_state_store_release(svc, STORAGE_SVC_STATE_DONE);
   __sev();
 }
 
@@ -294,13 +316,11 @@ static void logger_storage_worker_drain(storage_worker_shared_t *shared) {
 
       /* Even on failure, advance the barrier counter so core 0
        * doesn't spin for the full 5 s timeout.  Set the result
-       * flag first, then advance the counter — core 0 reads the
-       * flag only after observing the counter change. */
+       * flag first, then release-publish the counter — core 0 reads the
+       * flag only after acquire-observing the counter change. */
       if (needs_sync_ack) {
-        pipe->barrier_last_ok = false;
-        __mem_fence_release();
-        pipe->barriers_done_seq += 1u;
-        __mem_fence_release();
+        logger_ipc_bool_store_relaxed(&pipe->barrier_last_ok, false);
+        logger_ipc_u32_add_fetch_release(&pipe->barriers_done_seq, 1u);
         __sev();
       }
 
@@ -314,10 +334,8 @@ static void logger_storage_worker_drain(storage_worker_shared_t *shared) {
       if (needs_sync_ack) {
         /* Advance the completion counter so core 0 knows this
          * barrier was dispatched, then wake it. */
-        pipe->barrier_last_ok = true;
-        __mem_fence_release();
-        pipe->barriers_done_seq += 1u;
-        __mem_fence_release();
+        logger_ipc_bool_store_relaxed(&pipe->barrier_last_ok, true);
+        logger_ipc_u32_add_fetch_release(&pipe->barriers_done_seq, 1u);
         __sev();
 
         /* Best-effort event ring push for telemetry. */
@@ -384,8 +402,7 @@ static void logger_storage_worker_entry(void) {
       __wfe();
     }
   }
-  shared->core1_lockout_ready = true;
-  __mem_fence_release();
+  logger_ipc_bool_store_release(&shared->core1_lockout_ready, true);
   __sev(); /* wake core 0 if it is in __wfe */
 
   printf("[storage_worker] core 1: worker loop started\n");
@@ -424,11 +441,17 @@ static void logger_storage_worker_entry(void) {
 void logger_storage_worker_init(storage_worker_shared_t *shared,
                                 capture_pipe_t *pipe,
                                 logger_session_context_t *session_ctx) {
-  g_storage_worker_owns_fatfs = false;
+  logger_ipc_bool_store_relaxed(&g_storage_worker_owns_fatfs, false);
   memset(shared, 0, sizeof(*shared));
   shared->pipe = pipe;
   shared->session_ctx = session_ctx;
-  shared->core1_lockout_ready = false;
+  logger_ipc_bool_store_relaxed(&shared->core1_lockout_ready, false);
+  logger_ipc_bool_store_relaxed(&shared->storage_service_ready, false);
+  logger_ipc_u32_store_relaxed(&shared->service.kind, STORAGE_SVC_NONE);
+  logger_ipc_u32_store_relaxed(&shared->service.state, STORAGE_SVC_STATE_IDLE);
+  logger_ipc_u32_store_relaxed(&shared->service.request_seq, 0u);
+  logger_ipc_u32_store_relaxed(&shared->service.done_seq, 0u);
+  logger_ipc_bool_store_relaxed(&shared->service.ok, false);
 }
 
 bool logger_storage_worker_launch(storage_worker_shared_t *shared) {
@@ -437,6 +460,14 @@ bool logger_storage_worker_launch(storage_worker_shared_t *shared) {
   }
 
   printf("[storage_worker] launching core 1 storage worker\n");
+
+  /*
+   * From this point onward core 1 may execute from XIP flash.  Tell the
+   * project flash-safety helper before the launch so any flash write attempted
+   * during the launch/lockout-init window is rejected rather than falling back
+   * to the early-boot IRQ-only path.
+   */
+  logger_flash_safety_note_core1_launching();
 
   /*
    * Launch core 1 into our entry point.
@@ -474,14 +505,13 @@ bool logger_storage_worker_launch(storage_worker_shared_t *shared) {
    */
   const uint32_t launch_timeout_ms = 5000u;
   const uint32_t start_ms = (uint32_t)(time_us_64() / 1000ull);
-  while (!shared->core1_lockout_ready) {
+  while (!logger_ipc_bool_load_acquire(&shared->core1_lockout_ready)) {
     if (((uint32_t)(time_us_64() / 1000ull) - start_ms) >= launch_timeout_ms) {
       printf("[storage_worker] core 1 lockout timed out\n");
       return false;
     }
     (void)best_effort_wfe_or_timeout(make_timeout_time_ms(1u));
   }
-  __mem_fence_acquire();
 
   printf("[storage_worker] core 1 lockout ready confirmed\n");
 
@@ -497,8 +527,7 @@ bool logger_storage_worker_launch(storage_worker_shared_t *shared) {
 
   printf("[storage_worker] core 0 flash-safe init done\n");
 
-  shared->storage_service_ready = true;
-  g_storage_worker_owns_fatfs = true;
-  __mem_fence_release();
+  logger_ipc_bool_store_release(&shared->storage_service_ready, true);
+  logger_ipc_bool_store_release(&g_storage_worker_owns_fatfs, true);
   return true;
 }

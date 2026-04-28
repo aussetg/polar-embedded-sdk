@@ -35,23 +35,22 @@ static logger_writer_cmd_t *g_test_cmd_ring;
 static void test_capture_pipe_init(capture_pipe_t *pipe) {
   /* Allocate once; reuse across tests. */
   if (!g_test_staging) {
-    g_test_staging =
-        (logger_writer_cmd_t *)aligned_alloc(16u,
-            TEST_STAGING_CAPACITY * sizeof(logger_writer_cmd_t));
-    g_test_cmd_ring =
-        (logger_writer_cmd_t *)aligned_alloc(16u,
-            TEST_CMD_RING_CAPACITY * sizeof(logger_writer_cmd_t));
+    g_test_staging = (logger_writer_cmd_t *)aligned_alloc(
+        16u, TEST_STAGING_CAPACITY * sizeof(logger_writer_cmd_t));
+    g_test_cmd_ring = (logger_writer_cmd_t *)aligned_alloc(
+        16u, TEST_CMD_RING_CAPACITY * sizeof(logger_writer_cmd_t));
     assert(g_test_staging != NULL && g_test_cmd_ring != NULL);
   }
-  memset(g_test_staging, 0, TEST_STAGING_CAPACITY * sizeof(logger_writer_cmd_t));
-  memset(g_test_cmd_ring, 0, TEST_CMD_RING_CAPACITY * sizeof(logger_writer_cmd_t));
-  capture_pipe_init(pipe,
-                    &(capture_pipe_init_params_t){
-                        .staging_slots = g_test_staging,
-                        .staging_capacity = TEST_STAGING_CAPACITY,
-                        .cmd_ring_slots = g_test_cmd_ring,
-                        .cmd_ring_capacity = TEST_CMD_RING_CAPACITY,
-                    });
+  memset(g_test_staging, 0,
+         TEST_STAGING_CAPACITY * sizeof(logger_writer_cmd_t));
+  memset(g_test_cmd_ring, 0,
+         TEST_CMD_RING_CAPACITY * sizeof(logger_writer_cmd_t));
+  capture_pipe_init(pipe, &(capture_pipe_init_params_t){
+                              .staging_slots = g_test_staging,
+                              .staging_capacity = TEST_STAGING_CAPACITY,
+                              .cmd_ring_slots = g_test_cmd_ring,
+                              .cmd_ring_capacity = TEST_CMD_RING_CAPACITY,
+                          });
 }
 
 static void test_capture_pipe_cleanup(void) {
@@ -304,8 +303,7 @@ static void test_health_transitions(void) {
 
   /* Drain down to 49% (below recovered threshold of 50%) */
   const uint32_t keep_count =
-      (TEST_CMD_RING_CAPACITY * (CAPTURE_RECOVERED_THRESHOLD_PCT - 1u)) /
-      100u;
+      (TEST_CMD_RING_CAPACITY * (CAPTURE_RECOVERED_THRESHOLD_PCT - 1u)) / 100u;
   const uint32_t drain_count = distressed_count - keep_count;
   for (uint32_t i = 0; i < drain_count; i++) {
     logger_writer_cmd_t out;
@@ -352,12 +350,14 @@ static void test_hard_failure_recovery_before_deadline(void) {
   capture_pipe_t pipe;
   test_capture_pipe_init(&pipe);
 
-  /* Simulate a hard failure (e.g. a barrier timeout) */
+  /* Simulate an unclassified pressure/degraded condition.  Concrete writer
+   * failures are terminal; this recovery path is only for degradation that has
+   * not lost data or skipped a synchronous command. */
   capture_pipe_note_hard_failure(&pipe, 1000u);
-  pipe.last_writer_failure = CAPTURE_WRITER_FAILURE_ENQUEUE_TIMEOUT;
   assert(pipe.hard_failure_active == true);
   assert(pipe.degraded_deadline_active == true);
   assert(pipe.degraded_deadline_start_ms == 1000u);
+  assert(pipe.last_writer_failure == CAPTURE_WRITER_FAILURE_NONE);
 
   /* Ring is already empty (no staging overflow), so evaluating health
    * before the deadline expires should recover. */
@@ -368,6 +368,61 @@ static void test_hard_failure_recovery_before_deadline(void) {
   assert(pipe.degraded_deadline_active == false);
   assert(pipe.last_writer_failure == CAPTURE_WRITER_FAILURE_NONE);
   assert(pipe.telemetry.control.distressed_exit_count == 1u);
+
+  printf(" ok\n");
+}
+
+/* ── Test: classified writer failure is terminal ─────────────── */
+
+static void test_classified_writer_failure_needs_recovery(void) {
+  printf("  classified_writer_failure_needs_recovery...");
+
+  capture_pipe_t pipe;
+  test_capture_pipe_init(&pipe);
+
+  capture_pipe_publish_writer_failure(
+      &pipe, CAPTURE_WRITER_FAILURE_PACKET_WRITE_FAILED);
+
+  /* Old bug: evaluate_health() ingested the packet failure, saw an empty ring,
+   * and cleared it as "recovered" before the app could route sd_write_failed.
+   */
+  capture_health_t h = capture_pipe_evaluate_health(&pipe, 5000u);
+  assert(h == CAPTURE_HARD_FAILURE);
+  assert(pipe.hard_failure_active == true);
+  assert(pipe.last_writer_failure ==
+         CAPTURE_WRITER_FAILURE_PACKET_WRITE_FAILED);
+  assert(capture_pipe_needs_recovery(&pipe, 5000u) == true);
+
+  /* It must stay sticky on later health evaluations even while the ring is
+   * empty and below the recovered threshold. */
+  h = capture_pipe_evaluate_health(&pipe, 6000u);
+  assert(h == CAPTURE_HARD_FAILURE);
+  assert(pipe.last_writer_failure ==
+         CAPTURE_WRITER_FAILURE_PACKET_WRITE_FAILED);
+
+  printf(" ok\n");
+}
+
+/* ── Test: pending async failure fails next sync submit ───────── */
+
+static void test_pending_async_failure_fails_next_submit(void) {
+  printf("  pending_async_failure_fails_next_submit...");
+
+  capture_pipe_t pipe;
+  test_capture_pipe_init(&pipe);
+
+  capture_pipe_publish_writer_failure(
+      &pipe, CAPTURE_WRITER_FAILURE_PACKET_WRITE_FAILED);
+
+  logger_writer_cmd_t barrier = make_barrier_cmd();
+  assert(capture_pipe_submit_cmd(&pipe, (logger_session_context_t *)&pipe,
+                                 &barrier) == false);
+
+  assert(pipe.last_writer_failure ==
+         CAPTURE_WRITER_FAILURE_PACKET_WRITE_FAILED);
+  assert(pipe.hard_failure_active == true);
+  assert(capture_cmd_ring_occupancy(&pipe) == 0u);
+  assert(capture_pipe_needs_recovery(&pipe, 1000u) == true);
 
   printf(" ok\n");
 }
@@ -533,8 +588,8 @@ static void test_occupancy_pct(void) {
   }
   assert(capture_cmd_ring_occupancy_pct(&pipe) == 50u);
 
-  for (uint32_t i = TEST_CMD_RING_CAPACITY / 2u;
-       i < TEST_CMD_RING_CAPACITY; i++) {
+  for (uint32_t i = TEST_CMD_RING_CAPACITY / 2u; i < TEST_CMD_RING_CAPACITY;
+       i++) {
     logger_writer_cmd_t cmd = make_packet_cmd(i);
     capture_cmd_ring_enqueue(&pipe, &cmd);
   }
@@ -588,8 +643,10 @@ static void test_wrap_around(void) {
   }
 
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
-  assert(pipe.telemetry.control.cmd_enqueue_count == 10u * TEST_CMD_RING_CAPACITY);
-  assert(pipe.telemetry.writer.cmd_dequeue_count == 10u * TEST_CMD_RING_CAPACITY);
+  assert(pipe.telemetry.control.cmd_enqueue_count ==
+         10u * TEST_CMD_RING_CAPACITY);
+  assert(pipe.telemetry.writer.cmd_dequeue_count ==
+         10u * TEST_CMD_RING_CAPACITY);
 
   printf(" ok\n");
 }
@@ -647,7 +704,8 @@ static void test_barrier_counter_and_events(void) {
   assert(capture_cmd_ring_occupancy(&pipe) == 5u);
 
   /* Simulate core 1 drain: dequeue + dispatch + advance counter. */
-  const uint32_t seq_before = pipe.barriers_done_seq;
+  const uint32_t seq_before =
+      logger_ipc_u32_load_acquire(&pipe.barriers_done_seq);
   for (uint32_t i = 0; i < 5u; i++) {
     logger_writer_cmd_t cmd;
     assert(capture_cmd_ring_dequeue(&pipe, &cmd) == true);
@@ -657,8 +715,8 @@ static void test_barrier_counter_and_events(void) {
     const bool is_barrier = cmd.type != LOGGER_WRITER_APPEND_PMD_PACKET &&
                             cmd.type != LOGGER_WRITER_REFRESH_LIVE;
     if (is_barrier) {
-      pipe.barrier_last_ok = true;
-      pipe.barriers_done_seq += 1u;
+      logger_ipc_bool_store_relaxed(&pipe.barrier_last_ok, true);
+      logger_ipc_u32_add_fetch_release(&pipe.barriers_done_seq, 1u);
       capture_event_t ev;
       memset(&ev, 0, sizeof(ev));
       ev.kind = CAPTURE_EVENT_BARRIER_COMPLETE;
@@ -670,8 +728,9 @@ static void test_barrier_counter_and_events(void) {
   assert(capture_cmd_ring_occupancy(&pipe) == 0u);
 
   /* Counter advanced exactly once (one barrier). */
-  assert(pipe.barriers_done_seq == seq_before + 1u);
-  assert(pipe.barrier_last_ok == true);
+  assert(logger_ipc_u32_load_acquire(&pipe.barriers_done_seq) ==
+         seq_before + 1u);
+  assert(logger_ipc_bool_load_relaxed(&pipe.barrier_last_ok) == true);
 
   /* One event for the barrier */
   assert(capture_event_ring_has_data(&pipe) == true);
@@ -1107,6 +1166,8 @@ int main(void) {
   test_health_transitions();
   test_hard_failure_deadline();
   test_hard_failure_recovery_before_deadline();
+  test_classified_writer_failure_needs_recovery();
+  test_pending_async_failure_fails_next_submit();
   test_hard_failure_no_recovery_with_overflow();
   test_hard_failure_no_recovery_after_deadline();
   test_hard_failure_recovers_when_ring_drains();

@@ -102,9 +102,10 @@ int main(void) {
    *
    * watchdog_update() is called at the top of every main-loop
    * iteration.  Long blocking waits inside logger_app_step()
-   * (barrier waits up to 5 s, storage-service calls up to 30 s)
-   * also kick the watchdog in their spin loops so that slow-but-
-   * progressing SD operations don't trigger a false reset.
+   * (barrier waits up to 5 s, storage-service calls up to 30 s,
+   * and bounded H10/PMD security/GATT waits) also kick the watchdog
+   * in their spin loops so that slow-but-progressing I/O doesn't
+   * trigger a false reset.
    *
    * pause_on_debug = true so attaching a debugger doesn't trip it.
    *

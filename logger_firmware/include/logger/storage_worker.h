@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #include "logger/capture_pipe.h"
+#include "logger/ipc_atomic.h"
 #include "logger/queue.h"
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
@@ -85,17 +86,18 @@ typedef struct {
  */
 typedef struct {
   /*
-   * Cross-core ordering relies on explicit memory fences
-   * (__mem_fence_release / __mem_fence_acquire) paired with __sev()/waits.
-   * Completion/control flags are volatile because core 0 polls them while
-   * core 1 updates them.
+   * Cross-core ordering is carried by typed acquire/release IPC words.  Core 0
+   * publishes request payloads with a release-store to state=SUBMITTED; core 1
+   * acquire-loads state before reading them.  Core 1 publishes response
+   * payloads with release-stores to done_seq/state; core 0 acquire-loads
+   * completion before copying response fields.
    */
 
   /* Request fields — core 0 writes before enqueue, core 1 reads */
-  volatile storage_service_kind_t kind;
-  volatile storage_service_state_t state;
-  volatile uint32_t request_seq;
-  volatile uint32_t done_seq;
+  logger_ipc_u32_t kind;
+  logger_ipc_u32_t state;
+  logger_ipc_u32_t request_seq;
+  logger_ipc_u32_t done_seq;
 
   union {
     struct {
@@ -131,7 +133,7 @@ typedef struct {
   storage_service_response_t response;
 
   /* Completion — core 1 sets ok before publishing DONE/FAILED. */
-  volatile bool ok;
+  logger_ipc_bool_t ok;
 } storage_service_t;
 
 /* ── Worker state (for diagnostics) ────────────────────────────── */
@@ -159,7 +161,7 @@ typedef struct {
   logger_session_context_t *session_ctx;
 
   /* Handshake: core 0 waits on this before proceeding past BOOT. */
-  volatile bool core1_lockout_ready;
+  logger_ipc_bool_t core1_lockout_ready;
 
   /* Worker statistics (core 1 writes, core 0 reads occasionally). */
   storage_worker_stats_t stats;
@@ -169,7 +171,7 @@ typedef struct {
    * core 0 after the worker is launched and both cores are flash-lockout-ready;
    * from then on, storage-service wrappers route post-boot SD/FatFS operations
    * through core 1.  Core 1 never reads or writes this field. */
-  bool storage_service_ready;
+  logger_ipc_bool_t storage_service_ready;
 
   /* Service request channel for non-logging SD operations. */
   storage_service_t service;

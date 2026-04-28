@@ -27,14 +27,15 @@
  *   - Max single enqueue wait on core 0: 1 ms.
  *   - Distressed at >= 75% occupancy.
  *   - Recovered below 50%.
- *   - First hard failure starts a 15 s degraded deadline.
- *   - If staging overflows or deadline expires => sd_write_failed path.
+ *   - Classified writer/data-loss failures enter sd_write_failed immediately.
+ *   - Unclassified degraded pressure gets a 15 s recovery window.
  */
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
+#include "logger/ipc_atomic.h"
 #include "logger/writer_protocol.h"
 
 /* ── Ring sizing ───────────────────────────────────────────────── */
@@ -64,29 +65,27 @@
 /*
  * MEMORY ORDERING
  *
- * The ring uses __mem_fence_release()/__mem_fence_acquire() (both
- * are __dmb on Cortex-M33) at the SPSC boundary:
+ * The ring uses typed acquire/release IPC words at the SPSC boundary:
  *
- *   Producer:  store slot data, then release fence, then store tail.
+ *   Producer:  store slot data, then release-store tail.
  *              Guarantees the consumer sees the payload before it
  *              observes the updated tail.
  *
- *   Consumer:  load tail, then acquire fence, then load slot data.
- *              Then release fence before storing head, so the
+ *   Consumer:  acquire-load tail, then load slot data.
+ *              Then release-store head, so the
  *              producer sees the slot as reclaimed before it
  *              observes the advanced head.
  *
- * On single-core execution these compile to a compiler barrier
- * only (no DMB emitted).  On dual-core they emit a real DMB,
- * preventing the M33 write buffer from retiring stores out of
- * order from the other core's perspective.
+ * The publication word itself carries the ordering.  This avoids the fragile
+ * pattern of plain stores followed by a fence in the wrong direction, and also
+ * prevents the compiler from caching cross-core head/tail values.
  */
 typedef struct {
   logger_writer_cmd_t *slots; /* PSRAM-backed, set at init */
-  uint32_t capacity;         /* power of 2 */
-  uint32_t head; /* consumer reads here (writer side) */
-  uint32_t tail; /* producer writes here (control core) */
-  uint32_t seq;  /* monotonically increasing command position */
+  uint32_t capacity;          /* power of 2 */
+  logger_ipc_u32_t head;      /* consumer publishes here (writer side) */
+  logger_ipc_u32_t tail;      /* producer publishes here (control core) */
+  uint32_t seq;               /* monotonically increasing command position */
 } capture_cmd_ring_t;
 
 /* ── Event ring (writer → control core) ────────────────────────── */
@@ -111,8 +110,8 @@ typedef struct {
  */
 typedef struct {
   capture_event_t slots[CAPTURE_EVENT_RING_CAPACITY];
-  uint32_t head;
-  uint32_t tail;
+  logger_ipc_u32_t head;
+  logger_ipc_u32_t tail;
 } capture_event_ring_t;
 
 /* ── Source staging ────────────────────────────────────────────── */
@@ -127,7 +126,7 @@ typedef struct {
  */
 typedef struct {
   logger_writer_cmd_t *slots; /* PSRAM-backed, set at init */
-  uint32_t capacity;         /* power of 2 */
+  uint32_t capacity;          /* power of 2 */
   uint32_t head;
   uint32_t tail;
   uint32_t overflow_count;
@@ -256,21 +255,18 @@ typedef struct capture_pipe {
    * dispatch.  Core 0 reads it only after seeing
    * the counter advance.
    *
-   * These fields are immune to event-ring overflow.
-   *
-   * volatile because core 1 writes and core 0 reads without
-   * a lock; the fences in the ring ops provide ordering. */
-  volatile uint32_t barriers_done_seq;
-  volatile bool barrier_last_ok;
+   * These fields are immune to event-ring overflow. */
+  logger_ipc_u32_t barriers_done_seq;
+  logger_ipc_bool_t barrier_last_ok;
 
   /* Reliable writer-failure publication channel.
    * Producer: core 1. Consumer/owner of health state: core 0.
    * First unobserved failure wins: while writer_failure_seq differs from
    * writer_failure_observed_seq, core 1 must not overwrite
    * writer_failure_kind. */
-  volatile uint32_t writer_failure_seq;
-  volatile capture_writer_failure_t writer_failure_kind;
-  volatile uint32_t writer_failure_observed_seq;
+  logger_ipc_u32_t writer_failure_seq;
+  logger_ipc_u32_t writer_failure_kind;
+  logger_ipc_u32_t writer_failure_observed_seq;
 
   /* Distress / degraded deadline */
   capture_health_t health;

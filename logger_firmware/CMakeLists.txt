@@ -64,6 +64,8 @@ add_executable(logger_appliance
     src/clock.c
     src/clock_local.c
     src/config_store.c
+    src/fatfs_guard.c
+    src/flash_safety.c
     src/faults.c
     src/h10.c
     src/identity.c
@@ -156,6 +158,45 @@ target_link_libraries(logger_appliance PRIVATE
     hardware_dma
     hardware_spi
     hardware_watchdog
+)
+
+target_link_options(logger_appliance PRIVATE
+    LINKER:--wrap=f_mount
+    LINKER:--wrap=f_mkfs
+    LINKER:--wrap=f_getfree
+    LINKER:--wrap=f_mkdir
+    LINKER:--wrap=f_stat
+    LINKER:--wrap=f_open
+    LINKER:--wrap=f_read
+    LINKER:--wrap=f_write
+    LINKER:--wrap=f_sync
+    LINKER:--wrap=f_lseek
+    LINKER:--wrap=f_truncate
+    LINKER:--wrap=f_close
+    LINKER:--wrap=f_unlink
+    LINKER:--wrap=f_rename
+    LINKER:--wrap=f_opendir
+    LINKER:--wrap=f_readdir
+    LINKER:--wrap=f_closedir
+    LINKER:--wrap=f_findfirst
+    LINKER:--wrap=f_findnext
+    LINKER:--wrap=f_chmod
+    LINKER:--wrap=f_utime
+    LINKER:--wrap=f_chdir
+    LINKER:--wrap=f_chdrive
+    LINKER:--wrap=f_getcwd
+    LINKER:--wrap=f_getlabel
+    LINKER:--wrap=f_setlabel
+    LINKER:--wrap=f_forward
+    LINKER:--wrap=f_expand
+    LINKER:--wrap=f_fdisk
+    LINKER:--wrap=f_setcp
+    LINKER:--wrap=f_putc
+    LINKER:--wrap=f_puts
+    LINKER:--wrap=f_gets
+    # FatFS f_printf is variadic and has no safe forwarding wrapper here.
+    # Make accidental firmware use a link error instead of an unguarded path.
+    LINKER:--wrap=f_printf
 )
 
 target_compile_definitions(logger_appliance PRIVATE

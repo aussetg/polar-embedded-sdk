@@ -23,8 +23,25 @@ void logger_storage_svc_init(storage_worker_shared_t *shared) {
   g_svc_shared = shared;
 }
 
+static storage_service_state_t
+logger_storage_svc_state_load_acquire(const storage_service_t *svc) {
+  return (storage_service_state_t)logger_ipc_u32_load_acquire(&svc->state);
+}
+
+static void
+logger_storage_svc_state_store_release(storage_service_t *svc,
+                                       storage_service_state_t state) {
+  logger_ipc_u32_store_release(&svc->state, (uint32_t)state);
+}
+
+static void logger_storage_svc_kind_store_relaxed(storage_service_t *svc,
+                                                  storage_service_kind_t kind) {
+  logger_ipc_u32_store_relaxed(&svc->kind, (uint32_t)kind);
+}
+
 static bool logger_storage_svc_available(void) {
-  return g_svc_shared != NULL && g_svc_shared->storage_service_ready;
+  return g_svc_shared != NULL &&
+         logger_ipc_bool_load_acquire(&g_svc_shared->storage_service_ready);
 }
 
 /* ── Submit service requests ─────────────────────────────────────
@@ -83,7 +100,8 @@ static void logger_storage_svc_wait_heartbeat(void) {
 }
 
 static void logger_storage_svc_prepare(storage_service_t *svc) {
-  hard_assert(svc->state == STORAGE_SVC_STATE_IDLE);
+  hard_assert(logger_storage_svc_state_load_acquire(svc) ==
+              STORAGE_SVC_STATE_IDLE);
   memset(&svc->params, 0, sizeof(svc->params));
   svc->system_log = NULL;
   memset(&svc->response, 0, sizeof(svc->response));
@@ -94,19 +112,19 @@ static bool logger_storage_svc_submit_async(storage_service_kind_t kind,
   storage_service_t *svc = &g_svc_shared->service;
 
   /* Debug guard: catch re-entrancy or double-submit. */
-  hard_assert(svc->state == STORAGE_SVC_STATE_IDLE);
+  hard_assert(logger_storage_svc_state_load_acquire(svc) ==
+              STORAGE_SVC_STATE_IDLE);
 
-  svc->ok = false;
-  const uint32_t request_seq = svc->request_seq + 1u;
-  svc->request_seq = request_seq;
+  logger_ipc_bool_store_relaxed(&svc->ok, false);
+  const uint32_t request_seq =
+      logger_ipc_u32_load_relaxed(&svc->request_seq) + 1u;
+  logger_ipc_u32_store_relaxed(&svc->request_seq, request_seq);
   if (request_seq_out != NULL) {
     *request_seq_out = request_seq;
   }
 
-  __mem_fence_release();
-  svc->kind = kind;
-  svc->state = STORAGE_SVC_STATE_SUBMITTED;
-  __mem_fence_release();
+  logger_storage_svc_kind_store_relaxed(svc, kind);
+  logger_storage_svc_state_store_release(svc, STORAGE_SVC_STATE_SUBMITTED);
 
   /* Enqueue a service-request command to wake core 1 */
   logger_writer_cmd_t cmd;
@@ -123,8 +141,8 @@ static bool logger_storage_svc_submit_async(storage_service_kind_t kind,
 
   if (!capture_cmd_ring_enqueue(g_svc_shared->pipe, &cmd)) {
     printf("[storage_svc] enqueue failed for kind=%d\n", (int)kind);
-    svc->kind = STORAGE_SVC_NONE;
-    svc->state = STORAGE_SVC_STATE_IDLE;
+    logger_storage_svc_kind_store_relaxed(svc, STORAGE_SVC_NONE);
+    logger_storage_svc_state_store_release(svc, STORAGE_SVC_STATE_IDLE);
     return false;
   }
   __sev();
@@ -145,9 +163,14 @@ static bool logger_storage_svc_wait(storage_service_kind_t kind,
   const uint32_t start_ms = (uint32_t)(time_us_64() / 1000ull);
   const uint32_t timeout_ms = logger_storage_svc_timeout_ms(kind);
   bool timed_out = false;
-  while (svc->done_seq != request_seq ||
-         (svc->state != STORAGE_SVC_STATE_DONE &&
-          svc->state != STORAGE_SVC_STATE_FAILED)) {
+  storage_service_state_t state = STORAGE_SVC_STATE_IDLE;
+  while (true) {
+    const uint32_t done_seq = logger_ipc_u32_load_acquire(&svc->done_seq);
+    state = logger_storage_svc_state_load_acquire(svc);
+    if (done_seq == request_seq && (state == STORAGE_SVC_STATE_DONE ||
+                                    state == STORAGE_SVC_STATE_FAILED)) {
+      break;
+    }
     const uint32_t now_ms = (uint32_t)(time_us_64() / 1000ull);
     if (!timed_out && (now_ms - start_ms) >= timeout_ms) {
       printf("[storage_svc] timeout waiting for kind=%d\n", (int)kind);
@@ -162,11 +185,11 @@ static bool logger_storage_svc_wait(storage_service_kind_t kind,
     watchdog_update();
     logger_storage_svc_wait_heartbeat();
   }
-  __mem_fence_acquire();
 
-  const bool ok = !timed_out && svc->state == STORAGE_SVC_STATE_DONE && svc->ok;
-  svc->kind = STORAGE_SVC_NONE;
-  svc->state = STORAGE_SVC_STATE_IDLE;
+  const bool ok = !timed_out && state == STORAGE_SVC_STATE_DONE &&
+                  logger_ipc_bool_load_relaxed(&svc->ok);
+  logger_storage_svc_kind_store_relaxed(svc, STORAGE_SVC_NONE);
+  logger_storage_svc_state_store_release(svc, STORAGE_SVC_STATE_IDLE);
   return ok;
 }
 
