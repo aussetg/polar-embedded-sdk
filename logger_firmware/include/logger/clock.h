@@ -75,7 +75,9 @@ bool logger_clock_derive_study_day_local_observed(
 
 static inline const char *
 logger_clock_now_utc_or_null(const logger_clock_status_t *clock) {
-  return clock->now_utc[0] != '\0' ? clock->now_utc : NULL;
+  return clock != NULL && clock->valid && clock->now_utc[0] != '\0'
+             ? clock->now_utc
+             : NULL;
 }
 
 #endif

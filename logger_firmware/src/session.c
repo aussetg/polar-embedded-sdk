@@ -664,7 +664,7 @@ static bool logger_session_begin_span(logger_session_state_t *session,
   logger_copy_string(span->start_reason, sizeof(span->start_reason),
                      start_reason);
   logger_copy_string(span->start_utc, sizeof(span->start_utc),
-                     clock != NULL ? clock->now_utc : NULL);
+                     logger_clock_now_utc_or_null(clock));
   session->span_count += 1u;
   session->next_packet_seq_in_span = 0u;
 
@@ -736,7 +736,7 @@ static bool logger_session_control_close_span(
   logger_copy_string(se->span_id, sizeof(se->span_id), span->span_id);
   se->span_index_in_session = session->current_span_index;
   logger_copy_string(se->end_utc, sizeof(se->end_utc),
-                     clock != NULL ? clock->now_utc : NULL);
+                     logger_clock_now_utc_or_null(clock));
   logger_copy_string(se->end_reason, sizeof(se->end_reason), end_reason);
   /* packet_count / seq fields are filled by core 1 after sealing */
 
@@ -747,7 +747,7 @@ static bool logger_session_control_close_span(
   /* Control-plane state updated only on dispatch success. */
   logger_copy_string(span->end_reason, sizeof(span->end_reason), end_reason);
   logger_copy_string(span->end_utc, sizeof(span->end_utc),
-                     clock != NULL ? clock->now_utc : NULL);
+                     logger_clock_now_utc_or_null(clock));
   session->span_active = false;
   session->current_span_id[0] = '\0';
   session->current_span_index = 0xffffffffu;
@@ -799,7 +799,7 @@ static bool logger_session_append_session_end(
 
   /* Control-plane: capture session end metadata */
   logger_copy_string(session->session_end_utc, sizeof(session->session_end_utc),
-                     clock != NULL ? clock->now_utc : NULL);
+                     logger_clock_now_utc_or_null(clock));
   logger_copy_string(session->session_end_reason,
                      sizeof(session->session_end_reason), end_reason);
 
@@ -1051,8 +1051,9 @@ static bool logger_session_finalize_internal(
   logger_writer_finalize_session_t *fs = &cmd.finalize_session;
   fs->boot_counter = boot_counter;
   fs->now_ms = now_ms;
-  if (clock != NULL && clock->now_utc[0] != '\0') {
-    logger_copy_string(fs->now_utc, sizeof(fs->now_utc), clock->now_utc);
+  const char *trusted_utc = logger_clock_now_utc_or_null(clock);
+  if (trusted_utc != NULL) {
+    logger_copy_string(fs->now_utc, sizeof(fs->now_utc), trusted_utc);
   }
 
   if (!session_dispatch(session, &cmd)) {
@@ -1066,11 +1067,9 @@ static bool logger_session_finalize_internal(
   if (logger_json_object_writer_bool_field(&writer, "debug", debug_session) &&
       logger_json_object_writer_string_field(&writer, "reason", end_reason) &&
       logger_json_object_writer_finish(&writer)) {
-    (void)logger_system_log_append(
-        system_log,
-        clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
-        "session_closed", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-        logger_json_object_writer_data(&writer));
+    (void)logger_system_log_append(system_log, trusted_utc, "session_closed",
+                                   LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+                                   logger_json_object_writer_data(&writer));
   }
   logger_session_init(session);
   return true;
@@ -1119,7 +1118,7 @@ static bool logger_session_start_new_active_internal(
   logger_random_hex128(session->session_id);
   logger_copy_string(session->session_start_utc,
                      sizeof(session->session_start_utc),
-                     clock != NULL ? clock->now_utc : NULL);
+                     logger_clock_now_utc_or_null(clock));
   logger_copy_string(session->session_start_reason,
                      sizeof(session->session_start_reason),
                      "first_span_of_session");
@@ -1195,9 +1194,8 @@ static bool logger_session_start_new_active_internal(
   if (logger_json_object_writer_bool_field(&writer, "debug", debug_session) &&
       logger_json_object_writer_finish(&writer)) {
     (void)logger_system_log_append(
-        system_log,
-        clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
-        "session_started", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        system_log, logger_clock_now_utc_or_null(clock), "session_started",
+        LOGGER_SYSTEM_LOG_SEVERITY_INFO,
         logger_json_object_writer_data(&writer));
   }
   return true;
@@ -1432,7 +1430,7 @@ static bool logger_session_restore_state_from_scan(
       !logger_hex_to_bytes_16(session->current_span_id,
                               session->current_span_id_raw)) {
     logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
+        system_log, logger_clock_now_utc_or_null(clock),
         "session_recovery_failed", "{\"reason\":\"span_id_parse_failed\"}");
     return false;
   }
@@ -1460,7 +1458,7 @@ static bool logger_session_materialize_recovered_manifest(
   if (!logger_session_compute_file_sha256(session->journal_path, journal_sha256,
                                           &journal_size_bytes)) {
     logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
+        system_log, logger_clock_now_utc_or_null(clock),
         "session_recovery_failed", "{\"reason\":\"journal_hash_failed\"}");
     return false;
   }
@@ -1477,7 +1475,7 @@ static bool logger_session_materialize_recovered_manifest(
   logger_session_manifest_persisted_release(persisted_for_manifest);
   if (!build_ok) {
     logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
+        system_log, logger_clock_now_utc_or_null(clock),
         "session_recovery_failed", "{\"reason\":\"manifest_build_failed\"}");
     return false;
   }
@@ -1485,7 +1483,7 @@ static bool logger_session_materialize_recovered_manifest(
   if (!logger_storage_write_file_atomic(session->manifest_path, manifest,
                                         manifest_len)) {
     logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
+        system_log, logger_clock_now_utc_or_null(clock),
         "session_recovery_failed", "{\"reason\":\"manifest_write_failed\"}");
     return false;
   }
@@ -1574,9 +1572,10 @@ bool logger_session_refresh_live(logger_session_state_t *session,
   cmd.type = LOGGER_WRITER_REFRESH_LIVE;
   cmd.refresh_live.boot_counter = boot_counter;
   cmd.refresh_live.now_ms = now_ms;
-  if (clock != NULL && clock->now_utc[0] != '\0') {
+  const char *trusted_utc = logger_clock_now_utc_or_null(clock);
+  if (trusted_utc != NULL) {
     logger_copy_string(cmd.refresh_live.now_utc,
-                       sizeof(cmd.refresh_live.now_utc), clock->now_utc);
+                       sizeof(cmd.refresh_live.now_utc), trusted_utc);
   }
 
   return session_dispatch(session, &cmd);
@@ -1617,8 +1616,9 @@ bool logger_session_write_status_snapshot(
   s->quarantined = session->quarantined;
   logger_copy_string(s->fault_code, sizeof(s->fault_code),
                      logger_fault_code_name(current_fault));
-  if (clock != NULL && clock->now_utc[0] != '\0') {
-    logger_copy_string(s->now_utc, sizeof(s->now_utc), clock->now_utc);
+  const char *trusted_utc = logger_clock_now_utc_or_null(clock);
+  if (trusted_utc != NULL) {
+    logger_copy_string(s->now_utc, sizeof(s->now_utc), trusted_utc);
   }
 
   return session_dispatch(session, &cmd);
@@ -1946,6 +1946,7 @@ bool logger_session_recover_on_boot(
   if (!logger_storage_ready_for_logging(storage)) {
     return true;
   }
+  const char *trusted_utc = logger_clock_now_utc_or_null(clock);
 
   workspace = logger_session_recovery_workspace_acquire();
 
@@ -1953,9 +1954,9 @@ bool logger_session_recover_on_boot(
   if (!logger_session_find_recovery_paths(workspace, &live_scan_error)) {
     logger_session_recovery_workspace_release(workspace);
     if (live_scan_error) {
-      logger_session_log_recovery_issue(
-          system_log, clock != NULL ? clock->now_utc : NULL,
-          "session_recovery_failed", "{\"reason\":\"live_scan_failed\"}");
+      logger_session_log_recovery_issue(system_log, trusted_utc,
+                                        "session_recovery_failed",
+                                        "{\"reason\":\"live_scan_failed\"}");
       return false;
     }
     return true;
@@ -1969,9 +1970,9 @@ bool logger_session_recover_on_boot(
   if (!logger_journal_scan(workspace->journal_path, &workspace->scan) ||
       !workspace->scan.valid) {
     logger_session_recovery_workspace_release(workspace);
-    logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
-        "session_recovery_failed", "{\"reason\":\"journal_scan_failed\"}");
+    logger_session_log_recovery_issue(system_log, trusted_utc,
+                                      "session_recovery_failed",
+                                      "{\"reason\":\"journal_scan_failed\"}");
     return false;
   }
   uint64_t actual_file_size = 0u;
@@ -1984,14 +1985,14 @@ bool logger_session_recover_on_boot(
                                         workspace->scan.valid_size_bytes)) {
     logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
-        "session_recovery_failed", "{\"reason\":\"journal_truncate_failed\"}");
+        system_log, trusted_utc, "session_recovery_failed",
+        "{\"reason\":\"journal_truncate_failed\"}");
     return false;
   }
   if (!workspace->scan.saw_session_start) {
     const bool hard_failure = workspace->live_present;
     logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
+        system_log, trusted_utc,
         hard_failure ? "session_recovery_failed" : "session_recovery_skipped",
         hard_failure ? "{\"reason\":\"journal_missing_session_start\","
                        "\"live_present\":true}"
@@ -2004,8 +2005,8 @@ bool logger_session_recover_on_boot(
       strcmp(workspace->live_session_id, workspace->scan.session_id) != 0) {
     logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
-        "session_recovery_failed", "{\"reason\":\"live_journal_id_mismatch\"}");
+        system_log, trusted_utc, "session_recovery_failed",
+        "{\"reason\":\"live_journal_id_mismatch\"}");
     return false;
   }
 
@@ -2035,8 +2036,7 @@ bool logger_session_recover_on_boot(
     if (workspace->live_present) {
       (void)logger_storage_remove_file(workspace->live_path);
     }
-    if (!logger_upload_queue_refresh_file(
-            system_log, clock != NULL ? clock->now_utc : NULL, NULL)) {
+    if (!logger_upload_queue_refresh_file(system_log, trusted_utc, NULL)) {
       logger_session_recovery_workspace_release(workspace);
       return false;
     }
@@ -2054,8 +2054,7 @@ bool logger_session_recover_on_boot(
     if (workspace->live_present) {
       (void)logger_storage_remove_file(workspace->live_path);
     }
-    if (!logger_upload_queue_refresh_file(
-            system_log, clock != NULL ? clock->now_utc : NULL, NULL)) {
+    if (!logger_upload_queue_refresh_file(system_log, trusted_utc, NULL)) {
       logger_session_recovery_workspace_release(workspace);
       return false;
     }
@@ -2075,8 +2074,7 @@ bool logger_session_recover_on_boot(
                                            workspace->scan.valid_size_bytes)) {
     logger_session_recovery_workspace_release(workspace);
     logger_session_log_recovery_issue(
-        system_log, clock != NULL ? clock->now_utc : NULL,
-        "session_recovery_failed",
+        system_log, trusted_utc, "session_recovery_failed",
         "{\"reason\":\"journal_writer_open_failed\"}");
     return false;
   }
@@ -2128,11 +2126,9 @@ bool logger_session_recover_on_boot(
     return false;
   }
 
-  (void)logger_system_log_append(
-      system_log,
-      clock != NULL && clock->now_utc[0] != '\0' ? clock->now_utc : NULL,
-      "session_recovered", LOGGER_SYSTEM_LOG_SEVERITY_INFO,
-      "{\"resume_allowed\":true}");
+  (void)logger_system_log_append(system_log, trusted_utc, "session_recovered",
+                                 LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+                                 "{\"resume_allowed\":true}");
   if (recovered_active_out != NULL) {
     *recovered_active_out = true;
   }

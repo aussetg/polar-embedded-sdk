@@ -36,6 +36,17 @@ static logger_clock_status_t utc_status(int year, int month, int day, int hour,
   return status;
 }
 
+static void test_now_utc_or_null_requires_valid_clock(void) {
+  logger_clock_status_t status = utc_status(2026, 1, 15, 12, 0, 0);
+  strcpy(status.now_utc, "2026-01-15T12:00:00Z");
+
+  assert(logger_clock_now_utc_or_null(&status) == status.now_utc);
+
+  status.valid = false;
+  assert(logger_clock_now_utc_or_null(&status) == NULL);
+  assert(logger_clock_now_utc_or_null(NULL) == NULL);
+}
+
 static void assert_local_tz(const char *label, const char *timezone,
                             logger_clock_status_t utc, int year, int month,
                             int day, int hour, int minute, int second) {
@@ -201,6 +212,7 @@ static void test_study_day_rollover(void) {
 }
 
 int main(void) {
+  test_now_utc_or_null_requires_valid_clock();
   test_europe_paris_offsets();
   test_fixed_offset_timezones();
   test_europe_capital_timezones();
