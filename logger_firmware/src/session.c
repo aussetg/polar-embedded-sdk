@@ -883,30 +883,6 @@ static bool __attribute__((noinline)) logger_session_build_manifest(
   return true;
 }
 
-static void logger_session_manifest_ctx_refresh_from_config(
-    logger_session_manifest_ctx_t *mc,
-    const logger_persisted_state_t *persisted) {
-  if (mc == NULL || persisted == NULL) {
-    return;
-  }
-  if (logger_string_present(persisted->config.logger_id)) {
-    logger_copy_string(mc->logger_id, sizeof(mc->logger_id),
-                       persisted->config.logger_id);
-  }
-  if (logger_string_present(persisted->config.subject_id)) {
-    logger_copy_string(mc->subject_id, sizeof(mc->subject_id),
-                       persisted->config.subject_id);
-  }
-  if (logger_string_present(persisted->config.timezone)) {
-    logger_copy_string(mc->timezone, sizeof(mc->timezone),
-                       persisted->config.timezone);
-  }
-  if (logger_string_present(persisted->config.bound_h10_address)) {
-    logger_copy_string(mc->bound_h10_address, sizeof(mc->bound_h10_address),
-                       persisted->config.bound_h10_address);
-  }
-}
-
 static bool logger_session_finalize_internal(
     logger_session_state_t *session, logger_system_log_t *system_log,
     const logger_persisted_state_t *persisted,
@@ -1796,18 +1772,9 @@ bool logger_session_recover_on_boot(
    */
   {
     logger_session_manifest_ctx_t *mc = &session->manifest_ctx;
-    memset(mc, 0, sizeof(*mc));
-    logger_copy_string(mc->hardware_id, sizeof(mc->hardware_id), hardware_id);
-    logger_copy_string(mc->logger_id, sizeof(mc->logger_id),
-                       workspace->scan.logger_id);
-    logger_copy_string(mc->subject_id, sizeof(mc->subject_id),
-                       workspace->scan.subject_id);
-    logger_copy_string(mc->timezone, sizeof(mc->timezone),
-                       workspace->scan.timezone);
-    logger_session_manifest_ctx_refresh_from_config(mc, persisted);
-    mc->storage = *storage;
-    mc->debug_session = false;
-    mc->system_log = system_log;
+    logger_session_manifest_ctx_seed_recovered(mc, hardware_id,
+                                               &workspace->scan, persisted,
+                                               storage, false, system_log);
   }
 
   if (!resume_allowed) {
@@ -2265,18 +2232,7 @@ static bool __attribute__((noinline)) logger_writer_handle_finalize_session(
   size_t manifest_len = 0u;
   logger_persisted_state_t *persisted_for_manifest =
       logger_session_manifest_persisted_acquire();
-  logger_copy_string(persisted_for_manifest->config.logger_id,
-                     sizeof(persisted_for_manifest->config.logger_id),
-                     mc->logger_id);
-  logger_copy_string(persisted_for_manifest->config.subject_id,
-                     sizeof(persisted_for_manifest->config.subject_id),
-                     mc->subject_id);
-  logger_copy_string(persisted_for_manifest->config.timezone,
-                     sizeof(persisted_for_manifest->config.timezone),
-                     mc->timezone);
-  logger_copy_string(persisted_for_manifest->config.bound_h10_address,
-                     sizeof(persisted_for_manifest->config.bound_h10_address),
-                     mc->bound_h10_address);
+  logger_session_manifest_ctx_copy_persisted(mc, persisted_for_manifest);
   if (!logger_session_build_manifest(
           session, mc->hardware_id, persisted_for_manifest, &storage_now,
           journal_sha256, journal_size_bytes, manifest,

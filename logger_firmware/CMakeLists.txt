@@ -77,6 +77,7 @@ add_executable(logger_appliance
     src/journal_writer.c
     src/queue.c
     src/session.c
+    src/session_manifest.c
     src/service_cli.c
     src/sha256.c
     src/storage.c

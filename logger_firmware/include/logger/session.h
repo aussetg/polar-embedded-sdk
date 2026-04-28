@@ -116,6 +116,18 @@ void logger_session_init(logger_session_state_t *session);
 void logger_session_set_pipe(logger_session_state_t *session,
                              struct capture_pipe *pipe);
 void logger_session_init_buffers(void);
+void logger_session_manifest_ctx_refresh_from_config(
+    logger_session_manifest_ctx_t *mc,
+    const logger_persisted_state_t *persisted);
+void logger_session_manifest_ctx_seed_recovered(
+    logger_session_manifest_ctx_t *mc, const char *hardware_id,
+    const logger_journal_scan_result_t *scan,
+    const logger_persisted_state_t *persisted,
+    const logger_storage_status_t *storage, bool debug_session,
+    logger_system_log_t *system_log);
+void logger_session_manifest_ctx_copy_persisted(
+    const logger_session_manifest_ctx_t *mc,
+    logger_persisted_state_t *persisted_for_manifest);
 
 /* Approximate cross-core telemetry accessor for writer-owned durable size.
  *

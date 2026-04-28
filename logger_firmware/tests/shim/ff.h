@@ -47,11 +47,13 @@ typedef struct {
   uint8_t *buf;
   size_t buf_cap;
   size_t buf_len;
+  size_t pos;
 } FIL;
 
 /* Shim functions — implemented by the test */
 FRESULT f_open(FIL *fp, const char *path, unsigned int mode);
 FRESULT f_write(FIL *fp, const void *data, UINT len, UINT *written);
+FRESULT f_read(FIL *fp, void *data, UINT len, UINT *read);
 FRESULT f_sync(FIL *fp);
 FRESULT f_close(FIL *fp);
 
