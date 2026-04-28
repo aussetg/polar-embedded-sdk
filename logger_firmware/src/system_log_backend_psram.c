@@ -2,19 +2,25 @@
  * PSRAM-backed storage backend for the system log.
  *
  * The system log occupies the first 512 KB of the 8 MB APS6404L PSRAM
- * (1024 records × 512 B each).  Reads and writes are plain memcpy
- * through the QMI memory-mapped window — no erase cycles, no flash
- * lockout, no multicore safety concerns.
+ * (1024 records × 512 B each).  The APS6404L density is 64 Mbit /
+ * 8M × 8 bits (AP Memory APS6404L-3SQR datasheet Rev. 2.3, p. 1;
+ * ordering-code density table p. 7).  Reads and writes are plain memcpy
+ * through the QMI memory-mapped window — no erase cycles, no flash lockout.
  *
  * ## XIP cache coherency on RP2350
  *
  * The RP2350 has a SINGLE shared XIP cache (xip_ctrl, 16 KB 2-way
  * set-associative) shared by both Cortex-M33 cores.  The M33 cores on
- * this SoC were built WITHOUT private L1 caches.  XIP-mapped PSRAM
- * writes are write-through: the shared cache line is updated on hit
- * AND the write is posted to QMI.  Either core's subsequent read sees
- * the updated data regardless of which core wrote it — no per-core
- * cache maintenance needed.
+ * this SoC were built WITHOUT private L1 caches.  Both cores use the
+ * same cached XIP alias here, so either core's subsequent read observes
+ * the updated shared cache state regardless of which core wrote it — no
+ * per-core cache maintenance is needed for this backend's cached-alias
+ * memcpy traffic.
+ *
+ * Do not generalise this to "physical PSRAM is immediately updated".
+ * RP2350's XIP cache has dirty-line clean/invalidate operations.  Any
+ * future path that mixes cached aliases with uncached aliases or external
+ * visibility requirements must make that cache-maintenance policy explicit.
  *
  * This is NOT the case on many other dual-core embedded chips:
  *   - STM32H745 (M7+M4): private M7 L1 D-cache, explicit clean/invalidate
@@ -25,7 +31,7 @@
  * not about cross-core cache coherency.  They ensure QMI posted writes
  * are submitted to the bus before the fence completes, and that QMI
  * reads are ordered before subsequent memory operations.  The shared
- * cache handles coherency transparently.
+ * cache handles cached-alias coherency transparently.
  */
 
 #include "logger/system_log_backend_psram.h"

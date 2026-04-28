@@ -1743,11 +1743,21 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
    * step_boot will route to RECOVERY_HOLD.
    */
   const system_log_backend_t *log_backend = NULL;
-  if (psram_init(PIMORONI_PICO_LIPO2XL_W_PSRAM_CS_PIN) > 0u) {
+  const size_t psram_size = psram_init(PIMORONI_PICO_LIPO2XL_W_PSRAM_CS_PIN);
+  if (psram_size == PSRAM_SIZE &&
+      psram_size >= PSRAM_LAYOUT_RESERVED_END_OFFSET) {
     log_backend = &system_log_backend_psram;
-    printf("[logger] psram initialised, system log -> psram\n");
+    printf("[logger] psram initialised (%lu bytes), system log -> psram\n",
+           (unsigned long)psram_size);
   } else {
-    printf("[logger] FATAL: psram init failed — hardware fault\n");
+    if (psram_size == 0u) {
+      printf("[logger] FATAL: psram init failed — hardware fault\n");
+    } else {
+      printf("[logger] FATAL: psram size mismatch detected=%lu expected=%lu "
+             "layout_required=%lu\n",
+             (unsigned long)psram_size, (unsigned long)PSRAM_SIZE,
+             (unsigned long)PSRAM_LAYOUT_RESERVED_END_OFFSET);
+    }
     logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_PSRAM_INIT_FAILED);
   }
   logger_system_log_init(&app->system_log, log_backend,

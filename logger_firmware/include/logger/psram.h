@@ -8,6 +8,10 @@
  * Base address of the APS6404L PSRAM when mapped via QMI window 1.
  * After psram_init() succeeds, this 8 MB region is accessible as
  * ordinary memory (byte-addressable, no erase needed).
+ *
+ * PSRAM_BASE is RP2350 QMI CS1's XIP window.  PSRAM_SIZE is the APS6404L
+ * density: 64 Mbit / 8M × 8 bits (AP Memory APS6404L-3SQR datasheet
+ * Rev. 2.3, p. 1; ordering-code density table p. 7).
  */
 #define PSRAM_BASE ((uintptr_t)0x11000000u)
 #define PSRAM_SIZE (8u * 1024u * 1024u)
