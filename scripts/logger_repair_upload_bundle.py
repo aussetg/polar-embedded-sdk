@@ -348,13 +348,13 @@ def verify_gcs_object(gcs_uri: str, expected_sha256: str, *, project: str | None
     return {"gcs_uri": gcs_uri, "sha256": actual, "verified": True}
 
 
-def mark_verified_on_device(port: str | None, session_id: str, receipt_id: str) -> dict[str, Any]:
+def mark_verified_on_device(port: str | None, session_id: str, receipt_id: str, uploaded_sha256: str) -> dict[str, Any]:
     with LoggerDevice(port) as device:
         command_ok(device, "service enter", "service enter", 20.0)
         command_ok(device, "service unlock", "service unlock", 10.0)
         return command_ok(
             device,
-            f"debug queue mark-verified {session_id} {receipt_id}",
+            f"debug queue mark-verified {session_id} {receipt_id} {uploaded_sha256}",
             "debug queue mark-verified",
             30.0,
         )
@@ -449,7 +449,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.mark_verified:
         if not receipt_id:
             raise ValueError("--mark-verified requires --upload to return receipt_id")
-        summary["steps"]["mark_verified"] = mark_verified_on_device(args.port, args.session_id, receipt_id)
+        summary["steps"]["mark_verified"] = mark_verified_on_device(
+            args.port, args.session_id, receipt_id, uploaded_sha or sha256_hex(upload_tar.read_bytes())
+        )
     else:
         summary["steps"]["mark_verified"] = {"skipped": True}
 

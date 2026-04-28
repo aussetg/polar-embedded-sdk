@@ -36,6 +36,7 @@ typedef struct {
                                  1];
   char last_response_excerpt[LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX + 1];
   char verified_upload_utc[LOGGER_UPLOAD_QUEUE_UTC_MAX + 1];
+  char verified_bundle_sha256[LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN + 1];
   char receipt_id[LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX + 1];
 } logger_upload_queue_entry_t;
 

@@ -22,7 +22,7 @@
 #define LOGGER_QUEUE_READ_MAX 49152u
 #define LOGGER_MANIFEST_JSON_TOKEN_MAX 512u
 #define LOGGER_QUEUE_TOP_LEVEL_JSON_TOKEN_COUNT 7u
-#define LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT 37u
+#define LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT 39u
 #define LOGGER_QUEUE_JSON_TOKEN_MAX                                            \
   (LOGGER_QUEUE_TOP_LEVEL_JSON_TOKEN_COUNT +                                   \
    (LOGGER_UPLOAD_QUEUE_MAX_SESSIONS * LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT))
@@ -410,6 +410,9 @@ logger_queue_copy_mutable_fields(logger_upload_queue_entry_t *dst,
                      src->last_response_excerpt);
   logger_copy_string(dst->verified_upload_utc, sizeof(dst->verified_upload_utc),
                      src->verified_upload_utc);
+  logger_copy_string(dst->verified_bundle_sha256,
+                     sizeof(dst->verified_bundle_sha256),
+                     src->verified_bundle_sha256);
   logger_copy_string(dst->receipt_id, sizeof(dst->receipt_id), src->receipt_id);
 }
 
@@ -526,6 +529,9 @@ static bool logger_parse_queue_entry_json(const logger_json_doc_t *doc,
   logger_queue_copy_optional_string(doc, object_tok, "last_response_excerpt",
                                     entry->last_response_excerpt,
                                     sizeof(entry->last_response_excerpt));
+  logger_queue_copy_optional_string(doc, object_tok, "verified_bundle_sha256",
+                                    entry->verified_bundle_sha256,
+                                    sizeof(entry->verified_bundle_sha256));
   return true;
 }
 
@@ -1138,6 +1144,9 @@ bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
     ok = ok && logger_file_write_cstr(&file, ",\"verified_upload_utc\":");
     ok = ok && logger_file_write_json_string_or_null(
                    &file, entry->verified_upload_utc);
+    ok = ok && logger_file_write_cstr(&file, ",\"verified_bundle_sha256\":");
+    ok = ok && logger_file_write_json_string_or_null(
+                   &file, entry->verified_bundle_sha256);
     ok = ok && logger_file_write_cstr(&file, ",\"receipt_id\":");
     ok = ok && logger_file_write_json_string_or_null(&file, entry->receipt_id);
     ok = ok && logger_file_write_cstr(&file, "}");
@@ -1227,6 +1236,7 @@ bool logger_upload_queue_requeue_blocked_file(
     entry->last_server_error_message[0] = '\0';
     entry->last_response_excerpt[0] = '\0';
     entry->verified_upload_utc[0] = '\0';
+    entry->verified_bundle_sha256[0] = '\0';
     entry->receipt_id[0] = '\0';
     requeued_count += 1u;
   }

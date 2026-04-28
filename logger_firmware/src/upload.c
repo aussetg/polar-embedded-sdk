@@ -1438,6 +1438,7 @@ static bool logger_upload_process_selected(
   entry->last_failure_class[0] = '\0';
   logger_upload_clear_entry_diagnostics(entry);
   entry->verified_upload_utc[0] = '\0';
+  entry->verified_bundle_sha256[0] = '\0';
   entry->receipt_id[0] = '\0';
   if (!logger_storage_svc_queue_write(queue)) {
     logger_upload_process_workspace_release(process_workspace);
@@ -1678,6 +1679,11 @@ static bool logger_upload_process_selected(
             : now_utc_or_null);
     logger_copy_string(entry->receipt_id, sizeof(entry->receipt_id),
                        process_workspace->reply.receipt_id);
+    logger_copy_string(entry->verified_bundle_sha256,
+                       sizeof(entry->verified_bundle_sha256),
+                       logger_string_present(process_workspace->reply.sha256)
+                           ? process_workspace->reply.sha256
+                           : entry->bundle_sha256);
     if (!logger_storage_svc_queue_write(queue)) {
       logger_upload_http_response_workspace_release(http_response);
       logger_upload_process_workspace_release(process_workspace);
@@ -1724,6 +1730,7 @@ static bool logger_upload_process_selected(
   logger_upload_set_entry_http_diagnostics(entry, http_response,
                                            &process_workspace->reply);
   entry->verified_upload_utc[0] = '\0';
+  entry->verified_bundle_sha256[0] = '\0';
   entry->receipt_id[0] = '\0';
   (void)logger_storage_svc_queue_write(queue);
 

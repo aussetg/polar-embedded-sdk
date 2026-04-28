@@ -1568,6 +1568,11 @@ static void logger_handle_queue_json(logger_app_t *app) {
             ? entry->verified_upload_utc
             : NULL);
     logger_json_stream_writer_field_string_or_null(
+        &w, "verified_bundle_sha256",
+        logger_string_present(entry->verified_bundle_sha256)
+            ? entry->verified_bundle_sha256
+            : NULL);
+    logger_json_stream_writer_field_string_or_null(
         &w, "receipt_id",
         logger_string_present(entry->receipt_id) ? entry->receipt_id : NULL);
     logger_json_stream_writer_field_string_or_null(
@@ -3531,27 +3536,44 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
 
   char session_id[LOGGER_SESSION_ID_HEX_LEN + 1];
   char receipt_id[LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX + 1];
+  char uploaded_sha256[LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN + 1];
   memset(session_id, 0, sizeof(session_id));
   memset(receipt_id, 0, sizeof(receipt_id));
+  memset(uploaded_sha256, 0, sizeof(uploaded_sha256));
 
   const char *space = args != NULL ? strchr(args, ' ') : NULL;
-  if (space == NULL || (size_t)(space - args) != LOGGER_SESSION_ID_HEX_LEN ||
-      strlen(space + 1u) == 0u ||
-      strlen(space + 1u) > LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX) {
+  const char *sha_space = space != NULL ? strchr(space + 1u, ' ') : NULL;
+  if (space == NULL || sha_space == NULL ||
+      (size_t)(space - args) != LOGGER_SESSION_ID_HEX_LEN ||
+      (size_t)(sha_space - (space + 1u)) == 0u ||
+      (size_t)(sha_space - (space + 1u)) > LOGGER_UPLOAD_QUEUE_RECEIPT_ID_MAX ||
+      strlen(sha_space + 1u) != LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN) {
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
             "invalid_argument",
-            "expected: debug queue mark-verified <session_id> <receipt_id>");
+            "expected: debug queue mark-verified <session_id> <receipt_id> "
+            "<uploaded_sha256>");
     return;
   }
   memcpy(session_id, args, LOGGER_SESSION_ID_HEX_LEN);
-  logger_copy_string(receipt_id, sizeof(receipt_id), space + 1u);
+  memcpy(receipt_id, space + 1u, (size_t)(sha_space - (space + 1u)));
+  receipt_id[sha_space - (space + 1u)] = '\0';
+  logger_copy_string(uploaded_sha256, sizeof(uploaded_sha256), sha_space + 1u);
 
   uint8_t session_id_bytes[16];
   if (!logger_hex_to_bytes_16(session_id, session_id_bytes)) {
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
             "invalid_argument", "session_id must be 32 hexadecimal chars");
+    return;
+  }
+  uint8_t uploaded_sha_prefix[16];
+  uint8_t uploaded_sha_suffix[16];
+  if (!logger_hex_to_bytes_16(uploaded_sha256, uploaded_sha_prefix) ||
+      !logger_hex_to_bytes_16(uploaded_sha256 + 32u, uploaded_sha_suffix)) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument", "uploaded_sha256 must be 64 hexadecimal chars");
     return;
   }
 
@@ -3581,6 +3603,8 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
 
   logger_copy_string(entry->status, sizeof(entry->status), "verified");
   logger_copy_string(entry->receipt_id, sizeof(entry->receipt_id), receipt_id);
+  logger_copy_string(entry->verified_bundle_sha256,
+                     sizeof(entry->verified_bundle_sha256), uploaded_sha256);
   logger_copy_string(entry->verified_upload_utc,
                      sizeof(entry->verified_upload_utc),
                      logger_clock_now_utc_or_null(&app->clock));
@@ -3611,6 +3635,8 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
                                              session_id) &&
       logger_json_object_writer_string_field(&writer, "receipt_id",
                                              receipt_id) &&
+      logger_json_object_writer_string_field(&writer, "uploaded_sha256",
+                                             uploaded_sha256) &&
       logger_json_object_writer_string_field(&writer, "source",
                                              "host_manual_upload") &&
       logger_json_object_writer_finish(&writer)) {
@@ -3625,6 +3651,8 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
   logger_json_stream_writer_field_string_or_null(&w, "session_id", session_id);
   logger_json_stream_writer_field_string_or_null(&w, "status", "verified");
   logger_json_stream_writer_field_string_or_null(&w, "receipt_id", receipt_id);
+  logger_json_stream_writer_field_string_or_null(&w, "uploaded_sha256",
+                                                 uploaded_sha256);
   logger_json_stream_writer_field_uint32(&w, "pending_count",
                                          summary.pending_count);
   jsw_end(&w);
