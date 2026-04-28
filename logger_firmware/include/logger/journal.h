@@ -26,6 +26,7 @@ typedef struct {
 
 typedef struct {
   bool valid;
+  bool saw_session_start;
   bool session_closed;
   bool active_span_open;
   bool quarantined;

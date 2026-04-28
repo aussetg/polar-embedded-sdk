@@ -161,13 +161,34 @@ static logger_journal_scan_result_t make_scanned_session_start(void) {
   memset(&scan, 0, sizeof(scan));
   assert(logger_journal_scan("journal.bin", &scan));
   assert(scan.valid);
+  assert(scan.saw_session_start);
   return scan;
+}
+
+static void test_journal_scan_distinguishes_header_only_journal(void) {
+  shim_reset();
+
+  logger_journal_writer_t writer;
+  logger_journal_writer_init(&writer);
+  assert(logger_journal_writer_create(&writer, "journal.bin",
+                                      "913d0640c032abc4093b972719c26e84", 7u,
+                                      1777125951000000000ll));
+  assert(logger_journal_writer_close(&writer));
+
+  logger_journal_scan_result_t scan;
+  memset(&scan, 0, sizeof(scan));
+  assert(logger_journal_scan("journal.bin", &scan));
+  assert(scan.valid);
+  assert(!scan.saw_session_start);
+  assert(scan.valid_size_bytes == 64u);
+  assert(scan.next_record_seq == 0u);
 }
 
 static void test_journal_scan_captures_session_start_identity(void) {
   logger_journal_scan_result_t scan = make_scanned_session_start();
 
   assert(strcmp(scan.session_id, "913d0640c032abc4093b972719c26e84") == 0);
+  assert(scan.saw_session_start);
   assert(strcmp(scan.study_day_local, "2026-04-25") == 0);
   assert(strcmp(scan.session_start_utc, "2026-04-25T14:05:51Z") == 0);
   assert(strcmp(scan.session_start_reason, "first_span_of_session") == 0);
@@ -225,6 +246,7 @@ static void test_live_config_overrides_recovered_identity_when_present(void) {
 }
 
 int main(void) {
+  test_journal_scan_distinguishes_header_only_journal();
   test_journal_scan_captures_session_start_identity();
   test_recovered_manifest_uses_durable_identity_when_config_empty();
   test_live_config_overrides_recovered_identity_when_present();

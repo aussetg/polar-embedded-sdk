@@ -1884,6 +1884,18 @@ bool logger_session_recover_on_boot(
         "session_recovery_failed", "{\"reason\":\"journal_truncate_failed\"}");
     return false;
   }
+  if (!workspace->scan.saw_session_start) {
+    const bool hard_failure = workspace->live_present;
+    logger_session_log_recovery_issue(
+        system_log, clock != NULL ? clock->now_utc : NULL,
+        hard_failure ? "session_recovery_failed" : "session_recovery_skipped",
+        hard_failure ? "{\"reason\":\"journal_missing_session_start\","
+                       "\"live_present\":true}"
+                     : "{\"reason\":\"journal_missing_session_start\","
+                       "\"live_present\":false}");
+    logger_session_recovery_workspace_release(workspace);
+    return !hard_failure;
+  }
   if (have_live_session_id &&
       strcmp(workspace->live_session_id, workspace->scan.session_id) != 0) {
     logger_session_recovery_workspace_release(workspace);

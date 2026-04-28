@@ -110,6 +110,7 @@ logger_journal_apply_json_record(logger_journal_scan_result_t *result,
                                  const jsmntok_t *root) {
   switch (record_type) {
   case LOGGER_JOURNAL_RECORD_SESSION_START: {
+    result->saw_session_start = true;
     (void)logger_json_object_copy_string(doc, root, "session_id",
                                          result->session_id,
                                          sizeof(result->session_id));
