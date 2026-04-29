@@ -80,7 +80,7 @@ static bool logger_json_hex4_decode(const char *src, uint32_t *value_out) {
 
 static bool logger_json_append_byte(char *out, size_t out_len, size_t *out_i,
                                     uint8_t value) {
-  if (out == NULL || out_i == NULL || (*out_i + 1u) >= out_len) {
+  if (out == NULL || out_i == NULL || value == 0u || (*out_i + 1u) >= out_len) {
     return false;
   }
   out[*out_i] = (char)value;

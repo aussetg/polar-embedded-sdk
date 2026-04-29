@@ -483,6 +483,12 @@ When upload mode was entered by an off-charger long press, the firmware MUST mak
 
 When `upload.url` uses `https://`, the firmware MUST verify the server certificate chain against the built-in public root profile `logger-public-roots-v1` and MUST perform hostname verification against the URL host. For backward-compatible configs, omitting explicit upload TLS settings for an HTTPS URL is interpreted as this built-in `public_roots` mode.
 
+Before constructing an upload request, firmware MUST validate the configured
+URL, `logger_id`, API key, and bearer token using the stable v1 config grammar.
+Values containing NUL, CR, LF, tab, other control bytes, DEL, URL userinfo, or
+URL fragments are malformed config. Firmware MUST block upload for malformed
+config; it MUST NOT trim, escape, or send those values.
+
 ### 14.4 Upload success semantics
 
 A session is considered uploaded only when the server has:

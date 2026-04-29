@@ -7,9 +7,8 @@
 #include "logger/config_store.h"
 #include "logger/queue.h"
 #include "logger/system_log.h"
+#include "logger/upload_url.h"
 
-#define LOGGER_UPLOAD_URL_HOST_MAX 128
-#define LOGGER_UPLOAD_URL_PATH_MAX 192
 #define LOGGER_UPLOAD_DETAIL_MAX 160
 #define LOGGER_UPLOAD_MESSAGE_MAX 160
 

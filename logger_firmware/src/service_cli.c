@@ -13,6 +13,7 @@
 #include "board_config.h"
 #include "logger/app_main.h"
 #include "logger/capture_stats.h"
+#include "logger/config_validate.h"
 #include "logger/faults.h"
 #include "logger/json.h"
 #include "logger/json_stream_writer.h"
@@ -287,11 +288,6 @@ static bool logger_json_array_copy_single_string(const logger_json_doc_t *doc,
   }
   const jsmntok_t *value_tok = logger_json_array_get(doc, array_tok, 0u);
   return logger_json_token_copy_string(doc, value_tok, out, out_len);
-}
-
-static bool logger_upload_url_supported(const char *url) {
-  return url != NULL && (strncmp(url, "http://", 7u) == 0 ||
-                         strncmp(url, "https://", 8u) == 0);
 }
 
 static bool logger_upload_url_uses_https(const char *url) {
@@ -652,6 +648,11 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     *error_message_out = "config import identity section is invalid";
     return false;
   }
+  if (!logger_config_logger_id_valid(state_out->config.logger_id, true) ||
+      !logger_config_subject_id_valid(state_out->config.subject_id, true)) {
+    *error_message_out = "config import identity values are invalid";
+    return false;
+  }
 
   if (!logger_json_object_copy_string_or_empty_required(
           &doc, recording_tok, "bound_h10_address",
@@ -832,6 +833,11 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     *error_message_out = "config import upload.url is invalid";
     return false;
   }
+  if (logger_string_present(workspace->upload_url) &&
+      !logger_config_upload_url_valid(workspace->upload_url, false)) {
+    *error_message_out = "config import upload.url is invalid";
+    return false;
+  }
   const jsmntok_t *auth_tok = logger_json_object_get(&doc, upload_tok, "auth");
   if (auth_tok == NULL || auth_tok->type != JSMN_OBJECT) {
     *error_message_out = "config import upload.auth is invalid";
@@ -866,6 +872,14 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
     *error_message_out = "config import upload.auth.token is invalid";
     return false;
   }
+  if (!logger_config_upload_api_key_valid(workspace->auth_api_key, true)) {
+    *error_message_out = "config import upload.auth.api_key is invalid";
+    return false;
+  }
+  if (!logger_config_upload_token_valid(workspace->auth_token, true)) {
+    *error_message_out = "config import upload.auth.token is invalid";
+    return false;
+  }
   if (logger_json_object_has_key(&doc, auth_tok, "api_key_present") &&
       !logger_json_object_get_bool(&doc, auth_tok, "api_key_present",
                                    &api_key_present_marker)) {
@@ -882,9 +896,10 @@ logger_parse_config_import_document(const logger_app_t *app, const char *json,
   (void)token_present_marker;
 
   if (upload_enabled) {
-    if (!logger_upload_url_supported(workspace->upload_url)) {
+    if (!logger_config_upload_url_valid(workspace->upload_url, false)) {
       *error_message_out = "config import requires upload.url to be an "
-                           "absolute http:// or https:// URL";
+                           "absolute http:// or https:// URL without "
+                           "control characters, userinfo, or fragments";
       return false;
     }
     logger_copy_string(state_out->config.upload_url,

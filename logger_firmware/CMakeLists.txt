@@ -39,6 +39,11 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_LIST_DIR}/tests/test_upload_request_headers.py
     )
+    add_test(
+        NAME logger_config_upload_material_validation
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_LIST_DIR}/tests/test_config_upload_material_validation.py
+    )
 endif()
 
 set(LOGGER_FIRMWARE_VERSION "0.2.0" CACHE STRING "Semantic firmware version string")
@@ -122,6 +127,7 @@ set(LOGGER_PROJECT_SOURCES
     src/clock.c
     src/clock_local.c
     src/config_store.c
+    src/config_validate.c
     src/fatfs_guard.c
     src/flash_safety.c
     src/faults.c
@@ -149,6 +155,7 @@ set(LOGGER_PROJECT_SOURCES
     src/system_log.c
     src/upload.c
     src/upload_bundle.c
+    src/upload_url.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_helpers.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_gatt.c
     ${CMAKE_CURRENT_LIST_DIR}/../polar_sdk/core/src/polar_sdk_btstack_adv_runtime.c

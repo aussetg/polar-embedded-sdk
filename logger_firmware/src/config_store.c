@@ -13,6 +13,7 @@
 #include "hardware/sync.h"
 #include "pico/flash.h"
 
+#include "logger/config_validate.h"
 #include "logger/flash_layout.h"
 #include "logger/util.h"
 
@@ -329,6 +330,22 @@ static void logger_config_normalize(const logger_config_t *src,
                      sizeof(dst->upload_tls_anchor_subject),
                      src->upload_tls_anchor_subject);
 
+  if (!logger_config_logger_id_valid(dst->logger_id, true)) {
+    dst->logger_id[0] = '\0';
+  }
+  if (!logger_config_subject_id_valid(dst->subject_id, true)) {
+    dst->subject_id[0] = '\0';
+  }
+  if (!logger_config_upload_url_valid(dst->upload_url, true)) {
+    dst->upload_url[0] = '\0';
+  }
+  if (!logger_config_upload_api_key_valid(dst->upload_api_key, true)) {
+    dst->upload_api_key[0] = '\0';
+  }
+  if (!logger_config_upload_token_valid(dst->upload_token, true)) {
+    dst->upload_token[0] = '\0';
+  }
+
   logger_config_sanitize_upload_tls(dst);
 }
 
@@ -613,18 +630,22 @@ bool logger_config_store_factory_reset(logger_persisted_state_t *state) {
 }
 
 bool logger_config_normal_logging_ready(const logger_config_t *config) {
-  return logger_string_present(config->logger_id) &&
-         logger_string_present(config->subject_id) &&
+  return config != NULL &&
+         logger_config_logger_id_valid(config->logger_id, false) &&
+         logger_config_subject_id_valid(config->subject_id, false) &&
          logger_string_present(config->bound_h10_address) &&
          logger_timezone_supported(config->timezone);
 }
 
 bool logger_config_upload_configured(const logger_config_t *config) {
-  return logger_string_present(config->upload_url);
+  return config != NULL && logger_string_present(config->upload_url);
 }
 
 bool logger_config_upload_ready(const logger_config_t *config) {
   if (!logger_config_upload_configured(config)) {
+    return false;
+  }
+  if (!logger_config_upload_url_valid(config->upload_url, false)) {
     return false;
   }
   const char *mode = logger_config_upload_tls_mode(config);
@@ -716,6 +737,9 @@ logger_normalize_h10_address(const char *src,
 
 bool logger_config_set_logger_id(logger_persisted_state_t *state,
                                  const char *value) {
+  if (!logger_config_logger_id_valid(value != NULL ? value : "", true)) {
+    return false;
+  }
   if (!logger_write_if_changed(state->config.logger_id,
                                sizeof(state->config.logger_id), value, NULL)) {
     return false;
@@ -725,6 +749,9 @@ bool logger_config_set_logger_id(logger_persisted_state_t *state,
 
 bool logger_config_set_subject_id(logger_persisted_state_t *state,
                                   const char *value) {
+  if (!logger_config_subject_id_valid(value != NULL ? value : "", true)) {
+    return false;
+  }
   if (!logger_write_if_changed(state->config.subject_id,
                                sizeof(state->config.subject_id), value, NULL)) {
     return false;
@@ -781,6 +808,9 @@ bool logger_config_set_wifi_psk(logger_persisted_state_t *state,
 
 bool logger_config_set_upload_url(logger_persisted_state_t *state,
                                   const char *value) {
+  if (!logger_config_upload_url_valid(value != NULL ? value : "", true)) {
+    return false;
+  }
   bool url_changed = false;
   if (!logger_write_if_changed(state->config.upload_url,
                                sizeof(state->config.upload_url), value,
@@ -799,6 +829,9 @@ bool logger_config_set_upload_url(logger_persisted_state_t *state,
 
 bool logger_config_set_upload_api_key(logger_persisted_state_t *state,
                                       const char *value) {
+  if (!logger_config_upload_api_key_valid(value != NULL ? value : "", true)) {
+    return false;
+  }
   if (!logger_write_if_changed(state->config.upload_api_key,
                                sizeof(state->config.upload_api_key), value,
                                NULL)) {
@@ -809,6 +842,9 @@ bool logger_config_set_upload_api_key(logger_persisted_state_t *state,
 
 bool logger_config_set_upload_token(logger_persisted_state_t *state,
                                     const char *value) {
+  if (!logger_config_upload_token_valid(value != NULL ? value : "", true)) {
+    return false;
+  }
   if (!logger_write_if_changed(state->config.upload_token,
                                sizeof(state->config.upload_token), value,
                                NULL)) {

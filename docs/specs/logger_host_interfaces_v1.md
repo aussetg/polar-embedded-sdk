@@ -696,6 +696,15 @@ If `enabled` is `false`, `url` MAY be `null`.
 - `api_key` and `token` when secrets are included, or
 - `api_key_present: true` and `token_present: true` when secrets are omitted.
 
+Stable v1 import MUST reject decoded `identity.logger_id`,
+`identity.subject_id`, `upload.url`, `upload.auth.api_key`, and
+`upload.auth.token` values containing NUL, CR, LF, tab, other control bytes,
+or DEL. `logger_id` and `subject_id` are ASCII tokens using only
+`A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`. Upload secrets are exact visible
+ASCII values (`0x21..0x7e`) and MUST NOT be trimmed, escaped, or normalized.
+`upload.url` MUST be an absolute `http://` or `https://` URL without userinfo
+or fragments; any non-visible byte must be percent-encoded before import.
+
 If `tls` is present, it is an object containing at least:
 
 - `mode`

@@ -924,6 +924,12 @@ If configured, the request also includes:
 - `x-api-key: <api_key>`
 - `Authorization: Bearer <token>`
 
+All client-supplied request-target and header material originating from device
+configuration MUST be validated before upload request construction. In stable
+v1, `logger_id`, `api_key`, `token`, and the configured URL MUST NOT contain
+NUL, CR, LF, tab, other control bytes, or DEL. Upload clients MUST reject the
+configuration rather than escaping, trimming, or sending such values.
+
 Firmware upload clients MUST NOT include `X-Logger-Subject-Id` or any other
 subject-identity header. The server MUST derive the canonical upload
 `subject_id` from the authenticated bearer token. Manifest `subject_id` is

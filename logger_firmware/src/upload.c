@@ -20,6 +20,7 @@
 
 #include "mbedtls/ssl.h"
 
+#include "logger/config_validate.h"
 #include "logger/json.h"
 #include "logger/json_writer.h"
 #include "logger/net.h"
@@ -46,6 +47,7 @@ typedef struct {
   char host[LOGGER_UPLOAD_URL_HOST_MAX + 1];
   char path[LOGGER_UPLOAD_URL_PATH_MAX + 1];
   uint16_t port;
+  bool host_bracketed_literal;
   bool host_is_literal;
   ip_addr_t literal_addr;
 } logger_upload_url_t;
@@ -299,91 +301,22 @@ logger_upload_process_result_init(logger_upload_process_result_t *result) {
 static bool logger_upload_parse_url(const char *url,
                                     logger_upload_url_t *parsed) {
   memset(parsed, 0, sizeof(*parsed));
-  if (!logger_string_present(url)) {
+  logger_upload_url_parts_t parts;
+  if (!logger_upload_url_parse(url, &parts)) {
     return false;
   }
 
-  const char *after_scheme = NULL;
-  if (strncmp(url, "http://", 7u) == 0) {
-    parsed->https = false;
-    parsed->port = 80u;
-    after_scheme = url + 7u;
-  } else if (strncmp(url, "https://", 8u) == 0) {
-    parsed->https = true;
-    parsed->port = 443u;
-    after_scheme = url + 8u;
-  } else {
-    return false;
-  }
-
-  const char *path_start = strchr(after_scheme, '/');
-  const char *authority_end =
-      path_start != NULL ? path_start : (after_scheme + strlen(after_scheme));
-  if (authority_end == after_scheme) {
-    return false;
-  }
-
-  const char *host_start = after_scheme;
-  const char *host_end = authority_end;
-  const char *port_start = NULL;
-  if (*host_start == '[') {
-    const char *close =
-        memchr(host_start, ']', (size_t)(authority_end - host_start));
-    if (close == NULL) {
-      return false;
-    }
-    host_start += 1;
-    host_end = close;
-    if ((close + 1) < authority_end) {
-      if (*(close + 1) != ':') {
-        return false;
-      }
-      port_start = close + 2;
-    }
-  } else {
-    const char *colon =
-        memchr(host_start, ':', (size_t)(authority_end - host_start));
-    if (colon != NULL) {
-      host_end = colon;
-      port_start = colon + 1;
-    }
-  }
-
-  if (host_end <= host_start ||
-      (size_t)(host_end - host_start) > LOGGER_UPLOAD_URL_HOST_MAX) {
-    return false;
-  }
-  memcpy(parsed->host, host_start, (size_t)(host_end - host_start));
-  parsed->host[host_end - host_start] = '\0';
-
-  if (port_start != NULL) {
-    unsigned long port = 0u;
-    for (const char *p = port_start; p < authority_end; ++p) {
-      if (!isdigit((unsigned char)*p)) {
-        return false;
-      }
-      port = (port * 10u) + (unsigned long)(*p - '0');
-      if (port > 65535u) {
-        return false;
-      }
-    }
-    if (port == 0u) {
-      return false;
-    }
-    parsed->port = (uint16_t)port;
-  }
-
-  if (path_start == NULL) {
-    logger_copy_string(parsed->path, sizeof(parsed->path), "/");
-  } else {
-    if (strlen(path_start) > LOGGER_UPLOAD_URL_PATH_MAX) {
-      return false;
-    }
-    logger_copy_string(parsed->path, sizeof(parsed->path), path_start);
-  }
+  parsed->https = parts.https;
+  parsed->port = parts.port;
+  parsed->host_bracketed_literal = parts.host_bracketed_literal;
+  logger_copy_string(parsed->host, sizeof(parsed->host), parts.host);
+  logger_copy_string(parsed->path, sizeof(parsed->path), parts.path);
 
   parsed->host_is_literal =
       ipaddr_aton(parsed->host, &parsed->literal_addr) != 0;
+  if (parsed->host_bracketed_literal && !parsed->host_is_literal) {
+    return false;
+  }
   return true;
 }
 
@@ -394,8 +327,11 @@ static bool logger_upload_format_host_header(const logger_upload_url_t *url,
   }
   const bool default_port =
       (!url->https && url->port == 80u) || (url->https && url->port == 443u);
-  const int n = snprintf(out, out_len, default_port ? "%s" : "%s:%u", url->host,
-                         (unsigned)url->port);
+  const int n = url->host_bracketed_literal
+                    ? snprintf(out, out_len, default_port ? "[%s]" : "[%s]:%u",
+                               url->host, (unsigned)url->port)
+                    : snprintf(out, out_len, default_port ? "%s" : "%s:%u",
+                               url->host, (unsigned)url->port);
   return n > 0 && (size_t)n < out_len;
 }
 
@@ -1641,6 +1577,11 @@ bool logger_upload_net_test(const logger_config_t *config,
                                            "upload URL is not configured");
     return false;
   }
+  if (!logger_config_upload_url_valid(config->upload_url, false)) {
+    logger_upload_net_test_result_fail_all(
+        result, "upload URL is not a valid absolute http(s) URL");
+    return false;
+  }
   if (!logger_config_upload_ready(config)) {
     logger_upload_net_test_result_fail_all(result,
                                            "upload TLS trust is not ready");
@@ -1807,6 +1748,14 @@ static bool logger_upload_process_selected(
                        "upload URL is not configured");
     return false;
   }
+  if (!logger_config_upload_url_valid(config->upload_url, false)) {
+    result->code = LOGGER_UPLOAD_PROCESS_RESULT_CONFIG_BLOCKED;
+    logger_copy_string(result->failure_class, sizeof(result->failure_class),
+                       "malformed_config");
+    logger_copy_string(result->message, sizeof(result->message),
+                       "upload config field upload_url is invalid");
+    return false;
+  }
   if (!logger_config_upload_ready(config)) {
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
@@ -1817,6 +1766,16 @@ static bool logger_upload_process_selected(
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED;
     logger_copy_string(result->message, sizeof(result->message),
                        "upload auth requires both api key and bearer token");
+    return false;
+  }
+  char bad_config_field[32];
+  if (!logger_config_upload_request_material_valid(config, bad_config_field,
+                                                   sizeof(bad_config_field))) {
+    result->code = LOGGER_UPLOAD_PROCESS_RESULT_CONFIG_BLOCKED;
+    logger_copy_string(result->failure_class, sizeof(result->failure_class),
+                       "malformed_config");
+    snprintf(result->message, sizeof(result->message),
+             "upload config field %s is invalid", bad_config_field);
     return false;
   }
 
