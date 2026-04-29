@@ -33,7 +33,9 @@
 #include "upload_tls_roots.h"
 
 #define LOGGER_UPLOAD_HTTP_REQUEST_MAX 1536u
+#define LOGGER_UPLOAD_HTTP_HEADER_MAX 2048u
 #define LOGGER_UPLOAD_HTTP_RESPONSE_MAX 2048u
+#define LOGGER_UPLOAD_HTTP_RECV_CHUNK_MAX 256u
 #define LOGGER_UPLOAD_TCP_POLL_INTERVAL 2u
 #define LOGGER_UPLOAD_DNS_TIMEOUT_MS 10000u
 #define LOGGER_UPLOAD_CONNECT_TIMEOUT_MS 15000u
@@ -62,6 +64,10 @@ typedef struct {
   bool request_complete;
   bool response_complete;
   bool response_truncated;
+  bool response_incomplete;
+  bool headers_complete;
+  bool headers_too_large;
+  bool protocol_error;
   bool transport_failed;
   err_t transport_err;
   int http_status;
@@ -76,13 +82,19 @@ typedef struct {
   size_t body_chunk_len;
   size_t body_chunk_offset;
   bool body_eof;
-  char response[LOGGER_UPLOAD_HTTP_RESPONSE_MAX + 1u];
-  size_t response_len;
+  uint8_t recv_chunk[LOGGER_UPLOAD_HTTP_RECV_CHUNK_MAX];
+  char response_headers[LOGGER_UPLOAD_HTTP_HEADER_MAX + 1u];
+  char response_body[LOGGER_UPLOAD_HTTP_RESPONSE_MAX + 1u];
+  size_t response_body_len;
+  size_t response_body_seen;
 } logger_upload_http_request_t;
 
 typedef struct {
   int http_status;
   bool body_truncated;
+  bool body_incomplete;
+  bool headers_too_large;
+  bool protocol_error;
   char body[LOGGER_UPLOAD_HTTP_RESPONSE_MAX + 1u];
   char remote_address[48];
   char transport_failure_class[LOGGER_UPLOAD_QUEUE_FAILURE_CLASS_MAX + 1u];
@@ -491,23 +503,95 @@ static void logger_upload_http_cleanup(logger_upload_http_request_t *request) {
   logger_upload_http_free_tls_config(request);
 }
 
+static void
+logger_upload_http_check_body_complete(logger_upload_http_request_t *request) {
+  if (!request->headers_complete || request->content_length < 0) {
+    return;
+  }
+
+  const size_t expected = (size_t)request->content_length;
+  if (request->response_body_seen >= expected) {
+    request->response_complete = true;
+    return;
+  }
+
+  if (request->response_body_len >= LOGGER_UPLOAD_HTTP_RESPONSE_MAX) {
+    request->response_truncated = true;
+    request->response_complete = true;
+  }
+}
+
+static void
+logger_upload_http_capture_body(logger_upload_http_request_t *request,
+                                const uint8_t *data, size_t len) {
+  if (len == 0u || data == NULL) {
+    logger_upload_http_check_body_complete(request);
+    return;
+  }
+
+  if (request->content_length >= 0) {
+    const size_t expected = (size_t)request->content_length;
+    if (request->response_body_seen >= expected) {
+      request->response_complete = true;
+      return;
+    }
+    const size_t remaining_expected = expected - request->response_body_seen;
+    if (len > remaining_expected) {
+      len = remaining_expected;
+    }
+  }
+
+  request->response_body_seen += len;
+
+  const size_t capacity = LOGGER_UPLOAD_HTTP_RESPONSE_MAX;
+  if (request->response_body_len < capacity) {
+    size_t copy_len = capacity - request->response_body_len;
+    if (copy_len > len) {
+      copy_len = len;
+    }
+    memcpy(request->response_body + request->response_body_len, data, copy_len);
+    request->response_body_len += copy_len;
+    request->response_body[request->response_body_len] = '\0';
+    if (copy_len < len) {
+      request->response_truncated = true;
+      request->response_complete = true;
+      return;
+    }
+  } else {
+    request->response_truncated = true;
+    request->response_complete = true;
+    return;
+  }
+
+  logger_upload_http_check_body_complete(request);
+}
+
 static void logger_upload_http_parse_response_progress(
     logger_upload_http_request_t *request) {
   if (request->http_status < 0) {
-    const char *line_end = strstr(request->response, "\r\n");
+    const char *line_end = strstr(request->response_headers, "\r\n");
     if (line_end != NULL) {
       int http_status = -1;
-      if (sscanf(request->response, "HTTP/%*u.%*u %d", &http_status) == 1) {
+      if (sscanf(request->response_headers, "HTTP/%*u.%*u %d", &http_status) ==
+              1 &&
+          http_status >= 100 && http_status <= 999) {
         request->http_status = http_status;
+      } else {
+        request->protocol_error = true;
+        request->response_complete = true;
+        return;
       }
     }
   }
 
-  if (request->header_len == 0u) {
-    const char *headers_end = strstr(request->response, "\r\n\r\n");
+  if (!request->headers_complete) {
+    const char *headers_end = strstr(request->response_headers, "\r\n\r\n");
     if (headers_end != NULL) {
-      request->header_len = (size_t)(headers_end - request->response) + 4u;
-      const char *cl = strstr(request->response, "\r\nContent-Length: ");
+      const size_t full_header_len =
+          (size_t)(headers_end - request->response_headers) + 4u;
+      const size_t overflow_body_len = request->header_len - full_header_len;
+      const char *cl =
+          strstr(request->response_headers, "\r\nContent-Length: ");
       if (cl != NULL && cl < headers_end) {
         cl += strlen("\r\nContent-Length: ");
         char *end = NULL;
@@ -516,13 +600,54 @@ static void logger_upload_http_parse_response_progress(
           request->content_length = (int)val;
         }
       }
+
+      request->headers_complete = true;
+      if (overflow_body_len > 0u) {
+        logger_upload_http_capture_body(
+            request,
+            (const uint8_t *)request->response_headers + full_header_len,
+            overflow_body_len);
+      }
+      request->header_len = full_header_len;
+      request->response_headers[request->header_len] = '\0';
+      logger_upload_http_check_body_complete(request);
     }
   }
+}
 
-  if (request->header_len != 0u && request->content_length >= 0) {
-    const size_t total_needed =
-        request->header_len + (size_t)request->content_length;
-    if (request->response_len >= total_needed) {
+static void
+logger_upload_http_ingest_bytes(logger_upload_http_request_t *request,
+                                const uint8_t *data, size_t len) {
+  size_t offset = 0u;
+  while (offset < len && !request->response_complete &&
+         !request->transport_failed) {
+    if (request->headers_complete) {
+      logger_upload_http_capture_body(request, data + offset, len - offset);
+      break;
+    }
+
+    if (request->header_len >= LOGGER_UPLOAD_HTTP_HEADER_MAX) {
+      request->headers_too_large = true;
+      request->response_complete = true;
+      break;
+    }
+
+    size_t copy_len = LOGGER_UPLOAD_HTTP_HEADER_MAX - request->header_len;
+    const size_t remaining = len - offset;
+    if (copy_len > remaining) {
+      copy_len = remaining;
+    }
+
+    memcpy(request->response_headers + request->header_len, data + offset,
+           copy_len);
+    request->header_len += copy_len;
+    request->response_headers[request->header_len] = '\0';
+    offset += copy_len;
+
+    logger_upload_http_parse_response_progress(request);
+    if (!request->headers_complete &&
+        request->header_len >= LOGGER_UPLOAD_HTTP_HEADER_MAX) {
+      request->headers_too_large = true;
       request->response_complete = true;
     }
   }
@@ -564,28 +689,38 @@ static err_t logger_upload_http_recv_cb(void *arg, struct altcp_pcb *pcb,
 
   if (p == NULL) {
     request->remote_closed = true;
+    if (request->http_status >= 0) {
+      if (!request->headers_complete ||
+          (request->content_length >= 0 &&
+           request->response_body_seen < (size_t)request->content_length)) {
+        request->response_incomplete = true;
+      }
+    }
     request->response_complete = true;
     logger_upload_http_close_pcb(request);
     return ERR_OK;
   }
 
   altcp_recved(pcb, p->tot_len);
-  if ((request->response_len + p->tot_len) >= sizeof(request->response)) {
-    request->response_truncated = true;
-    request->transport_failed = true;
-    request->transport_err = ERR_MEM;
-    pbuf_free(p);
-    logger_upload_http_close_pcb(request);
-    return ERR_MEM;
+  u16_t copied = 0u;
+  while (copied < p->tot_len && !request->response_complete &&
+         !request->transport_failed) {
+    u16_t chunk_len = (u16_t)(p->tot_len - copied);
+    if (chunk_len > sizeof(request->recv_chunk)) {
+      chunk_len = (u16_t)sizeof(request->recv_chunk);
+    }
+    const u16_t got =
+        pbuf_copy_partial(p, request->recv_chunk, chunk_len, copied);
+    if (got != chunk_len) {
+      request->transport_failed = true;
+      request->transport_err = ERR_VAL;
+      break;
+    }
+    logger_upload_http_ingest_bytes(request, request->recv_chunk, got);
+    copied = (u16_t)(copied + got);
   }
-
-  pbuf_copy_partial(p, request->response + request->response_len, p->tot_len,
-                    0u);
-  request->response_len += p->tot_len;
-  request->response[request->response_len] = '\0';
   pbuf_free(p);
 
-  logger_upload_http_parse_response_progress(request);
   if (request->response_complete) {
     logger_upload_http_close_pcb(request);
   }
@@ -840,6 +975,31 @@ static bool logger_upload_http_execute(
                   sizeof(response->remote_address));
   }
 
+  if (!request->response_complete && request->transport_failed &&
+      request->http_status >= 0) {
+    request->response_incomplete = true;
+  }
+
+  const bool received_http_bytes =
+      request->header_len > 0u || request->response_body_len > 0u;
+  if (request->http_status < 0 &&
+      (request->protocol_error || received_http_bytes)) {
+    logger_copy_string(response->transport_failure_class,
+                       sizeof(response->transport_failure_class),
+                       "http_protocol_error");
+    response->protocol_error = true;
+    if (request->header_len > 0u) {
+      const size_t copy_len = request->header_len < sizeof(response->body) - 1u
+                                  ? request->header_len
+                                  : sizeof(response->body) - 1u;
+      memcpy(response->body, request->response_headers, copy_len);
+      response->body[copy_len] = '\0';
+    }
+    logger_upload_http_cleanup(request);
+    logger_upload_http_request_workspace_release(request);
+    return false;
+  }
+
   if (!request->response_complete && request->transport_failed) {
     logger_copy_string(response->transport_failure_class,
                        sizeof(response->transport_failure_class),
@@ -851,10 +1011,15 @@ static bool logger_upload_http_execute(
     return false;
   }
 
-  if (request->header_len == 0u || request->http_status < 0) {
+  if (request->http_status < 0) {
+    const bool protocol_failure =
+        request->protocol_error || received_http_bytes;
     logger_copy_string(response->transport_failure_class,
                        sizeof(response->transport_failure_class),
-                       url->https ? "tls_failed" : "tcp_failed");
+                       protocol_failure
+                           ? "http_protocol_error"
+                           : (url->https ? "tls_failed" : "tcp_failed"));
+    response->protocol_error = protocol_failure;
     logger_upload_http_cleanup(request);
     logger_upload_http_request_workspace_release(request);
     return false;
@@ -862,13 +1027,25 @@ static bool logger_upload_http_execute(
 
   response->http_status = request->http_status;
   response->body_truncated = request->response_truncated;
-  if (request->header_len < request->response_len) {
-    const size_t body_len = request->response_len - request->header_len;
-    const size_t copy_len = body_len < sizeof(response->body) - 1u
-                                ? body_len
-                                : sizeof(response->body) - 1u;
-    memcpy(response->body, request->response + request->header_len, copy_len);
+  response->body_incomplete = request->response_incomplete;
+  response->headers_too_large = request->headers_too_large;
+  response->protocol_error = request->protocol_error;
+  if (request->headers_complete) {
+    const size_t copy_len =
+        request->response_body_len < sizeof(response->body) - 1u
+            ? request->response_body_len
+            : sizeof(response->body) - 1u;
+    memcpy(response->body, request->response_body, copy_len);
     response->body[copy_len] = '\0';
+  } else {
+    response->body_incomplete = true;
+    if (request->headers_too_large) {
+      const size_t copy_len = request->header_len < sizeof(response->body) - 1u
+                                  ? request->header_len
+                                  : sizeof(response->body) - 1u;
+      memcpy(response->body, request->response_headers, copy_len);
+      response->body[copy_len] = '\0';
+    }
   }
   logger_upload_http_cleanup(request);
   logger_upload_http_request_workspace_release(request);
@@ -978,6 +1155,34 @@ static void logger_upload_copy_response_excerpt(char *dst, size_t dst_len,
   dst[out] = '\0';
 }
 
+static void logger_upload_append_response_excerpt_marker(char *dst,
+                                                         size_t dst_len,
+                                                         const char *marker) {
+  if (dst == NULL || dst_len == 0u || !logger_string_present(marker)) {
+    return;
+  }
+  size_t len = strlen(dst);
+  const char prefix[] = " [";
+  const char suffix[] = "]";
+  const size_t marker_len =
+      (sizeof(prefix) - 1u) + strlen(marker) + (sizeof(suffix) - 1u);
+  if (marker_len >= dst_len) {
+    dst[0] = '\0';
+    len = 0u;
+  } else if (len + marker_len >= dst_len) {
+    len = dst_len - 1u - marker_len;
+    dst[len] = '\0';
+  }
+  const char *parts[] = {prefix, marker, suffix};
+  for (size_t i = 0u; i < sizeof(parts) / sizeof(parts[0]); ++i) {
+    const char *part = parts[i];
+    for (size_t j = 0u; part[j] != '\0' && len + 1u < dst_len; ++j) {
+      dst[len++] = part[j];
+    }
+  }
+  dst[len] = '\0';
+}
+
 static void logger_upload_set_entry_http_diagnostics(
     logger_upload_queue_entry_t *entry,
     const logger_upload_http_response_t *response,
@@ -992,6 +1197,21 @@ static void logger_upload_set_entry_http_diagnostics(
     logger_upload_copy_response_excerpt(entry->last_response_excerpt,
                                         sizeof(entry->last_response_excerpt),
                                         response->body);
+    if (response->headers_too_large) {
+      logger_upload_append_response_excerpt_marker(
+          entry->last_response_excerpt, sizeof(entry->last_response_excerpt),
+          "headers_too_large");
+    }
+    if (response->body_truncated) {
+      logger_upload_append_response_excerpt_marker(
+          entry->last_response_excerpt, sizeof(entry->last_response_excerpt),
+          "truncated");
+    }
+    if (response->body_incomplete) {
+      logger_upload_append_response_excerpt_marker(
+          entry->last_response_excerpt, sizeof(entry->last_response_excerpt),
+          "incomplete");
+    }
   }
   if (reply != NULL) {
     logger_copy_string(entry->last_server_error_code,
@@ -1184,6 +1404,53 @@ logger_upload_nonretryable_decision(const char *failure_class) {
       .failure_class = failure_class,
   };
   return decision;
+}
+
+static logger_upload_reject_decision_t
+logger_upload_retryable_decision(const char *failure_class) {
+  logger_upload_reject_decision_t decision = {
+      .action = LOGGER_UPLOAD_REJECT_RETRYABLE,
+      .failure_class = failure_class,
+  };
+  return decision;
+}
+
+static bool logger_upload_http_response_has_body_problem(
+    const logger_upload_http_response_t *response) {
+  return response != NULL &&
+         (response->headers_too_large || response->body_truncated ||
+          response->body_incomplete || response->protocol_error);
+}
+
+static const char *logger_upload_http_response_problem_class(
+    const logger_upload_http_response_t *response) {
+  if (response == NULL) {
+    return "server_reply_invalid";
+  }
+  if (response->headers_too_large) {
+    return "http_headers_too_large";
+  }
+  if (response->body_incomplete) {
+    return "http_response_incomplete";
+  }
+  if (response->body_truncated) {
+    return "http_response_truncated";
+  }
+  if (response->protocol_error) {
+    return "http_protocol_error";
+  }
+  return "server_reply_invalid";
+}
+
+static logger_upload_reject_decision_t
+logger_upload_decide_unparseable_http_response(
+    const logger_upload_http_response_t *response) {
+  const int http_status = response != NULL ? response->http_status : -1;
+  if (http_status >= 200 && http_status < 300) {
+    return logger_upload_retryable_decision(
+        logger_upload_http_response_problem_class(response));
+  }
+  return logger_upload_decide_http_rejection(http_status, NULL);
 }
 
 static bool
@@ -1863,8 +2130,7 @@ static bool logger_upload_process_selected(
     snprintf(result->message, sizeof(result->message),
              "server reply parse failed: %.104s", http_response->body);
     logger_upload_reject_decision_t decision =
-        logger_upload_decide_http_rejection(http_response->http_status,
-                                            &process_workspace->reply);
+        logger_upload_decide_unparseable_http_response(http_response);
     const bool accepted = logger_upload_apply_rejected_attempt(
         system_log, queue, entry, http_response, NULL, decision,
         now_utc_or_null, result->message, result);
@@ -1877,6 +2143,20 @@ static bool logger_upload_process_selected(
   result->attempted = true;
   result->http_status = http_response->http_status;
   if (http_response->http_status >= 200 && http_response->http_status < 300) {
+    if (logger_upload_http_response_has_body_problem(http_response)) {
+      logger_upload_reject_decision_t decision =
+          logger_upload_retryable_decision(
+              logger_upload_http_response_problem_class(http_response));
+      const bool accepted = logger_upload_apply_rejected_attempt(
+          system_log, queue, entry, http_response, &process_workspace->reply,
+          decision, now_utc_or_null,
+          "server acknowledgment response was incomplete or truncated", result);
+      logger_upload_http_response_workspace_release(http_response);
+      logger_upload_process_workspace_release(process_workspace);
+      logger_upload_queue_tmp_release(queue);
+      return accepted;
+    }
+
     if ((logger_string_present(process_workspace->reply.session_id) &&
          strcmp(process_workspace->reply.session_id, entry->session_id) != 0) ||
         (logger_string_present(process_workspace->reply.sha256) &&
