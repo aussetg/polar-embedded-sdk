@@ -657,7 +657,11 @@ static bool logger_app_validate_storage_low_space_recovery(logger_app_t *app,
     logger_app_recovery_set_status(app, "storage_prune_refresh", "blocked");
     return false;
   }
-  logger_app_recovery_set_status(app, "storage_prune_refresh", "passed");
+  if (!logger_app_storage_self_test(app)) {
+    logger_app_recovery_set_status(app, "storage_self_test", "failed");
+    return false;
+  }
+  logger_app_recovery_set_status(app, "storage_self_test", "passed");
   return true;
 }
 
