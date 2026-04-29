@@ -1316,6 +1316,12 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   logger_json_stream_writer_field_object_begin(w, "storage");
   logger_json_stream_writer_field_bool(w, "sd_present",
                                        app->storage.card_present);
+  logger_json_stream_writer_field_bool(w, "mounted", app->storage.mounted);
+  logger_json_stream_writer_field_bool(w, "writable", app->storage.writable);
+  logger_json_stream_writer_field_bool(w, "logger_root_ready",
+                                       app->storage.logger_root_ready);
+  logger_json_stream_writer_field_bool(w, "reserve_ok",
+                                       app->storage.reserve_ok);
   logger_json_stream_writer_field_string_or_null(
       w, "filesystem",
       logger_string_present(app->storage.filesystem) ? app->storage.filesystem
