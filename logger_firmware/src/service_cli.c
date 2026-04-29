@@ -1184,32 +1184,6 @@ static void logger_write_storage_card_identity(jsw *w,
                                                  app->storage.serial_number);
 }
 
-static const char *
-logger_recovery_resume_mode_name(logger_runtime_state_t state) {
-  if (state == LOGGER_RUNTIME_BOOT) {
-    return NULL;
-  }
-  if (state == LOGGER_RUNTIME_SERVICE) {
-    return "service";
-  }
-  if (state == LOGGER_RUNTIME_RECOVERY_HOLD) {
-    return "recovery_hold";
-  }
-  if (logger_runtime_state_is_logging(state)) {
-    return "logging";
-  }
-  if (logger_runtime_state_is_upload(state)) {
-    return "upload";
-  }
-  if (state == LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER) {
-    return "idle_waiting_for_charger";
-  }
-  if (state == LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE) {
-    return "idle_upload_complete";
-  }
-  return NULL;
-}
-
 static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
   char study_day_local[11] = {0};
   const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
@@ -1284,8 +1258,8 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
         w, "next_attempt_ms", app->recovery_next_attempt_mono_ms - now_ms);
   }
   logger_json_stream_writer_field_string_or_null(
-      w, "resume_mode",
-      logger_recovery_resume_mode_name(app->recovery_resume_state));
+      w, "exit_policy",
+      logger_recovery_exit_policy_name(app->recovery_exit_policy));
   logger_json_stream_writer_field_bool(w, "service_pinned_by_user",
                                        app->service_pinned_by_user);
   logger_json_stream_writer_field_string_or_null(

@@ -47,6 +47,11 @@ typedef enum {
   LOGGER_FAULT_CLEAR_NOT_CLEARABLE,
 } logger_fault_clear_result_t;
 
+typedef enum {
+  LOGGER_RECOVERY_EXIT_UNATTENDED = 0,
+  LOGGER_RECOVERY_EXIT_SERVICE_IF_USB,
+} logger_recovery_exit_policy_t;
+
 static inline const char *
 logger_debug_storage_fault_name(logger_debug_storage_fault_t fault) {
   switch (fault) {
@@ -82,6 +87,17 @@ logger_recovery_reason_name(logger_recovery_reason_t reason) {
   case LOGGER_RECOVERY_NONE:
   default:
     return NULL;
+  }
+}
+
+static inline const char *
+logger_recovery_exit_policy_name(logger_recovery_exit_policy_t policy) {
+  switch (policy) {
+  case LOGGER_RECOVERY_EXIT_SERVICE_IF_USB:
+    return "service_if_usb";
+  case LOGGER_RECOVERY_EXIT_UNATTENDED:
+  default:
+    return "unattended";
   }
 }
 
@@ -157,7 +173,7 @@ typedef struct logger_app {
   bool boot_recovery_done;
   bool reboot_pending;
   logger_runtime_state_t deferred_boot_queue_refresh_skip_state;
-  logger_runtime_state_t recovery_resume_state;
+  logger_recovery_exit_policy_t recovery_exit_policy;
 } logger_app_t;
 
 void logger_app_clear_current_fault(logger_app_t *app, const char *source);
