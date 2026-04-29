@@ -1992,7 +1992,6 @@ static bool logger_upload_process_selected(
       "X-Logger-Session-Id: %s\r\n"
       "X-Logger-Hardware-Id: %s\r\n"
       "X-Logger-Logger-Id: %s\r\n"
-      "X-Logger-Subject-Id: %s\r\n"
       "X-Logger-Study-Day: %s\r\n"
       "X-Logger-SHA256: %s\r\n"
       "X-Logger-Tar-Canonicalization-Version: 1\r\n"
@@ -2003,9 +2002,9 @@ static bool logger_upload_process_selected(
       "\r\n",
       process_workspace->url.path, process_workspace->host_header,
       (unsigned long long)entry->bundle_size_bytes, entry->session_id,
-      hardware_id, config->logger_id, config->subject_id,
-      entry->study_day_local, entry->bundle_sha256,
-      process_workspace->auth_header, process_workspace->api_key_header);
+      hardware_id, config->logger_id, entry->study_day_local,
+      entry->bundle_sha256, process_workspace->auth_header,
+      process_workspace->api_key_header);
   if (request_n <= 0 ||
       (size_t)request_n >= sizeof(process_workspace->request_text)) {
     logger_net_wifi_leave();

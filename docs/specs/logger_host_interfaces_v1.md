@@ -642,6 +642,7 @@ Config import is a full replacement of the persisted device configuration, not a
 - `subject_id`
 
 `subject_id` remains required in device config as local study metadata and for immutable session artifacts. Upload authentication identity is derived from the configured bearer token, not from `identity.subject_id`.
+Host tooling MUST NOT mirror `identity.subject_id` into upload request headers.
 
 #### `recording`
 

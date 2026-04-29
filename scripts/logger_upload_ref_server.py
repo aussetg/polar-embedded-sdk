@@ -15,6 +15,7 @@ Features:
 - rejects same-session different-hash replays as ``validation_failed``,
 - optionally enforces ``x-api-key``, bearer token, and a minimum firmware version,
 - can derive the canonical upload ``subject_id`` from the configured bearer-token subject,
+- rejects deprecated/untrusted subject identity headers,
 - exposes small inspection endpoints for local testing.
 
 Useful endpoints:
@@ -516,6 +517,14 @@ def validate_tar_member_common(member: tarfile.TarInfo, expected_mode: int, cont
 
 
 def validate_bundle(body: bytes, headers: Any, config: ServerConfig) -> ValidatedUpload:
+    if headers.get("X-Logger-Subject-Id") is not None:
+        raise UploadError(
+            HTTPStatus.BAD_REQUEST,
+            "malformed_request",
+            "X-Logger-Subject-Id is forbidden; upload subject is derived from auth",
+            retryable=False,
+        )
+
     declared_api_version = require_header(headers, "X-Logger-Api-Version")
     if declared_api_version != str(API_VERSION):
         raise UploadError(

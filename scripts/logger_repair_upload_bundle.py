@@ -313,7 +313,6 @@ def upload_bundle(tar_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         "X-Logger-Session-Id": required_string(parts.manifest.get("session_id"), "manifest.session_id"),
         "X-Logger-Hardware-Id": required_string(parts.manifest.get("hardware_id"), "manifest.hardware_id"),
         "X-Logger-Logger-Id": required_string(parts.manifest.get("logger_id"), "manifest.logger_id"),
-        "X-Logger-Subject-Id": required_string(parts.manifest.get("subject_id"), "manifest.subject_id"),
         "X-Logger-Study-Day": required_string(parts.manifest.get("study_day_local"), "manifest.study_day_local"),
         "X-Logger-SHA256": sha256_hex(body),
         "X-Logger-Tar-Canonicalization-Version": str(parts.manifest.get("tar_canonicalization_version", 1)),

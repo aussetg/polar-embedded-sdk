@@ -924,7 +924,12 @@ If configured, the request also includes:
 - `x-api-key: <api_key>`
 - `Authorization: Bearer <token>`
 
-The server MUST derive the canonical upload `subject_id` from the authenticated bearer token. If a client also sends `X-Logger-Subject-Id`, the server MUST treat it as untrusted metadata and MUST NOT use it as an authorization input.
+Firmware upload clients MUST NOT include `X-Logger-Subject-Id` or any other
+subject-identity header. The server MUST derive the canonical upload
+`subject_id` from the authenticated bearer token. Manifest `subject_id` is
+metadata only and MUST NOT be used as an authorization input. A server receiving
+`X-Logger-Subject-Id` MUST reject the request as `malformed_request` with
+`error.retryable: false`.
 
 ### 11.2 Success semantics
 
