@@ -36,6 +36,8 @@ static char g_service_cli_details_json[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1u];
 static logger_upload_net_test_result_t g_service_cli_net_test_result;
 static logger_upload_process_result_t g_service_cli_upload_process_result;
 static logger_system_log_event_t g_service_cli_system_log_event;
+static char g_service_cli_mark_verified_manifest_path[LOGGER_STORAGE_PATH_MAX];
+static char g_service_cli_mark_verified_journal_path[LOGGER_STORAGE_PATH_MAX];
 
 #define LOGGER_SERVICE_BUNDLE_EXPORT_CHUNK_BYTES STORAGE_SVC_BUNDLE_READ_MAX
 
@@ -3563,6 +3565,36 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+static bool logger_manual_receipt_id_valid(const char *receipt_id) {
+  if (!logger_string_present(receipt_id)) {
+    return false;
+  }
+
+  for (const unsigned char *p = (const unsigned char *)receipt_id; *p != '\0';
+       ++p) {
+    if (*p < 0x21u || *p == 0x7fu || isspace(*p)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void logger_queue_entry_mark_verified_manual(
+    logger_upload_queue_entry_t *entry, const char *receipt_id,
+    const char *verified_sha256, const char *verified_utc) {
+  logger_copy_string(entry->status, sizeof(entry->status), "verified");
+  logger_copy_string(entry->receipt_id, sizeof(entry->receipt_id), receipt_id);
+  logger_copy_string(entry->verified_bundle_sha256,
+                     sizeof(entry->verified_bundle_sha256), verified_sha256);
+  logger_copy_string(entry->verified_upload_utc,
+                     sizeof(entry->verified_upload_utc), verified_utc);
+  entry->last_failure_class[0] = '\0';
+  entry->last_http_status = 0u;
+  entry->last_server_error_code[0] = '\0';
+  entry->last_server_error_message[0] = '\0';
+  entry->last_response_excerpt[0] = '\0';
+}
+
 static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
                                                     logger_app_t *app,
                                                     const char *args) {
@@ -3597,12 +3629,23 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
   receipt_id[sha_space - (space + 1u)] = '\0';
   logger_copy_string(uploaded_sha256, sizeof(uploaded_sha256), sha_space + 1u);
 
+  if (!logger_manual_receipt_id_valid(receipt_id)) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument",
+            "receipt_id must be non-empty printable text without whitespace");
+    return;
+  }
+
   uint8_t session_id_bytes[16];
   if (!logger_hex_to_bytes_16(session_id, session_id_bytes)) {
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
             "invalid_argument", "session_id must be 32 hexadecimal chars");
     return;
+  }
+  for (size_t i = 0u; i < LOGGER_SESSION_ID_HEX_LEN; ++i) {
+    session_id[i] = (char)tolower((unsigned char)session_id[i]);
   }
   uint8_t uploaded_sha_prefix[16];
   uint8_t uploaded_sha_suffix[16];
@@ -3612,6 +3655,9 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
             "invalid_argument", "uploaded_sha256 must be 64 hexadecimal chars");
     return;
+  }
+  for (size_t i = 0u; i < LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN; ++i) {
+    uploaded_sha256[i] = (char)tolower((unsigned char)uploaded_sha256[i]);
   }
 
   logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
@@ -3638,20 +3684,92 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
     return;
   }
 
-  logger_copy_string(entry->status, sizeof(entry->status), "verified");
-  logger_copy_string(entry->receipt_id, sizeof(entry->receipt_id), receipt_id);
-  logger_copy_string(entry->verified_bundle_sha256,
-                     sizeof(entry->verified_bundle_sha256), uploaded_sha256);
-  logger_copy_string(entry->verified_upload_utc,
-                     sizeof(entry->verified_upload_utc),
-                     logger_clock_now_utc_or_null(&app->clock));
-  entry->last_failure_class[0] = '\0';
-  entry->last_http_status = 0u;
-  entry->last_server_error_code[0] = '\0';
-  entry->last_server_error_message[0] = '\0';
-  entry->last_response_excerpt[0] = '\0';
+  if (strcmp(entry->status, "verified") == 0 &&
+      (strcmp(entry->receipt_id, receipt_id) != 0 ||
+       strcmp(entry->verified_bundle_sha256, uploaded_sha256) != 0)) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "already_verified",
+            "session is already verified with a different receipt or hash");
+    return;
+  }
+  if (strcmp(entry->status, "verified") == 0) {
+    logger_upload_queue_summary_t summary;
+    logger_upload_queue_compute_summary(queue, &summary);
+    logger_upload_queue_tmp_release(queue);
+
+    jsw w;
+    jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+    logger_json_stream_writer_field_string_or_null(&w, "session_id",
+                                                   session_id);
+    logger_json_stream_writer_field_string_or_null(&w, "status", "verified");
+    logger_json_stream_writer_field_bool(&w, "already_verified", true);
+    logger_json_stream_writer_field_string_or_null(&w, "receipt_id",
+                                                   receipt_id);
+    logger_json_stream_writer_field_string_or_null(&w, "uploaded_sha256",
+                                                   uploaded_sha256);
+    logger_json_stream_writer_field_uint32(&w, "pending_count",
+                                           summary.pending_count);
+    jsw_end(&w);
+    return;
+  }
+
+  const bool paths_ok =
+      logger_path_join3(g_service_cli_mark_verified_manifest_path,
+                        sizeof(g_service_cli_mark_verified_manifest_path),
+                        "0:/logger/sessions/", entry->dir_name,
+                        "/manifest.json") &&
+      logger_path_join3(g_service_cli_mark_verified_journal_path,
+                        sizeof(g_service_cli_mark_verified_journal_path),
+                        "0:/logger/sessions/", entry->dir_name, "/journal.bin");
+  if (!paths_ok) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "artifact_path_invalid",
+            "failed to build canonical bundle paths for session");
+    return;
+  }
+
+  char local_sha256[LOGGER_UPLOAD_QUEUE_SHA256_HEX_LEN + 1];
+  uint64_t local_size_bytes = 0u;
+  if (!logger_storage_svc_bundle_compute(
+          entry->dir_name, g_service_cli_mark_verified_manifest_path,
+          g_service_cli_mark_verified_journal_path, local_sha256,
+          &local_size_bytes)) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "artifact_unavailable",
+            "failed to recompute canonical upload bundle");
+    return;
+  }
+
+  if (strcmp(local_sha256, entry->bundle_sha256) != 0 ||
+      local_size_bytes != entry->bundle_size_bytes) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "queue_artifact_mismatch",
+            "local canonical bundle no longer matches upload_queue.json");
+    return;
+  }
+
+  if (strcmp(uploaded_sha256, local_sha256) != 0) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "artifact_hash_mismatch",
+            "uploaded_sha256 does not match the local canonical bundle");
+    return;
+  }
+
+  const char *now_utc = logger_clock_now_utc_or_null(&app->clock);
+  logger_queue_entry_mark_verified_manual(entry, receipt_id, local_sha256,
+                                          now_utc);
   logger_copy_string(queue->updated_at_utc, sizeof(queue->updated_at_utc),
-                     logger_clock_now_utc_or_null(&app->clock));
+                     now_utc);
 
   if (!logger_storage_svc_queue_write(queue)) {
     logger_upload_queue_tmp_release(queue);
@@ -3674,6 +3792,8 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
                                              receipt_id) &&
       logger_json_object_writer_string_field(&writer, "uploaded_sha256",
                                              uploaded_sha256) &&
+      logger_json_object_writer_string_field(&writer, "local_sha256",
+                                             local_sha256) &&
       logger_json_object_writer_string_field(&writer, "source",
                                              "host_manual_upload") &&
       logger_json_object_writer_finish(&writer)) {
@@ -3687,9 +3807,14 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
   jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
   logger_json_stream_writer_field_string_or_null(&w, "session_id", session_id);
   logger_json_stream_writer_field_string_or_null(&w, "status", "verified");
+  logger_json_stream_writer_field_bool(&w, "already_verified", false);
   logger_json_stream_writer_field_string_or_null(&w, "receipt_id", receipt_id);
   logger_json_stream_writer_field_string_or_null(&w, "uploaded_sha256",
                                                  uploaded_sha256);
+  logger_json_stream_writer_field_string_or_null(&w, "local_sha256",
+                                                 local_sha256);
+  logger_json_stream_writer_field_uint64(&w, "bundle_size_bytes",
+                                         local_size_bytes);
   logger_json_stream_writer_field_uint32(&w, "pending_count",
                                          summary.pending_count);
   jsw_end(&w);
