@@ -2183,11 +2183,203 @@ static void logger_app_recovery_complete(logger_app_t *app,
   logger_app_apply_unattended_target(app, "recovery_cleared", now_ms);
 }
 
+static void
+logger_app_prepare_manual_clear_validation(logger_app_t *app,
+                                           logger_recovery_reason_t reason) {
+  if (reason == LOGGER_RECOVERY_NONE || app->recovery_reason == reason) {
+    return;
+  }
+
+  logger_app_reset_recovery_state(app);
+  app->recovery_reason = reason;
+  app->recovery_resume_state = LOGGER_RUNTIME_BOOT;
+  app->recovery_probe_interval_ms =
+      logger_app_recovery_initial_probe_interval_ms(reason);
+  logger_app_recovery_set_status(app, "manual_clear_validate", "pending");
+}
+
+static void logger_app_manual_clear_schedule_deadline(logger_app_t *app,
+                                                      uint32_t deadline_ms) {
+  app->recovery_next_attempt_mono_ms = deadline_ms;
+}
+
+static bool logger_app_manual_battery_clear_ready(logger_app_t *app,
+                                                  logger_fault_code_t code,
+                                                  uint32_t now_ms) {
+  const logger_recovery_reason_t reason =
+      logger_app_recovery_reason_from_fault(code);
+  const uint16_t clear_mv = code == LOGGER_FAULT_LOW_BATTERY_BLOCKED_START
+                                ? LOGGER_RECOVERY_LOW_START_CLEAR_MV
+                                : LOGGER_RECOVERY_CRITICAL_CLEAR_MV;
+  const bool usb_good = app->battery.vbus_present;
+  const bool voltage_good = app->battery.voltage_mv >= clear_mv;
+  const uint32_t dwell_ms = usb_good ? LOGGER_RECOVERY_USB_CLEAR_DWELL_MS
+                                     : LOGGER_RECOVERY_BATTERY_CLEAR_DWELL_MS;
+
+  logger_app_prepare_manual_clear_validation(app, reason);
+  if (!usb_good && !voltage_good) {
+    logger_app_recovery_reset_validation(app);
+    logger_app_recovery_set_status(app, "battery_recheck", "blocked");
+    logger_app_recovery_schedule_next(app, now_ms);
+    return false;
+  }
+
+  if (app->recovery_good_since_mono_ms == 0u) {
+    app->recovery_good_since_mono_ms = now_ms;
+    logger_app_recovery_set_status(app, "battery_recheck", "stabilizing");
+    logger_app_manual_clear_schedule_deadline(app, now_ms + dwell_ms);
+    return false;
+  }
+  if ((now_ms - app->recovery_good_since_mono_ms) < dwell_ms) {
+    logger_app_recovery_set_status(app, "battery_recheck", "stabilizing");
+    logger_app_manual_clear_schedule_deadline(
+        app, app->recovery_good_since_mono_ms + dwell_ms);
+    return false;
+  }
+
+  logger_app_recovery_set_status(app, "battery_recheck", "passed");
+  return true;
+}
+
+static bool logger_app_manual_storage_clear_ready(
+    logger_app_t *app, logger_recovery_reason_t reason, uint32_t now_ms) {
+  bool success = false;
+
+  logger_app_prepare_manual_clear_validation(app, reason);
+  if (reason == LOGGER_RECOVERY_SD_MISSING_OR_UNWRITABLE) {
+    success = logger_app_validate_storage_missing_recovery(app, now_ms);
+  } else if (reason == LOGGER_RECOVERY_SD_LOW_SPACE_RESERVE_UNMET) {
+    success = logger_app_validate_storage_low_space_recovery(app, now_ms);
+  } else if (reason == LOGGER_RECOVERY_SD_WRITE_FAILED) {
+    success = logger_app_validate_storage_write_recovery(app, now_ms);
+  }
+
+  if (!success) {
+    logger_app_recovery_reset_validation(app);
+    logger_app_recovery_schedule_next(app, now_ms);
+    return false;
+  }
+
+  app->recovery_probe_interval_ms =
+      logger_app_recovery_initial_probe_interval_ms(reason);
+  if (app->recovery_validation_success_count == 0u ||
+      (now_ms - app->recovery_last_success_mono_ms) >=
+          LOGGER_RECOVERY_STORAGE_CLEAR_SUCCESS_GAP_MS) {
+    app->recovery_validation_success_count += 1u;
+    app->recovery_last_success_mono_ms = now_ms;
+  }
+  if (app->recovery_validation_success_count < 2u) {
+    logger_app_recovery_set_status(app, "storage_validate", "stabilizing");
+    logger_app_manual_clear_schedule_deadline(
+        app, now_ms + LOGGER_RECOVERY_STORAGE_CLEAR_SUCCESS_GAP_MS);
+    return false;
+  }
+
+  return true;
+}
+
+static bool logger_app_upload_blocked_fault_present(void) {
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
+  logger_upload_queue_summary_t summary;
+  logger_upload_queue_summary_init(&summary);
+  if (!logger_storage_svc_queue_load(queue)) {
+    logger_upload_queue_tmp_release(queue);
+    return true;
+  }
+  logger_upload_queue_compute_summary(queue, &summary);
+  logger_upload_queue_tmp_release(queue);
+  return summary.blocked_count > 0u;
+}
+
+logger_fault_clear_result_t
+logger_app_manual_clear_current_fault(logger_app_t *app, uint32_t now_ms,
+                                      logger_fault_code_t *previous_code_out) {
+  if (previous_code_out != NULL) {
+    *previous_code_out = LOGGER_FAULT_NONE;
+  }
+  if (app == NULL) {
+    return LOGGER_FAULT_CLEAR_NO_FAULT;
+  }
+
+  const logger_fault_code_t previous = app->persisted.current_fault_code;
+  if (previous_code_out != NULL) {
+    *previous_code_out = previous;
+  }
+
+  switch (previous) {
+  case LOGGER_FAULT_NONE:
+    return LOGGER_FAULT_CLEAR_NO_FAULT;
+  case LOGGER_FAULT_CONFIG_INCOMPLETE:
+    if (!logger_config_normal_logging_ready(&app->persisted.config)) {
+      return LOGGER_FAULT_CLEAR_CONDITION_PRESENT;
+    }
+    break;
+  case LOGGER_FAULT_CLOCK_INVALID:
+    if (!app->clock.valid) {
+      app->clock_valid_since_mono_ms = 0u;
+      return LOGGER_FAULT_CLEAR_CONDITION_PRESENT;
+    }
+    if (app->clock_valid_since_mono_ms == 0u) {
+      app->clock_valid_since_mono_ms = now_ms;
+      return LOGGER_FAULT_CLEAR_CONDITION_PRESENT;
+    }
+    if ((now_ms - app->clock_valid_since_mono_ms) <
+        LOGGER_RECOVERY_CLOCK_CLEAR_DWELL_MS) {
+      return LOGGER_FAULT_CLEAR_CONDITION_PRESENT;
+    }
+    break;
+  case LOGGER_FAULT_LOW_BATTERY_BLOCKED_START:
+  case LOGGER_FAULT_CRITICAL_LOW_BATTERY_STOPPED:
+    if (!logger_app_manual_battery_clear_ready(app, previous, now_ms)) {
+      return LOGGER_FAULT_CLEAR_CONDITION_PRESENT;
+    }
+    break;
+  case LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE:
+  case LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET:
+  case LOGGER_FAULT_SD_WRITE_FAILED:
+    if (!logger_app_manual_storage_clear_ready(
+            app, logger_app_recovery_reason_from_fault(previous), now_ms)) {
+      return LOGGER_FAULT_CLEAR_CONDITION_PRESENT;
+    }
+    break;
+  case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
+    if (logger_app_upload_blocked_fault_present()) {
+      return LOGGER_FAULT_CLEAR_CONDITION_PRESENT;
+    }
+    break;
+  case LOGGER_FAULT_PSRAM_INIT_FAILED:
+    logger_app_recovery_set_status(app, "psram", "not_clearable");
+    return LOGGER_FAULT_CLEAR_NOT_CLEARABLE;
+  default:
+    return LOGGER_FAULT_CLEAR_NOT_CLEARABLE;
+  }
+
+  const logger_recovery_reason_t reason =
+      logger_app_recovery_reason_from_fault(previous);
+  const bool matching_recovery =
+      reason != LOGGER_RECOVERY_NONE &&
+      app->runtime.current_state == LOGGER_RUNTIME_RECOVERY_HOLD &&
+      app->recovery_reason == reason;
+  if (matching_recovery) {
+    logger_app_recovery_complete(app, "manual", now_ms);
+  } else {
+    logger_app_clear_current_fault(app, "manual");
+    if (reason != LOGGER_RECOVERY_NONE && app->recovery_reason == reason) {
+      logger_app_reset_recovery_state(app);
+    }
+  }
+
+  return LOGGER_FAULT_CLEAR_CLEARED;
+}
+
 static void logger_step_recovery_hold(logger_app_t *app, uint32_t now_ms) {
   logger_app_refresh_observations(app, now_ms);
   logger_app_reconcile_clock_invalid_fault(app, now_ms);
   logger_h10_set_enabled(&app->h10, false);
   logger_service_cli_poll(&app->cli, app, now_ms);
+  if (app->runtime.current_state != LOGGER_RUNTIME_RECOVERY_HOLD) {
+    return;
+  }
 
   if (app->recovery_reason == LOGGER_RECOVERY_NONE) {
     logger_app_apply_unattended_target(app, "recovery_missing_reason", now_ms);

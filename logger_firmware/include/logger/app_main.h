@@ -12,6 +12,7 @@
 #include "logger/capture_stats.h"
 #include "logger/clock.h"
 #include "logger/config_store.h"
+#include "logger/faults.h"
 #include "logger/h10.h"
 #include "logger/identity.h"
 #include "logger/queue.h"
@@ -38,6 +39,13 @@ typedef enum {
   LOGGER_DEBUG_STORAGE_FAULT_LOW_SPACE,
   LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED,
 } logger_debug_storage_fault_t;
+
+typedef enum {
+  LOGGER_FAULT_CLEAR_NO_FAULT = 0,
+  LOGGER_FAULT_CLEAR_CLEARED,
+  LOGGER_FAULT_CLEAR_CONDITION_PRESENT,
+  LOGGER_FAULT_CLEAR_NOT_CLEARABLE,
+} logger_fault_clear_result_t;
 
 static inline const char *
 logger_debug_storage_fault_name(logger_debug_storage_fault_t fault) {
@@ -153,6 +161,9 @@ typedef struct logger_app {
 } logger_app_t;
 
 void logger_app_clear_current_fault(logger_app_t *app, const char *source);
+logger_fault_clear_result_t
+logger_app_manual_clear_current_fault(logger_app_t *app, uint32_t now_ms,
+                                      logger_fault_code_t *previous_code_out);
 void logger_app_init(logger_app_t *app, uint32_t now_ms,
                      logger_boot_gesture_t boot_gesture);
 

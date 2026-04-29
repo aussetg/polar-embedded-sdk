@@ -1166,45 +1166,6 @@ static bool logger_cli_is_upload_mode(const logger_app_t *app) {
   return logger_runtime_state_is_upload(app->runtime.current_state);
 }
 
-static bool logger_cli_upload_blocked_fault_present(void) {
-  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
-  logger_upload_queue_summary_t summary;
-  logger_upload_queue_summary_init(&summary);
-  if (!logger_storage_svc_queue_load(queue)) {
-    logger_upload_queue_tmp_release(queue);
-    return true;
-  }
-  logger_upload_queue_compute_summary(queue, &summary);
-  logger_upload_queue_tmp_release(queue);
-  return summary.blocked_count > 0u;
-}
-
-static bool logger_cli_fault_condition_still_present(const logger_app_t *app) {
-  switch (app->persisted.current_fault_code) {
-  case LOGGER_FAULT_CONFIG_INCOMPLETE:
-    return !logger_config_normal_logging_ready(&app->persisted.config);
-  case LOGGER_FAULT_CLOCK_INVALID:
-    return !app->clock.valid;
-  case LOGGER_FAULT_LOW_BATTERY_BLOCKED_START:
-    return logger_battery_low_start_blocked(&app->battery);
-  case LOGGER_FAULT_CRITICAL_LOW_BATTERY_STOPPED:
-    return logger_battery_is_critical(&app->battery);
-  case LOGGER_FAULT_SD_MISSING_OR_UNWRITABLE:
-  case LOGGER_FAULT_SD_LOW_SPACE_RESERVE_UNMET:
-    return logger_fault_from_storage(&app->storage) ==
-           app->persisted.current_fault_code;
-  case LOGGER_FAULT_SD_WRITE_FAILED:
-    return app->debug_storage_fault ==
-               LOGGER_DEBUG_STORAGE_FAULT_WRITE_FAILED ||
-           logger_fault_from_storage(&app->storage) != LOGGER_FAULT_NONE;
-  case LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE:
-    return logger_cli_upload_blocked_fault_present();
-  case LOGGER_FAULT_NONE:
-  default:
-    return false;
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /*  JSON payload writers                                              */
 /* ------------------------------------------------------------------ */
@@ -2030,7 +1991,7 @@ static void logger_handle_service_enter(logger_app_t *app, uint32_t now_ms) {
   jsw_end(&w);
 }
 
-static void logger_handle_fault_clear(logger_app_t *app) {
+static void logger_handle_fault_clear(logger_app_t *app, uint32_t now_ms) {
   if (logger_cli_is_logging_mode(app)) {
     jsw w;
     jsw_err(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock),
@@ -2045,8 +2006,10 @@ static void logger_handle_fault_clear(logger_app_t *app) {
     return;
   }
 
-  const logger_fault_code_t previous = app->persisted.current_fault_code;
-  if (previous == LOGGER_FAULT_NONE) {
+  logger_fault_code_t previous = LOGGER_FAULT_NONE;
+  const logger_fault_clear_result_t result =
+      logger_app_manual_clear_current_fault(app, now_ms, &previous);
+  if (result == LOGGER_FAULT_CLEAR_NO_FAULT) {
     jsw w;
     jsw_ok(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock));
     logger_json_stream_writer_field_bool(&w, "cleared", false);
@@ -2054,17 +2017,17 @@ static void logger_handle_fault_clear(logger_app_t *app) {
     jsw_end(&w);
     return;
   }
-  if (logger_cli_fault_condition_still_present(app)) {
+  if (result == LOGGER_FAULT_CLEAR_CONDITION_PRESENT) {
     jsw w;
     jsw_err(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock),
             "condition_still_present", "fault condition is still present");
     return;
   }
-
-  logger_app_clear_current_fault(app, "manual");
-
-  if (app->runtime.current_state == LOGGER_RUNTIME_RECOVERY_HOLD) {
-    app->recovery_next_attempt_mono_ms = 0u;
+  if (result == LOGGER_FAULT_CLEAR_NOT_CLEARABLE) {
+    jsw w;
+    jsw_err(&w, "fault clear", logger_clock_now_utc_or_null(&app->clock),
+            "not_clearable", "fault cannot be cleared manually");
+    return;
   }
 
   jsw w;
@@ -4303,7 +4266,7 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
     return;
   }
   if (strcmp(line, "fault clear") == 0) {
-    logger_handle_fault_clear(app);
+    logger_handle_fault_clear(app, now_ms);
     return;
   }
   if (strcmp(line, "factory-reset") == 0) {
