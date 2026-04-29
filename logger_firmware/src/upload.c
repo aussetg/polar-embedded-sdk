@@ -854,6 +854,7 @@ static bool logger_upload_http_connect(logger_upload_http_request_t *request,
 static bool logger_upload_http_execute(
     const logger_config_t *config, const logger_upload_url_t *url,
     const char *request_text, bool use_bundle_stream, uint32_t timeout_ms,
+    const logger_busy_poll_t *busy_poll,
     logger_upload_http_response_t *response) {
   logger_upload_http_request_t *request =
       logger_upload_http_request_workspace_acquire();
@@ -875,6 +876,14 @@ static bool logger_upload_http_execute(
     cyw43_arch_poll();
 
     const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    logger_busy_poll_phase_t busy_phase = LOGGER_BUSY_POLL_PHASE_UPLOAD_HTTP;
+    if (!request->dns_done) {
+      busy_phase = LOGGER_BUSY_POLL_PHASE_UPLOAD_DNS;
+    } else if (!request->connected) {
+      busy_phase = LOGGER_BUSY_POLL_PHASE_UPLOAD_CONNECT;
+    }
+    logger_busy_poll_run(busy_poll, busy_phase);
+
     if (!request->dns_done &&
         logger_mono_ms_deadline_reached(now_ms, dns_deadline)) {
       request->transport_failed = true;
@@ -1676,7 +1685,8 @@ bool logger_upload_net_test(const logger_config_t *config,
 
   process_workspace->ip_buf[0] = '\0';
   int wifi_rc = 0;
-  if (!logger_net_wifi_join(config, &wifi_rc, process_workspace->ip_buf)) {
+  if (!logger_net_wifi_join(config, &wifi_rc, process_workspace->ip_buf,
+                            NULL)) {
     logger_upload_process_workspace_release(process_workspace);
     result->wifi_join_result = "fail";
     snprintf(result->wifi_join_details, sizeof(result->wifi_join_details),
@@ -1735,8 +1745,8 @@ bool logger_upload_net_test(const logger_config_t *config,
   logger_upload_http_response_t *probe_response =
       logger_upload_http_response_workspace_acquire();
   const bool reachable = logger_upload_http_execute(
-      config, &process_workspace->url, process_workspace->request_text, NULL,
-      LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS, probe_response);
+      config, &process_workspace->url, process_workspace->request_text, false,
+      LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS, NULL, probe_response);
   if (process_workspace->url.host_is_literal) {
     result->dns_result = "pass";
     snprintf(result->dns_details, sizeof(result->dns_details), "literal=%s",
@@ -1798,7 +1808,7 @@ bool logger_upload_net_test(const logger_config_t *config,
 static bool logger_upload_process_selected(
     logger_system_log_t *system_log, const logger_config_t *config,
     const char *hardware_id, const char *now_utc_or_null,
-    const char *target_session_id_or_null,
+    const char *target_session_id_or_null, const logger_busy_poll_t *busy_poll,
     logger_upload_process_result_t *result) {
   logger_upload_process_result_init(result);
 
@@ -1907,7 +1917,8 @@ static bool logger_upload_process_selected(
 
   process_workspace->ip_buf[0] = '\0';
   int wifi_rc = 0;
-  if (!logger_net_wifi_join(config, &wifi_rc, process_workspace->ip_buf)) {
+  if (!logger_net_wifi_join(config, &wifi_rc, process_workspace->ip_buf,
+                            busy_poll)) {
     snprintf(result->message, sizeof(result->message),
              "Wi-Fi join failed rc=%d", wifi_rc);
     const bool accepted = logger_upload_apply_local_attempt_failure(
@@ -2011,7 +2022,7 @@ static bool logger_upload_process_selected(
       logger_upload_http_response_workspace_acquire();
   const bool http_ok = logger_upload_http_execute(
       config, &process_workspace->url, process_workspace->request_text, true,
-      LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS, http_response);
+      LOGGER_UPLOAD_RESPONSE_TIMEOUT_MS, busy_poll, http_response);
   logger_storage_svc_bundle_close();
   logger_net_wifi_leave();
 
@@ -2174,9 +2185,11 @@ bool logger_upload_process_one(logger_system_log_t *system_log,
                                const logger_config_t *config,
                                const char *hardware_id,
                                const char *now_utc_or_null,
+                               const logger_busy_poll_t *busy_poll,
                                logger_upload_process_result_t *result) {
   return logger_upload_process_selected(system_log, config, hardware_id,
-                                        now_utc_or_null, NULL, result);
+                                        now_utc_or_null, NULL, busy_poll,
+                                        result);
 }
 
 bool logger_upload_process_session(logger_system_log_t *system_log,
@@ -2184,7 +2197,9 @@ bool logger_upload_process_session(logger_system_log_t *system_log,
                                    const char *hardware_id,
                                    const char *now_utc_or_null,
                                    const char *session_id,
+                                   const logger_busy_poll_t *busy_poll,
                                    logger_upload_process_result_t *result) {
   return logger_upload_process_selected(system_log, config, hardware_id,
-                                        now_utc_or_null, session_id, result);
+                                        now_utc_or_null, session_id, busy_poll,
+                                        result);
 }

@@ -9,6 +9,7 @@
 
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
+#include "hardware/watchdog.h"
 
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
@@ -175,7 +176,8 @@ static void logger_clock_ntp_recv_cb(void *arg, struct udp_pcb *pcb,
 
 static bool logger_clock_resolve_ntp_server(
     const char *hostname, ip_addr_t *address_out, char remote_address_out[48],
-    char message_out[LOGGER_CLOCK_NTP_MESSAGE_MAX + 1]) {
+    char message_out[LOGGER_CLOCK_NTP_MESSAGE_MAX + 1],
+    const logger_busy_poll_t *busy_poll) {
   if (address_out == NULL || remote_address_out == NULL ||
       message_out == NULL) {
     return false;
@@ -205,7 +207,9 @@ static bool logger_clock_resolve_ntp_server(
   const uint32_t deadline_ms =
       to_ms_since_boot(get_absolute_time()) + LOGGER_CLOCK_NTP_DNS_TIMEOUT_MS;
   while (!resolution.done) {
+    watchdog_update();
     cyw43_arch_poll();
+    logger_busy_poll_run(busy_poll, LOGGER_BUSY_POLL_PHASE_NTP_DNS);
     const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     if (logger_mono_ms_deadline_reached(now_ms, deadline_ms)) {
       logger_copy_string(message_out, LOGGER_CLOCK_NTP_MESSAGE_MAX + 1u,
@@ -229,7 +233,8 @@ static bool logger_clock_ntp_exchange(
     const char *server, uint32_t originate_sec, uint32_t originate_frac,
     bool have_reference_unix_seconds, int64_t reference_unix_seconds,
     int64_t *unix_ns_out, uint8_t *stratum_out, char remote_address_out[48],
-    char message_out[LOGGER_CLOCK_NTP_MESSAGE_MAX + 1]) {
+    char message_out[LOGGER_CLOCK_NTP_MESSAGE_MAX + 1],
+    const logger_busy_poll_t *busy_poll) {
   if (unix_ns_out == NULL || stratum_out == NULL ||
       remote_address_out == NULL || message_out == NULL) {
     return false;
@@ -239,7 +244,8 @@ static bool logger_clock_ntp_exchange(
 
   ip_addr_t server_address;
   if (!logger_clock_resolve_ntp_server(server, &server_address,
-                                       remote_address_out, message_out)) {
+                                       remote_address_out, message_out,
+                                       busy_poll)) {
     return false;
   }
   if (!IP_IS_V4(&server_address)) {
@@ -299,7 +305,9 @@ static bool logger_clock_ntp_exchange(
   const uint32_t deadline_ms = to_ms_since_boot(get_absolute_time()) +
                                LOGGER_CLOCK_NTP_RESPONSE_TIMEOUT_MS;
   while (!response_state.received) {
+    watchdog_update();
     cyw43_arch_poll();
+    logger_busy_poll_run(busy_poll, LOGGER_BUSY_POLL_PHASE_NTP_RESPONSE);
     const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     if (logger_mono_ms_deadline_reached(now_ms, deadline_ms)) {
       logger_copy_string(message_out, LOGGER_CLOCK_NTP_MESSAGE_MAX + 1u,
@@ -655,7 +663,8 @@ bool logger_clock_set_utc(const char *rfc3339_utc,
 
 bool logger_clock_ntp_sync(const logger_clock_status_t *current_status,
                            logger_clock_ntp_sync_result_t *result,
-                           logger_clock_status_t *status_out) {
+                           logger_clock_status_t *status_out,
+                           const logger_busy_poll_t *busy_poll) {
   if (result == NULL) {
     return false;
   }
@@ -692,7 +701,7 @@ bool logger_clock_ntp_sync(const logger_clock_status_t *current_status,
     if (!logger_clock_ntp_exchange(
             server, originate_sec, originate_frac, have_previous_utc,
             previous_utc_ns / 1000000000ll, &ntp_utc_ns, &result->stratum,
-            result->remote_address, result->message)) {
+            result->remote_address, result->message, busy_poll)) {
       continue;
     }
 

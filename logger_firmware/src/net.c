@@ -15,7 +15,8 @@
 #define LOGGER_WIFI_STA_RESET_DELAY_MS 100u
 
 static int logger_net_wifi_join_auth_mode(const char *ssid, const char *psk,
-                                          uint32_t auth_mode) {
+                                          uint32_t auth_mode,
+                                          const logger_busy_poll_t *busy_poll) {
   const int err = cyw43_arch_wifi_connect_async(ssid, psk, auth_mode);
   if (err != PICO_OK) {
     return err;
@@ -28,6 +29,7 @@ static int logger_net_wifi_join_auth_mode(const char *ssid, const char *psk,
   while (true) {
     watchdog_update();
     cyw43_arch_poll();
+    logger_busy_poll_run(busy_poll, LOGGER_BUSY_POLL_PHASE_WIFI_JOIN);
 
     int new_status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
     if (new_status == CYW43_LINK_NONET) {
@@ -58,7 +60,8 @@ static int logger_net_wifi_join_auth_mode(const char *ssid, const char *psk,
 }
 
 bool logger_net_wifi_join(const logger_config_t *config, int *rc_out,
-                          char ip_buf[48]) {
+                          char ip_buf[48],
+                          const logger_busy_poll_t *busy_poll) {
   bool sta_mode_active = false;
   if (rc_out != NULL) {
     *rc_out = PICO_ERROR_GENERIC;
@@ -75,7 +78,7 @@ bool logger_net_wifi_join(const logger_config_t *config, int *rc_out,
     cyw43_arch_enable_sta_mode();
     sta_mode_active = true;
     rc = logger_net_wifi_join_auth_mode(config->wifi_ssid, NULL,
-                                        CYW43_AUTH_OPEN);
+                                        CYW43_AUTH_OPEN, busy_poll);
   } else {
     static const uint32_t auth_modes[] = {
         CYW43_AUTH_WPA2_AES_PSK,
@@ -85,11 +88,12 @@ bool logger_net_wifi_join(const logger_config_t *config, int *rc_out,
     for (size_t i = 0u; i < sizeof(auth_modes) / sizeof(auth_modes[0]); ++i) {
       cyw43_arch_disable_sta_mode();
       watchdog_update();
+      logger_busy_poll_run(busy_poll, LOGGER_BUSY_POLL_PHASE_WIFI_JOIN);
       sleep_ms(LOGGER_WIFI_STA_RESET_DELAY_MS);
       cyw43_arch_enable_sta_mode();
       sta_mode_active = true;
       rc = logger_net_wifi_join_auth_mode(config->wifi_ssid, config->wifi_psk,
-                                          auth_modes[i]);
+                                          auth_modes[i], busy_poll);
       if (rc == 0 || rc == PICO_ERROR_BADAUTH) {
         break;
       }
@@ -106,6 +110,7 @@ bool logger_net_wifi_join(const logger_config_t *config, int *rc_out,
   while (true) {
     watchdog_update();
     cyw43_arch_poll();
+    logger_busy_poll_run(busy_poll, LOGGER_BUSY_POLL_PHASE_WIFI_DHCP);
     if (netif_default != NULL && netif_is_up(netif_default) &&
         netif_is_link_up(netif_default) &&
         !ip4_addr_isany(netif_ip4_addr(netif_default))) {

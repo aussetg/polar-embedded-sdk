@@ -68,6 +68,16 @@ static logger_h10_packet_t g_app_h10_packet;
 static logger_writer_cmd_t g_app_h10_cmd;
 static logger_upload_process_result_t g_app_upload_process_result;
 
+static void logger_app_upload_busy_poll(void *ctx,
+                                        logger_busy_poll_phase_t phase) {
+  logger_app_t *app = (logger_app_t *)ctx;
+  if (app == NULL) {
+    return;
+  }
+  logger_service_cli_poll_upload_busy(
+      &app->cli, app, to_ms_since_boot(get_absolute_time()), phase);
+}
+
 static int64_t logger_app_i64_abs(int64_t value) {
   return value < 0 ? -(value + 1) + 1 : value;
 }
@@ -1117,8 +1127,17 @@ bool logger_app_clock_sync_ntp(logger_app_t *app,
     return false;
   }
 
+  logger_busy_poll_t busy_poll = {
+      .ctx = app,
+      .poll = logger_app_upload_busy_poll,
+  };
+  const logger_busy_poll_t *busy_poll_or_null =
+      logger_runtime_state_is_upload(app->runtime.current_state) ? &busy_poll
+                                                                 : NULL;
+
   int wifi_rc = 0;
-  if (!logger_net_wifi_join(&app->persisted.config, &wifi_rc, NULL)) {
+  if (!logger_net_wifi_join(&app->persisted.config, &wifi_rc, NULL,
+                            busy_poll_or_null)) {
     snprintf(result->message, sizeof(result->message),
              "Wi-Fi join failed rc=%d", wifi_rc);
     logger_app_log_ntp_sync_result(app, "ntp_sync_failed",
@@ -1126,7 +1145,8 @@ bool logger_app_clock_sync_ntp(logger_app_t *app,
     return false;
   }
 
-  const bool synced = logger_clock_ntp_sync(&app->clock, result, &app->clock);
+  const bool synced = logger_clock_ntp_sync(&app->clock, result, &app->clock,
+                                            busy_poll_or_null);
   logger_net_wifi_leave();
 
   if (synced) {
@@ -2965,9 +2985,14 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
   const char *session_id =
       app->upload_pass_session_ids[app->upload_pass_next_index];
   logger_upload_process_result_t *result = &g_app_upload_process_result;
-  (void)logger_upload_process_session(
-      &app->system_log, &app->persisted.config, app->hardware_id,
-      logger_clock_now_utc_or_null(&app->clock), session_id, result);
+  const logger_busy_poll_t busy_poll = {
+      .ctx = app,
+      .poll = logger_app_upload_busy_poll,
+  };
+  (void)logger_upload_process_session(&app->system_log, &app->persisted.config,
+                                      app->hardware_id,
+                                      logger_clock_now_utc_or_null(&app->clock),
+                                      session_id, &busy_poll, result);
 
   if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED) {
     app->upload_pass_had_success = true;

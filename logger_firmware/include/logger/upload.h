@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "logger/busy_poll.h"
 #include "logger/config_store.h"
 #include "logger/queue.h"
 #include "logger/system_log.h"
@@ -57,6 +58,7 @@ bool logger_upload_process_one(logger_system_log_t *system_log,
                                const logger_config_t *config,
                                const char *hardware_id,
                                const char *now_utc_or_null,
+                               const logger_busy_poll_t *busy_poll,
                                logger_upload_process_result_t *result);
 
 bool logger_upload_process_session(logger_system_log_t *system_log,
@@ -64,6 +66,7 @@ bool logger_upload_process_session(logger_system_log_t *system_log,
                                    const char *hardware_id,
                                    const char *now_utc_or_null,
                                    const char *session_id,
+                                   const logger_busy_poll_t *busy_poll,
                                    logger_upload_process_result_t *result);
 
 #endif

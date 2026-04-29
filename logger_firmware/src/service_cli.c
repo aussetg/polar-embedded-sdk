@@ -41,6 +41,8 @@ static char g_service_cli_mark_verified_manifest_path[LOGGER_STORAGE_PATH_MAX];
 static char g_service_cli_mark_verified_journal_path[LOGGER_STORAGE_PATH_MAX];
 
 #define LOGGER_SERVICE_BUNDLE_EXPORT_CHUNK_BYTES STORAGE_SVC_BUNDLE_READ_MAX
+#define LOGGER_SERVICE_CLI_BUSY_POLL_CHAR_BUDGET 96u
+#define LOGGER_SERVICE_CLI_BUSY_POLL_LINE_BUDGET 1u
 
 typedef struct {
   bool open;
@@ -1507,6 +1509,60 @@ static void logger_handle_status_json(const logger_app_t *app) {
   jsw_ok(&w, "status", logger_clock_now_utc_or_null(&app->clock));
   logger_write_status_payload(&w, app);
   jsw_end(&w);
+}
+
+static void
+logger_handle_status_upload_busy_json(const logger_app_t *app,
+                                      logger_busy_poll_phase_t phase) {
+  jsw w;
+  jsw_ok(&w, "status", logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "mode", logger_mode_name(&app->runtime));
+  logger_json_stream_writer_field_string_or_null(
+      &w, "runtime_state",
+      logger_runtime_state_name(app->runtime.current_state));
+  logger_json_stream_writer_field_object_begin(&w, "upload_busy");
+  logger_json_stream_writer_field_bool(&w, "active", true);
+  logger_json_stream_writer_field_string_or_null(
+      &w, "phase", logger_busy_poll_phase_name(phase));
+  logger_json_stream_writer_field_string_or_null(&w, "command_handling",
+                                                 "bounded_busy_pump");
+  logger_json_stream_writer_object_end(&w);
+  jsw_end(&w);
+}
+
+/*
+ * Bounded upload-busy dispatcher.
+ *
+ * This deliberately does not call logger_service_cli_execute(): upload owns
+ * the queue workspace, bundle stream, Wi-Fi, and TLS client while this pump is
+ * active.  Only immediate, non-mutating busy responses are allowed here.
+ */
+static void logger_service_cli_execute_upload_busy(
+    logger_service_cli_t *cli, logger_app_t *app, const char *line,
+    uint32_t now_ms, logger_busy_poll_phase_t phase) {
+  if (cli->unlocked &&
+      logger_mono_ms_deadline_reached(now_ms, cli->unlock_deadline_mono_ms)) {
+    cli->unlocked = false;
+  }
+
+  if (strcmp(line, "status --json") == 0) {
+    logger_handle_status_upload_busy_json(app, phase);
+    return;
+  }
+
+  if (strcmp(line, "service enter") == 0) {
+    jsw w;
+    jsw_err(&w, "service enter", logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_mode",
+            "service enter is not permitted while upload is in progress");
+    return;
+  }
+
+  jsw w;
+  jsw_err(&w, line, logger_clock_now_utc_or_null(&app->clock), "busy_upload",
+          "upload is in progress; retry after the current upload attempt "
+          "completes");
 }
 
 static void logger_handle_provisioning_status_json(logger_app_t *app) {
@@ -4356,6 +4412,23 @@ static void logger_handle_debug_prune_once(logger_service_cli_t *cli,
   jsw_end(&w);
 }
 
+typedef struct {
+  logger_service_cli_t *cli;
+  logger_app_t *app;
+} logger_service_cli_upload_busy_hook_ctx_t;
+
+static void
+logger_service_cli_upload_busy_hook(void *ctx, logger_busy_poll_phase_t phase) {
+  logger_service_cli_upload_busy_hook_ctx_t *hook_ctx =
+      (logger_service_cli_upload_busy_hook_ctx_t *)ctx;
+  if (hook_ctx == NULL || hook_ctx->cli == NULL || hook_ctx->app == NULL) {
+    return;
+  }
+  logger_service_cli_poll_upload_busy(hook_ctx->cli, hook_ctx->app,
+                                      to_ms_since_boot(get_absolute_time()),
+                                      phase);
+}
+
 static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
                                             logger_app_t *app) {
   const bool allowed_in_wait_h10 =
@@ -4379,9 +4452,14 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
   }
 
   logger_upload_process_result_t *result = &g_service_cli_upload_process_result;
+  logger_service_cli_upload_busy_hook_ctx_t busy_ctx = {.cli = cli, .app = app};
+  const logger_busy_poll_t busy_poll = {
+      .ctx = &busy_ctx,
+      .poll = logger_service_cli_upload_busy_hook,
+  };
   const bool ok = logger_upload_process_one(
       &app->system_log, &app->persisted.config, app->hardware_id,
-      logger_clock_now_utc_or_null(&app->clock), result);
+      logger_clock_now_utc_or_null(&app->clock), &busy_poll, result);
 
   if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
     jsw w;
@@ -4816,10 +4894,48 @@ void logger_service_cli_poll(logger_service_cli_t *cli, logger_app_t *app,
     }
     if (ch == '\n') {
       cli->line_buf[cli->line_len] = '\0';
-      if (cli->line_len > 0u) {
+      const bool have_line = cli->line_len > 0u;
+      cli->line_len = 0u;
+      if (have_line) {
         logger_service_cli_execute(cli, app, cli->line_buf, now_ms);
       }
+      continue;
+    }
+    if (cli->line_len + 1u >= sizeof(cli->line_buf)) {
       cli->line_len = 0u;
+      jsw w;
+      jsw_err(&w, "input", logger_clock_now_utc_or_null(&app->clock),
+              "internal_error", "input line too long");
+      break;
+    }
+    cli->line_buf[cli->line_len++] = (char)ch;
+  }
+}
+
+void logger_service_cli_poll_upload_busy(logger_service_cli_t *cli,
+                                         logger_app_t *app, uint32_t now_ms,
+                                         logger_busy_poll_phase_t phase) {
+  size_t chars = 0u;
+  size_t lines = 0u;
+  while (chars < LOGGER_SERVICE_CLI_BUSY_POLL_CHAR_BUDGET &&
+         lines < LOGGER_SERVICE_CLI_BUSY_POLL_LINE_BUDGET) {
+    int ch = getchar_timeout_us(0);
+    if (ch == PICO_ERROR_TIMEOUT) {
+      break;
+    }
+    chars += 1u;
+    if (ch == '\r') {
+      continue;
+    }
+    if (ch == '\n') {
+      cli->line_buf[cli->line_len] = '\0';
+      const bool have_line = cli->line_len > 0u;
+      cli->line_len = 0u;
+      if (have_line) {
+        logger_service_cli_execute_upload_busy(cli, app, cli->line_buf, now_ms,
+                                               phase);
+        lines += 1u;
+      }
       continue;
     }
     if (cli->line_len + 1u >= sizeof(cli->line_buf)) {

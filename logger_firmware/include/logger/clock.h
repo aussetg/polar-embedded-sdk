@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "logger/busy_poll.h"
+
 #define LOGGER_CLOCK_RFC3339_UTC_LEN 30
 #define LOGGER_CLOCK_NTP_SERVER_MAX 64
 #define LOGGER_CLOCK_NTP_MESSAGE_MAX 160
@@ -56,7 +58,8 @@ bool logger_clock_set_utc(const char *rfc3339_utc,
 void logger_clock_ntp_sync_result_init(logger_clock_ntp_sync_result_t *result);
 bool logger_clock_ntp_sync(const logger_clock_status_t *current_status,
                            logger_clock_ntp_sync_result_t *result,
-                           logger_clock_status_t *status_out);
+                           logger_clock_status_t *status_out,
+                           const logger_busy_poll_t *busy_poll);
 
 const char *logger_clock_state_name(const logger_clock_status_t *status);
 /* Convert the RTC sample to UTC nanoseconds only when clock validity is

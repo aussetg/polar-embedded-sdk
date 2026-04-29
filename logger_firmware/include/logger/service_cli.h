@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "logger/busy_poll.h"
+
 typedef struct logger_app logger_app_t;
 
 #define LOGGER_SERVICE_CLI_LINE_MAX 2048u
@@ -26,5 +28,8 @@ void logger_service_cli_init(logger_service_cli_t *cli);
 void logger_service_cli_abort_mutable_session(logger_service_cli_t *cli);
 void logger_service_cli_poll(logger_service_cli_t *cli, logger_app_t *app,
                              uint32_t now_ms);
+void logger_service_cli_poll_upload_busy(logger_service_cli_t *cli,
+                                         logger_app_t *app, uint32_t now_ms,
+                                         logger_busy_poll_phase_t phase);
 
 #endif

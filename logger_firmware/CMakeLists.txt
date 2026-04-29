@@ -49,6 +49,11 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_LIST_DIR}/tests/test_upload_inflight_lifecycle.py
     )
+    add_test(
+        NAME logger_upload_busy_cli_pump
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_LIST_DIR}/tests/test_upload_busy_cli_pump.py
+    )
 endif()
 
 set(LOGGER_FIRMWARE_VERSION "0.2.0" CACHE STRING "Semantic firmware version string")
