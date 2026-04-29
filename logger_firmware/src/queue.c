@@ -11,14 +11,21 @@
 #include "logger/json.h"
 #include "logger/json_writer.h"
 #include "logger/psram_layout.h"
+#include "logger/sha256.h"
 #include "logger/storage.h"
 #include "logger/upload_bundle.h"
 #include "logger/util.h"
 
-#define LOGGER_QUEUE_PATH "0:/logger/state/upload_queue.json"
-#define LOGGER_QUEUE_TMP_PATH "0:/logger/state/upload_queue.json.tmp"
-#define LOGGER_QUEUE_BACKUP_PATH "0:/logger/state/upload_queue.json.bak"
-#define LOGGER_QUEUE_ROLLBACK_PATH "0:/logger/state/upload_queue.json.rollback"
+/*
+ * Durable A/B queue store.
+ *
+ * The newest valid slot is the committed queue.  Writes always target the
+ * other slot, so a reset during commit cannot damage the committed copy.
+ * Slot validity is header/trailer agreement + SHA-256 + JSON validation; no
+ * rename/tmp/bak/rollback path is part of v1.
+ */
+#define LOGGER_QUEUE_SLOT_A_PATH "0:/logger/state/upload_queue.a"
+#define LOGGER_QUEUE_SLOT_B_PATH "0:/logger/state/upload_queue.b"
 #define LOGGER_SESSIONS_DIR "0:/logger/sessions"
 #define LOGGER_MANIFEST_READ_MAX 8192u
 /*
@@ -29,6 +36,14 @@
  * 1 MiB PSRAM queue region together with tokens and queue workspaces.
  */
 #define LOGGER_QUEUE_FILE_MAX (384u * 1024u)
+#define LOGGER_QUEUE_SLOT_HEADER_BYTES 512u
+#define LOGGER_QUEUE_SLOT_TRAILER_BYTES 512u
+#define LOGGER_QUEUE_SLOT_PAYLOAD_OFFSET LOGGER_QUEUE_SLOT_HEADER_BYTES
+#define LOGGER_QUEUE_SLOT_TRAILER_OFFSET                                       \
+  (LOGGER_QUEUE_SLOT_PAYLOAD_OFFSET + LOGGER_QUEUE_FILE_MAX)
+#define LOGGER_QUEUE_SLOT_FILE_BYTES                                           \
+  (LOGGER_QUEUE_SLOT_TRAILER_OFFSET + LOGGER_QUEUE_SLOT_TRAILER_BYTES)
+#define LOGGER_QUEUE_SLOT_FORMAT_VERSION 1u
 #define LOGGER_MANIFEST_JSON_TOKEN_MAX 512u
 #define LOGGER_QUEUE_TOP_LEVEL_JSON_TOKEN_COUNT 7u
 #define LOGGER_QUEUE_ENTRY_JSON_TOKEN_COUNT 39u
@@ -101,6 +116,12 @@ _Static_assert(LOGGER_QUEUE_FILE_WORST_CASE_MAX <= LOGGER_QUEUE_FILE_MAX,
                "upload queue file cap must cover max serialized v1 queue");
 _Static_assert((LOGGER_QUEUE_FILE_MAX % 512u) == 0u,
                "upload queue file cap should be sector-aligned");
+_Static_assert(LOGGER_QUEUE_SLOT_HEADER_BYTES == 512u,
+               "upload queue slot header is one sector");
+_Static_assert(LOGGER_QUEUE_SLOT_TRAILER_BYTES == 512u,
+               "upload queue slot trailer is one sector");
+_Static_assert((LOGGER_QUEUE_SLOT_FILE_BYTES % 512u) == 0u,
+               "upload queue slot file should be sector-aligned");
 
 typedef struct {
   char session_id[33];
@@ -115,6 +136,9 @@ typedef struct {
  * PSRAM-backed to free ~70 KiB of SRAM. */
 typedef union {
   struct {
+    FIL file;
+    uint8_t header[LOGGER_QUEUE_SLOT_HEADER_BYTES];
+    uint8_t trailer[LOGGER_QUEUE_SLOT_TRAILER_BYTES];
     char json[LOGGER_QUEUE_FILE_MAX + 1u];
     jsmntok_t tokens[LOGGER_QUEUE_JSON_TOKEN_MAX];
   } load;
@@ -158,6 +182,7 @@ typedef struct {
 
 typedef struct {
   FIL file;
+  logger_upload_queue_t probe_queue;
   bool in_use;
 } queue_write_workspace_t;
 
@@ -171,7 +196,49 @@ typedef struct {
   FIL *file;
   size_t bytes_written;
   size_t limit;
+  logger_sha256_t *sha;
 } logger_queue_file_writer_t;
+
+typedef struct {
+  uint32_t payload_len;
+  uint64_t generation;
+  uint8_t payload_sha256[LOGGER_SHA256_BYTES];
+} logger_queue_slot_meta_t;
+
+typedef enum {
+  LOGGER_QUEUE_SLOT_ABSENT,
+  LOGGER_QUEUE_SLOT_VALID,
+  LOGGER_QUEUE_SLOT_CORRUPT,
+  LOGGER_QUEUE_SLOT_IO_ERROR,
+} logger_queue_slot_read_result_t;
+
+typedef enum {
+  LOGGER_UPLOAD_QUEUE_LOAD_EMPTY,
+  LOGGER_UPLOAD_QUEUE_LOAD_LOADED,
+  LOGGER_UPLOAD_QUEUE_LOAD_CORRUPT,
+  LOGGER_UPLOAD_QUEUE_LOAD_IO_ERROR,
+} logger_upload_queue_load_result_t;
+
+typedef struct {
+  const char *path;
+  logger_queue_slot_read_result_t result;
+  bool present;
+  bool integrity_valid;
+  bool queue_valid;
+  uint64_t generation;
+} logger_queue_slot_probe_t;
+
+static const uint8_t LOGGER_QUEUE_SLOT_HEADER_MAGIC[16] = {
+    'L', 'Q', 'S',  'L',  'O', 'T', '1',  'H',
+    'D', 'R', 0x0d, 0x0a, 'A', 'B', 0x00, 0x00};
+static const uint8_t LOGGER_QUEUE_SLOT_TRAILER_MAGIC[16] = {
+    'L', 'Q', 'S',  'L',  'O', 'T', '1',  'T',
+    'R', 'L', 0x0d, 0x0a, 'A', 'B', 0x00, 0x00};
+static const uint8_t LOGGER_QUEUE_SLOT_HASH_DOMAIN[] =
+    "logger.upload_queue.slot.v1";
+
+static logger_upload_queue_load_result_t
+logger_upload_queue_load_internal(logger_upload_queue_t *queue);
 
 #define LOGGER_QUEUE_SCRATCH_ADDR (PSRAM_QUEUE_REGION_BASE)
 
@@ -219,6 +286,114 @@ static queue_write_workspace_t *logger_queue_write_workspace_ptr(void) {
 
 static queue_stat_workspace_t *logger_queue_stat_workspace_ptr(void) {
   return (queue_stat_workspace_t *)LOGGER_QUEUE_STAT_WORKSPACE_ADDR;
+}
+
+static void logger_queue_store_u32_le(uint8_t *dst, uint32_t value) {
+  dst[0] = (uint8_t)(value & 0xffu);
+  dst[1] = (uint8_t)((value >> 8) & 0xffu);
+  dst[2] = (uint8_t)((value >> 16) & 0xffu);
+  dst[3] = (uint8_t)((value >> 24) & 0xffu);
+}
+
+static uint32_t logger_queue_load_u32_le(const uint8_t *src) {
+  return ((uint32_t)src[0]) | ((uint32_t)src[1] << 8) |
+         ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
+}
+
+static void logger_queue_store_u64_le(uint8_t *dst, uint64_t value) {
+  for (size_t i = 0u; i < 8u; ++i) {
+    dst[i] = (uint8_t)((value >> (8u * i)) & 0xffu);
+  }
+}
+
+static uint64_t logger_queue_load_u64_le(const uint8_t *src) {
+  uint64_t value = 0u;
+  for (size_t i = 0u; i < 8u; ++i) {
+    value |= ((uint64_t)src[i]) << (8u * i);
+  }
+  return value;
+}
+
+static void logger_queue_slot_hash_begin(logger_sha256_t *sha,
+                                         uint64_t generation) {
+  uint8_t generation_le[8];
+  logger_queue_store_u64_le(generation_le, generation);
+  logger_sha256_init(sha);
+  logger_sha256_update(sha, LOGGER_QUEUE_SLOT_HASH_DOMAIN,
+                       sizeof(LOGGER_QUEUE_SLOT_HASH_DOMAIN) - 1u);
+  logger_sha256_update(sha, generation_le, sizeof(generation_le));
+}
+
+static void
+logger_queue_slot_metadata_write(uint8_t *dst, const uint8_t magic[16],
+                                 const logger_queue_slot_meta_t *meta) {
+  memset(dst, 0, LOGGER_QUEUE_SLOT_HEADER_BYTES);
+  memcpy(dst, magic, 16u);
+  logger_queue_store_u32_le(dst + 16u, LOGGER_QUEUE_SLOT_FORMAT_VERSION);
+  logger_queue_store_u32_le(dst + 20u, LOGGER_QUEUE_SLOT_HEADER_BYTES);
+  logger_queue_store_u32_le(dst + 24u, LOGGER_QUEUE_SLOT_FILE_BYTES);
+  logger_queue_store_u32_le(dst + 28u, LOGGER_QUEUE_SLOT_PAYLOAD_OFFSET);
+  logger_queue_store_u32_le(dst + 32u, LOGGER_QUEUE_FILE_MAX);
+  logger_queue_store_u32_le(dst + 36u, meta->payload_len);
+  logger_queue_store_u64_le(dst + 40u, meta->generation);
+  memcpy(dst + 48u, meta->payload_sha256, LOGGER_SHA256_BYTES);
+}
+
+static bool logger_queue_slot_metadata_read(const uint8_t *src,
+                                            const uint8_t magic[16],
+                                            logger_queue_slot_meta_t *meta) {
+  if (memcmp(src, magic, 16u) != 0 ||
+      logger_queue_load_u32_le(src + 16u) != LOGGER_QUEUE_SLOT_FORMAT_VERSION ||
+      logger_queue_load_u32_le(src + 20u) != LOGGER_QUEUE_SLOT_HEADER_BYTES ||
+      logger_queue_load_u32_le(src + 24u) != LOGGER_QUEUE_SLOT_FILE_BYTES ||
+      logger_queue_load_u32_le(src + 28u) != LOGGER_QUEUE_SLOT_PAYLOAD_OFFSET ||
+      logger_queue_load_u32_le(src + 32u) != LOGGER_QUEUE_FILE_MAX) {
+    return false;
+  }
+
+  memset(meta, 0, sizeof(*meta));
+  meta->payload_len = logger_queue_load_u32_le(src + 36u);
+  meta->generation = logger_queue_load_u64_le(src + 40u);
+  if (meta->payload_len > LOGGER_QUEUE_FILE_MAX || meta->generation == 0u) {
+    return false;
+  }
+  memcpy(meta->payload_sha256, src + 48u, LOGGER_SHA256_BYTES);
+  return true;
+}
+
+static bool logger_queue_slot_meta_match(const logger_queue_slot_meta_t *a,
+                                         const logger_queue_slot_meta_t *b) {
+  return a->payload_len == b->payload_len && a->generation == b->generation &&
+         memcmp(a->payload_sha256, b->payload_sha256, LOGGER_SHA256_BYTES) == 0;
+}
+
+static bool logger_queue_file_read_exact(FIL *file, void *data, size_t len) {
+  uint8_t *p = (uint8_t *)data;
+  while (len > 0u) {
+    const UINT chunk = (len > 4096u) ? 4096u : (UINT)len;
+    UINT got = 0u;
+    if (f_read(file, p, chunk, &got) != FR_OK || got != chunk) {
+      return false;
+    }
+    p += chunk;
+    len -= chunk;
+  }
+  return true;
+}
+
+static bool logger_queue_file_write_exact(FIL *file, const void *data,
+                                          size_t len) {
+  const uint8_t *p = (const uint8_t *)data;
+  while (len > 0u) {
+    const UINT chunk = (len > 4096u) ? 4096u : (UINT)len;
+    UINT written = 0u;
+    if (f_write(file, p, chunk, &written) != FR_OK || written != chunk) {
+      return false;
+    }
+    p += chunk;
+    len -= chunk;
+  }
+  return true;
 }
 
 /* Debug/contract tripwire for the shared core-0 temporary queue workspace.
@@ -930,9 +1105,13 @@ static bool logger_upload_queue_merge_scan_with_previous(
     logger_upload_queue_t *merged, const logger_upload_queue_t *scanned,
     logger_upload_queue_t *previous, bool *previous_seen,
     logger_system_log_t *system_log, const char *updated_at_utc_or_null) {
-  const bool queue_file_present = logger_storage_file_exists(LOGGER_QUEUE_PATH);
-  const bool loaded_previous = logger_upload_queue_load(previous);
-  if (!loaded_previous && queue_file_present) {
+  const logger_upload_queue_load_result_t load_result =
+      logger_upload_queue_load_internal(previous);
+  if (load_result == LOGGER_UPLOAD_QUEUE_LOAD_IO_ERROR) {
+    return false;
+  }
+  const bool loaded_previous = load_result == LOGGER_UPLOAD_QUEUE_LOAD_LOADED;
+  if (load_result == LOGGER_UPLOAD_QUEUE_LOAD_CORRUPT) {
     logger_log_queue_rebuilt(system_log, updated_at_utc_or_null, "load_failed");
   }
 
@@ -966,6 +1145,9 @@ logger_file_write_all(logger_queue_file_writer_t *writer, const void *data,
   UINT written = 0u;
   if (f_write(writer->file, data, len, &written) != FR_OK || written != len) {
     return false;
+  }
+  if (writer->sha != NULL) {
+    logger_sha256_update(writer->sha, data, len);
   }
   writer->bytes_written += len;
   return true;
@@ -1108,34 +1290,9 @@ void logger_upload_queue_compute_summary(
   }
 }
 
-static bool logger_upload_queue_load_from_path(logger_upload_queue_t *queue,
-                                               const char *path,
-                                               bool *present_out) {
+static bool logger_upload_queue_parse_json(logger_upload_queue_t *queue,
+                                           size_t len) {
   logger_upload_queue_init(queue);
-  if (present_out != NULL) {
-    *present_out = false;
-  }
-
-  FILINFO info;
-  memset(&info, 0, sizeof(info));
-  const FRESULT stat_fr = f_stat(path, &info);
-  if (stat_fr == FR_NO_FILE || stat_fr == FR_NO_PATH) {
-    return true;
-  }
-  if (stat_fr != FR_OK) {
-    return false;
-  }
-  if (present_out != NULL) {
-    *present_out = true;
-  }
-
-  size_t len = 0u;
-  assert(g_queue_scratch != NULL);
-  if (!logger_storage_read_file(path, g_queue_scratch->load.json,
-                                LOGGER_QUEUE_FILE_MAX, &len)) {
-    logger_upload_queue_init(queue);
-    return false;
-  }
   g_queue_scratch->load.json[len] = '\0';
 
   logger_json_doc_t doc;
@@ -1197,30 +1354,191 @@ static bool logger_upload_queue_load_from_path(logger_upload_queue_t *queue,
   return true;
 }
 
-bool logger_upload_queue_load(logger_upload_queue_t *queue) {
+static logger_queue_slot_read_result_t
+logger_queue_slot_read_payload(const char *path, bool *present_out,
+                               logger_queue_slot_meta_t *meta_out) {
+  if (present_out != NULL) {
+    *present_out = false;
+  }
+  if (meta_out != NULL) {
+    memset(meta_out, 0, sizeof(*meta_out));
+  }
+
+  assert(g_queue_scratch != NULL);
+  FIL *file = &g_queue_scratch->load.file;
+  FRESULT fr = f_open(file, path, FA_READ);
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    return LOGGER_QUEUE_SLOT_ABSENT;
+  }
+  if (fr != FR_OK) {
+    return LOGGER_QUEUE_SLOT_IO_ERROR;
+  }
+  if (present_out != NULL) {
+    *present_out = true;
+  }
+
+  logger_queue_slot_read_result_t result = LOGGER_QUEUE_SLOT_IO_ERROR;
+  logger_queue_slot_meta_t header_meta;
+  logger_queue_slot_meta_t trailer_meta;
+  memset(&header_meta, 0, sizeof(header_meta));
+  memset(&trailer_meta, 0, sizeof(trailer_meta));
+
+  if (f_size(file) != (FSIZE_t)LOGGER_QUEUE_SLOT_FILE_BYTES) {
+    result = LOGGER_QUEUE_SLOT_CORRUPT;
+  } else if (f_lseek(file, 0u) != FR_OK ||
+             !logger_queue_file_read_exact(file, g_queue_scratch->load.header,
+                                           LOGGER_QUEUE_SLOT_HEADER_BYTES)) {
+    result = LOGGER_QUEUE_SLOT_IO_ERROR;
+  } else if (!logger_queue_slot_metadata_read(g_queue_scratch->load.header,
+                                              LOGGER_QUEUE_SLOT_HEADER_MAGIC,
+                                              &header_meta)) {
+    result = LOGGER_QUEUE_SLOT_CORRUPT;
+  } else if (f_lseek(file, LOGGER_QUEUE_SLOT_TRAILER_OFFSET) != FR_OK ||
+             !logger_queue_file_read_exact(file, g_queue_scratch->load.trailer,
+                                           LOGGER_QUEUE_SLOT_TRAILER_BYTES)) {
+    result = LOGGER_QUEUE_SLOT_IO_ERROR;
+  } else if (!logger_queue_slot_metadata_read(g_queue_scratch->load.trailer,
+                                              LOGGER_QUEUE_SLOT_TRAILER_MAGIC,
+                                              &trailer_meta) ||
+             !logger_queue_slot_meta_match(&header_meta, &trailer_meta)) {
+    result = LOGGER_QUEUE_SLOT_CORRUPT;
+  } else if (f_lseek(file, LOGGER_QUEUE_SLOT_PAYLOAD_OFFSET) != FR_OK ||
+             !logger_queue_file_read_exact(file, g_queue_scratch->load.json,
+                                           header_meta.payload_len)) {
+    result = LOGGER_QUEUE_SLOT_IO_ERROR;
+  } else {
+    logger_sha256_t sha;
+    uint8_t digest[LOGGER_SHA256_BYTES];
+    logger_queue_slot_hash_begin(&sha, header_meta.generation);
+    if (header_meta.payload_len > 0u) {
+      logger_sha256_update(&sha, g_queue_scratch->load.json,
+                           header_meta.payload_len);
+    }
+    logger_sha256_final(&sha, digest);
+    result =
+        memcmp(digest, header_meta.payload_sha256, LOGGER_SHA256_BYTES) == 0
+            ? LOGGER_QUEUE_SLOT_VALID
+            : LOGGER_QUEUE_SLOT_CORRUPT;
+  }
+
+  const FRESULT close_fr = f_close(file);
+  if (close_fr != FR_OK) {
+    return LOGGER_QUEUE_SLOT_IO_ERROR;
+  }
+  if (result == LOGGER_QUEUE_SLOT_VALID && meta_out != NULL) {
+    *meta_out = header_meta;
+  }
+  return result;
+}
+
+static bool logger_queue_slot_probe(const char *path,
+                                    logger_queue_slot_probe_t *probe,
+                                    logger_upload_queue_t *parse_queue) {
+  memset(probe, 0, sizeof(*probe));
+  probe->path = path;
+
+  logger_queue_slot_meta_t meta;
+  bool present = false;
+  const logger_queue_slot_read_result_t result =
+      logger_queue_slot_read_payload(path, &present, &meta);
+  probe->result = result;
+  probe->present = present;
+  probe->integrity_valid = result == LOGGER_QUEUE_SLOT_VALID;
+  probe->generation = probe->integrity_valid ? meta.generation : 0u;
+  if (probe->integrity_valid && parse_queue != NULL) {
+    probe->queue_valid =
+        logger_upload_queue_parse_json(parse_queue, meta.payload_len);
+  }
+  return result != LOGGER_QUEUE_SLOT_IO_ERROR;
+}
+
+static bool logger_queue_slots_probe(logger_queue_slot_probe_t *a,
+                                     logger_queue_slot_probe_t *b,
+                                     logger_upload_queue_t *parse_queue) {
+  return logger_queue_slot_probe(LOGGER_QUEUE_SLOT_A_PATH, a, parse_queue) &&
+         logger_queue_slot_probe(LOGGER_QUEUE_SLOT_B_PATH, b, parse_queue);
+}
+
+static logger_queue_slot_read_result_t
+logger_upload_queue_load_from_slot(logger_upload_queue_t *queue,
+                                   const char *path) {
+  bool present = false;
+  logger_queue_slot_meta_t meta;
+  const logger_queue_slot_read_result_t result =
+      logger_queue_slot_read_payload(path, &present, &meta);
+  if (result != LOGGER_QUEUE_SLOT_VALID) {
+    logger_upload_queue_init(queue);
+    return result;
+  }
+  if (!logger_upload_queue_parse_json(queue, meta.payload_len)) {
+    logger_upload_queue_init(queue);
+    return LOGGER_QUEUE_SLOT_CORRUPT;
+  }
+  return LOGGER_QUEUE_SLOT_VALID;
+}
+
+static logger_upload_queue_load_result_t
+logger_upload_queue_load_internal(logger_upload_queue_t *queue) {
   logger_storage_status_t storage;
   (void)logger_storage_refresh(&storage);
   if (!storage.mounted) {
     logger_upload_queue_init(queue);
-    return false;
+    return LOGGER_UPLOAD_QUEUE_LOAD_IO_ERROR;
   }
 
-  bool primary_present = false;
-  const bool primary_ok = logger_upload_queue_load_from_path(
-      queue, LOGGER_QUEUE_PATH, &primary_present);
-  if (primary_ok && primary_present) {
-    return true;
+  logger_queue_slot_probe_t a;
+  logger_queue_slot_probe_t b;
+  if (!logger_queue_slots_probe(&a, &b, NULL)) {
+    logger_upload_queue_init(queue);
+    return LOGGER_UPLOAD_QUEUE_LOAD_IO_ERROR;
   }
 
-  bool backup_present = false;
-  const bool backup_ok = logger_upload_queue_load_from_path(
-      queue, LOGGER_QUEUE_BACKUP_PATH, &backup_present);
-  if (backup_ok && backup_present) {
-    return true;
+  const bool any_present = a.present || b.present;
+  if (!a.integrity_valid && !b.integrity_valid) {
+    logger_upload_queue_init(queue);
+    return any_present ? LOGGER_UPLOAD_QUEUE_LOAD_CORRUPT
+                       : LOGGER_UPLOAD_QUEUE_LOAD_EMPTY;
+  }
+
+  const logger_queue_slot_probe_t *first = &a;
+  const logger_queue_slot_probe_t *second = &b;
+  if (b.integrity_valid &&
+      (!a.integrity_valid || b.generation > a.generation)) {
+    first = &b;
+    second = &a;
+  }
+
+  logger_queue_slot_read_result_t load_result = LOGGER_QUEUE_SLOT_CORRUPT;
+  if (first->integrity_valid) {
+    load_result = logger_upload_queue_load_from_slot(queue, first->path);
+    if (load_result == LOGGER_QUEUE_SLOT_VALID) {
+      return LOGGER_UPLOAD_QUEUE_LOAD_LOADED;
+    }
+    if (load_result == LOGGER_QUEUE_SLOT_IO_ERROR) {
+      logger_upload_queue_init(queue);
+      return LOGGER_UPLOAD_QUEUE_LOAD_IO_ERROR;
+    }
+  }
+  if (second->integrity_valid) {
+    load_result = logger_upload_queue_load_from_slot(queue, second->path);
+    if (load_result == LOGGER_QUEUE_SLOT_VALID) {
+      return LOGGER_UPLOAD_QUEUE_LOAD_LOADED;
+    }
+    if (load_result == LOGGER_QUEUE_SLOT_IO_ERROR) {
+      logger_upload_queue_init(queue);
+      return LOGGER_UPLOAD_QUEUE_LOAD_IO_ERROR;
+    }
   }
 
   logger_upload_queue_init(queue);
-  return primary_ok && !primary_present && backup_ok && !backup_present;
+  return LOGGER_UPLOAD_QUEUE_LOAD_CORRUPT;
+}
+
+bool logger_upload_queue_load(logger_upload_queue_t *queue) {
+  const logger_upload_queue_load_result_t result =
+      logger_upload_queue_load_internal(queue);
+  return result == LOGGER_UPLOAD_QUEUE_LOAD_LOADED ||
+         result == LOGGER_UPLOAD_QUEUE_LOAD_EMPTY;
 }
 
 bool logger_upload_queue_scan(logger_upload_queue_t *queue,
@@ -1356,62 +1674,57 @@ bool logger_upload_queue_scan(logger_upload_queue_t *queue,
   return true;
 }
 
-static bool logger_queue_file_exists(const char *path, bool *exists_out) {
-  if (exists_out != NULL) {
-    *exists_out = false;
-  }
-  queue_stat_workspace_t *workspace = logger_queue_stat_workspace_acquire();
-  memset(&workspace->info, 0, sizeof(workspace->info));
-  const FRESULT fr = f_stat(path, &workspace->info);
-  if (fr == FR_OK) {
-    if (exists_out != NULL) {
-      *exists_out = true;
+static bool logger_queue_slot_prepare_file(FIL *file) {
+  const FSIZE_t wanted = (FSIZE_t)LOGGER_QUEUE_SLOT_FILE_BYTES;
+  const FSIZE_t size = f_size(file);
+  if (size > wanted) {
+    if (f_lseek(file, wanted) != FR_OK || f_truncate(file) != FR_OK) {
+      return false;
     }
-    logger_queue_stat_workspace_release(workspace);
-    return true;
-  }
-  logger_queue_stat_workspace_release(workspace);
-  return fr == FR_NO_FILE || fr == FR_NO_PATH;
-}
-
-static bool logger_queue_remove_if_present(const char *path) {
-  const FRESULT fr = f_unlink(path);
-  return fr == FR_OK || fr == FR_NO_FILE || fr == FR_NO_PATH;
-}
-
-static bool logger_upload_queue_promote_tmp(void) {
-  bool current_exists = false;
-  if (!logger_queue_file_exists(LOGGER_QUEUE_PATH, &current_exists)) {
-    return false;
-  }
-
-  bool backup_exists = false;
-  if (!logger_queue_file_exists(LOGGER_QUEUE_BACKUP_PATH, &backup_exists)) {
-    return false;
-  }
-
-  if (current_exists) {
-    if (backup_exists) {
-      if (!logger_queue_remove_if_present(LOGGER_QUEUE_ROLLBACK_PATH) ||
-          f_rename(LOGGER_QUEUE_PATH, LOGGER_QUEUE_ROLLBACK_PATH) != FR_OK) {
-        return false;
-      }
-    } else if (f_rename(LOGGER_QUEUE_PATH, LOGGER_QUEUE_BACKUP_PATH) != FR_OK) {
+  } else if (size < wanted) {
+    const uint8_t zero = 0u;
+    if (f_lseek(file, wanted - 1u) != FR_OK ||
+        !logger_queue_file_write_exact(file, &zero, sizeof(zero))) {
       return false;
     }
   }
+  return true;
+}
 
-  if (f_rename(LOGGER_QUEUE_TMP_PATH, LOGGER_QUEUE_PATH) != FR_OK) {
-    if (current_exists) {
-      (void)f_rename(backup_exists ? LOGGER_QUEUE_ROLLBACK_PATH
-                                   : LOGGER_QUEUE_BACKUP_PATH,
-                     LOGGER_QUEUE_PATH);
-    }
+static bool
+logger_queue_slot_choose_write_target(const char **path_out,
+                                      uint64_t *generation_out,
+                                      logger_upload_queue_t *parse_queue) {
+  logger_queue_slot_probe_t a;
+  logger_queue_slot_probe_t b;
+  if (path_out == NULL || generation_out == NULL || parse_queue == NULL ||
+      !logger_queue_slots_probe(&a, &b, parse_queue)) {
     return false;
   }
-  if (current_exists && backup_exists) {
-    (void)logger_queue_remove_if_present(LOGGER_QUEUE_ROLLBACK_PATH);
+
+  uint64_t best_generation = 0u;
+  const char *target = LOGGER_QUEUE_SLOT_A_PATH;
+  /* The committed copy is the newest JSON-parse-valid slot, not merely the
+   * newest header/trailer/SHA-valid slot.  A reset during write must never
+   * invalidate the only parse-valid queue. */
+  if (a.queue_valid && (!b.queue_valid || a.generation >= b.generation)) {
+    best_generation = a.generation;
+    target = LOGGER_QUEUE_SLOT_B_PATH;
+  } else if (b.queue_valid) {
+    best_generation = b.generation;
+    target = LOGGER_QUEUE_SLOT_A_PATH;
+  } else if (a.integrity_valid &&
+             (!b.integrity_valid || a.generation >= b.generation)) {
+    target = LOGGER_QUEUE_SLOT_A_PATH;
+  } else if (b.integrity_valid) {
+    target = LOGGER_QUEUE_SLOT_B_PATH;
   }
+  if (best_generation == UINT64_MAX) {
+    return false;
+  }
+
+  *path_out = target;
+  *generation_out = best_generation + 1u;
   return true;
 }
 
@@ -1428,16 +1741,43 @@ bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
   }
 
   queue_write_workspace_t *workspace = logger_queue_write_workspace_acquire();
-  FIL *file = &workspace->file;
-  if (f_open(file, LOGGER_QUEUE_TMP_PATH, FA_WRITE | FA_CREATE_ALWAYS) !=
-      FR_OK) {
+  const char *slot_path = NULL;
+  uint64_t generation = 0u;
+  if (!logger_queue_slot_choose_write_target(&slot_path, &generation,
+                                             &workspace->probe_queue)) {
     logger_queue_write_workspace_release(workspace);
     return false;
   }
+
+  FIL *file = &workspace->file;
+  if (f_open(file, slot_path, FA_READ | FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
+    logger_queue_write_workspace_release(workspace);
+    return false;
+  }
+  if (!logger_queue_slot_prepare_file(file)) {
+    (void)f_close(file);
+    logger_queue_write_workspace_release(workspace);
+    return false;
+  }
+
+  assert(g_queue_scratch != NULL);
+  memset(g_queue_scratch->load.header, 0, LOGGER_QUEUE_SLOT_HEADER_BYTES);
+  if (f_lseek(file, 0u) != FR_OK ||
+      !logger_queue_file_write_exact(file, g_queue_scratch->load.header,
+                                     LOGGER_QUEUE_SLOT_HEADER_BYTES) ||
+      f_lseek(file, LOGGER_QUEUE_SLOT_PAYLOAD_OFFSET) != FR_OK) {
+    (void)f_close(file);
+    logger_queue_write_workspace_release(workspace);
+    return false;
+  }
+
+  logger_sha256_t sha;
+  logger_queue_slot_hash_begin(&sha, generation);
   logger_queue_file_writer_t writer = {
       .file = file,
       .bytes_written = 0u,
       .limit = LOGGER_QUEUE_FILE_MAX,
+      .sha = &sha,
   };
 
   bool ok = true;
@@ -1523,16 +1863,30 @@ bool logger_upload_queue_write(const logger_upload_queue_t *queue) {
   }
 
   ok = ok && logger_file_write_cstr(&writer, "]}");
+  logger_queue_slot_meta_t meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.payload_len = (uint32_t)writer.bytes_written;
+  meta.generation = generation;
+  logger_sha256_final(&sha, meta.payload_sha256);
+
+  if (ok) {
+    logger_queue_slot_metadata_write(g_queue_scratch->load.trailer,
+                                     LOGGER_QUEUE_SLOT_TRAILER_MAGIC, &meta);
+    ok = f_lseek(file, LOGGER_QUEUE_SLOT_TRAILER_OFFSET) == FR_OK &&
+         logger_queue_file_write_exact(file, g_queue_scratch->load.trailer,
+                                       LOGGER_QUEUE_SLOT_TRAILER_BYTES);
+  }
+  if (ok) {
+    logger_queue_slot_metadata_write(g_queue_scratch->load.header,
+                                     LOGGER_QUEUE_SLOT_HEADER_MAGIC, &meta);
+    ok = f_lseek(file, 0u) == FR_OK &&
+         logger_queue_file_write_exact(file, g_queue_scratch->load.header,
+                                       LOGGER_QUEUE_SLOT_HEADER_BYTES);
+  }
+
   const FRESULT sync_fr = ok ? f_sync(file) : FR_INT_ERR;
   const FRESULT close_fr = f_close(file);
   if (!ok || sync_fr != FR_OK || close_fr != FR_OK) {
-    (void)f_unlink(LOGGER_QUEUE_TMP_PATH);
-    logger_queue_write_workspace_release(workspace);
-    return false;
-  }
-
-  if (!logger_upload_queue_promote_tmp()) {
-    (void)f_unlink(LOGGER_QUEUE_TMP_PATH);
     logger_queue_write_workspace_release(workspace);
     return false;
   }

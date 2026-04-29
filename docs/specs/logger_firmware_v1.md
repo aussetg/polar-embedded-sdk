@@ -496,14 +496,28 @@ A session is considered uploaded only when the server has:
 
 Retries MUST be safe and idempotent. Re-uploading an already accepted session MUST be treated by the server as a success.
 
+Automatic retries are only for failures that can plausibly clear without
+changing the immutable session artifact: transport failures, temporary server
+failures, or server responses explicitly marked retryable. Hard per-session
+rejections such as validation failure, body too large, duplicate/conflict
+rejection, acknowledgment hash mismatch, or local immutable artifact corruption
+MUST be persisted as `nonretryable` queue entries. `nonretryable` entries MUST
+not be retried until an explicit service-side requeue action moves them back to
+`pending`.
+
 ### 14.6 Firmware-version rejection
 
 If the server rejects upload because firmware is too old, the logger MUST:
 
 - keep the session queued,
-- stop retrying that upload until firmware changes,
+- stop retrying that upload automatically,
+- require an explicit queue requeue/reset before that session is retried,
 - latch an update-needed fault,
 - continue allowing new local logging.
+
+Reflashing newer firmware later does not change the immutable
+closed-session `manifest.json` for already-recorded sessions, so an old blocked
+session does not become uploadable solely because the running firmware changed.
 
 ### 14.7 Unplug during upload
 

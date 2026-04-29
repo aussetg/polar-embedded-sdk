@@ -2963,10 +2963,19 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
 
   if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_VERIFIED) {
     app->upload_pass_had_success = true;
+  } else if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_PERSIST_FAILED) {
+    logger_app_route_blocking_fault(app, LOGGER_FAULT_SD_WRITE_FAILED,
+                                    LOGGER_RECOVERY_EXIT_UNATTENDED,
+                                    "upload_queue_write_failed", now_ms);
+    return;
   } else if (result->code ==
              LOGGER_UPLOAD_PROCESS_RESULT_BLOCKED_MIN_FIRMWARE) {
     logger_app_maybe_latch_new_fault(app,
                                      LOGGER_FAULT_UPLOAD_BLOCKED_MIN_FIRMWARE);
+  } else if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_CONFIG_BLOCKED) {
+    logger_app_transition_idle_upload_complete(app, app->battery.vbus_present,
+                                               "upload_config_blocked", now_ms);
+    return;
   } else if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_NOT_ATTEMPTED) {
     logger_app_transition_idle_upload_complete(app, app->battery.vbus_present,
                                                "upload_not_attempted", now_ms);

@@ -230,7 +230,8 @@ manifest.json
 Mutable non-session state lives under:
 
 ```text
-/logger/state/upload_queue.json
+/logger/state/upload_queue.a
+/logger/state/upload_queue.b
 ```
 
 ### 4.4 Optional exports
@@ -658,7 +659,7 @@ To avoid self-reference and to keep closed-session artifacts immutable, the clos
 5. write final `manifest.json` containing the journal metadata and upload-bundle canonicalization metadata,
 6. flush and finalize `manifest.json`,
 7. compute canonical tar `bundle_sha256` and `bundle_size_bytes` from `manifest.json` + `journal.bin`,
-8. write those derived tar values into `upload_queue.json`.
+8. write those derived tar values into the upload queue store.
 
 Once `manifest.json` is written, it MUST NOT be rewritten in v1.
 
@@ -700,11 +701,58 @@ For v1 `live.json` MUST be rewritten and flushed:
 
 ---
 
-## 9) `upload_queue.json` (mutable queue state)
+## 9) Upload queue store (mutable queue state)
 
-`upload_queue.json` is the mutable index of closed sessions and their upload/prune state.
+The upload queue store is the mutable index of closed sessions and their upload/prune state.
 
-Updates to `upload_queue.json` MUST use replace-by-temp-file-and-rename semantics. In-place truncation/rewrite is not allowed.
+The store consists of two fixed-size generation slots:
+
+```text
+/logger/state/upload_queue.a
+/logger/state/upload_queue.b
+```
+
+The logical queue is the valid slot with the highest `generation`.
+
+Each slot is exactly `394240` bytes:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| `0` | `512` | header |
+| `512` | `393216` | payload area |
+| `393728` | `512` | trailer |
+
+The payload is the UTF-8 JSON queue body described below. `payload_len`
+selects the committed prefix of the payload area; bytes after `payload_len`
+are ignored.
+
+Header and trailer both contain:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| `0` | `16` | magic (`LQSLOT1HDR\r\nAB\0\0` or `LQSLOT1TRL\r\nAB\0\0`) |
+| `16` | `4` | slot format version (`1`, little-endian) |
+| `20` | `4` | section size (`512`) |
+| `24` | `4` | slot file size (`394240`) |
+| `28` | `4` | payload offset (`512`) |
+| `32` | `4` | payload capacity (`393216`) |
+| `36` | `4` | payload length |
+| `40` | `8` | generation (`uint64`, little-endian; zero is invalid) |
+| `48` | `32` | payload SHA-256 |
+
+`payload_sha256` is SHA-256 over:
+
+1. ASCII domain string `logger.upload_queue.slot.v1`, without a NUL byte,
+2. little-endian `uint64` generation,
+3. exactly `payload_len` payload bytes.
+
+A slot is valid only when the file size is exact, header and trailer metadata
+match, the digest matches, and the payload JSON parses and validates.
+
+Queue commits MUST write the inactive slot and MUST NOT mutate the newest valid
+slot. A commit writes an invalid header first, then the payload, then the
+trailer, then the valid header, then flushes and closes. Rename-based commit,
+`.tmp`, `.bak`, and `.rollback` queue files are not part of the v1 contract.
 
 Multiple queue entries MAY share the same `study_day_local`. `session_id` is the unique queue key.
 
@@ -749,11 +797,12 @@ Allowed `status` values:
 - `uploading`
 - `verified`
 - `blocked_min_firmware`
+- `nonretryable`
 - `failed`
 
 Entries eligible for the next upload pass are those with `status` equal to `pending` or `failed`.
 
-Entries with `status` equal to `blocked_min_firmware` or `verified` are not eligible for upload attempts.
+Entries with `status` equal to `blocked_min_firmware`, `nonretryable`, or `verified` are not eligible for upload attempts.
 
 Required queue state transition rules:
 
@@ -762,14 +811,29 @@ Required queue state transition rules:
 - `uploading -> failed` on any completed failed attempt,
 - `failed -> uploading` on retry,
 - `uploading -> blocked_min_firmware` on explicit server minimum-version rejection,
-- `blocked_min_firmware -> pending` only after firmware version changes or explicit service-side queue reset.
+- `uploading -> nonretryable` on completed hard session rejection such as `413 body_too_large`, `422 validation_failed`, duplicate/conflict rejection, acknowledgment hash mismatch, or local immutable artifact corruption,
+- `pending -> nonretryable` or `failed -> nonretryable` when pre-upload canonical bundle recomputation proves the immutable local artifact is missing or corrupt,
+- `blocked_min_firmware -> pending` only after explicit service-side queue reset or requeue,
+- `nonretryable -> pending` only after explicit service-side queue requeue.
+
+A later device firmware or build change MUST NOT by itself rewrite an existing
+`blocked_min_firmware` entry back to `pending`, because the immutable
+closed-session manifest remains the authoritative upload artifact for that
+session.
+
+Queue refresh/rebuild operations that rescan closed session directories MUST
+preserve the mutable state of any entry whose immutable identity still matches
+the local closed-session files. In particular, rescanning MUST NOT silently
+reset `status`, `attempt_count`, `last_attempt_utc`, `last_failure_class`,
+`verified_upload_utc`, or `receipt_id` back to fresh-scan defaults for an
+unchanged session.
 
 On boot recovery, any queue entry left in `uploading` state from a previous interrupted run MUST be normalized to:
 
 - `status: failed`
 - `last_failure_class: interrupted`
 
-`upload_queue.json` MUST be rewritten and flushed immediately after every queue state transition.
+The upload queue store MUST be rewritten and flushed immediately after every queue state transition.
 
 Recommended `last_failure_class` values include:
 
@@ -778,8 +842,14 @@ Recommended `last_failure_class` values include:
 - `tcp_failed`
 - `tls_failed`
 - `http_rejected`
+- `malformed_request`
+- `body_too_large`
 - `hash_mismatch`
 - `server_validation_failed`
+- `duplicate_rejected`
+- `auth_failed`
+- `server_error`
+- `queue_write_failed`
 - `min_firmware_rejected`
 - `interrupted`
 - `local_missing`
@@ -802,7 +872,7 @@ That directory contains exactly:
 - `manifest.json`
 - `journal.bin`
 
-Mutable state files such as `live.json` and `upload_queue.json` MUST NOT be included.
+Mutable state files such as `live.json` and the upload queue slot files MUST NOT be included.
 
 ### 10.2 Canonicalization rules
 
@@ -909,6 +979,15 @@ If the firmware receives a non-successful HTTP response without parseable JSON, 
 - HTTP responses with unreadable bodies map to `http_rejected` unless a more specific class is known,
 - HTTP `426` maps to `min_firmware_rejected`.
 
+For parsed error bodies, `error.retryable` controls automatic retry only after
+hard safety classifications are applied. `minimum_firmware`/HTTP `426` always
+maps to `blocked_min_firmware`. Hard per-session rejections such as
+`body_too_large`, `validation_failed`, duplicate/conflict rejection, and
+acknowledgment hash mismatch map to queue status `nonretryable`. Auth,
+malformed request, and endpoint-shape failures stop the current upload pass as
+configuration/client-blocked without marking every queued session
+`nonretryable`.
+
 ### 11.6 Acknowledgment body
 
 On success the server returns JSON with at least:
@@ -950,7 +1029,7 @@ On recovery after an unclean reset:
 - new recovery metadata is appended later,
 - existing durable journal bytes are never rewritten.
 
-Boot recovery MUST also reconcile closed session directories against `upload_queue.json`:
+Boot recovery MUST also reconcile closed session directories against the upload queue store:
 
 - if a closed session directory contains `manifest.json` and `journal.bin` but has no queue entry, a new `pending` queue entry MUST be created,
 - if a queue entry points to a missing session directory, that queue entry MUST be removed and a system-log event emitted,
@@ -964,7 +1043,7 @@ Pruning removes the entire closed session directory as one unit.
 
 Only already verified-uploaded sessions are eligible for pruning.
 
-When a session directory is pruned, the corresponding `upload_queue.json` entry MUST be removed in the same pruning transaction before the operation is considered complete.
+When a session directory is pruned, the corresponding upload queue entry MUST be removed in the same pruning transaction before the operation is considered complete.
 
 ### 12.3 Quarantined sessions
 

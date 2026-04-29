@@ -240,7 +240,7 @@ Responsibilities:
 - close current span if any,
 - close session if one exists,
 - write immutable manifest if a session exists,
-- update `upload_queue.json` if a closed session was produced,
+- update the upload queue store if a closed session was produced,
 - decide next mode.
 
 Transitions:
@@ -548,7 +548,7 @@ The exact file names are not normative, but a coding agent SHOULD decompose the 
 - `journal.[ch]` — `journal.bin` framing and chunk writing
 - `session.[ch]` — session/span lifecycle and manifest generation
 - `system_log.[ch]` — append-only internal-flash event log
-- `queue.[ch]` — `upload_queue.json`
+- `queue.[ch]` — upload queue store
 - `h10_link.[ch]` — scan/connect/security/disconnect policy
 - `h10_ecg.[ch]` — PMD ECG stream control and packet ingest
 - `upload.[ch]` — canonical tar streaming + HTTP(S) POST + ack handling, including built-in public-root validation and hostname verification for HTTPS uploads

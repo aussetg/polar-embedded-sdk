@@ -714,7 +714,7 @@ upload queue unblocked
 UPLOAD_BLOCKED_MIN_FW_LATCHED
   ↓ keep local logging allowed
 PASSIVE_MONITOR
-  ↓ firmware changes or fresh queue scan shows zero blocked entries
+  ↓ explicit queue requeue/reset or fresh queue scan shows zero blocked entries
 CLEAR
   ↓ stay in current mode
 RESUME
@@ -724,9 +724,10 @@ RESUME
 
 - This fault MUST NOT block local logging.
 - This fault does not require `RECOVERY_HOLD` by itself.
-- If firmware changes on boot and blocked entries are requeued successfully,
-  the runtime MUST reevaluate the blocked condition and auto-clear the fault if
-  no blocked entries remain.
+- Firmware or build changes on boot MUST NOT auto-requeue blocked entries by
+  themselves. Existing closed-session manifests remain authoritative, so the
+  artifact firmware version seen by the upload server does not change just
+  because newer firmware is now running locally.
 - Clear requires a fresh queue scan showing zero blocked-min-firmware entries.
 
 ### Resume target

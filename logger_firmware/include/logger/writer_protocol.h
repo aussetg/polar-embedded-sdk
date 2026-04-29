@@ -254,7 +254,7 @@ typedef struct {
   logger_writer_cmd_type_t type; /* LOGGER_WRITER_FINALIZE_SESSION */
   uint32_t boot_counter;
   uint32_t now_ms;
-  char now_utc[32]; /* RFC 3339 UTC for upload_queue.json updated_at_utc */
+  char now_utc[32]; /* RFC 3339 UTC for upload queue updated_at_utc */
 } logger_writer_finalize_session_t;
 
 /* ── REFRESH_LIVE ──────────────────────────────────────────────── */
@@ -272,7 +272,8 @@ typedef struct {
   logger_writer_cmd_type_t type; /* LOGGER_WRITER_FLUSH_BARRIER */
   uint32_t boot_counter;
   uint32_t now_ms;
-  bool force; /* true = seal now; false = seal only when writer-side age says so */
+  bool force; /* true = seal now; false = seal only when writer-side age says so
+               */
 } logger_writer_flush_barrier_t;
 
 /* ── Tagged union ──────────────────────────────────────────────── */

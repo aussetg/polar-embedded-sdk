@@ -372,6 +372,8 @@ Must include:
 - `blocked_count`
 - `oldest_pending_study_day`
 - `last_failure_class`
+- `blocked_reason`
+- `blocked_retry_hint`
 
 `oldest_pending_study_day` is `null` when no pending uploads exist.
 
@@ -380,6 +382,17 @@ Must include:
 `pending_count` counts queue entries whose upload work is not yet complete, i.e. entries whose status is `pending`, `failed`, or `uploading`.
 
 `blocked_count` counts entries whose status is `blocked_min_firmware`.
+
+`blocked_reason` and `blocked_retry_hint` are `null` when no blocked-min-firmware
+entries exist.
+
+When present, `blocked_reason` explains that blocked uploads are gated by the
+closed-session manifest `firmware_version`, not by the currently running
+firmware.
+
+When present, `blocked_retry_hint` explains that reflashing newer firmware alone
+does not unblock old sessions and that explicit queue requeue/reset is required
+before retry.
 
 #### `last_day_outcome`
 
@@ -459,7 +472,7 @@ This command exposes closed-session queue state.
 
 Required payload fields:
 
-- `schema_source` (`upload_queue.json`)
+- `schema_source` (`upload_queue_slots_v1`)
 - `updated_at_utc`
 - `sessions`
 
@@ -478,8 +491,11 @@ Each `sessions[]` entry MUST include:
 - `last_failure_class`
 - `verified_upload_utc`
 - `receipt_id`
+- `status_detail`
+- `retry_hint`
 
-`verified_upload_utc`, `receipt_id`, and `last_failure_class` are `null` when not yet applicable.
+`verified_upload_utc`, `receipt_id`, `last_failure_class`, `status_detail`, and
+`retry_hint` are `null` when not yet applicable.
 
 Allowed `status` values are:
 
@@ -487,7 +503,17 @@ Allowed `status` values are:
 - `uploading`
 - `verified`
 - `blocked_min_firmware`
+- `nonretryable`
 - `failed`
+
+For `blocked_min_firmware` entries, `status_detail` explains that the block is
+based on the immutable closed-session manifest `firmware_version` rather than
+the currently running firmware, and `retry_hint` explains that reflashing alone
+does not unblock the session.
+
+For `nonretryable` entries, `status_detail` explains the hard rejection or
+local artifact problem, and `retry_hint` explains that explicit service-side
+requeue is required before the firmware will retry the session.
 
 The `sessions` array MUST be returned in the same oldest-first order used for upload processing.
 

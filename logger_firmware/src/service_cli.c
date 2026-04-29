@@ -94,6 +94,11 @@ static const char *logger_upload_blocked_retry_hint(void) {
          "requeue-blocked only after server-side minimum changes";
 }
 
+static const char *logger_upload_nonretryable_retry_hint(void) {
+  return "automatic retry is disabled for this session; inspect diagnostics "
+         "and use debug queue requeue-nonretryable only after repair";
+}
+
 static const char *logger_upload_queue_summary_blocked_reason_hint(
     const logger_upload_queue_summary_t *summary) {
   if (summary == NULL || summary->blocked_count == 0u) {
@@ -121,18 +126,27 @@ static const char *logger_upload_queue_entry_status_detail(
   if (logger_string_present(entry->last_response_excerpt)) {
     return entry->last_response_excerpt;
   }
-  if (strcmp(entry->status, "blocked_min_firmware") != 0) {
-    return NULL;
+  if (strcmp(entry->status, "blocked_min_firmware") == 0) {
+    return logger_upload_blocked_reason_hint();
   }
-  return logger_upload_blocked_reason_hint();
+  if (strcmp(entry->status, "nonretryable") == 0) {
+    return "hard upload rejection or local artifact problem";
+  }
+  return NULL;
 }
 
 static const char *
 logger_upload_queue_entry_retry_hint(const logger_upload_queue_entry_t *entry) {
-  if (entry == NULL || strcmp(entry->status, "blocked_min_firmware") != 0) {
+  if (entry == NULL) {
     return NULL;
   }
-  return logger_upload_blocked_retry_hint();
+  if (strcmp(entry->status, "blocked_min_firmware") == 0) {
+    return logger_upload_blocked_retry_hint();
+  }
+  if (strcmp(entry->status, "nonretryable") == 0) {
+    return logger_upload_nonretryable_retry_hint();
+  }
+  return NULL;
 }
 
 static bool logger_cli_reason_token_valid(const char *reason) {
@@ -1511,7 +1525,7 @@ static void logger_handle_queue_json(logger_app_t *app) {
   jsw w;
   jsw_ok(&w, "queue", logger_clock_now_utc_or_null(&app->clock));
   logger_json_stream_writer_field_string_or_null(&w, "schema_source",
-                                                 "upload_queue.json");
+                                                 "upload_queue_slots_v1");
   logger_json_stream_writer_field_string_or_null(
       &w, "updated_at_utc",
       logger_string_present(queue->updated_at_utc) ? queue->updated_at_utc
@@ -3487,7 +3501,7 @@ static void logger_handle_debug_queue_rebuild(logger_service_cli_t *cli,
     jsw w;
     jsw_err(&w, "debug queue rebuild",
             logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
-            "failed to rebuild upload_queue.json from local sessions");
+            "failed to rebuild upload queue store from local sessions");
     return;
   }
 
@@ -3544,7 +3558,7 @@ static void logger_handle_debug_queue_requeue_blocked(logger_service_cli_t *cli,
     jsw w;
     jsw_err(&w, "debug queue requeue-blocked",
             logger_clock_now_utc_or_null(&app->clock), "storage_unavailable",
-            "failed to rewrite blocked upload_queue.json entries as pending");
+            "failed to rewrite blocked upload queue entries as pending");
     return;
   }
 
@@ -3665,7 +3679,7 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
     logger_upload_queue_tmp_release(queue);
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
-            "storage_unavailable", "failed to load upload_queue.json");
+            "storage_unavailable", "failed to load upload queue store");
     return;
   }
 
@@ -3680,7 +3694,7 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
     logger_upload_queue_tmp_release(queue);
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock), "not_found",
-            "session_id is not present in upload_queue.json");
+            "session_id is not present in upload queue");
     return;
   }
 
@@ -3752,7 +3766,7 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
             "queue_artifact_mismatch",
-            "local canonical bundle no longer matches upload_queue.json");
+            "local canonical bundle no longer matches upload queue entry");
     return;
   }
 
@@ -3775,7 +3789,7 @@ static void logger_handle_debug_queue_mark_verified(logger_service_cli_t *cli,
     logger_upload_queue_tmp_release(queue);
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
-            "storage_unavailable", "failed to write upload_queue.json");
+            "storage_unavailable", "failed to write upload queue store");
     return;
   }
 
@@ -3865,7 +3879,7 @@ static void logger_handle_debug_queue_mark_nonretryable(
     logger_upload_queue_tmp_release(queue);
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
-            "storage_unavailable", "failed to load upload_queue.json");
+            "storage_unavailable", "failed to load upload queue store");
     return;
   }
 
@@ -3880,7 +3894,7 @@ static void logger_handle_debug_queue_mark_nonretryable(
     logger_upload_queue_tmp_release(queue);
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock), "not_found",
-            "session_id is not present in upload_queue.json");
+            "session_id is not present in upload queue");
     return;
   }
   if (strcmp(entry->status, "verified") == 0) {
@@ -3910,7 +3924,7 @@ static void logger_handle_debug_queue_mark_nonretryable(
     logger_upload_queue_tmp_release(queue);
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
-            "storage_unavailable", "failed to write upload_queue.json");
+            "storage_unavailable", "failed to write upload queue store");
     return;
   }
 
@@ -3937,6 +3951,160 @@ static void logger_handle_debug_queue_mark_nonretryable(
   logger_json_stream_writer_field_string_or_null(&w, "session_id", session_id);
   logger_json_stream_writer_field_string_or_null(&w, "status", "nonretryable");
   logger_json_stream_writer_field_string_or_null(&w, "reason", reason);
+  logger_json_stream_writer_field_uint32(&w, "pending_count",
+                                         summary.pending_count);
+  jsw_end(&w);
+}
+
+static void logger_handle_debug_queue_requeue_nonretryable(
+    logger_service_cli_t *cli, logger_app_t *app, const char *args) {
+  const char *command = "debug queue requeue-nonretryable";
+  if (!logger_cli_require_service_unlocked(cli, app, command)) {
+    return;
+  }
+
+  char target[LOGGER_SESSION_ID_HEX_LEN + 1];
+  char reason[LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX + 1];
+  memset(target, 0, sizeof(target));
+  memset(reason, 0, sizeof(reason));
+
+  const char *space = args != NULL ? strchr(args, ' ') : NULL;
+  const size_t target_len = space != NULL ? (size_t)(space - args) : 0u;
+  if (space == NULL || target_len == 0u ||
+      target_len > LOGGER_SESSION_ID_HEX_LEN ||
+      strlen(space + 1u) > LOGGER_UPLOAD_QUEUE_RESPONSE_EXCERPT_MAX) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument",
+            "expected: debug queue requeue-nonretryable <session_id|all> "
+            "<reason_token>");
+    return;
+  }
+  memcpy(target, args, target_len);
+  target[target_len] = '\0';
+  logger_copy_string(reason, sizeof(reason), space + 1u);
+
+  if (!logger_cli_reason_token_valid(reason)) {
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "invalid_argument",
+            "reason_token must be lowercase snake_case and <=160 chars");
+    return;
+  }
+
+  const bool all = strcmp(target, "all") == 0;
+  if (!all) {
+    if (target_len != LOGGER_SESSION_ID_HEX_LEN) {
+      jsw w;
+      jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+              "invalid_argument",
+              "target must be 'all' or a 32-char session_id");
+      return;
+    }
+    uint8_t session_id_bytes[16];
+    if (!logger_hex_to_bytes_16(target, session_id_bytes)) {
+      jsw w;
+      jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+              "invalid_argument", "session_id must be 32 hexadecimal chars");
+      return;
+    }
+    for (size_t i = 0u; i < LOGGER_SESSION_ID_HEX_LEN; ++i) {
+      target[i] = (char)tolower((unsigned char)target[i]);
+    }
+  }
+
+  logger_upload_queue_t *queue = logger_upload_queue_tmp_acquire();
+  if (!logger_storage_svc_queue_load(queue)) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", "failed to load upload queue store");
+    return;
+  }
+
+  bool target_found = all;
+  bool target_wrong_status = false;
+  size_t requeued_count = 0u;
+  for (size_t i = 0u; i < queue->session_count; ++i) {
+    logger_upload_queue_entry_t *entry = &queue->sessions[i];
+    if (!all && strcmp(entry->session_id, target) != 0) {
+      continue;
+    }
+    target_found = true;
+    if (strcmp(entry->status, "nonretryable") != 0) {
+      target_wrong_status = !all;
+      if (!all) {
+        break;
+      }
+      continue;
+    }
+
+    logger_copy_string(entry->status, sizeof(entry->status), "pending");
+    entry->last_failure_class[0] = '\0';
+    entry->last_http_status = 0u;
+    entry->last_server_error_code[0] = '\0';
+    entry->last_server_error_message[0] = '\0';
+    entry->last_response_excerpt[0] = '\0';
+    entry->verified_upload_utc[0] = '\0';
+    entry->verified_bundle_sha256[0] = '\0';
+    entry->receipt_id[0] = '\0';
+    requeued_count += 1u;
+    if (!all) {
+      break;
+    }
+  }
+
+  if (!target_found) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock), "not_found",
+            "session_id is not present in upload queue");
+    return;
+  }
+  if (target_wrong_status) {
+    logger_upload_queue_tmp_release(queue);
+    jsw w;
+    jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+            "not_permitted_in_status", "selected session is not nonretryable");
+    return;
+  }
+
+  if (requeued_count > 0u) {
+    logger_copy_string(queue->updated_at_utc, sizeof(queue->updated_at_utc),
+                       logger_clock_now_utc_or_null(&app->clock));
+    if (!logger_storage_svc_queue_write(queue)) {
+      logger_upload_queue_tmp_release(queue);
+      jsw w;
+      jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock),
+              "storage_unavailable", "failed to write upload queue store");
+      return;
+    }
+  }
+
+  logger_upload_queue_summary_t summary;
+  logger_upload_queue_compute_summary(queue, &summary);
+  logger_upload_queue_tmp_release(queue);
+
+  logger_json_object_writer_t writer;
+  logger_json_object_writer_init(&writer, g_service_cli_details_json,
+                                 sizeof(g_service_cli_details_json));
+  if (logger_json_object_writer_string_field(&writer, "target", target) &&
+      logger_json_object_writer_string_field(&writer, "reason", reason) &&
+      logger_json_object_writer_uint32_field(&writer, "requeued_count",
+                                             (uint32_t)requeued_count) &&
+      logger_json_object_writer_finish(&writer)) {
+    (void)logger_system_log_append(
+        &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+        "queue_requeue_nonretryable", LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+        logger_json_object_writer_data(&writer));
+  }
+
+  jsw w;
+  jsw_ok(&w, command, logger_clock_now_utc_or_null(&app->clock));
+  logger_json_stream_writer_field_string_or_null(&w, "target", target);
+  logger_json_stream_writer_field_string_or_null(&w, "reason", reason);
+  logger_json_stream_writer_field_uint32(&w, "requeued_count",
+                                         (uint32_t)requeued_count);
   logger_json_stream_writer_field_uint32(&w, "pending_count",
                                          summary.pending_count);
   jsw_end(&w);
@@ -3993,7 +4161,7 @@ static void logger_handle_debug_bundle_open(logger_service_cli_t *cli,
     logger_upload_queue_tmp_release(queue);
     jsw w;
     jsw_err(&w, command, logger_clock_now_utc_or_null(&app->clock), "not_found",
-            "session_id is not present in upload_queue.json");
+            "session_id is not present in upload queue");
     return;
   }
 
@@ -4204,6 +4372,29 @@ static void logger_handle_debug_upload_once(logger_service_cli_t *cli,
     jsw w;
     jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
             "invalid_config", result->message);
+    return;
+  }
+  if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_PERSIST_FAILED) {
+    jsw w;
+    jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+            "storage_unavailable", result->message);
+    return;
+  }
+  if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_CONFIG_BLOCKED) {
+    jsw w;
+    jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+            logger_string_present(result->failure_class)
+                ? result->failure_class
+                : "upload_config_blocked",
+            result->message);
+    return;
+  }
+  if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_NONRETRYABLE) {
+    jsw w;
+    jsw_err(&w, "debug upload once", logger_clock_now_utc_or_null(&app->clock),
+            logger_string_present(result->failure_class) ? result->failure_class
+                                                         : "nonretryable",
+            result->message);
     return;
   }
   if (result->code == LOGGER_UPLOAD_PROCESS_RESULT_FAILED) {
@@ -4480,6 +4671,10 @@ static void logger_service_cli_execute(logger_service_cli_t *cli,
   }
   if (strncmp(line, "debug queue mark-verified ", 26) == 0) {
     logger_handle_debug_queue_mark_verified(cli, app, line + 26);
+    return;
+  }
+  if (strncmp(line, "debug queue requeue-nonretryable ", 33) == 0) {
+    logger_handle_debug_queue_requeue_nonretryable(cli, app, line + 33);
     return;
   }
   if (strncmp(line, "debug queue mark-nonretryable ", 30) == 0) {
