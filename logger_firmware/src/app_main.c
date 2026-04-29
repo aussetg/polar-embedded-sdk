@@ -789,6 +789,14 @@ logger_app_prepare_upload_pass(logger_app_t *app,
     logger_upload_queue_tmp_release(queue);
     return false;
   }
+
+  const size_t interrupted_count = logger_upload_queue_recover_interrupted(
+      queue, &app->system_log, logger_clock_now_utc_or_null(&app->clock));
+  if (interrupted_count > 0u && !logger_storage_svc_queue_write(queue)) {
+    logger_upload_queue_tmp_release(queue);
+    return false;
+  }
+
   logger_upload_queue_compute_summary(queue, summary_out);
   if (summary_out->blocked_count == 0u &&
       app->persisted.current_fault_code ==

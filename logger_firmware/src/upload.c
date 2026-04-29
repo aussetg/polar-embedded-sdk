@@ -1406,6 +1406,74 @@ logger_upload_persist_queue_state(logger_upload_queue_t *queue,
   return false;
 }
 
+static void
+logger_upload_clear_entry_verification(logger_upload_queue_entry_t *entry) {
+  if (entry == NULL) {
+    return;
+  }
+  entry->verified_upload_utc[0] = '\0';
+  entry->verified_bundle_sha256[0] = '\0';
+  entry->receipt_id[0] = '\0';
+}
+
+static bool logger_upload_apply_local_attempt_failure(
+    logger_system_log_t *system_log, logger_upload_queue_t *queue,
+    logger_upload_queue_entry_t *entry, const char *now_utc_or_null,
+    const char *status, const char *failure_class, const char *local_detail,
+    logger_upload_process_result_code_t result_code, const char *result_message,
+    const char *persist_failure_message, const char *event_kind,
+    logger_upload_process_result_t *result) {
+  logger_upload_queue_set_updated_at(queue, now_utc_or_null);
+  logger_copy_string(entry->status, sizeof(entry->status), status);
+  logger_copy_string(entry->last_failure_class,
+                     sizeof(entry->last_failure_class), failure_class);
+  logger_upload_set_entry_local_diagnostics(entry, local_detail);
+  logger_copy_string(entry->last_attempt_utc, sizeof(entry->last_attempt_utc),
+                     now_utc_or_null);
+  entry->attempt_count += 1u;
+  logger_upload_clear_entry_verification(entry);
+
+  result->attempted = true;
+  result->code = result_code;
+  logger_copy_string(result->final_status, sizeof(result->final_status),
+                     entry->status);
+  logger_copy_string(result->failure_class, sizeof(result->failure_class),
+                     entry->last_failure_class);
+  logger_upload_copy_entry_diagnostics_to_result(entry, result);
+  logger_copy_string(result->message, sizeof(result->message),
+                     logger_string_present(result_message) ? result_message
+                                                           : local_detail);
+
+  if (!logger_upload_persist_queue_state(queue, result,
+                                         persist_failure_message)) {
+    return false;
+  }
+
+  logger_upload_append_failure_event(
+      system_log, now_utc_or_null, event_kind, LOGGER_SYSTEM_LOG_SEVERITY_WARN,
+      entry->session_id, entry->last_failure_class);
+  return false;
+}
+
+static bool logger_upload_mark_inflight_attempt(
+    logger_upload_queue_t *queue, logger_upload_queue_entry_t *entry,
+    const char *now_utc_or_null, logger_upload_process_result_t *result) {
+  logger_upload_queue_set_updated_at(queue, now_utc_or_null);
+  logger_copy_string(entry->status, sizeof(entry->status), "uploading");
+  entry->attempt_count += 1u;
+  logger_copy_string(entry->last_attempt_utc, sizeof(entry->last_attempt_utc),
+                     now_utc_or_null);
+  entry->last_failure_class[0] = '\0';
+  logger_upload_clear_entry_diagnostics(entry);
+  logger_upload_clear_entry_verification(entry);
+  if (!logger_upload_persist_queue_state(
+          queue, result, "failed to persist uploading queue state")) {
+    return false;
+  }
+  result->attempted = true;
+  return true;
+}
+
 static bool logger_upload_apply_rejected_attempt(
     logger_system_log_t *system_log, logger_upload_queue_t *queue,
     logger_upload_queue_entry_t *entry,
@@ -1419,9 +1487,7 @@ static bool logger_upload_apply_rejected_attempt(
   logger_copy_string(entry->last_failure_class,
                      sizeof(entry->last_failure_class), decision.failure_class);
   logger_upload_set_entry_http_diagnostics(entry, response, reply);
-  entry->verified_upload_utc[0] = '\0';
-  entry->verified_bundle_sha256[0] = '\0';
-  entry->receipt_id[0] = '\0';
+  logger_upload_clear_entry_verification(entry);
 
   result->attempted = true;
   result->code = logger_upload_result_code_for_rejection(decision.action);
@@ -1799,6 +1865,15 @@ static bool logger_upload_process_selected(
     return false;
   }
 
+  if (logger_upload_queue_recover_interrupted(queue, system_log,
+                                              now_utc_or_null) > 0u &&
+      !logger_upload_persist_queue_state(
+          queue, result, "interrupted upload recovery queue write failed")) {
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
+    return false;
+  }
+
   logger_upload_queue_entry_t *entry =
       logger_upload_queue_find_eligible_session(queue,
                                                 target_session_id_or_null);
@@ -1819,82 +1894,29 @@ static bool logger_upload_process_selected(
 
   if (!logger_upload_recompute_entry_bundle(
           process_workspace, entry, result->message, sizeof(result->message))) {
-    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
-    logger_copy_string(entry->status, sizeof(entry->status), "nonretryable");
-    logger_copy_string(entry->last_failure_class,
-                       sizeof(entry->last_failure_class), "local_corrupt");
-    logger_upload_set_entry_local_diagnostics(entry, result->message);
-    logger_copy_string(entry->last_attempt_utc, sizeof(entry->last_attempt_utc),
-                       now_utc_or_null);
-    entry->attempt_count += 1u;
-    result->attempted = true;
-    result->code = LOGGER_UPLOAD_PROCESS_RESULT_NONRETRYABLE;
-    logger_copy_string(result->final_status, sizeof(result->final_status),
-                       entry->status);
-    logger_copy_string(result->failure_class, sizeof(result->failure_class),
-                       entry->last_failure_class);
-    logger_upload_copy_entry_diagnostics_to_result(entry, result);
-    if (!logger_upload_persist_queue_state(
-            queue, result,
-            "local bundle check failed and queue write failed")) {
-      logger_upload_process_workspace_release(process_workspace);
-      logger_upload_queue_tmp_release(queue);
-      return false;
-    }
+    const bool accepted = logger_upload_apply_local_attempt_failure(
+        system_log, queue, entry, now_utc_or_null, "nonretryable",
+        "local_corrupt", result->message,
+        LOGGER_UPLOAD_PROCESS_RESULT_NONRETRYABLE, result->message,
+        "local bundle check failed and queue write failed",
+        "upload_nonretryable", result);
     logger_upload_process_workspace_release(process_workspace);
     logger_upload_queue_tmp_release(queue);
-    logger_upload_append_failure_event(
-        system_log, now_utc_or_null, "upload_nonretryable",
-        LOGGER_SYSTEM_LOG_SEVERITY_WARN, entry->session_id, "local_corrupt");
-    return false;
-  }
-
-  logger_upload_queue_set_updated_at(queue, now_utc_or_null);
-  logger_copy_string(entry->status, sizeof(entry->status), "uploading");
-  entry->attempt_count += 1u;
-  logger_copy_string(entry->last_attempt_utc, sizeof(entry->last_attempt_utc),
-                     now_utc_or_null);
-  entry->last_failure_class[0] = '\0';
-  logger_upload_clear_entry_diagnostics(entry);
-  entry->verified_upload_utc[0] = '\0';
-  entry->verified_bundle_sha256[0] = '\0';
-  entry->receipt_id[0] = '\0';
-  if (!logger_upload_persist_queue_state(
-          queue, result, "failed to persist uploading queue state")) {
-    logger_upload_process_workspace_release(process_workspace);
-    logger_upload_queue_tmp_release(queue);
-    return false;
+    return accepted;
   }
 
   process_workspace->ip_buf[0] = '\0';
   int wifi_rc = 0;
   if (!logger_net_wifi_join(config, &wifi_rc, process_workspace->ip_buf)) {
-    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
-    logger_copy_string(entry->status, sizeof(entry->status), "failed");
-    logger_copy_string(entry->last_failure_class,
-                       sizeof(entry->last_failure_class), "wifi_join_failed");
     snprintf(result->message, sizeof(result->message),
              "Wi-Fi join failed rc=%d", wifi_rc);
-    logger_upload_set_entry_local_diagnostics(entry, result->message);
-    result->attempted = true;
-    result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
-    logger_copy_string(result->final_status, sizeof(result->final_status),
-                       entry->status);
-    logger_copy_string(result->failure_class, sizeof(result->failure_class),
-                       entry->last_failure_class);
-    logger_upload_copy_entry_diagnostics_to_result(entry, result);
-    if (!logger_upload_persist_queue_state(
-            queue, result, "Wi-Fi join failed and queue write failed")) {
-      logger_upload_process_workspace_release(process_workspace);
-      logger_upload_queue_tmp_release(queue);
-      return false;
-    }
+    const bool accepted = logger_upload_apply_local_attempt_failure(
+        system_log, queue, entry, now_utc_or_null, "failed", "wifi_join_failed",
+        result->message, LOGGER_UPLOAD_PROCESS_RESULT_FAILED, result->message,
+        "Wi-Fi join failed and queue write failed", "upload_failed", result);
     logger_upload_process_workspace_release(process_workspace);
     logger_upload_queue_tmp_release(queue);
-    logger_upload_append_failure_event(
-        system_log, now_utc_or_null, "upload_failed",
-        LOGGER_SYSTEM_LOG_SEVERITY_WARN, entry->session_id, "wifi_join_failed");
-    return false;
+    return accepted;
   }
 
   process_workspace->auth_header[0] = '\0';
@@ -1910,35 +1932,16 @@ static bool logger_upload_process_selected(
           &process_workspace->url, process_workspace->host_header,
           sizeof(process_workspace->host_header))) {
     logger_net_wifi_leave();
-    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
-    logger_copy_string(entry->status, sizeof(entry->status), "failed");
-    logger_copy_string(entry->last_failure_class,
-                       sizeof(entry->last_failure_class), "malformed_request");
-    logger_upload_set_entry_local_diagnostics(entry,
-                                              "Host header buffer overflow");
-    result->attempted = true;
-    result->code = LOGGER_UPLOAD_PROCESS_RESULT_CONFIG_BLOCKED;
-    logger_copy_string(result->final_status, sizeof(result->final_status),
-                       entry->status);
-    logger_copy_string(result->failure_class, sizeof(result->failure_class),
-                       entry->last_failure_class);
-    logger_upload_copy_entry_diagnostics_to_result(entry, result);
-    logger_copy_string(result->message, sizeof(result->message),
-                       "Host header buffer overflow");
-    if (!logger_upload_persist_queue_state(
-            queue, result,
-            "request construction failed and queue write failed")) {
-      logger_upload_process_workspace_release(process_workspace);
-      logger_upload_queue_tmp_release(queue);
-      return false;
-    }
+    const bool accepted = logger_upload_apply_local_attempt_failure(
+        system_log, queue, entry, now_utc_or_null, "failed",
+        "malformed_request", "Host header buffer overflow",
+        LOGGER_UPLOAD_PROCESS_RESULT_CONFIG_BLOCKED,
+        "Host header buffer overflow",
+        "request construction failed and queue write failed",
+        "upload_config_blocked", result);
     logger_upload_process_workspace_release(process_workspace);
     logger_upload_queue_tmp_release(queue);
-    logger_upload_append_failure_event(system_log, now_utc_or_null,
-                                       "upload_config_blocked",
-                                       LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-                                       entry->session_id, "malformed_request");
-    return false;
+    return accepted;
   }
 
   const int request_n = snprintf(
@@ -1967,68 +1970,40 @@ static bool logger_upload_process_selected(
   if (request_n <= 0 ||
       (size_t)request_n >= sizeof(process_workspace->request_text)) {
     logger_net_wifi_leave();
-    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
-    logger_copy_string(entry->status, sizeof(entry->status), "failed");
-    logger_copy_string(entry->last_failure_class,
-                       sizeof(entry->last_failure_class), "malformed_request");
-    logger_upload_set_entry_local_diagnostics(entry,
-                                              "HTTP request buffer overflow");
-    result->attempted = true;
-    result->code = LOGGER_UPLOAD_PROCESS_RESULT_CONFIG_BLOCKED;
-    logger_copy_string(result->final_status, sizeof(result->final_status),
-                       entry->status);
-    logger_copy_string(result->failure_class, sizeof(result->failure_class),
-                       entry->last_failure_class);
-    logger_upload_copy_entry_diagnostics_to_result(entry, result);
-    logger_copy_string(result->message, sizeof(result->message),
-                       "HTTP request buffer overflow");
-    if (!logger_upload_persist_queue_state(
-            queue, result,
-            "request construction failed and queue write failed")) {
-      logger_upload_process_workspace_release(process_workspace);
-      logger_upload_queue_tmp_release(queue);
-      return false;
-    }
+    const bool accepted = logger_upload_apply_local_attempt_failure(
+        system_log, queue, entry, now_utc_or_null, "failed",
+        "malformed_request", "HTTP request buffer overflow",
+        LOGGER_UPLOAD_PROCESS_RESULT_CONFIG_BLOCKED,
+        "HTTP request buffer overflow",
+        "request construction failed and queue write failed",
+        "upload_config_blocked", result);
     logger_upload_process_workspace_release(process_workspace);
     logger_upload_queue_tmp_release(queue);
-    logger_upload_append_failure_event(system_log, now_utc_or_null,
-                                       "upload_config_blocked",
-                                       LOGGER_SYSTEM_LOG_SEVERITY_WARN,
-                                       entry->session_id, "malformed_request");
-    return false;
+    return accepted;
   }
 
   if (!logger_storage_svc_bundle_open(entry->dir_name,
                                       process_workspace->manifest_path,
                                       process_workspace->journal_path)) {
     logger_net_wifi_leave();
-    logger_copy_string(entry->status, sizeof(entry->status), "nonretryable");
-    logger_copy_string(entry->last_failure_class,
-                       sizeof(entry->last_failure_class), "local_corrupt");
-    logger_upload_set_entry_local_diagnostics(
-        entry, "failed to open canonical bundle stream");
-    logger_upload_queue_set_updated_at(queue, now_utc_or_null);
-    result->attempted = true;
-    result->code = LOGGER_UPLOAD_PROCESS_RESULT_NONRETRYABLE;
-    logger_copy_string(result->final_status, sizeof(result->final_status),
-                       entry->status);
-    logger_copy_string(result->failure_class, sizeof(result->failure_class),
-                       entry->last_failure_class);
-    logger_upload_copy_entry_diagnostics_to_result(entry, result);
-    logger_copy_string(result->message, sizeof(result->message),
-                       "failed to open canonical bundle stream");
-    if (!logger_upload_persist_queue_state(
-            queue, result,
-            "bundle stream open failed and queue write failed")) {
-      logger_upload_process_workspace_release(process_workspace);
-      logger_upload_queue_tmp_release(queue);
-      return false;
-    }
+    const bool accepted = logger_upload_apply_local_attempt_failure(
+        system_log, queue, entry, now_utc_or_null, "nonretryable",
+        "local_corrupt", "failed to open canonical bundle stream",
+        LOGGER_UPLOAD_PROCESS_RESULT_NONRETRYABLE,
+        "failed to open canonical bundle stream",
+        "bundle stream open failed and queue write failed",
+        "upload_nonretryable", result);
     logger_upload_process_workspace_release(process_workspace);
     logger_upload_queue_tmp_release(queue);
-    logger_upload_append_failure_event(
-        system_log, now_utc_or_null, "upload_nonretryable",
-        LOGGER_SYSTEM_LOG_SEVERITY_WARN, entry->session_id, "local_corrupt");
+    return accepted;
+  }
+
+  if (!logger_upload_mark_inflight_attempt(queue, entry, now_utc_or_null,
+                                           result)) {
+    logger_storage_svc_bundle_close();
+    logger_net_wifi_leave();
+    logger_upload_process_workspace_release(process_workspace);
+    logger_upload_queue_tmp_release(queue);
     return false;
   }
 
@@ -2051,6 +2026,7 @@ static bool logger_upload_process_selected(
                        sizeof(entry->last_failure_class),
                        transport_failure_class);
     logger_upload_set_entry_local_diagnostics(entry, transport_failure_class);
+    logger_upload_clear_entry_verification(entry);
     result->attempted = true;
     result->code = LOGGER_UPLOAD_PROCESS_RESULT_FAILED;
     logger_copy_string(result->final_status, sizeof(result->final_status),

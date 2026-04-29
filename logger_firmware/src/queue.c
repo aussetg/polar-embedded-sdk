@@ -685,6 +685,26 @@ logger_log_upload_interrupted(logger_system_log_t *system_log,
       LOGGER_SYSTEM_LOG_SEVERITY_WARN, logger_json_object_writer_data(&writer));
 }
 
+static void
+logger_queue_entry_mark_interrupted(logger_upload_queue_entry_t *entry,
+                                    logger_system_log_t *system_log,
+                                    const char *updated_at_utc_or_null) {
+  if (entry == NULL) {
+    return;
+  }
+  logger_copy_string(entry->status, sizeof(entry->status), "failed");
+  logger_copy_string(entry->last_failure_class,
+                     sizeof(entry->last_failure_class), "interrupted");
+  entry->last_http_status = 0u;
+  entry->last_server_error_code[0] = '\0';
+  entry->last_server_error_message[0] = '\0';
+  entry->last_response_excerpt[0] = '\0';
+  entry->verified_upload_utc[0] = '\0';
+  entry->verified_bundle_sha256[0] = '\0';
+  entry->receipt_id[0] = '\0';
+  logger_log_upload_interrupted(system_log, updated_at_utc_or_null, entry);
+}
+
 static bool logger_queue_status_valid(const char *status) {
   return strcmp(status, "pending") == 0 || strcmp(status, "uploading") == 0 ||
          strcmp(status, "verified") == 0 ||
@@ -1043,13 +1063,8 @@ static void __attribute__((noinline)) logger_upload_queue_merge_scanned_entries(
                                                  &previous->sessions[j])) {
             logger_queue_copy_mutable_fields(entry, &previous->sessions[j]);
             if (strcmp(entry->status, "uploading") == 0) {
-              logger_copy_string(entry->status, sizeof(entry->status),
-                                 "failed");
-              logger_copy_string(entry->last_failure_class,
-                                 sizeof(entry->last_failure_class),
-                                 "interrupted");
-              logger_log_upload_interrupted(system_log, updated_at_utc_or_null,
-                                            entry);
+              logger_queue_entry_mark_interrupted(entry, system_log,
+                                                  updated_at_utc_or_null);
             }
           } else {
             logger_log_local_corrupt(system_log, updated_at_utc_or_null,
@@ -1288,6 +1303,31 @@ void logger_upload_queue_compute_summary(
       }
     }
   }
+}
+
+size_t
+logger_upload_queue_recover_interrupted(logger_upload_queue_t *queue,
+                                        logger_system_log_t *system_log,
+                                        const char *updated_at_utc_or_null) {
+  if (queue == NULL) {
+    return 0u;
+  }
+
+  size_t recovered_count = 0u;
+  for (size_t i = 0u; i < queue->session_count; ++i) {
+    logger_upload_queue_entry_t *entry = &queue->sessions[i];
+    if (strcmp(entry->status, "uploading") != 0) {
+      continue;
+    }
+    logger_queue_entry_mark_interrupted(entry, system_log,
+                                        updated_at_utc_or_null);
+    recovered_count += 1u;
+  }
+  if (recovered_count > 0u) {
+    logger_copy_string(queue->updated_at_utc, sizeof(queue->updated_at_utc),
+                       updated_at_utc_or_null);
+  }
+  return recovered_count;
 }
 
 static bool logger_upload_queue_parse_json(logger_upload_queue_t *queue,
