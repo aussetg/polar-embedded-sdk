@@ -139,7 +139,8 @@ static void logger_app_refresh_observations(logger_app_t *app,
     app->clock.valid = false;
     app->clock.now_utc[0] = '\0';
   }
-  if (!logger_runtime_state_is_logging(app->runtime.current_state)) {
+  if (!logger_runtime_state_is_logging(app->runtime.current_state) ||
+      !app->session.active) {
     (void)logger_storage_svc_refresh(&app->storage);
   }
   switch (app->debug_storage_fault) {
