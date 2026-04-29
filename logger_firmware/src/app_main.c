@@ -2522,6 +2522,13 @@ static void logger_step_recovery_hold(logger_app_t *app, uint32_t now_ms) {
     return;
   }
 
+  if (app->recovery_reason == LOGGER_RECOVERY_PSRAM_INIT_FAILED) {
+    /* Irrevocable hardware fault.  No recovery probe is possible, so do not
+     * advance attempt_count: it counts real probes, not status ticks. */
+    logger_app_recovery_set_status(app, "psram", "irrevocable");
+    return;
+  }
+
   if (app->recovery_next_attempt_mono_ms != 0u &&
       !logger_app_deadline_reached(now_ms,
                                    app->recovery_next_attempt_mono_ms)) {
@@ -2609,12 +2616,9 @@ static void logger_step_recovery_hold(logger_app_t *app, uint32_t now_ms) {
     return;
   }
 
-  case LOGGER_RECOVERY_PSRAM_INIT_FAILED:
-    /* Irrevocable hardware fault.  No recovery probe possible. */
-    logger_app_recovery_set_status(app, "psram", "irrevocable");
-    return;
-
   case LOGGER_RECOVERY_NONE:
+  case LOGGER_RECOVERY_CONFIG_INCOMPLETE:
+  case LOGGER_RECOVERY_PSRAM_INIT_FAILED:
   default:
     logger_app_apply_unattended_target(app, "recovery_unknown_reason", now_ms);
     return;
