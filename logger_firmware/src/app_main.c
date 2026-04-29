@@ -283,6 +283,30 @@ void logger_app_clear_current_fault(logger_app_t *app, const char *source) {
       logger_json_object_writer_data(&writer));
 }
 
+static void logger_app_log_storage_service_timeout_reset(
+    logger_app_t *app, const logger_reset_marker_t *marker) {
+  logger_app_maybe_latch_new_fault(app, LOGGER_FAULT_SD_WRITE_FAILED);
+
+  char details[LOGGER_SYSTEM_LOG_DETAILS_JSON_MAX + 1];
+  logger_json_object_writer_t writer;
+  logger_json_object_writer_init(&writer, details, sizeof(details));
+  if (!logger_json_object_writer_string_field(
+          &writer, "reason", logger_reset_marker_reason_name(marker->reason)) ||
+      !logger_json_object_writer_uint32_field(&writer, "service_kind",
+                                              marker->arg0) ||
+      !logger_json_object_writer_uint32_field(&writer, "request_seq",
+                                              marker->arg1) ||
+      !logger_json_object_writer_bool_field(&writer, "watchdog_reset",
+                                            app->boot_watchdog_reset) ||
+      !logger_json_object_writer_finish(&writer)) {
+    return;
+  }
+  (void)logger_system_log_append(
+      &app->system_log, logger_clock_now_utc_or_null(&app->clock),
+      "storage_service_timeout_reset", LOGGER_SYSTEM_LOG_SEVERITY_ERROR,
+      logger_json_object_writer_data(&writer));
+}
+
 static bool logger_app_should_enter_overnight_idle(const logger_app_t *app) {
   if (!app->battery.vbus_present) {
     return false;
@@ -1853,23 +1877,46 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
    */
   app->boot_recovery_done = false;
 
-  logger_app_refresh_observations(app, now_ms);
-
   /*
-   * Capture the watchdog reboot flag BEFORE any watchdog API call
-   * that might touch the scratch registers.  watchdog_enable() is
-   * called later in main.c; we read the flag here, early in init.
+   * Capture reset breadcrumbs BEFORE watchdog_enable() in main.c can touch
+   * the SDK watchdog scratch marker.
    *
    * watchdog_enable_caused_reboot() is true only when the watchdog
-   * timer expired after being armed by watchdog_enable().  It returns
-   * false after a deliberate watchdog_reboot() call (factory reset),
-   * a power cycle, or a RUN-pin reset.
+   * timer expired after being armed by watchdog_enable().  RP2350 also
+   * exposes watchdog_caused_reboot(), which includes watchdog_reboot()
+   * force resets.  Our project-owned detail marker lives in POWMAN scratch
+   * because watchdog scratch registers are reset by chip-level watchdog
+   * resets and are also used by the bootrom/SDK.
    */
+  const bool watchdog_reset = watchdog_caused_reboot();
   const bool wdt_timeout_reboot = watchdog_enable_caused_reboot();
+  logger_reset_marker_t reset_marker;
+  const bool have_reset_marker = logger_reset_marker_consume(&reset_marker);
+  app->boot_watchdog_reset = watchdog_reset;
+  app->boot_watchdog_timeout_reboot = wdt_timeout_reboot;
+  app->boot_watchdog_forced_reboot = watchdog_reset && !wdt_timeout_reboot;
+  if (watchdog_reset && have_reset_marker) {
+    app->boot_reset_marker_reason = reset_marker.reason;
+    if (reset_marker.reason == LOGGER_RESET_MARKER_STORAGE_SERVICE_TIMEOUT) {
+      app->boot_storage_service_timeout_reset = true;
+      app->boot_storage_service_timeout_kind = reset_marker.arg0;
+      app->boot_storage_service_timeout_request_seq = reset_marker.arg1;
+    }
+  }
+
+  logger_app_refresh_observations(app, now_ms);
 
   logger_print_boot_banner(app);
   if (wdt_timeout_reboot) {
     printf("[logger] *** watchdog timeout caused last reboot ***\n");
+  } else if (app->boot_watchdog_forced_reboot) {
+    printf("[logger] *** watchdog force reset caused last reboot ***\n");
+  }
+  if (app->boot_storage_service_timeout_reset) {
+    printf("[logger] *** storage service timeout before reboot: kind=%lu "
+           "request_seq=%lu ***\n",
+           (unsigned long)app->boot_storage_service_timeout_kind,
+           (unsigned long)app->boot_storage_service_timeout_request_seq);
   }
   app->boot_banner_printed = true;
 
@@ -1887,14 +1934,30 @@ void logger_app_init(logger_app_t *app, uint32_t now_ms,
       logger_json_object_writer_bool_field(
           &boot_writer, "firmware_changed",
           app->boot_firmware_identity_changed) &&
+      logger_json_object_writer_bool_field(&boot_writer, "watchdog_reset",
+                                           app->boot_watchdog_reset) &&
       logger_json_object_writer_bool_field(&boot_writer, "watchdog_reboot",
                                            wdt_timeout_reboot) &&
+      logger_json_object_writer_bool_field(
+          &boot_writer, "watchdog_timeout_reboot", wdt_timeout_reboot) &&
+      logger_json_object_writer_bool_field(&boot_writer,
+                                           "watchdog_forced_reboot",
+                                           app->boot_watchdog_forced_reboot) &&
+      logger_json_object_writer_string_or_null_field(
+          &boot_writer, "reset_marker",
+          logger_reset_marker_reason_name(app->boot_reset_marker_reason)) &&
+      logger_json_object_writer_bool_field(
+          &boot_writer, "storage_service_timeout",
+          app->boot_storage_service_timeout_reset) &&
       logger_json_object_writer_finish(&boot_writer)) {
     (void)logger_system_log_append(
         &app->system_log, logger_clock_now_utc_or_null(&app->clock), "boot",
-        wdt_timeout_reboot ? LOGGER_SYSTEM_LOG_SEVERITY_WARN
-                           : LOGGER_SYSTEM_LOG_SEVERITY_INFO,
+        app->boot_watchdog_reset ? LOGGER_SYSTEM_LOG_SEVERITY_WARN
+                                 : LOGGER_SYSTEM_LOG_SEVERITY_INFO,
         logger_json_object_writer_data(&boot_writer));
+  }
+  if (app->boot_storage_service_timeout_reset) {
+    logger_app_log_storage_service_timeout_reset(app, &reset_marker);
   }
   if (app->clock.lost_power) {
     (void)logger_system_log_append(

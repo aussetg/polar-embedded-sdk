@@ -1217,6 +1217,34 @@ static void logger_write_status_payload(jsw *w, const logger_app_t *app) {
       w, "subject_id", app->persisted.config.subject_id);
   logger_json_stream_writer_object_end(w);
 
+  logger_json_stream_writer_field_object_begin(w, "boot");
+  logger_json_stream_writer_field_uint32(w, "boot_counter",
+                                         app->persisted.boot_counter);
+  logger_json_stream_writer_field_bool(w, "firmware_changed",
+                                       app->boot_firmware_identity_changed);
+  logger_json_stream_writer_field_bool(w, "watchdog_reset",
+                                       app->boot_watchdog_reset);
+  logger_json_stream_writer_field_bool(w, "watchdog_timeout_reboot",
+                                       app->boot_watchdog_timeout_reboot);
+  logger_json_stream_writer_field_bool(w, "watchdog_forced_reboot",
+                                       app->boot_watchdog_forced_reboot);
+  logger_json_stream_writer_field_string_or_null(
+      w, "reset_marker",
+      logger_reset_marker_reason_name(app->boot_reset_marker_reason));
+  logger_json_stream_writer_field_bool(w, "storage_service_timeout",
+                                       app->boot_storage_service_timeout_reset);
+  if (app->boot_storage_service_timeout_reset) {
+    logger_json_stream_writer_field_uint32(
+        w, "storage_service_kind", app->boot_storage_service_timeout_kind);
+    logger_json_stream_writer_field_uint32(
+        w, "storage_service_request_seq",
+        app->boot_storage_service_timeout_request_seq);
+  } else {
+    logger_json_stream_writer_field_null(w, "storage_service_kind");
+    logger_json_stream_writer_field_null(w, "storage_service_request_seq");
+  }
+  logger_json_stream_writer_object_end(w);
+
   logger_json_stream_writer_field_object_begin(w, "provisioning");
   logger_json_stream_writer_field_bool(
       w, "normal_logging_ready",

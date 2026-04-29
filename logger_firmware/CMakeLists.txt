@@ -127,6 +127,7 @@ set(LOGGER_PROJECT_SOURCES
     src/journal.c
     src/journal_writer.c
     src/queue.c
+    src/reset_marker.c
     src/session.c
     src/session_manifest.c
     src/service_cli.c

@@ -16,6 +16,7 @@
 #include "logger/h10.h"
 #include "logger/identity.h"
 #include "logger/queue.h"
+#include "logger/reset_marker.h"
 #include "logger/service_cli.h"
 #include "logger/session.h"
 #include "logger/storage.h"
@@ -168,12 +169,19 @@ typedef struct logger_app {
   bool indicator_led_on;
   bool boot_banner_printed;
   bool boot_firmware_identity_changed;
+  bool boot_watchdog_reset;
+  bool boot_watchdog_timeout_reboot;
+  bool boot_watchdog_forced_reboot;
+  bool boot_storage_service_timeout_reset;
   bool deferred_boot_queue_refresh_pending;
   bool deferred_boot_queue_refresh_skip_logged;
   bool boot_recovery_done;
   bool reboot_pending;
   logger_runtime_state_t deferred_boot_queue_refresh_skip_state;
   logger_recovery_exit_policy_t recovery_exit_policy;
+  logger_reset_marker_reason_t boot_reset_marker_reason;
+  uint32_t boot_storage_service_timeout_kind;
+  uint32_t boot_storage_service_timeout_request_seq;
 } logger_app_t;
 
 void logger_app_clear_current_fault(logger_app_t *app, const char *source);

@@ -9,6 +9,7 @@
 
 #include "logger/capture_pipe.h"
 #include "logger/queue.h"
+#include "logger/reset_marker.h"
 #include "logger/storage.h"
 #include "logger/storage_worker.h"
 #include "logger/upload_bundle.h"
@@ -176,7 +177,11 @@ static bool logger_storage_svc_wait(storage_service_kind_t kind,
       printf("[storage_svc] timeout waiting for kind=%d\n", (int)kind);
       timed_out = true;
       /* Treat this as a fatal worker liveness failure and reboot instead of
-       * feeding the watchdog forever. */
+       * feeding the watchdog forever.  Store a one-shot POWMAN marker first:
+       * watchdog_reboot() intentionally clears the SDK watchdog scratch magic,
+       * and RP2350 watchdog chip resets clear watchdog scratch registers. */
+      logger_reset_marker_record_storage_service_timeout((uint32_t)kind,
+                                                         request_seq);
       watchdog_reboot(0, 0, 0);
       while (true) {
         tight_loop_contents();
