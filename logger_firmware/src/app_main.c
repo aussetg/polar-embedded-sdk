@@ -1158,8 +1158,7 @@ bool logger_app_request_service_mode(logger_app_t *app, uint32_t now_ms,
 
   case LOGGER_RUNTIME_UPLOAD_PREP:
   case LOGGER_RUNTIME_UPLOAD_RUNNING:
-    logger_app_enter_service(app, "host_service_request", now_ms, true);
-    return true;
+    return false;
 
   case LOGGER_RUNTIME_BOOT:
     return false;
@@ -2028,6 +2027,24 @@ static logger_step_result_t logger_step_common_prologue(logger_app_t *app,
   return LOGGER_STEP_CONTINUE;
 }
 
+static bool logger_step_enter_exact(logger_app_t *app, uint32_t now_ms,
+                                    logger_runtime_state_t expected_state,
+                                    bool h10_enabled) {
+  if (app->runtime.current_state != expected_state) {
+    return false;
+  }
+
+  if (logger_step_common_prologue(app, now_ms, h10_enabled) ==
+      LOGGER_STEP_ABORTED) {
+    return false;
+  }
+
+  /* The prologue polls the host CLI and may route faults.  If that changed
+   * state, stop this state's step immediately; the next scheduler tick will
+   * dispatch the new owner. */
+  return app->runtime.current_state == expected_state;
+}
+
 static bool logger_app_state_allows_deferred_boot_queue_refresh(
     logger_runtime_state_t state) {
   switch (state) {
@@ -2210,6 +2227,9 @@ static void logger_step_service(logger_app_t *app, uint32_t now_ms) {
   logger_app_reconcile_clock_invalid_fault(app, now_ms);
   logger_h10_set_enabled(&app->h10, false);
   logger_service_cli_poll(&app->cli, app, now_ms);
+  if (app->runtime.current_state != LOGGER_RUNTIME_SERVICE) {
+    return;
+  }
   (void)logger_button_poll(&app->button, now_ms);
 
   if (!app->battery.vbus_present) {
@@ -2627,7 +2647,7 @@ static void logger_step_recovery_hold(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_logging_link_state(logger_app_t *app, uint32_t now_ms) {
   const logger_runtime_state_t step_entry_state = app->runtime.current_state;
-  if (logger_step_common_prologue(app, now_ms, true) == LOGGER_STEP_ABORTED) {
+  if (!logger_step_enter_exact(app, now_ms, step_entry_state, true)) {
     return;
   }
   logger_h10_poll(&app->h10, now_ms);
@@ -2807,7 +2827,8 @@ static void logger_step_log_stopping(logger_app_t *app, uint32_t now_ms) {
 }
 
 static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
-  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
+  if (!logger_step_enter_exact(app, now_ms, LOGGER_RUNTIME_UPLOAD_PREP,
+                               false)) {
     return;
   }
 
@@ -2859,7 +2880,8 @@ static void logger_step_upload_prep(logger_app_t *app, uint32_t now_ms) {
 }
 
 static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
-  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
+  if (!logger_step_enter_exact(app, now_ms, LOGGER_RUNTIME_UPLOAD_RUNNING,
+                               false)) {
     return;
   }
 
@@ -2956,7 +2978,8 @@ static void logger_step_upload_running(logger_app_t *app, uint32_t now_ms) {
 
 static void logger_step_idle_waiting_for_charger(logger_app_t *app,
                                                  uint32_t now_ms) {
-  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
+  if (!logger_step_enter_exact(
+          app, now_ms, LOGGER_RUNTIME_IDLE_WAITING_FOR_CHARGER, false)) {
     return;
   }
   (void)logger_button_poll(&app->button, now_ms);
@@ -2970,7 +2993,8 @@ static void logger_step_idle_waiting_for_charger(logger_app_t *app,
 
 static void logger_step_idle_upload_complete(logger_app_t *app,
                                              uint32_t now_ms) {
-  if (logger_step_common_prologue(app, now_ms, false) == LOGGER_STEP_ABORTED) {
+  if (!logger_step_enter_exact(app, now_ms, LOGGER_RUNTIME_IDLE_UPLOAD_COMPLETE,
+                               false)) {
     return;
   }
   (void)logger_button_poll(&app->button, now_ms);
